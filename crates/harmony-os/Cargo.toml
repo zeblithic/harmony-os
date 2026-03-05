@@ -1,0 +1,23 @@
+[package]
+name = "harmony-os"
+description = "Ring 3: Full Harmony OS with Linux ABI compatibility, DDE, declarative config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Ring 2
+harmony-microkernel = { workspace = true }
+
+# Ring 0 — full protocol stack available at the OS level
+harmony-crypto = { workspace = true }
+harmony-identity = { workspace = true }
+harmony-reticulum = { workspace = true }
+harmony-zenoh = { workspace = true }
+harmony-content = { workspace = true }
+harmony-compute = { workspace = true }
+harmony-workflow = { workspace = true }
+
+[dev-dependencies]

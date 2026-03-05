@@ -1,0 +1,18 @@
+[package]
+name = "harmony-microkernel"
+description = "Ring 2: Microkernel with 9P IPC, capability enforcement, process isolation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Ring 1
+harmony-unikernel = { workspace = true }
+
+# Ring 0 — additional protocol crates needed at the kernel level
+harmony-crypto = { workspace = true }
+harmony-identity = { workspace = true }
+
+[dev-dependencies]

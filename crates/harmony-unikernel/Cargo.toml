@@ -1,0 +1,17 @@
+[package]
+name = "harmony-unikernel"
+description = "Ring 1: Bootable single-purpose Harmony node (bare metal / hypervisor)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Ring 0 — harmony protocol core
+harmony-crypto = { workspace = true }
+harmony-identity = { workspace = true }
+harmony-reticulum = { workspace = true }
+
+
+[dev-dependencies]
