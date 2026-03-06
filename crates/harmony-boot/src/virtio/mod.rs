@@ -3,4 +3,4 @@
 
 pub mod pci_cap;
 pub mod virtqueue;
-// pub mod net;
+pub mod net;
