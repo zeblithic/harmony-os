@@ -16,7 +16,7 @@ fn main() {
             build_image();
         }
         Some("run") => {
-            build_kernel_with_features(&["qemu-test"]);
+            build_kernel();
             build_image();
             run_qemu();
         }

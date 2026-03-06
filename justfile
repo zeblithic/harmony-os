@@ -17,7 +17,7 @@ build-test:
 
 # Build test disk image (with qemu-test feature)
 build-image-test: build-test
-    cargo +nightly run --manifest-path xtask/Cargo.toml -- build-image
+    cargo +nightly run --manifest-path xtask/Cargo.toml -- build-image-test
 
 # Run in QEMU interactively (no auto-exit — stays in event loop)
 run: build
