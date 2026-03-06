@@ -21,14 +21,27 @@ build-test:
 build-image-test:
     cargo +nightly run --manifest-path xtask/Cargo.toml -- build-image-test
 
-# Run in QEMU interactively (no auto-exit — stays in event loop)
+# Run in QEMU interactively with VirtIO-net (multicast LAN)
 run: build
     qemu-system-x86_64 \
         -drive format=raw,file=target/harmony-boot-bios.img \
         -serial stdio \
         -display none \
         -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-        -cpu qemu64,+rdrand
+        -cpu qemu64,+rdrand \
+        -device virtio-net-pci,netdev=n0 \
+        -netdev socket,id=n0,mcast=230.0.0.1:1234
+
+# Run a second peer on the same virtual LAN
+run-peer: build
+    qemu-system-x86_64 \
+        -drive format=raw,file=target/harmony-boot-bios.img \
+        -serial stdio \
+        -display none \
+        -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+        -cpu qemu64,+rdrand \
+        -device virtio-net-pci,netdev=n0 \
+        -netdev socket,id=n0,mcast=230.0.0.1:1234
 
 # Host-native unit tests (workspace crates only, no bare-metal)
 test:
@@ -47,6 +60,8 @@ test-qemu: build-image-test
         -display none \
         -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
         -cpu qemu64,+rdrand \
+        -device virtio-net-pci,netdev=n0 \
+        -netdev socket,id=n0,mcast=230.0.0.1:1234 \
         2>/dev/null | tee "$LOG"
     EXIT=${PIPESTATUS[0]}
     cat "$LOG" >&2
