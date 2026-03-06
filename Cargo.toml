@@ -5,6 +5,11 @@ members = [
     "crates/harmony-microkernel",
     "crates/harmony-os",
 ]
+# harmony-boot is excluded from the workspace because it targets bare metal
+# (x86_64-unknown-none) and Cargo's workspace feature unification would force
+# std features on its no_std dependencies. Build it via `cargo xtask` or
+# `cargo check -p harmony-boot --target x86_64-unknown-none` from crates/harmony-boot/.
+exclude = ["crates/harmony-boot", "xtask"]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,9 +20,12 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 # Ring 0 — harmony core (consumed under MIT license arm)
-harmony-crypto = { git = "https://github.com/zeblithic/harmony.git" }
-harmony-identity = { git = "https://github.com/zeblithic/harmony.git" }
-harmony-reticulum = { git = "https://github.com/zeblithic/harmony.git" }
+# default-features = false so bare-metal crates can consume without std;
+# members that need std re-enable via features = ["std"].
+harmony-crypto = { git = "https://github.com/zeblithic/harmony.git", default-features = false }
+harmony-identity = { git = "https://github.com/zeblithic/harmony.git", default-features = false }
+harmony-platform = { git = "https://github.com/zeblithic/harmony.git", default-features = false }
+harmony-reticulum = { git = "https://github.com/zeblithic/harmony.git", default-features = false }
 harmony-zenoh = { git = "https://github.com/zeblithic/harmony.git" }
 harmony-content = { git = "https://github.com/zeblithic/harmony.git" }
 harmony-compute = { git = "https://github.com/zeblithic/harmony.git" }
@@ -25,6 +33,9 @@ harmony-workflow = { git = "https://github.com/zeblithic/harmony.git" }
 # Note: harmony-node is a binary crate (no lib target), not usable as a dependency
 
 # Internal workspace crates
-harmony-unikernel = { path = "crates/harmony-unikernel" }
+harmony-unikernel = { path = "crates/harmony-unikernel", default-features = false }
 harmony-microkernel = { path = "crates/harmony-microkernel" }
 harmony-os = { path = "crates/harmony-os" }
+
+# Shared dependencies
+rand_core = { version = "0.6", default-features = false }

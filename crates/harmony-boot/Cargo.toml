@@ -1,0 +1,18 @@
+[package]
+name = "harmony-boot"
+description = "Ring 1: x86_64 boot stub for Harmony unikernel (QEMU target)"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/zeblithic/harmony-os"
+
+# Excluded from workspace — bare-metal target requires independent feature resolution
+# to avoid std feature unification with host-target workspace members.
+
+[dependencies]
+# harmony-unikernel integration will be enabled once Ring 0 crates fully support
+# no_std on bare-metal targets (requires upstream default-features = false fixes).
+# harmony-unikernel = { path = "../harmony-unikernel", default-features = false }
+bootloader_api = "0.11"
+linked_list_allocator = "0.10"
+x86_64 = { version = "0.15", default-features = false, features = ["instructions"] }
