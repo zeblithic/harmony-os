@@ -310,7 +310,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
 
         tick += 1;
-        x86_64::instructions::hlt();
+        // TODO(harmony-timer): replace spin-loop with hlt once a timer interrupt
+        // source (PIT/HPET/LAPIC) is configured; without one, hlt halts forever
+        // because VirtIO is in pure poll mode with no MSI-X/INTx interrupts.
+        core::hint::spin_loop();
     }
 }
 

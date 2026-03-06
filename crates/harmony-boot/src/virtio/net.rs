@@ -183,6 +183,12 @@ impl VirtioNet {
         unsafe { mmio_write32(common + DRIVER_FEATURE, VIRTIO_NET_F_MAC) };
 
         // VIRTIO_F_VERSION_1 is bit 32 (bit 0 of feature word 1) — required by §6.
+        // §3.1.1: driver MUST NOT accept features the device did not offer.
+        unsafe { mmio_write32(common + DEVICE_FEATURE_SELECT, 1) };
+        let device_features_hi = unsafe { mmio_read32(common + DEVICE_FEATURE) };
+        if device_features_hi & 1 == 0 {
+            return Err("virtio-net: device does not offer VIRTIO_F_VERSION_1");
+        }
         unsafe { mmio_write32(common + DRIVER_FEATURE_SELECT, 1) };
         unsafe { mmio_write32(common + DRIVER_FEATURE, 1) };
 
@@ -361,6 +367,8 @@ impl NetworkInterface for VirtioNet {
         }
 
         // Build virtio_net_hdr + Ethernet frame on the stack.
+        // TODO(perf): Build frame directly in the DMA buffer to avoid the
+        // 2 KiB stack allocation and the extra copy into submit_send.
         // Bytes 0..12: virtio_net_hdr (all zeros = no GSO, no checksum offload).
         let mut frame = [0u8; BUF_SIZE];
         let h = VIRTIO_NET_HDR_LEN;

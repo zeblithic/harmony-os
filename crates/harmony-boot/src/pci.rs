@@ -64,18 +64,13 @@ impl PciDevice {
         pci_config_read8(self.bus, self.device, self.function, 0x34)
     }
 
-    pub fn read_command(&self) -> u16 {
-        pci_config_read16(self.bus, self.device, self.function, 0x04)
-    }
-
-    pub fn write_command(&self, value: u16) {
-        pci_config_write16(self.bus, self.device, self.function, 0x04, value);
-    }
-
     pub fn enable_bus_master(&self) {
-        let cmd = self.read_command();
-        // Bit 1: Memory Space, Bit 2: Bus Master
-        self.write_command(cmd | 0b0000_0110);
+        // Read full 32-bit register at offset 0x04: [Status(15:0) | Command(15:0)].
+        // Write back with status bits zeroed to avoid clearing W1C status bits
+        // (writing 0 to a W1C bit is a no-op; writing 1 would clear it).
+        let word = pci_config_read32(self.bus, self.device, self.function, 0x04);
+        let cmd = (word as u16) | 0b0000_0110; // Memory Space + Bus Master
+        pci_config_write32(self.bus, self.device, self.function, 0x04, cmd as u32);
     }
 }
 

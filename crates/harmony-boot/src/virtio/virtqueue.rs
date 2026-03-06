@@ -180,7 +180,9 @@ impl Virtqueue {
 
     /// Return a descriptor to the free pool.
     pub fn free_desc(&mut self, idx: u16) {
-        self.free[idx as usize] = true;
+        if (idx as usize) < QUEUE_SIZE as usize {
+            self.free[idx as usize] = true;
+        }
     }
 
     /// Return a pointer to the buffer for descriptor `idx`.
