@@ -3,17 +3,15 @@
 //!
 //! Initialises serial output, heap, RDRAND entropy, generates a node
 //! identity, then enters the unikernel event loop.
-//!
-//! IDT setup is deferred until the x86_64 crate supports stable Rust's
-//! abi_x86_interrupt (v0.15 still gates it behind nightly #![feature]).
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
+use bootloader_api::config::Mapping;
 use bootloader_api::info::MemoryRegionKind;
-use bootloader_api::{entry_point, BootInfo};
+use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::fmt::Write;
 use core::panic::PanicInfo;
 use linked_list_allocator::LockedHeap;
@@ -22,6 +20,19 @@ use x86_64::instructions::port::Port;
 use harmony_identity::PrivateIdentity;
 use harmony_unikernel::serial::{hex_encode, SerialWriter};
 use harmony_unikernel::{KernelEntropy, MemoryState, UnikernelRuntime};
+
+// ---------------------------------------------------------------------------
+// Bootloader configuration
+// ---------------------------------------------------------------------------
+
+static BOOTLOADER_CONFIG: BootloaderConfig = {
+    let mut config = BootloaderConfig::new_default();
+    // Map all physical memory so we can use it for heap allocation.
+    config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config
+};
+
+entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 // ---------------------------------------------------------------------------
 // Global allocator
@@ -75,7 +86,6 @@ fn serial_writer() -> SerialWriter<impl FnMut(u8)> {
 
 /// Fill `buf` using the x86 RDRAND instruction.
 fn rdrand_fill(buf: &mut [u8]) {
-    // Process 8 bytes at a time via rdrand64.
     let mut i = 0;
     while i < buf.len() {
         let val: u64 = loop {
@@ -105,8 +115,6 @@ fn rdrand_fill(buf: &mut [u8]) {
 
 /// Check whether RDRAND is available via CPUID.
 fn rdrand_available() -> bool {
-    // CPUID leaf 1, ECX bit 30.
-    // rbx is reserved by LLVM, so we save/restore it manually.
     let ecx: u32;
     unsafe {
         core::arch::asm!(
@@ -129,7 +137,6 @@ fn rdrand_available() -> bool {
 
 /// Write to the QEMU isa-debug-exit device (I/O port 0xf4).
 /// Exit code seen by the host = (value << 1) | 1.
-/// value=0 -> host exit code 1; value=0x10 -> host exit code 0x21.
 fn qemu_debug_exit(value: u32) {
     unsafe {
         Port::new(0xf4).write(value);
@@ -140,15 +147,19 @@ fn qemu_debug_exit(value: u32) {
 // Entry point
 // ---------------------------------------------------------------------------
 
-entry_point!(kernel_main);
-
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // 1. Serial init
     serial_init();
     let mut serial = serial_writer();
     serial.log("BOOT", "Harmony unikernel v0.1.0");
 
-    // 2. Heap init — find first usable region >= 1 MiB
+    // 2. Get the physical memory offset so we can convert physical -> virtual
+    let phys_offset = boot_info
+        .physical_memory_offset
+        .into_option()
+        .expect("physical_memory_offset not provided by bootloader");
+
+    // 3. Heap init — find first usable region >= 1 MiB
     const MIN_HEAP_SIZE: usize = 1024 * 1024; // 1 MiB
     let mut heap_start: Option<u64> = None;
     let mut heap_size: usize = 0;
@@ -158,7 +169,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let size = (region.end - region.start) as usize;
             if size >= MIN_HEAP_SIZE {
                 heap_start = Some(region.start);
-                // Cap to a reasonable size (4 MiB) to avoid consuming all RAM.
                 heap_size = if size > 4 * 1024 * 1024 {
                     4 * 1024 * 1024
                 } else {
@@ -170,9 +180,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     match heap_start {
-        Some(start) => {
+        Some(phys_start) => {
+            let virt_start = phys_start + phys_offset;
             unsafe {
-                ALLOCATOR.lock().init(start as *mut u8, heap_size);
+                ALLOCATOR.lock().init(virt_start as *mut u8, heap_size);
             }
             let _ = writeln!(serial, "[HEAP] {}", heap_size);
         }
@@ -183,11 +194,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
         }
     }
-
-    // 3. IDT — skipped: x86_64 crate v0.15 gates interrupt handler types behind
-    //    nightly #![feature(abi_x86_interrupt)].  Stable Rust 1.85+ stabilised
-    //    the calling convention, but the crate hasn't updated yet.
-    serial.log("IDT", "skipped (x86_64 crate requires nightly for handlers)");
 
     // 4. RDRAND entropy
     if !rdrand_available() {
@@ -230,6 +236,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    serial_init();
     let mut serial = serial_writer();
     let _ = writeln!(serial, "[PANIC] {}", info);
     loop {

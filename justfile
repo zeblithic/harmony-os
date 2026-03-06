@@ -3,13 +3,13 @@
 default:
     @just --list
 
-# Build kernel ELF (stable Rust, no nightly required)
+# Build kernel ELF (stable Rust)
 build-kernel:
     cd crates/harmony-boot && cargo build --target x86_64-unknown-none --release
 
-# Build bootable BIOS disk image via xtask (requires nightly for bootloader crate)
+# Build bootable BIOS disk image (bootloader crate requires nightly + rust-src)
 build: build-kernel
-    cargo run --manifest-path xtask/Cargo.toml -- build-image
+    cargo +nightly run --manifest-path xtask/Cargo.toml -- build-image
 
 # Run in QEMU (serial on terminal)
 run: build
