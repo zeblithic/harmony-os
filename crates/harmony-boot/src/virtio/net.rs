@@ -139,11 +139,9 @@ unsafe fn mmio_write32(addr: usize, val: u32) {
 /// Manages a pair of split virtqueues (RX index 0, TX index 1) and
 /// provides the [`NetworkInterface`] trait for the unikernel event loop.
 pub struct VirtioNet {
-    caps: VirtioPciCaps,
     rx_queue: Virtqueue,
     tx_queue: Virtqueue,
     mac: [u8; 6],
-    rx_queue_size: u16,
     rx_notify_addr: usize,
     tx_notify_addr: usize,
 }
@@ -224,8 +222,8 @@ impl VirtioNet {
         tx_queue.set_queue_size(tx_queue_size);
 
         // Compute notification addresses for each queue.
-        let rx_notify_off = Self::read_queue_notify_off(&caps, common, 0);
-        let tx_notify_off = Self::read_queue_notify_off(&caps, common, 1);
+        let rx_notify_off = Self::read_queue_notify_off(common, 0);
+        let tx_notify_off = Self::read_queue_notify_off(common, 1);
 
         let rx_notify_addr =
             caps.notify_base + rx_notify_off as usize * caps.notify_off_multiplier as usize;
@@ -245,17 +243,15 @@ impl VirtioNet {
         fence(Ordering::SeqCst);
 
         let mut driver = VirtioNet {
-            caps,
             rx_queue,
             tx_queue,
             mac,
-            rx_queue_size,
             rx_notify_addr,
             tx_notify_addr,
         };
 
         // Pre-post RX buffers (capped at negotiated queue size).
-        for _ in 0..driver.rx_queue_size {
+        for _ in 0..rx_queue_size {
             driver.rx_queue.post_receive();
         }
 
@@ -311,7 +307,7 @@ impl VirtioNet {
 
     /// Read the notification offset for a queue (used to compute the
     /// queue's notification MMIO address).
-    fn read_queue_notify_off(_caps: &VirtioPciCaps, common: usize, queue_idx: u16) -> u16 {
+    fn read_queue_notify_off(common: usize, queue_idx: u16) -> u16 {
         unsafe {
             mmio_write16(common + QUEUE_SELECT, queue_idx);
             mmio_read16(common + QUEUE_NOTIFY_OFF)
@@ -391,9 +387,13 @@ impl NetworkInterface for VirtioNet {
         let (desc_id, len) = self.rx_queue.poll_used()?;
 
         // Read the raw buffer (virtio_net_hdr + Ethernet frame).
-        let frame = self.rx_queue.read_buffer(desc_id, len)?;
+        // Clamp len to BUF_SIZE to defend against misbehaving devices
+        // without leaking the descriptor (read_buffer cannot fail).
+        let clamped_len = if (len as usize) > BUF_SIZE { BUF_SIZE as u32 } else { len };
+        let frame = self.rx_queue.read_buffer(desc_id, clamped_len);
 
         // Free the descriptor and re-post a receive buffer.
+        // This must happen unconditionally to avoid descriptor leaks.
         self.rx_queue.free_desc(desc_id);
         self.rx_queue.post_receive();
 

@@ -60,11 +60,6 @@ pub struct PciDevice {
 }
 
 impl PciDevice {
-    pub fn read_bar(&self, bar_index: u8) -> u32 {
-        let offset = 0x10 + (bar_index * 4);
-        pci_config_read32(self.bus, self.device, self.function, offset)
-    }
-
     pub fn capabilities_ptr(&self) -> u8 {
         pci_config_read8(self.bus, self.device, self.function, 0x34)
     }
