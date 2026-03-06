@@ -60,6 +60,13 @@ pub fn parse_capabilities(dev: &PciDevice, phys_offset: u64) -> Option<VirtioPci
     // Walk the capability linked list.
     while cap_ptr != 0 && remaining > 0 {
         remaining -= 1;
+
+        // VirtIO PCI caps span up to cap_ptr+16. Skip if arithmetic
+        // would overflow the 256-byte PCI config space (u8 range).
+        if cap_ptr > 239 {
+            break;
+        }
+
         let cap_id = pci_config_read8(dev.bus, dev.device, dev.function, cap_ptr);
         let cap_next = pci_config_read8(dev.bus, dev.device, dev.function, cap_ptr + 1);
 

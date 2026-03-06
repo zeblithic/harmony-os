@@ -284,6 +284,10 @@ impl Virtqueue {
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
 
         // Validate device-provided descriptor id is in range.
+        // If invalid, we skip this entry (last_used_idx already advanced).
+        // The original descriptor leaks, but we can't free it safely
+        // because the device-provided id is garbage. This can only happen
+        // with misbehaving firmware — not possible on QEMU.
         if raw_id >= self.queue_size as u32 {
             return None;
         }

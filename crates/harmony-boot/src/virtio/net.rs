@@ -384,35 +384,42 @@ impl NetworkInterface for VirtioNet {
     }
 
     fn receive(&mut self) -> Option<Vec<u8>> {
-        let (desc_id, len) = self.rx_queue.poll_used()?;
+        // Loop to drain non-Harmony frames (ARP, mDNS, etc.) so that
+        // returning None means "used ring empty", not "got a filtered frame."
+        loop {
+            let (desc_id, len) = self.rx_queue.poll_used()?;
 
-        // Read the raw buffer (virtio_net_hdr + Ethernet frame).
-        // Clamp len to BUF_SIZE to defend against misbehaving devices
-        // without leaking the descriptor (read_buffer cannot fail).
-        let clamped_len = if (len as usize) > BUF_SIZE { BUF_SIZE as u32 } else { len };
-        let frame = self.rx_queue.read_buffer(desc_id, clamped_len);
+            // Read the raw buffer (virtio_net_hdr + Ethernet frame).
+            // Clamp len to BUF_SIZE to defend against misbehaving devices
+            // without leaking the descriptor (read_buffer cannot fail).
+            let clamped_len = if (len as usize) > BUF_SIZE {
+                BUF_SIZE as u32
+            } else {
+                len
+            };
+            let frame = self.rx_queue.read_buffer(desc_id, clamped_len);
 
-        // Free the descriptor and re-post a receive buffer.
-        // This must happen unconditionally to avoid descriptor leaks.
-        self.rx_queue.free_desc(desc_id);
-        self.rx_queue.post_receive();
+            // Free the descriptor and re-post a receive buffer.
+            // This must happen unconditionally to avoid descriptor leaks.
+            self.rx_queue.free_desc(desc_id);
+            self.rx_queue.post_receive();
 
-        // Notify the device that a new RX buffer is available.
-        unsafe { mmio_write16(self.rx_notify_addr, 0) };
+            // Notify the device that a new RX buffer is available.
+            unsafe { mmio_write16(self.rx_notify_addr, 0) };
 
-        // Skip the 12-byte virtio_net_hdr, then validate Ethernet header.
-        if frame.len() < VIRTIO_NET_HDR_LEN + ETH_HEADER_LEN {
-            return None;
+            // Skip short frames and non-Harmony EtherTypes.
+            if frame.len() < VIRTIO_NET_HDR_LEN + ETH_HEADER_LEN {
+                continue;
+            }
+
+            let eth = &frame[VIRTIO_NET_HDR_LEN..];
+
+            if eth[12..14] != ETHERTYPE_HARMONY {
+                continue;
+            }
+
+            // Strip virtio_net_hdr + Ethernet header and return the payload.
+            return Some(eth[ETH_HEADER_LEN..].to_vec());
         }
-
-        let eth = &frame[VIRTIO_NET_HDR_LEN..];
-
-        // Only accept Harmony EtherType (0x88B5).
-        if eth[12..14] != ETHERTYPE_HARMONY {
-            return None;
-        }
-
-        // Strip virtio_net_hdr + Ethernet header and return the payload.
-        Some(eth[ETH_HEADER_LEN..].to_vec())
     }
 }

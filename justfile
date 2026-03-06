@@ -32,7 +32,9 @@ run: build
         -device virtio-net-pci,netdev=n0 \
         -netdev socket,id=n0,mcast=230.0.0.1:1234
 
-# Run a second peer on the same virtual LAN
+# Run a second peer on the same virtual LAN.
+# Intentionally identical to `run` — QEMU auto-assigns distinct MAC
+# addresses per instance, so each peer gets a unique identity.
 run-peer: build
     qemu-system-x86_64 \
         -drive format=raw,file=target/harmony-boot-bios.img \
