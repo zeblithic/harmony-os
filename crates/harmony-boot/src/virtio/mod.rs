@@ -2,5 +2,5 @@
 //! VirtIO 1.0+ device driver support.
 
 pub mod pci_cap;
-// pub mod virtqueue;
+pub mod virtqueue;
 // pub mod net;
