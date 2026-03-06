@@ -10,6 +10,7 @@
 extern crate alloc;
 
 mod pci;
+mod virtio;
 
 use bootloader_api::config::Mapping;
 use bootloader_api::info::MemoryRegionKind;
