@@ -277,7 +277,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Poll network for inbound packets
         if let Some(ref mut net) = virtio_net {
             while let Some(data) = NetworkInterface::receive(net) {
-                let _actions = runtime.handle_packet("virtio0", data, tick);
+                let rx_actions = runtime.handle_packet("virtio0", data, tick);
+                for action in &rx_actions {
+                    if let NodeAction::SendOnInterface {
+                        interface_name,
+                        raw,
+                    } = action
+                    {
+                        if interface_name.as_ref() == "virtio0" {
+                            let _ = NetworkInterface::send(net, raw);
+                        }
+                    }
+                }
             }
         }
 

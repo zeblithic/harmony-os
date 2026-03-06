@@ -67,9 +67,17 @@ pub fn parse_capabilities(dev: &PciDevice, phys_offset: u64) -> Option<VirtioPci
             let offset = pci_config_read32(dev.bus, dev.device, dev.function, cap_ptr + 8);
             let _length = pci_config_read32(dev.bus, dev.device, dev.function, cap_ptr + 12);
 
-            // Read the BAR value and mask off the lower bits (type/prefetch flags).
+            // Read the BAR value and resolve the physical base address.
+            // 64-bit BARs (type bits [2:1] == 0b10) span two consecutive BARs.
             let bar_val = dev.bars[bar_index as usize];
-            let bar_base = (bar_val & 0xFFFF_FFF0) as u64;
+            let is_64bit = (bar_val >> 1) & 0x3 == 0x2;
+            let bar_base = if is_64bit {
+                let lo = (bar_val & 0xFFFF_FFF0) as u64;
+                let hi = dev.bars[bar_index as usize + 1] as u64;
+                lo | (hi << 32)
+            } else {
+                (bar_val & 0xFFFF_FFF0) as u64
+            };
             let virt_addr = (bar_base + phys_offset + offset as u64) as usize;
 
             match cfg_type {

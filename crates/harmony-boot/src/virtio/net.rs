@@ -29,6 +29,10 @@ const ETH_HEADER_LEN: usize = 14;
 /// Broadcast MAC address.
 const BROADCAST_MAC: [u8; 6] = [0xFF; 6];
 
+/// VirtIO net header length (VirtIO 1.0 §5.1.6).
+/// 12 bytes: 10-byte base header + 2-byte `num_buffers` (always present in 1.0+).
+const VIRTIO_NET_HDR_LEN: usize = 12;
+
 // ---------------------------------------------------------------------------
 // VirtIO common config MMIO offsets (VirtIO 1.0 §4.1.4.3)
 // ---------------------------------------------------------------------------
@@ -149,6 +153,7 @@ pub struct VirtioNet {
     rx_queue: Virtqueue,
     tx_queue: Virtqueue,
     mac: [u8; 6],
+    rx_queue_size: u16,
     rx_notify_addr: usize,
     tx_notify_addr: usize,
 }
@@ -214,11 +219,11 @@ impl VirtioNet {
 
         // Setup RX queue (index 0).
         let rx_queue = Virtqueue::new(phys_offset);
-        Self::setup_queue(&caps, common, 0, &rx_queue);
+        let rx_queue_size = Self::setup_queue(&caps, common, 0, &rx_queue);
 
         // Setup TX queue (index 1).
         let tx_queue = Virtqueue::new(phys_offset);
-        Self::setup_queue(&caps, common, 1, &tx_queue);
+        let _tx_queue_size = Self::setup_queue(&caps, common, 1, &tx_queue);
 
         // Compute notification addresses for each queue.
         let rx_notify_off = Self::read_queue_notify_off(&caps, common, 0);
@@ -229,24 +234,8 @@ impl VirtioNet {
         let tx_notify_addr =
             caps.notify_base + tx_notify_off as usize * caps.notify_off_multiplier as usize;
 
-        let mut driver = VirtioNet {
-            caps,
-            rx_queue,
-            tx_queue,
-            mac,
-            rx_notify_addr,
-            tx_notify_addr,
-        };
-
-        // Pre-post all RX buffers so the device can write incoming packets.
-        for _ in 0..QUEUE_SIZE {
-            driver.rx_queue.post_receive();
-        }
-
-        // Notify the device that RX buffers are available.
-        unsafe { mmio_write16(driver.rx_notify_addr, 0) };
-
         // §3.1.1 — Set DRIVER_OK: device is live.
+        // Must be set before any queue notifications (§3.1.1 step 8).
         unsafe {
             mmio_write8(
                 common + DEVICE_STATUS,
@@ -254,12 +243,35 @@ impl VirtioNet {
             )
         };
 
+        let mut driver = VirtioNet {
+            caps,
+            rx_queue,
+            tx_queue,
+            mac,
+            rx_queue_size,
+            rx_notify_addr,
+            tx_notify_addr,
+        };
+
+        // Pre-post RX buffers (capped at negotiated queue size).
+        for _ in 0..driver.rx_queue_size {
+            driver.rx_queue.post_receive();
+        }
+
+        // Notify the device that RX buffers are available.
+        unsafe { mmio_write16(driver.rx_notify_addr, 0) };
+
         Ok(driver)
     }
 
     /// Configure a single virtqueue on the device.
-    fn setup_queue(caps: &VirtioPciCaps, common: usize, queue_idx: u16, vq: &Virtqueue) {
-        unsafe {
+    fn setup_queue(
+        caps: &VirtioPciCaps,
+        common: usize,
+        queue_idx: u16,
+        vq: &Virtqueue,
+    ) -> u16 {
+        let size = unsafe {
             // Select the queue.
             mmio_write16(common + QUEUE_SELECT, queue_idx);
 
@@ -282,11 +294,14 @@ impl VirtioNet {
 
             // Enable the queue.
             mmio_write16(common + QUEUE_ENABLE, 1);
-        }
+
+            size
+        };
 
         // Suppress unused-field warning — we need caps for notify_base
         // but it isn't used in this helper (used later for notify addrs).
         let _ = caps;
+        size
     }
 
     /// Read the notification offset for a queue (used to compute the
@@ -339,21 +354,23 @@ impl NetworkInterface for VirtioNet {
         // Reclaim completed TX descriptors first.
         self.reclaim_tx();
 
-        let frame_len = ETH_HEADER_LEN + data.len();
+        let frame_len = VIRTIO_NET_HDR_LEN + ETH_HEADER_LEN + data.len();
         if frame_len > BUF_SIZE {
             return Err(PlatformError::SendFailed);
         }
 
-        // Build the Ethernet frame on the stack.
+        // Build virtio_net_hdr + Ethernet frame on the stack.
+        // Bytes 0..12: virtio_net_hdr (all zeros = no GSO, no checksum offload).
         let mut frame = [0u8; BUF_SIZE];
+        let h = VIRTIO_NET_HDR_LEN;
         // Destination: broadcast.
-        frame[0..6].copy_from_slice(&BROADCAST_MAC);
+        frame[h..h + 6].copy_from_slice(&BROADCAST_MAC);
         // Source: our MAC.
-        frame[6..12].copy_from_slice(&self.mac);
+        frame[h + 6..h + 12].copy_from_slice(&self.mac);
         // EtherType: Harmony (0x88B5).
-        frame[12..14].copy_from_slice(&ETHERTYPE_HARMONY);
+        frame[h + 12..h + 14].copy_from_slice(&ETHERTYPE_HARMONY);
         // Payload.
-        frame[14..14 + data.len()].copy_from_slice(data);
+        frame[h + ETH_HEADER_LEN..h + ETH_HEADER_LEN + data.len()].copy_from_slice(data);
 
         match self.tx_queue.submit_send(&frame[..frame_len]) {
             Some(_) => {
@@ -368,7 +385,7 @@ impl NetworkInterface for VirtioNet {
     fn receive(&mut self) -> Option<Vec<u8>> {
         let (desc_id, len) = self.rx_queue.poll_used()?;
 
-        // Read the raw Ethernet frame from the RX buffer.
+        // Read the raw buffer (virtio_net_hdr + Ethernet frame).
         let frame = self.rx_queue.read_buffer(desc_id, len);
 
         // Free the descriptor and re-post a receive buffer.
@@ -378,17 +395,19 @@ impl NetworkInterface for VirtioNet {
         // Notify the device that a new RX buffer is available.
         unsafe { mmio_write16(self.rx_notify_addr, 0) };
 
-        // Validate minimum frame size (need at least an Ethernet header).
-        if frame.len() < ETH_HEADER_LEN {
+        // Skip the 12-byte virtio_net_hdr, then validate Ethernet header.
+        if frame.len() < VIRTIO_NET_HDR_LEN + ETH_HEADER_LEN {
             return None;
         }
+
+        let eth = &frame[VIRTIO_NET_HDR_LEN..];
 
         // Only accept Harmony EtherType (0x88B5).
-        if frame[12..14] != ETHERTYPE_HARMONY {
+        if eth[12..14] != ETHERTYPE_HARMONY {
             return None;
         }
 
-        // Strip the 14-byte Ethernet header and return the payload.
-        Some(frame[ETH_HEADER_LEN..].to_vec())
+        // Strip virtio_net_hdr + Ethernet header and return the payload.
+        Some(eth[ETH_HEADER_LEN..].to_vec())
     }
 }
