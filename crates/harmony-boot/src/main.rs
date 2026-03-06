@@ -9,6 +9,8 @@
 
 extern crate alloc;
 
+mod pci;
+
 use bootloader_api::config::Mapping;
 use bootloader_api::info::MemoryRegionKind;
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
