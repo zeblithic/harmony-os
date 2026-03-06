@@ -51,15 +51,17 @@ impl<E: EntropySource, P: PersistentState> UnikernelRuntime<E, P> {
 
     /// Register a network interface with the node's routing table.
     pub fn register_interface(&mut self, name: &str) {
-        self.node.register_interface(
-            String::from(name),
-            InterfaceMode::Full,
-            None,
-        );
+        self.node
+            .register_interface(String::from(name), InterfaceMode::Full, None);
     }
 
     /// Feed an inbound packet from a network interface into the node.
-    pub fn handle_packet(&mut self, interface_name: &str, data: Vec<u8>, now: u64) -> Vec<NodeAction> {
+    pub fn handle_packet(
+        &mut self,
+        interface_name: &str,
+        data: Vec<u8>,
+        now: u64,
+    ) -> Vec<NodeAction> {
         self.node.handle_event(NodeEvent::InboundPacket {
             interface_name: String::from(interface_name),
             raw: data,

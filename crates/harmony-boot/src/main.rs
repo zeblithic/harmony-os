@@ -21,8 +21,8 @@ use linked_list_allocator::LockedHeap;
 use x86_64::instructions::port::Port;
 
 use harmony_identity::PrivateIdentity;
-use harmony_unikernel::serial::{hex_encode, SerialWriter};
 use harmony_platform::NetworkInterface;
+use harmony_unikernel::serial::{hex_encode, SerialWriter};
 use harmony_unikernel::{KernelEntropy, MemoryState, NodeAction, UnikernelRuntime};
 
 // ---------------------------------------------------------------------------
@@ -234,8 +234,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     Ok(net) => {
                         let mut mac_buf = [0u8; 17];
                         net.mac_str(&mut mac_buf);
-                        let mac_str = core::str::from_utf8(&mac_buf)
-                            .unwrap_or("??:??:??:??:??:??");
+                        let mac_str = core::str::from_utf8(&mac_buf).unwrap_or("??:??:??:??:??:??");
                         serial.log("VIRTIO", mac_str);
                         Some(net)
                     }
@@ -287,7 +286,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Dispatch outbound packets
         if let Some(ref mut net) = virtio_net {
             for action in &actions {
-                if let NodeAction::SendOnInterface { interface_name, raw } = action {
+                if let NodeAction::SendOnInterface {
+                    interface_name,
+                    raw,
+                } = action
+                {
                     if interface_name.as_ref() == "virtio0" {
                         let _ = NetworkInterface::send(net, raw);
                     }

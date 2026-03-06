@@ -174,12 +174,7 @@ impl VirtioNet {
         unsafe { mmio_write8(common + DEVICE_STATUS, STATUS_ACKNOWLEDGE) };
 
         // §3.1.1 — Set DRIVER status bit.
-        unsafe {
-            mmio_write8(
-                common + DEVICE_STATUS,
-                STATUS_ACKNOWLEDGE | STATUS_DRIVER,
-            )
-        };
+        unsafe { mmio_write8(common + DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER) };
 
         // §3.1.1 — Read device features (feature set 0).
         unsafe { mmio_write32(common + DEVICE_FEATURE_SELECT, 0) };

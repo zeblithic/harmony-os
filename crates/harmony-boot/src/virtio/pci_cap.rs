@@ -4,7 +4,7 @@
 //! VirtIO 1.0 §4.1.4: vendor-specific PCI capabilities (cap ID 0x09)
 //! with `cfg_type` identifying the structure type.
 
-use crate::pci::{pci_config_read8, pci_config_read32, PciDevice};
+use crate::pci::{pci_config_read32, pci_config_read8, PciDevice};
 
 /// PCI capability ID for vendor-specific capabilities.
 const PCI_CAP_ID_VENDOR: u8 = 0x09;

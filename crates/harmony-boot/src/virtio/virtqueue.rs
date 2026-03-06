@@ -117,20 +117,15 @@ impl Virtqueue {
     /// Panics if any of the heap allocations fail.
     pub fn new(phys_offset: u64) -> Self {
         // Allocate each region with the alignment required by the VirtIO spec.
-        let desc_layout = Layout::from_size_align(
-            core::mem::size_of::<VirtqDesc>() * QUEUE_SIZE as usize,
-            16,
-        )
-        .unwrap();
+        let desc_layout =
+            Layout::from_size_align(core::mem::size_of::<VirtqDesc>() * QUEUE_SIZE as usize, 16)
+                .unwrap();
 
-        let avail_layout =
-            Layout::from_size_align(core::mem::size_of::<VirtqAvail>(), 2).unwrap();
+        let avail_layout = Layout::from_size_align(core::mem::size_of::<VirtqAvail>(), 2).unwrap();
 
-        let used_layout =
-            Layout::from_size_align(core::mem::size_of::<VirtqUsed>(), 4).unwrap();
+        let used_layout = Layout::from_size_align(core::mem::size_of::<VirtqUsed>(), 4).unwrap();
 
-        let buffers_layout =
-            Layout::from_size_align(BUF_SIZE * QUEUE_SIZE as usize, 4096).unwrap();
+        let buffers_layout = Layout::from_size_align(BUF_SIZE * QUEUE_SIZE as usize, 4096).unwrap();
 
         let desc = unsafe { alloc_zeroed(desc_layout) } as *mut VirtqDesc;
         let avail = unsafe { alloc_zeroed(avail_layout) } as *mut VirtqAvail;
