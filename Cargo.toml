@@ -22,16 +22,14 @@ rust-version = "1.75"
 # Ring 0 — harmony core (consumed under MIT license arm)
 # default-features = false so bare-metal crates can consume without std;
 # members that need std re-enable via features = ["std"].
-# NOTE: points to jake-os-boot-stub which has default-features=false in
-# workspace deps. Update to branch = "main" after harmony PR #49 merges.
-harmony-crypto = { git = "https://github.com/zeblithic/harmony.git", branch = "jake-os-boot-stub", default-features = false }
-harmony-identity = { git = "https://github.com/zeblithic/harmony.git", branch = "jake-os-boot-stub", default-features = false }
-harmony-platform = { git = "https://github.com/zeblithic/harmony.git", branch = "jake-os-boot-stub", default-features = false }
-harmony-reticulum = { git = "https://github.com/zeblithic/harmony.git", branch = "jake-os-boot-stub", default-features = false }
-harmony-zenoh = { git = "https://github.com/zeblithic/harmony.git", branch = "jake-os-boot-stub" }
-harmony-content = { git = "https://github.com/zeblithic/harmony.git", branch = "jake-os-boot-stub" }
-harmony-compute = { git = "https://github.com/zeblithic/harmony.git", branch = "jake-os-boot-stub" }
-harmony-workflow = { git = "https://github.com/zeblithic/harmony.git", branch = "jake-os-boot-stub" }
+harmony-crypto = { git = "https://github.com/zeblithic/harmony.git", branch = "main", default-features = false }
+harmony-identity = { git = "https://github.com/zeblithic/harmony.git", branch = "main", default-features = false }
+harmony-platform = { git = "https://github.com/zeblithic/harmony.git", branch = "main", default-features = false }
+harmony-reticulum = { git = "https://github.com/zeblithic/harmony.git", branch = "main", default-features = false }
+harmony-zenoh = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
+harmony-content = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
+harmony-compute = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
+harmony-workflow = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
 # Note: harmony-node is a binary crate (no lib target), not usable as a dependency
 
 # Internal workspace crates

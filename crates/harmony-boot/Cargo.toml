@@ -11,7 +11,7 @@ repository = "https://github.com/zeblithic/harmony-os"
 
 [dependencies]
 harmony-unikernel = { path = "../harmony-unikernel", default-features = false }
-harmony-identity = { git = "https://github.com/zeblithic/harmony.git", branch = "jake-os-boot-stub", default-features = false }
+harmony-identity = { git = "https://github.com/zeblithic/harmony.git", branch = "main", default-features = false }
 bootloader_api = "0.11"
 linked_list_allocator = "0.10"
 x86_64 = { version = "0.15", default-features = false, features = ["instructions"] }
