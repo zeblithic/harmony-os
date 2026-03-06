@@ -26,6 +26,12 @@ impl<F: FnMut(u8)> Write for SerialWriter<F> {
 }
 
 pub fn hex_encode(bytes: &[u8], buf: &mut [u8]) {
+    debug_assert!(
+        buf.len() >= bytes.len() * 2,
+        "hex_encode: buf too small ({} < {})",
+        buf.len(),
+        bytes.len() * 2
+    );
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for (i, &b) in bytes.iter().enumerate() {
         buf[i * 2] = HEX[(b >> 4) as usize];

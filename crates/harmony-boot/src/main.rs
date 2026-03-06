@@ -137,6 +137,7 @@ fn rdrand_available() -> bool {
 
 /// Write to the QEMU isa-debug-exit device (I/O port 0xf4).
 /// Exit code seen by the host = (value << 1) | 1.
+#[cfg(feature = "qemu-test")]
 fn qemu_debug_exit(value: u32) {
     unsafe {
         Port::new(0xf4).write(value);
@@ -219,12 +220,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     serial.log("READY", "entering event loop");
 
-    // QEMU debug exit for automated testing
+    // Exit early during automated QEMU testing (feature-gated).
+    #[cfg(feature = "qemu-test")]
     qemu_debug_exit(0x10);
 
     let mut tick: u64 = 0;
     loop {
-        runtime.tick(tick);
+        let _actions = runtime.tick(tick);
+        // TODO(harmony-bpo): dispatch NodeActions to VirtIO-net interfaces
         tick += 1;
         x86_64::instructions::hlt();
     }

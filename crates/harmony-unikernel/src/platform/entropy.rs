@@ -35,6 +35,13 @@ impl<F: FnMut(&mut [u8])> RngCore for KernelEntropy<F> {
     }
 }
 
+/// # Safety contract
+///
+/// The caller MUST provide a fill function backed by a hardware CSPRNG
+/// (e.g., x86 RDRAND, ARM RNDR). Using a weak or deterministic source
+/// will produce insecure cryptographic keys — the type system cannot
+/// enforce this. Test code may use deterministic fills, but those
+/// `KernelEntropy` instances must never be used for real key generation.
 impl<F: FnMut(&mut [u8])> CryptoRng for KernelEntropy<F> {}
 
 #[cfg(test)]

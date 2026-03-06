@@ -3,7 +3,7 @@
 default:
     @just --list
 
-# Build kernel ELF (stable Rust)
+# Build kernel ELF (stable Rust, no QEMU exit)
 build-kernel:
     cd crates/harmony-boot && cargo build --target x86_64-unknown-none --release
 
@@ -11,7 +11,15 @@ build-kernel:
 build: build-kernel
     cargo +nightly run --manifest-path xtask/Cargo.toml -- build-image
 
-# Run in QEMU (serial on terminal)
+# Build kernel with qemu-test feature (enables isa-debug-exit after boot)
+build-test:
+    cd crates/harmony-boot && cargo build --target x86_64-unknown-none --release --features qemu-test
+
+# Build test disk image (with qemu-test feature)
+build-image-test: build-test
+    cargo +nightly run --manifest-path xtask/Cargo.toml -- build-image
+
+# Run in QEMU interactively (no auto-exit — stays in event loop)
 run: build
     qemu-system-x86_64 \
         -drive format=raw,file=target/harmony-boot-bios.img \
@@ -24,8 +32,8 @@ run: build
 test:
     cargo test --workspace
 
-# QEMU boot test — verifies kernel prints [IDENTITY] line within 10 seconds
-test-qemu: build
+# QEMU boot test — builds with qemu-test feature, verifies [IDENTITY] line
+test-qemu: build-image-test
     @echo "Booting QEMU and checking for [IDENTITY] line..."
     timeout 10 qemu-system-x86_64 \
         -drive format=raw,file=target/harmony-boot-bios.img \

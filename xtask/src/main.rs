@@ -11,8 +11,12 @@ fn main() {
             build_kernel();
             build_image();
         }
+        Some("build-image-test") => {
+            build_kernel_with_features(&["qemu-test"]);
+            build_image();
+        }
         Some("run") => {
-            build_kernel();
+            build_kernel_with_features(&["qemu-test"]);
             build_image();
             run_qemu();
         }
@@ -45,10 +49,20 @@ fn image_path() -> PathBuf {
 }
 
 fn build_kernel() {
+    build_kernel_with_features(&[]);
+}
+
+fn build_kernel_with_features(features: &[&str]) {
     let boot_dir = project_root().join("crates/harmony-boot");
     println!("Building kernel ELF...");
+    let mut args = vec!["build", "--target", TARGET, "--release"];
+    let features_str = features.join(",");
+    if !features.is_empty() {
+        args.push("--features");
+        args.push(&features_str);
+    }
     let status = Command::new("cargo")
-        .args(["build", "--target", TARGET, "--release"])
+        .args(&args)
         .current_dir(&boot_dir)
         .status()
         .expect("failed to invoke cargo");
