@@ -97,6 +97,8 @@ pub struct Virtqueue {
     /// Physical address of the buffer region.
     pub buffers_phys: u64,
 
+    /// Negotiated queue size (may be smaller than `QUEUE_SIZE`).
+    queue_size: u16,
     /// Tracks the last used ring index we processed.
     last_used_idx: u16,
     /// Per-descriptor free/allocated state.
@@ -151,16 +153,23 @@ impl Virtqueue {
             avail_phys,
             used_phys,
             buffers_phys,
+            queue_size: QUEUE_SIZE,
             last_used_idx: 0,
             free: [true; QUEUE_SIZE as usize],
         }
+    }
+
+    /// Set the negotiated queue size. Must be called before any ring
+    /// operations if the device reports a size smaller than `QUEUE_SIZE`.
+    pub fn set_queue_size(&mut self, size: u16) {
+        self.queue_size = size;
     }
 
     /// Allocate the first free descriptor, returning its index.
     ///
     /// Returns `None` if all descriptors are in use.
     pub fn alloc_desc(&mut self) -> Option<u16> {
-        for i in 0..QUEUE_SIZE as usize {
+        for i in 0..self.queue_size as usize {
             if self.free[i] {
                 self.free[i] = false;
                 return Some(i as u16);
@@ -201,7 +210,7 @@ impl Virtqueue {
 
             // Use volatile for avail ring since the device reads it via DMA.
             let avail_idx = ptr::read_volatile(&(*self.avail).idx);
-            (*self.avail).ring[(avail_idx % QUEUE_SIZE) as usize] = idx;
+            (*self.avail).ring[(avail_idx % self.queue_size) as usize] = idx;
 
             // Ensure descriptor writes are visible before the device sees
             // the updated available index.
@@ -236,7 +245,7 @@ impl Virtqueue {
 
             // Use volatile for avail ring since the device reads it via DMA.
             let avail_idx = ptr::read_volatile(&(*self.avail).idx);
-            (*self.avail).ring[(avail_idx % QUEUE_SIZE) as usize] = idx;
+            (*self.avail).ring[(avail_idx % self.queue_size) as usize] = idx;
 
             // Ensure descriptor + data writes are visible before the device
             // sees the updated available index.
@@ -264,7 +273,7 @@ impl Virtqueue {
 
         // Volatile reads: device writes used ring entries via DMA.
         let (raw_id, len) = unsafe {
-            let ring_idx = (self.last_used_idx % QUEUE_SIZE) as usize;
+            let ring_idx = (self.last_used_idx % self.queue_size) as usize;
             let elem = &(*self.used).ring[ring_idx];
             (
                 ptr::read_volatile(&elem.id),
@@ -275,7 +284,7 @@ impl Virtqueue {
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
 
         // Validate device-provided descriptor id is in range.
-        if raw_id >= QUEUE_SIZE as u32 {
+        if raw_id >= self.queue_size as u32 {
             return None;
         }
 

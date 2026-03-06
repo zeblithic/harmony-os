@@ -130,16 +130,6 @@ unsafe fn mmio_write32(addr: usize, val: u32) {
     write_volatile(addr as *mut u32, val);
 }
 
-/// Write a `u64` to a memory-mapped register.
-///
-/// # Safety
-///
-/// `addr` must be 8-byte aligned and point to a valid MMIO register.
-#[inline(always)]
-unsafe fn mmio_write64(addr: usize, val: u64) {
-    write_volatile(addr as *mut u64, val);
-}
-
 // ---------------------------------------------------------------------------
 // VirtioNet driver
 // ---------------------------------------------------------------------------
@@ -222,12 +212,16 @@ impl VirtioNet {
         }
 
         // Setup RX queue (index 0).
-        let rx_queue = Virtqueue::new(phys_offset);
-        let rx_queue_size = Self::setup_queue(&caps, common, 0, &rx_queue);
+        let mut rx_queue = Virtqueue::new(phys_offset);
+        let rx_queue_size = Self::setup_queue(&caps, common, 0, &rx_queue)
+            .ok_or("virtio-net: RX queue not available (max_size=0)")?;
+        rx_queue.set_queue_size(rx_queue_size);
 
         // Setup TX queue (index 1).
-        let tx_queue = Virtqueue::new(phys_offset);
-        let _tx_queue_size = Self::setup_queue(&caps, common, 1, &tx_queue);
+        let mut tx_queue = Virtqueue::new(phys_offset);
+        let tx_queue_size = Self::setup_queue(&caps, common, 1, &tx_queue)
+            .ok_or("virtio-net: TX queue not available (max_size=0)")?;
+        tx_queue.set_queue_size(tx_queue_size);
 
         // Compute notification addresses for each queue.
         let rx_notify_off = Self::read_queue_notify_off(&caps, common, 0);
@@ -246,6 +240,9 @@ impl VirtioNet {
                 STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK,
             )
         };
+
+        // Ensure DRIVER_OK is visible before any queue access or notification.
+        fence(Ordering::SeqCst);
 
         let mut driver = VirtioNet {
             caps,
@@ -269,12 +266,15 @@ impl VirtioNet {
     }
 
     /// Configure a single virtqueue on the device.
+    ///
+    /// Returns `None` if the device reports `max_size=0` (queue not
+    /// available per VirtIO 1.0 §4.1.5.1.3).
     fn setup_queue(
         caps: &VirtioPciCaps,
         common: usize,
         queue_idx: u16,
         vq: &Virtqueue,
-    ) -> u16 {
+    ) -> Option<u16> {
         let size = unsafe {
             // Select the queue.
             mmio_write16(common + QUEUE_SELECT, queue_idx);
@@ -282,8 +282,13 @@ impl VirtioNet {
             // Read the device's maximum queue size.
             let max_size = mmio_read16(common + QUEUE_SIZE_REG);
 
+            // §4.1.5.1.3: max_size == 0 means queue is not available.
+            if max_size == 0 {
+                return None;
+            }
+
             // Use the smaller of our compiled size and the device maximum.
-            let size = if max_size > 0 && max_size < QUEUE_SIZE {
+            let size = if max_size < QUEUE_SIZE {
                 max_size
             } else {
                 QUEUE_SIZE
@@ -309,7 +314,7 @@ impl VirtioNet {
         // Suppress unused-field warning — we need caps for notify_base
         // but it isn't used in this helper (used later for notify addrs).
         let _ = caps;
-        size
+        Some(size)
     }
 
     /// Read the notification offset for a queue (used to compute the
