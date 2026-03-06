@@ -174,7 +174,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             unsafe {
                 ALLOCATOR.lock().init(start as *mut u8, heap_size);
             }
-            let _ = write!(serial, "[HEAP] {}\n", heap_size);
+            let _ = writeln!(serial, "[HEAP] {}", heap_size);
         }
         None => {
             serial.log("HEAP", "FAILED: no usable region >= 1 MiB");
@@ -231,7 +231,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     let mut serial = serial_writer();
-    let _ = write!(serial, "[PANIC] {}\n", info);
+    let _ = writeln!(serial, "[PANIC] {}", info);
     loop {
         x86_64::instructions::hlt();
     }
