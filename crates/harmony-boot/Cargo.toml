@@ -10,9 +10,12 @@ repository = "https://github.com/zeblithic/harmony-os"
 # to avoid std feature unification with host-target workspace members.
 
 [dependencies]
-# harmony-unikernel integration will be enabled once Ring 0 crates fully support
-# no_std on bare-metal targets (requires upstream default-features = false fixes).
-# harmony-unikernel = { path = "../harmony-unikernel", default-features = false }
+harmony-unikernel = { path = "../harmony-unikernel", default-features = false }
+harmony-identity = { git = "https://github.com/zeblithic/harmony.git", branch = "jake-os-boot-stub", default-features = false }
 bootloader_api = "0.11"
 linked_list_allocator = "0.10"
 x86_64 = { version = "0.15", default-features = false, features = ["instructions"] }
+
+# Force software crypto — cross-compiling from aarch64 to x86_64-unknown-none
+# causes LLVM crashes with hardware-accelerated SHA and Poly1305 backends.
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }

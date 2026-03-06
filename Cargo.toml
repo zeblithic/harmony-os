@@ -22,14 +22,14 @@ rust-version = "1.75"
 # Ring 0 — harmony core (consumed under MIT license arm)
 # default-features = false so bare-metal crates can consume without std;
 # members that need std re-enable via features = ["std"].
-harmony-crypto = { git = "https://github.com/zeblithic/harmony.git", default-features = false }
-harmony-identity = { git = "https://github.com/zeblithic/harmony.git", default-features = false }
-harmony-platform = { git = "https://github.com/zeblithic/harmony.git", default-features = false }
-harmony-reticulum = { git = "https://github.com/zeblithic/harmony.git", default-features = false }
-harmony-zenoh = { git = "https://github.com/zeblithic/harmony.git" }
-harmony-content = { git = "https://github.com/zeblithic/harmony.git" }
-harmony-compute = { git = "https://github.com/zeblithic/harmony.git" }
-harmony-workflow = { git = "https://github.com/zeblithic/harmony.git" }
+harmony-crypto = { git = "https://github.com/zeblithic/harmony.git", branch = "jake-os-boot-stub", default-features = false }
+harmony-identity = { git = "https://github.com/zeblithic/harmony.git", branch = "jake-os-boot-stub", default-features = false }
+harmony-platform = { git = "https://github.com/zeblithic/harmony.git", branch = "jake-os-boot-stub", default-features = false }
+harmony-reticulum = { git = "https://github.com/zeblithic/harmony.git", branch = "jake-os-boot-stub", default-features = false }
+harmony-zenoh = { git = "https://github.com/zeblithic/harmony.git", branch = "jake-os-boot-stub" }
+harmony-content = { git = "https://github.com/zeblithic/harmony.git", branch = "jake-os-boot-stub" }
+harmony-compute = { git = "https://github.com/zeblithic/harmony.git", branch = "jake-os-boot-stub" }
+harmony-workflow = { git = "https://github.com/zeblithic/harmony.git", branch = "jake-os-boot-stub" }
 # Note: harmony-node is a binary crate (no lib target), not usable as a dependency
 
 # Internal workspace crates
