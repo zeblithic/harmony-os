@@ -9,10 +9,10 @@ rust-version.workspace = true
 
 [dependencies]
 # Ring 1
-harmony-unikernel = { workspace = true }
+harmony-unikernel = { workspace = true, features = ["std"] }
 
 # Ring 0 — additional protocol crates needed at the kernel level
-harmony-crypto = { workspace = true }
-harmony-identity = { workspace = true }
+harmony-crypto = { workspace = true, features = ["std"] }
+harmony-identity = { workspace = true, features = ["std"] }
 
 [dev-dependencies]

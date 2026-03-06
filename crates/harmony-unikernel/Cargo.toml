@@ -8,10 +8,20 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Ring 0 — harmony protocol core
+# Ring 0 — harmony protocol core (no_std when std feature disabled)
 harmony-crypto = { workspace = true }
 harmony-identity = { workspace = true }
+harmony-platform = { workspace = true }
 harmony-reticulum = { workspace = true }
+rand_core = { workspace = true }
 
+[features]
+default = ["std"]
+std = [
+    "harmony-crypto/std",
+    "harmony-identity/std",
+    "harmony-platform/std",
+    "harmony-reticulum/std",
+]
 
 [dev-dependencies]

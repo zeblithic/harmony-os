@@ -1,0 +1,26 @@
+[package]
+name = "harmony-boot"
+description = "Ring 1: x86_64 boot stub for Harmony unikernel (QEMU target)"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/zeblithic/harmony-os"
+
+# Excluded from workspace — bare-metal target requires independent feature resolution
+# to avoid std feature unification with host-target workspace members.
+
+[dependencies]
+harmony-unikernel = { path = "../harmony-unikernel", default-features = false }
+harmony-identity = { git = "https://github.com/zeblithic/harmony.git", branch = "main", default-features = false }
+bootloader_api = "0.11"
+linked_list_allocator = "0.10"
+x86_64 = { version = "0.15", default-features = false, features = ["instructions"] }
+
+# Force software crypto — cross-compiling from aarch64 to x86_64-unknown-none
+# causes LLVM crashes with hardware-accelerated SHA and Poly1305 backends.
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+
+[features]
+default = []
+# Gate the QEMU isa-debug-exit call so real boots enter the event loop.
+qemu-test = []

@@ -1,0 +1,15 @@
+# Bare-metal cross-compilation defaults for harmony-boot.
+#
+# Several crypto crates auto-detect x86_64 and compile SIMD/AES-NI code paths.
+# When cross-compiling from aarch64 (Apple Silicon) the LLVM backend crashes
+# trying to generate those instructions.  Force software fallbacks everywhere.
+
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = [
+    "--cfg", "poly1305_force_soft",
+    "--cfg", "aes_force_soft",
+    "--cfg", "curve25519_dalek_backend=\"serial\"",
+]

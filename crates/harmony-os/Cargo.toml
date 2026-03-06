@@ -12,9 +12,9 @@ rust-version.workspace = true
 harmony-microkernel = { workspace = true }
 
 # Ring 0 — full protocol stack available at the OS level
-harmony-crypto = { workspace = true }
-harmony-identity = { workspace = true }
-harmony-reticulum = { workspace = true }
+harmony-crypto = { workspace = true, features = ["std"] }
+harmony-identity = { workspace = true, features = ["std"] }
+harmony-reticulum = { workspace = true, features = ["std"] }
 harmony-zenoh = { workspace = true }
 harmony-content = { workspace = true }
 harmony-compute = { workspace = true }
