@@ -21,12 +21,13 @@ fn main() {
             run_qemu();
         }
         _ => {
-            eprintln!("Usage: cargo xtask [build-kernel|build-image|run]");
+            eprintln!("Usage: cargo xtask [build-kernel|build-image|build-image-test|run]");
             eprintln!();
             eprintln!("Commands:");
-            eprintln!("  build-kernel  Build the kernel ELF");
-            eprintln!("  build-image   Build kernel + bootable BIOS disk image");
-            eprintln!("  run           Build image + launch QEMU");
+            eprintln!("  build-kernel      Build the kernel ELF");
+            eprintln!("  build-image       Build kernel + bootable BIOS disk image");
+            eprintln!("  build-image-test  Build kernel with qemu-test feature + disk image");
+            eprintln!("  run               Build image + launch QEMU");
             std::process::exit(1);
         }
     }

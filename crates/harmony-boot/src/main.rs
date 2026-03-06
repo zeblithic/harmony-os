@@ -85,26 +85,34 @@ fn serial_writer() -> SerialWriter<impl FnMut(u8)> {
 // ---------------------------------------------------------------------------
 
 /// Fill `buf` using the x86 RDRAND instruction.
+///
+/// Retries each RDRAND invocation up to 10 times per Intel SDM §7.3.17.
 fn rdrand_fill(buf: &mut [u8]) {
+    const MAX_RETRIES: u32 = 10;
     let mut i = 0;
     while i < buf.len() {
-        let val: u64 = loop {
-            let mut v: u64;
+        let mut val: u64 = 0;
+        let mut success = false;
+        for _ in 0..MAX_RETRIES {
             let ok: u8;
             unsafe {
                 core::arch::asm!(
                     "rdrand {val}",
                     "setc {ok}",
-                    val = out(reg) v,
+                    val = out(reg) val,
                     ok = out(reg_byte) ok,
                     options(nomem, nostack),
                 );
             }
             if ok != 0 {
-                break v;
+                success = true;
+                break;
             }
             core::hint::spin_loop();
-        };
+        }
+        if !success {
+            panic!("RDRAND failed after {} retries", MAX_RETRIES);
+        }
         let bytes = val.to_le_bytes();
         let remaining = buf.len() - i;
         let n = if remaining < 8 { remaining } else { 8 };
@@ -125,7 +133,6 @@ fn rdrand_available() -> bool {
             out("ecx") ecx,
             out("eax") _,
             out("edx") _,
-            options(nomem),
         );
     }
     ecx & (1 << 30) != 0
@@ -224,6 +231,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(feature = "qemu-test")]
     qemu_debug_exit(0x10);
 
+    // TODO(harmony-timer): tick is a bare counter, not real time.
+    // Once HPET/PIT/TSC is set up, pass monotonic milliseconds here
+    // so protocol timing (announce intervals, link timeouts) works.
     let mut tick: u64 = 0;
     loop {
         let _actions = runtime.tick(tick);
