@@ -199,14 +199,14 @@ impl Virtqueue {
             desc.flags = VIRTQ_DESC_F_WRITE;
             desc.next = 0;
 
-            let avail = &mut *self.avail;
-            let avail_idx = avail.idx;
-            avail.ring[(avail_idx % QUEUE_SIZE) as usize] = idx;
+            // Use volatile for avail ring since the device reads it via DMA.
+            let avail_idx = ptr::read_volatile(&(*self.avail).idx);
+            (*self.avail).ring[(avail_idx % QUEUE_SIZE) as usize] = idx;
 
             // Ensure descriptor writes are visible before the device sees
             // the updated available index.
             fence(Ordering::Release);
-            avail.idx = avail_idx.wrapping_add(1);
+            ptr::write_volatile(&mut (*self.avail).idx, avail_idx.wrapping_add(1));
         }
 
         Some(idx)
@@ -234,14 +234,14 @@ impl Virtqueue {
             desc.flags = 0; // device-readable
             desc.next = 0;
 
-            let avail = &mut *self.avail;
-            let avail_idx = avail.idx;
-            avail.ring[(avail_idx % QUEUE_SIZE) as usize] = idx;
+            // Use volatile for avail ring since the device reads it via DMA.
+            let avail_idx = ptr::read_volatile(&(*self.avail).idx);
+            (*self.avail).ring[(avail_idx % QUEUE_SIZE) as usize] = idx;
 
             // Ensure descriptor + data writes are visible before the device
             // sees the updated available index.
             fence(Ordering::Release);
-            avail.idx = avail_idx.wrapping_add(1);
+            ptr::write_volatile(&mut (*self.avail).idx, avail_idx.wrapping_add(1));
         }
 
         Some(idx)
@@ -255,23 +255,31 @@ impl Virtqueue {
         // Ensure we see the latest used.idx written by the device.
         fence(Ordering::Acquire);
 
-        let used_idx = unsafe { (*self.used).idx };
+        // Volatile read: device writes used.idx via DMA.
+        let used_idx = unsafe { ptr::read_volatile(&(*self.used).idx) };
 
         if self.last_used_idx == used_idx {
             return None;
         }
 
-        let entry = unsafe {
+        // Volatile reads: device writes used ring entries via DMA.
+        let (raw_id, len) = unsafe {
             let ring_idx = (self.last_used_idx % QUEUE_SIZE) as usize;
-            &(*self.used).ring[ring_idx]
+            let elem = &(*self.used).ring[ring_idx];
+            (
+                ptr::read_volatile(&elem.id),
+                ptr::read_volatile(&elem.len),
+            )
         };
-
-        let desc_id = entry.id as u16;
-        let len = entry.len;
 
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
 
-        Some((desc_id, len))
+        // Validate device-provided descriptor id is in range.
+        if raw_id >= QUEUE_SIZE as u32 {
+            return None;
+        }
+
+        Some((raw_id as u16, len))
     }
 
     /// Copy `len` bytes from the buffer associated with `desc_idx` into a

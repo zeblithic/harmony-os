@@ -190,9 +190,13 @@ impl VirtioNet {
             return Err("virtio-net: device does not offer VIRTIO_NET_F_MAC");
         }
 
-        // Write driver features: only MAC.
+        // Write driver features: MAC (feature word 0).
         unsafe { mmio_write32(common + DRIVER_FEATURE_SELECT, 0) };
         unsafe { mmio_write32(common + DRIVER_FEATURE, VIRTIO_NET_F_MAC) };
+
+        // VIRTIO_F_VERSION_1 is bit 32 (bit 0 of feature word 1) — required by §6.
+        unsafe { mmio_write32(common + DRIVER_FEATURE_SELECT, 1) };
+        unsafe { mmio_write32(common + DRIVER_FEATURE, 1) };
 
         // §3.1.1 — Set FEATURES_OK.
         unsafe {
@@ -288,9 +292,13 @@ impl VirtioNet {
 
             // Write the physical addresses of the descriptor table,
             // available ring, and used ring.
-            mmio_write64(common + QUEUE_DESC, vq.desc_phys);
-            mmio_write64(common + QUEUE_AVAIL, vq.avail_phys);
-            mmio_write64(common + QUEUE_USED, vq.used_phys);
+            // VirtIO 1.0 §4.1.3.1: use paired 32-bit writes for portability.
+            mmio_write32(common + QUEUE_DESC, vq.desc_phys as u32);
+            mmio_write32(common + QUEUE_DESC + 4, (vq.desc_phys >> 32) as u32);
+            mmio_write32(common + QUEUE_AVAIL, vq.avail_phys as u32);
+            mmio_write32(common + QUEUE_AVAIL + 4, (vq.avail_phys >> 32) as u32);
+            mmio_write32(common + QUEUE_USED, vq.used_phys as u32);
+            mmio_write32(common + QUEUE_USED + 4, (vq.used_phys >> 32) as u32);
 
             // Enable the queue.
             mmio_write16(common + QUEUE_ENABLE, 1);

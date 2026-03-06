@@ -55,9 +55,11 @@ pub fn parse_capabilities(dev: &PciDevice, phys_offset: u64) -> Option<VirtioPci
     let mut isr_cfg: Option<usize> = None;
 
     let mut cap_ptr = dev.capabilities_ptr();
+    let mut remaining = 48; // PCI config space fits at most 48 capabilities
 
     // Walk the capability linked list.
-    while cap_ptr != 0 {
+    while cap_ptr != 0 && remaining > 0 {
+        remaining -= 1;
         let cap_id = pci_config_read8(dev.bus, dev.device, dev.function, cap_ptr);
         let cap_next = pci_config_read8(dev.bus, dev.device, dev.function, cap_ptr + 1);
 
@@ -67,11 +69,17 @@ pub fn parse_capabilities(dev: &PciDevice, phys_offset: u64) -> Option<VirtioPci
             let offset = pci_config_read32(dev.bus, dev.device, dev.function, cap_ptr + 8);
             let _length = pci_config_read32(dev.bus, dev.device, dev.function, cap_ptr + 12);
 
+            // Validate bar_index is within the 6-entry BAR array.
+            if bar_index as usize >= dev.bars.len() {
+                cap_ptr = cap_next;
+                continue;
+            }
+
             // Read the BAR value and resolve the physical base address.
             // 64-bit BARs (type bits [2:1] == 0b10) span two consecutive BARs.
             let bar_val = dev.bars[bar_index as usize];
             let is_64bit = (bar_val >> 1) & 0x3 == 0x2;
-            let bar_base = if is_64bit {
+            let bar_base = if is_64bit && (bar_index as usize + 1) < dev.bars.len() {
                 let lo = (bar_val & 0xFFFF_FFF0) as u64;
                 let hi = dev.bars[bar_index as usize + 1] as u64;
                 lo | (hi << 32)
