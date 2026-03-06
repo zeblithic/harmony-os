@@ -85,6 +85,8 @@ impl PciDevice {
 }
 
 pub fn find_virtio_net() -> Option<PciDevice> {
+    // NOTE: Only scans bus 0, function 0. Multi-function devices and
+    // secondary buses are not enumerated — sufficient for QEMU virtio-net.
     for device in 0..32u8 {
         let reg0 = pci_config_read32(0, device, 0, 0);
         let vendor_id = (reg0 & 0xFFFF) as u16;
@@ -93,6 +95,9 @@ pub fn find_virtio_net() -> Option<PciDevice> {
         }
         let device_id = ((reg0 >> 16) & 0xFFFF) as u16;
 
+        // Transitional (0x1000) devices are included; the modern VirtIO 1.0
+        // init in virtio/net.rs requires FEATURES_OK acceptance — legacy-only
+        // transitional devices will fail gracefully there.
         if vendor_id == VIRTIO_VENDOR_ID
             && (device_id == VIRTIO_NET_DEVICE_ID_MODERN
                 || device_id == VIRTIO_NET_DEVICE_ID_TRANSITIONAL)

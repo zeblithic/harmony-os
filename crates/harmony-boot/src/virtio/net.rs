@@ -213,13 +213,13 @@ impl VirtioNet {
 
         // Setup RX queue (index 0).
         let mut rx_queue = Virtqueue::new(phys_offset);
-        let rx_queue_size = Self::setup_queue(&caps, common, 0, &rx_queue)
+        let rx_queue_size = Self::setup_queue(common, 0, &rx_queue)
             .ok_or("virtio-net: RX queue not available (max_size=0)")?;
         rx_queue.set_queue_size(rx_queue_size);
 
         // Setup TX queue (index 1).
         let mut tx_queue = Virtqueue::new(phys_offset);
-        let tx_queue_size = Self::setup_queue(&caps, common, 1, &tx_queue)
+        let tx_queue_size = Self::setup_queue(common, 1, &tx_queue)
             .ok_or("virtio-net: TX queue not available (max_size=0)")?;
         tx_queue.set_queue_size(tx_queue_size);
 
@@ -269,12 +269,7 @@ impl VirtioNet {
     ///
     /// Returns `None` if the device reports `max_size=0` (queue not
     /// available per VirtIO 1.0 §4.1.5.1.3).
-    fn setup_queue(
-        caps: &VirtioPciCaps,
-        common: usize,
-        queue_idx: u16,
-        vq: &Virtqueue,
-    ) -> Option<u16> {
+    fn setup_queue(common: usize, queue_idx: u16, vq: &Virtqueue) -> Option<u16> {
         let size = unsafe {
             // Select the queue.
             mmio_write16(common + QUEUE_SELECT, queue_idx);
@@ -311,9 +306,6 @@ impl VirtioNet {
             size
         };
 
-        // Suppress unused-field warning — we need caps for notify_base
-        // but it isn't used in this helper (used later for notify addrs).
-        let _ = caps;
         Some(size)
     }
 
@@ -399,7 +391,7 @@ impl NetworkInterface for VirtioNet {
         let (desc_id, len) = self.rx_queue.poll_used()?;
 
         // Read the raw buffer (virtio_net_hdr + Ethernet frame).
-        let frame = self.rx_queue.read_buffer(desc_id, len);
+        let frame = self.rx_queue.read_buffer(desc_id, len)?;
 
         // Free the descriptor and re-post a receive buffer.
         self.rx_queue.free_desc(desc_id);

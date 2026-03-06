@@ -294,18 +294,19 @@ impl Virtqueue {
     /// Copy `len` bytes from the buffer associated with `desc_idx` into a
     /// new `Vec<u8>`.
     ///
-    /// # Panics
-    ///
-    /// Panics if `len` exceeds `BUF_SIZE`.
-    pub fn read_buffer(&self, desc_idx: u16, len: u32) -> Vec<u8> {
+    /// Returns `None` if `len` exceeds `BUF_SIZE` (defensive against
+    /// misbehaving devices reporting inflated lengths).
+    pub fn read_buffer(&self, desc_idx: u16, len: u32) -> Option<Vec<u8>> {
         let len = len as usize;
-        assert!(len <= BUF_SIZE, "read_buffer: len exceeds BUF_SIZE");
+        if len > BUF_SIZE {
+            return None;
+        }
 
         let mut out = alloc::vec![0u8; len];
         unsafe {
             let src = self.buffer_ptr(desc_idx);
             ptr::copy_nonoverlapping(src, out.as_mut_ptr(), len);
         }
-        out
+        Some(out)
     }
 }
