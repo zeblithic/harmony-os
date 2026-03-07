@@ -1,12 +1,41 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use harmony_identity::PrivateIdentity;
 use harmony_platform::{EntropySource, PersistentState};
+use harmony_reticulum::destination::DestinationName;
 use harmony_reticulum::interface::InterfaceMode;
+use harmony_reticulum::path_table::DestinationHash;
 use harmony_reticulum::{Node, NodeAction, NodeEvent};
+
+/// Runtime-level output actions. The caller dispatches these — no
+/// protocol-internal actions like AnnounceNeeded leak through.
+#[derive(Debug)]
+pub enum RuntimeAction {
+    /// Send raw bytes on a named interface.
+    SendOnInterface { interface_name: Arc<str>, raw: Vec<u8> },
+    /// A new peer was discovered via announce.
+    PeerDiscovered { address_hash: [u8; 16], hops: u8 },
+    /// A previously known peer has gone silent.
+    PeerLost { address_hash: [u8; 16] },
+    /// A heartbeat was received from a peer.
+    HeartbeatReceived { address_hash: [u8; 16], uptime_ms: u64 },
+    /// A non-heartbeat packet was delivered locally.
+    DeliverLocally { destination_hash: [u8; 16], payload: Vec<u8> },
+}
+
+/// Tracked state for a discovered peer.
+#[derive(Debug, Clone)]
+pub struct PeerInfo {
+    pub address_hash: [u8; 16],
+    pub last_seen_ms: u64,
+    pub hops: u8,
+    pub discovered_at_ms: u64,
+}
 
 pub struct UnikernelRuntime<E: EntropySource, P: PersistentState> {
     node: Node,
