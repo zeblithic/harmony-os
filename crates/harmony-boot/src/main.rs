@@ -324,6 +324,41 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     serial.log("READY", "entering event loop");
 
+    // ── Ring 2 microkernel IPC demo ────────────────────────────────────
+    // Uses EchoServer directly (Kernel struct requires std for Memory*
+    // stores). This proves the FileServer trait works in no_std.  Full
+    // Kernel + UCAN enforcement is exercised by `cargo test` (std).
+    #[cfg(feature = "ring2")]
+    {
+        use harmony_microkernel::echo::EchoServer;
+        use harmony_microkernel::{FileServer, OpenMode};
+
+        serial.log("KERN", "Ring 2 microkernel mode");
+
+        // Create echo server directly
+        let mut echo = EchoServer::new();
+
+        // Walk to hello
+        let qpath = echo.walk(0, 1, "hello").unwrap();
+        let _ = writeln!(serial, "[IPC]  walk hello qpath={}", qpath);
+
+        // Open and read
+        echo.open(1, OpenMode::Read).unwrap();
+        let data = echo.read(1, 0, 256).unwrap();
+        let msg = core::str::from_utf8(&data).unwrap_or("(non-utf8)");
+        let _ = writeln!(serial, "[IPC]  read: \"{}\"", msg);
+
+        // Walk to echo, write, read back
+        echo.walk(0, 2, "echo").unwrap();
+        echo.open(2, OpenMode::ReadWrite).unwrap();
+        echo.write(2, 0, b"Harmony Ring 2!").unwrap();
+        let data = echo.read(2, 0, 256).unwrap();
+        let msg = core::str::from_utf8(&data).unwrap_or("(non-utf8)");
+        let _ = writeln!(serial, "[IPC]  echo: \"{}\"", msg);
+
+        serial.log("KERN", "Ring 2 IPC demo complete");
+    }
+
     // Exit early during automated QEMU testing (feature-gated).
     #[cfg(feature = "qemu-test")]
     qemu_debug_exit(0x10);

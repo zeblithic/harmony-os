@@ -7,9 +7,12 @@
 //! - **9P-inspired IPC** — every process implements `FileServer`
 //! - **Capability enforcement** — UCAN tokens gate all cross-process IPC
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
 extern crate alloc;
 
 pub mod echo;
+#[cfg(feature = "std")]
 pub mod kernel;
 pub mod namespace;
 pub mod serial_server;

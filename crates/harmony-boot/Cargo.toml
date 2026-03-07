@@ -17,6 +17,9 @@ bootloader_api = "0.11"
 linked_list_allocator = "0.10"
 x86_64 = { version = "0.15", default-features = false, features = ["instructions"] }
 
+# Ring 2 microkernel (optional — only with `ring2` feature)
+harmony-microkernel = { path = "../harmony-microkernel", default-features = false, optional = true }
+
 # Force software crypto — cross-compiling from aarch64 to x86_64-unknown-none
 # causes LLVM crashes with hardware-accelerated SHA and Poly1305 backends.
 sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
@@ -25,3 +28,5 @@ sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 default = []
 # Gate the QEMU isa-debug-exit call so real boots enter the event loop.
 qemu-test = []
+# Ring 2 microkernel IPC demo on boot.
+ring2 = ["dep:harmony-microkernel"]

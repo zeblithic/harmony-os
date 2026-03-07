@@ -7,13 +7,23 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["std"]
+std = [
+    "harmony-unikernel/std",
+    "harmony-crypto/std",
+    "harmony-identity/std",
+    "harmony-identity/test-utils",
+    "harmony-platform/std",
+]
+
 [dependencies]
 # Ring 1
-harmony-unikernel = { workspace = true, features = ["std"] }
+harmony-unikernel = { workspace = true }
 
 # Ring 0 — protocol crates needed at the kernel level
-harmony-crypto = { workspace = true, features = ["std"] }
-harmony-identity = { workspace = true, features = ["std", "test-utils"] }
-harmony-platform = { workspace = true, features = ["std"] }
+harmony-crypto = { workspace = true }
+harmony-identity = { workspace = true }
+harmony-platform = { workspace = true }
 
 [dev-dependencies]
