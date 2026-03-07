@@ -224,18 +224,17 @@ impl Kernel {
             return Err(IpcError::InvalidFid);
         }
 
-        // Resolve namespace and check capabilities while holding only
-        // shared borrows. Copy scalars and remainder into locals so the
-        // borrow is released before the mutable borrow on the target.
+        // Resolve namespace and check capabilities. Split lifetimes on
+        // resolve() mean `remainder` borrows from `path`, not from `self`,
+        // so no heap allocation is needed to release the process borrow.
         let (target_pid, server_root_fid, remainder) = {
             let process = self.processes.get(&from_pid).ok_or(IpcError::NotFound)?;
-            let (mount, rem) = process
+            let (mount, remainder) = process
                 .namespace
                 .resolve(path)
                 .ok_or(IpcError::NotFound)?;
             let target_pid = mount.target_pid;
             let server_root_fid = mount.root_fid;
-            let remainder = alloc::string::String::from(rem);
             // Capability check uses &self — compatible with the shared
             // borrow through `process`, so no clone needed.
             self.check_endpoint_cap(

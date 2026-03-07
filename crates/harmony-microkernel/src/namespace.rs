@@ -50,7 +50,7 @@ impl Namespace {
     ///
     /// Finds the longest matching prefix. Returns `None` if no mount matches.
     /// The prefix must match at a "/" boundary or exactly (no partial matches).
-    pub fn resolve<'a>(&'a self, path: &'a str) -> Option<(&'a MountPoint, &'a str)> {
+    pub fn resolve<'s, 'p>(&'s self, path: &'p str) -> Option<(&'s MountPoint, &'p str)> {
         let mut best: Option<(&MountPoint, &str)> = None;
         let mut best_len = 0;
 
