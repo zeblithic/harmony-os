@@ -26,6 +26,10 @@ struct FidState {
 ///
 /// In tests, call `buffer()` to inspect what was written.
 /// In the boot crate, the buffer can be drained to a real serial port.
+///
+/// **Note:** The internal buffer grows without bound on each write.
+/// For long-running bare-metal use, the caller should periodically
+/// drain via `buffer()` or impose an external write budget.
 pub struct SerialServer {
     fids: BTreeMap<Fid, FidState>,
     buf: Vec<u8>,
@@ -94,7 +98,7 @@ impl FileServer for SerialServer {
         if matches!(state.mode, Some(OpenMode::Write)) {
             return Err(IpcError::PermissionDenied);
         }
-        let start = core::cmp::min(offset as usize, self.buf.len());
+        let start = core::cmp::min(offset.min(usize::MAX as u64) as usize, self.buf.len());
         let end = core::cmp::min(start + count as usize, self.buf.len());
         Ok(self.buf[start..end].to_vec())
     }

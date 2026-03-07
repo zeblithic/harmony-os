@@ -28,7 +28,7 @@ pub struct Process {
     /// Milestone A: PID-derived placeholder. Production builds will use
     /// a cryptographic address (e.g. SHA-256 of the process's public key).
     pub(crate) address_hash: [u8; 16],
-    pub(crate) server: Box<dyn FileServer>,
+    server: Box<dyn FileServer>,
 }
 
 /// The microkernel: process table, IPC dispatch, capability enforcement.
@@ -82,7 +82,9 @@ impl Kernel {
     /// Spawn a process. Returns the assigned PID.
     ///
     /// `mounts` are (path, target_pid, root_fid) tuples to pre-populate
-    /// the process's namespace.
+    /// the process's namespace. `target_pid` must refer to an already-spawned
+    /// process. `root_fid` is trusted — it is not validated against the
+    /// target server's fid table (by convention, 0 = root directory).
     pub fn spawn_process(
         &mut self,
         name: &str,

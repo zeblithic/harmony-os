@@ -118,7 +118,7 @@ impl FileServer for EchoServer {
             _ => return Err(IpcError::NotFound),
         };
 
-        let offset = offset as usize;
+        let offset = offset.min(usize::MAX as u64) as usize;
         if offset >= data.len() {
             return Ok(Vec::new());
         }
