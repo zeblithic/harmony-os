@@ -119,6 +119,9 @@ impl FileServer for SerialServer {
     }
 
     fn clunk(&mut self, fid: Fid) -> Result<(), IpcError> {
+        if fid == 0 {
+            return Err(IpcError::PermissionDenied);
+        }
         self.fids.remove(&fid).ok_or(IpcError::InvalidFid)?;
         Ok(())
     }
