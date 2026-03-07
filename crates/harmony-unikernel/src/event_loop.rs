@@ -254,7 +254,9 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
             Some(announce_interval_secs),
             now_secs,
         );
-        self.boot_time_ms = now;
+        if self.boot_time_ms == 0 {
+            self.boot_time_ms = now;
+        }
         dest_hash
     }
 
@@ -539,8 +541,11 @@ mod tests {
         runtime.register_interface("test0");
         runtime.register_announcing_destination("harmony", &["node"], 300_000, 0);
 
-        // Build a valid announce from a second identity.
+        // Build a valid announce from a distinct identity.
+        // Exhaust the same entropy bytes make_runtime() consumed so
+        // the peer identity is guaranteed to differ.
         let mut entropy2 = test_entropy();
+        let _ = PrivateIdentity::generate(&mut entropy2);
         let peer_identity = PrivateIdentity::generate(&mut entropy2);
         let peer_addr = peer_identity.public_identity().address_hash;
         let dest_name =
