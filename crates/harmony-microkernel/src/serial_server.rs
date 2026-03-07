@@ -99,7 +99,7 @@ impl FileServer for SerialServer {
             return Err(IpcError::PermissionDenied);
         }
         let start = core::cmp::min(offset.min(usize::MAX as u64) as usize, self.buf.len());
-        let end = core::cmp::min(start + count as usize, self.buf.len());
+        let end = core::cmp::min(start.saturating_add(count as usize), self.buf.len());
         Ok(self.buf[start..end].to_vec())
     }
 

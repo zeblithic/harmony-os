@@ -122,7 +122,7 @@ impl FileServer for EchoServer {
         if offset >= data.len() {
             return Ok(Vec::new());
         }
-        let end = core::cmp::min(offset + count as usize, data.len());
+        let end = core::cmp::min(offset.saturating_add(count as usize), data.len());
         Ok(data[offset..end].to_vec())
     }
 

@@ -91,6 +91,15 @@ impl Kernel {
         server: Box<dyn FileServer>,
         mounts: &[(&str, u32, Fid)],
     ) -> Result<u32, IpcError> {
+        // Validate mounts before allocating a PID so failures don't waste IDs.
+        let mut namespace = Namespace::new();
+        for &(path, target_pid, root_fid) in mounts {
+            if !self.processes.contains_key(&target_pid) {
+                return Err(IpcError::NotFound);
+            }
+            namespace.mount(path, target_pid, root_fid)?;
+        }
+
         let pid = self.next_pid;
         self.next_pid = self
             .next_pid
@@ -100,14 +109,6 @@ impl Kernel {
         // Derive a simple address hash from the pid.
         let mut address_hash = [0u8; 16];
         address_hash[..4].copy_from_slice(&pid.to_be_bytes());
-
-        let mut namespace = Namespace::new();
-        for &(path, target_pid, root_fid) in mounts {
-            if !self.processes.contains_key(&target_pid) {
-                return Err(IpcError::NotFound);
-            }
-            namespace.mount(path, target_pid, root_fid)?;
-        }
 
         self.processes.insert(
             pid,
