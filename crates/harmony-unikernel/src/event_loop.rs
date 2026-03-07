@@ -11,6 +11,7 @@ use harmony_reticulum::destination::DestinationName;
 use harmony_reticulum::interface::InterfaceMode;
 use harmony_reticulum::path_table::DestinationHash;
 use harmony_reticulum::{Node, NodeAction, NodeEvent};
+use rand_core::CryptoRngCore;
 
 /// Runtime-level output actions. The caller dispatches these — no
 /// protocol-internal actions like AnnounceNeeded leak through.
@@ -47,14 +48,14 @@ pub struct UnikernelRuntime<E: EntropySource, P: PersistentState> {
     dest_name: Option<DestinationName>,
     dest_hash: Option<DestinationHash>,
     // Peer tracking
-    peers: BTreeMap<[u8; 16], PeerInfo>,
+    pub(crate) peers: BTreeMap<[u8; 16], PeerInfo>,
     heartbeat_interval_ms: u64,
     peer_timeout_ms: u64,
     last_heartbeat_ms: u64,
     boot_time_ms: u64,
 }
 
-impl<E: EntropySource, P: PersistentState> UnikernelRuntime<E, P> {
+impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P> {
     pub fn new(identity: PrivateIdentity, entropy: E, persistence: P) -> Self {
         let node = Node::new();
         UnikernelRuntime {
@@ -73,9 +74,50 @@ impl<E: EntropySource, P: PersistentState> UnikernelRuntime<E, P> {
         }
     }
 
-    pub fn tick(&mut self, now: u64) -> Vec<NodeAction> {
+    /// Process a timer tick. Resolves AnnounceNeeded internally,
+    /// checks peer timeouts. Returns RuntimeAction only.
+    /// `now` is monotonic milliseconds.
+    pub fn tick(&mut self, now: u64) -> Vec<RuntimeAction> {
         self.tick_count += 1;
-        self.node.handle_event(NodeEvent::TimerTick { now })
+        let mut out = Vec::new();
+
+        let now_secs = now / 1000;
+        let node_actions = self.node.handle_event(NodeEvent::TimerTick { now: now_secs });
+
+        for action in node_actions {
+            match action {
+                NodeAction::AnnounceNeeded { dest_hash } => {
+                    let announce_actions = self.node.announce(
+                        &dest_hash,
+                        &mut self.entropy,
+                        now_secs,
+                    );
+                    for aa in announce_actions {
+                        if let NodeAction::SendOnInterface { interface_name, raw } = aa {
+                            out.push(RuntimeAction::SendOnInterface { interface_name, raw });
+                        }
+                    }
+                }
+                NodeAction::SendOnInterface { interface_name, raw } => {
+                    out.push(RuntimeAction::SendOnInterface { interface_name, raw });
+                }
+                _ => {} // PathsExpired etc. — diagnostic, skip
+            }
+        }
+
+        // Check peer timeouts.
+        let timeout = self.peer_timeout_ms;
+        let timed_out: Vec<[u8; 16]> = self.peers
+            .iter()
+            .filter(|(_, p)| now.saturating_sub(p.last_seen_ms) > timeout)
+            .map(|(k, _)| *k)
+            .collect();
+        for addr in timed_out {
+            self.peers.remove(&addr);
+            out.push(RuntimeAction::PeerLost { address_hash: addr });
+        }
+
+        out
     }
 
     pub fn tick_count(&self) -> u64 {
@@ -196,10 +238,45 @@ mod tests {
         let actions = runtime.tick(1000);
         for action in &actions {
             match action {
-                NodeAction::SendOnInterface { .. } => panic!("no interfaces, should not send"),
+                RuntimeAction::SendOnInterface { .. } => panic!("no interfaces, should not send"),
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn tick_resolves_announce_needed_internally() {
+        let mut runtime = make_runtime();
+        runtime.register_interface("test0");
+        runtime.register_announcing_destination("harmony", &["node"], 1_000, 0);
+
+        // Tick at 1000ms = 1 second. Node scheduler uses seconds,
+        // announce_interval=1s, next_announce_at=0, so announce fires.
+        let actions = runtime.tick(1_000);
+
+        let has_send = actions.iter().any(|a| matches!(a, RuntimeAction::SendOnInterface { .. }));
+        assert!(has_send, "tick should resolve announces into SendOnInterface");
+    }
+
+    #[test]
+    fn tick_emits_peer_lost_after_timeout() {
+        let mut runtime = make_runtime();
+        runtime.register_interface("test0");
+
+        // Manually insert a peer.
+        runtime.peers.insert([0xAA; 16], PeerInfo {
+            address_hash: [0xAA; 16],
+            last_seen_ms: 0,
+            hops: 1,
+            discovered_at_ms: 0,
+        });
+        assert_eq!(runtime.peer_count(), 1);
+
+        // Tick at 16_000ms — peer_timeout_ms is 15_000.
+        let actions = runtime.tick(16_000);
+        assert_eq!(runtime.peer_count(), 0);
+        let has_lost = actions.iter().any(|a| matches!(a, RuntimeAction::PeerLost { .. }));
+        assert!(has_lost, "should emit PeerLost");
     }
 
     #[test]
