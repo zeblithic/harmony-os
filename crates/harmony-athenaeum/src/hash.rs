@@ -6,14 +6,14 @@ use sha2::{Digest, Sha224, Sha256};
 use crate::addr::Algorithm;
 
 /// Compute full SHA-256 hash (32 bytes).
-pub(crate) fn sha256_hash(data: &[u8]) -> [u8; 32] {
+pub fn sha256_hash(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hasher.finalize().into()
 }
 
 /// Compute full SHA-224 hash (28 bytes).
-pub(crate) fn sha224_hash(data: &[u8]) -> [u8; 28] {
+pub fn sha224_hash(data: &[u8]) -> [u8; 28] {
     let mut hasher = Sha224::new();
     hasher.update(data);
     hasher.finalize().into()
