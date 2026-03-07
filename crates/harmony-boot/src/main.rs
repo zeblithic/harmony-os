@@ -10,6 +10,7 @@
 extern crate alloc;
 
 mod pci;
+mod pit;
 mod virtio;
 
 use bootloader_api::config::Mapping;
@@ -21,9 +22,8 @@ use linked_list_allocator::LockedHeap;
 use x86_64::instructions::port::Port;
 
 use harmony_identity::PrivateIdentity;
-use harmony_platform::NetworkInterface;
 use harmony_unikernel::serial::{hex_encode, SerialWriter};
-use harmony_unikernel::{KernelEntropy, MemoryState, NodeAction, UnikernelRuntime};
+use harmony_unikernel::{KernelEntropy, MemoryState, RuntimeAction, UnikernelRuntime};
 
 // ---------------------------------------------------------------------------
 // Bootloader configuration
@@ -156,6 +156,55 @@ fn qemu_debug_exit(value: u32) {
 }
 
 // ---------------------------------------------------------------------------
+// RuntimeAction dispatch
+// ---------------------------------------------------------------------------
+
+/// Dispatch RuntimeActions: send packets and log events.
+fn dispatch_actions(
+    actions: &[RuntimeAction],
+    virtio_net: &mut Option<virtio::net::VirtioNet>,
+    serial: &mut SerialWriter<impl FnMut(u8)>,
+) {
+    use core::fmt::Write;
+
+    for action in actions {
+        match action {
+            RuntimeAction::SendOnInterface { interface_name, raw } => {
+                if interface_name.as_ref() == "virtio0" {
+                    if let Some(ref mut net) = virtio_net {
+                        let _ = harmony_platform::NetworkInterface::send(net, raw);
+                    }
+                }
+            }
+            RuntimeAction::PeerDiscovered { address_hash, hops } => {
+                let mut hex = [0u8; 32];
+                hex_encode(address_hash, &mut hex);
+                let s = core::str::from_utf8(&hex).unwrap_or("?");
+                let _ = writeln!(serial, "[PEER+] {} ({} hops)", s, hops);
+            }
+            RuntimeAction::PeerLost { address_hash } => {
+                let mut hex = [0u8; 32];
+                hex_encode(address_hash, &mut hex);
+                let s = core::str::from_utf8(&hex).unwrap_or("?");
+                let _ = writeln!(serial, "[PEER-] {}", s);
+            }
+            RuntimeAction::HeartbeatReceived { address_hash, uptime_ms } => {
+                let mut hex = [0u8; 32];
+                hex_encode(address_hash, &mut hex);
+                let s = core::str::from_utf8(&hex).unwrap_or("?");
+                let _ = writeln!(serial, "[HBT] {} uptime={}ms", s, uptime_ms);
+            }
+            RuntimeAction::DeliverLocally { destination_hash, payload } => {
+                let mut hex = [0u8; 32];
+                hex_encode(destination_hash, &mut hex);
+                let s = core::str::from_utf8(&hex).unwrap_or("?");
+                let _ = writeln!(serial, "[RECV] {} {}B", s, payload.len());
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -164,6 +213,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_init();
     let mut serial = serial_writer();
     serial.log("BOOT", "Harmony unikernel v0.1.0");
+
+    let mut pit = pit::PitTimer::init();
+    serial.log("PIT", "timer initialized");
 
     // 2. Get the physical memory offset so we can convert physical -> virtual
     let phys_offset = boot_info
@@ -263,56 +315,39 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         runtime.register_interface("virtio0");
     }
 
+    let now = pit.now_ms();
+    let dest_hash = runtime.register_announcing_destination("harmony", &["node"], 300_000, now);
+    let mut dest_hex = [0u8; 32];
+    hex_encode(&dest_hash, &mut dest_hex);
+    let dest_str = core::str::from_utf8(&dest_hex).unwrap_or("????????????????????????????????");
+    serial.log("DEST", dest_str);
+
     serial.log("READY", "entering event loop");
 
     // Exit early during automated QEMU testing (feature-gated).
     #[cfg(feature = "qemu-test")]
     qemu_debug_exit(0x10);
 
-    // TODO(harmony-timer): tick is a bare counter, not real time.
-    // Once HPET/PIT/TSC is set up, pass monotonic milliseconds here
-    // so protocol timing (announce intervals, link timeouts) works.
-    let mut tick: u64 = 0;
     loop {
-        // Poll network for inbound packets
+        let now = pit.now_ms();
+
+        // Poll network for inbound packets.
+        // Collect received packets first to release the borrow on virtio_net.
+        let mut rx_packets = alloc::vec::Vec::new();
         if let Some(ref mut net) = virtio_net {
-            while let Some(data) = NetworkInterface::receive(net) {
-                let rx_actions = runtime.handle_packet("virtio0", data, tick);
-                for action in &rx_actions {
-                    if let NodeAction::SendOnInterface {
-                        interface_name,
-                        raw,
-                    } = action
-                    {
-                        if interface_name.as_ref() == "virtio0" {
-                            let _ = NetworkInterface::send(net, raw);
-                        }
-                    }
-                }
+            while let Some(data) = harmony_platform::NetworkInterface::receive(net) {
+                rx_packets.push(data);
             }
         }
-
-        let actions = runtime.tick(tick);
-
-        // Dispatch outbound packets
-        if let Some(ref mut net) = virtio_net {
-            for action in &actions {
-                if let NodeAction::SendOnInterface {
-                    interface_name,
-                    raw,
-                } = action
-                {
-                    if interface_name.as_ref() == "virtio0" {
-                        let _ = NetworkInterface::send(net, raw);
-                    }
-                }
-            }
+        for data in rx_packets {
+            let actions = runtime.handle_packet("virtio0", data, now);
+            dispatch_actions(&actions, &mut virtio_net, &mut serial);
         }
 
-        tick += 1;
-        // TODO(harmony-timer): replace spin-loop with hlt once a timer interrupt
-        // source (PIT/HPET/LAPIC) is configured; without one, hlt halts forever
-        // because VirtIO is in pure poll mode with no MSI-X/INTx interrupts.
+        // Timer tick.
+        let actions = runtime.tick(now);
+        dispatch_actions(&actions, &mut virtio_net, &mut serial);
+
         core::hint::spin_loop();
     }
 }
