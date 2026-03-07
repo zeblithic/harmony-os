@@ -14,13 +14,20 @@ use harmony_platform::EntropySource;
 use crate::namespace::Namespace;
 use crate::{Fid, FileServer, IpcError, OpenMode, QPath};
 
+/// Maximum UCAN delegation chain depth for capability verification.
+/// Chains longer than this are rejected. 5 is generous for milestone A
+/// where all tokens are root-issued (depth 0).
+const MAX_DELEGATION_DEPTH: usize = 5;
+
 /// A process in the microkernel.
 pub struct Process {
     pub pid: u32,
     pub name: Arc<str>,
-    pub namespace: Namespace,
-    pub capabilities: Vec<UcanToken>,
-    pub address_hash: [u8; 16],
+    pub(crate) namespace: Namespace,
+    pub(crate) capabilities: Vec<UcanToken>,
+    /// Milestone A: PID-derived placeholder. Production builds will use
+    /// a cryptographic address (e.g. SHA-256 of the process's public key).
+    pub(crate) address_hash: [u8; 16],
     pub(crate) server: Box<dyn FileServer>,
 }
 
@@ -180,7 +187,7 @@ impl Kernel {
                 &self.proof_store,
                 &self.identity_store,
                 &self.revocations,
-                5, // max delegation depth
+                MAX_DELEGATION_DEPTH,
             )
             .is_ok()
             {
@@ -206,26 +213,28 @@ impl Kernel {
         new_fid: Fid,
         now: u64,
     ) -> Result<QPath, IpcError> {
-        // Extract everything from the immutable borrow up front (copying
-        // remainder into an owned String) so the borrow is released before
-        // we take a mutable borrow on the target process.
-        let (target_pid, server_root_fid, remainder, caps, addr) = {
+        // Resolve namespace and check capabilities while holding only
+        // shared borrows. Copy scalars and remainder into locals so the
+        // borrow is released before the mutable borrow on the target.
+        let (target_pid, server_root_fid, remainder) = {
             let process = self.processes.get(&from_pid).ok_or(IpcError::NotFound)?;
             let (mount, rem) = process
                 .namespace
                 .resolve(path)
                 .ok_or(IpcError::NotFound)?;
-            (
-                mount.target_pid,
-                mount.root_fid,
-                alloc::string::String::from(rem),
-                process.capabilities.clone(),
-                process.address_hash,
-            )
+            let target_pid = mount.target_pid;
+            let server_root_fid = mount.root_fid;
+            let remainder = alloc::string::String::from(rem);
+            // Capability check uses &self — compatible with the shared
+            // borrow through `process`, so no clone needed.
+            self.check_endpoint_cap(
+                &process.capabilities,
+                &process.address_hash,
+                target_pid,
+                now,
+            )?;
+            (target_pid, server_root_fid, remainder)
         };
-
-        // Capability check
-        self.check_endpoint_cap(&caps, &addr, target_pid, now)?;
 
         // Reject if new_fid is already in use (prevents orphaning server fids)
         if self.fid_owners.contains_key(&(from_pid, new_fid)) {
@@ -287,6 +296,11 @@ impl Kernel {
     }
 
     /// Open a previously walked fid.
+    ///
+    /// Note: capability tokens are validated at walk time only, not on
+    /// subsequent operations. Once a fid is established, it remains
+    /// usable even if the originating token expires. This matches 9P
+    /// semantics where authentication gates session setup, not every I/O.
     pub fn open(
         &mut self,
         from_pid: u32,
