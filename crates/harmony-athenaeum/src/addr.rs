@@ -104,6 +104,30 @@ impl ChunkAddr {
         self.checksum() == expected
     }
 
+    /// Derive a ChunkAddr from chunk data.
+    /// Uses SHA-256 MSBs (algorithm 00) as the default strategy.
+    pub fn from_data(data: &[u8], depth: Depth, size_exponent: u8) -> Self {
+        let hash_bits = crate::hash::derive_hash_bits(data, Algorithm::Sha256Msb);
+        Self::new(hash_bits, Algorithm::Sha256Msb, depth, size_exponent, 0)
+    }
+
+    /// Derive a ChunkAddr with a specific algorithm (for collision resolution).
+    pub fn from_data_with_algorithm(
+        data: &[u8],
+        depth: Depth,
+        size_exponent: u8,
+        algorithm: Algorithm,
+    ) -> Self {
+        let hash_bits = crate::hash::derive_hash_bits(data, algorithm);
+        Self::new(hash_bits, algorithm, depth, size_exponent, 0)
+    }
+
+    /// Verify that `data` matches this address by re-deriving the hash bits.
+    pub fn verify_data(&self, data: &[u8]) -> bool {
+        let expected = crate::hash::derive_hash_bits(data, self.algorithm());
+        expected == self.hash_bits()
+    }
+
     /// Compute 4-bit XOR-fold checksum of 28 bits.
     fn compute_checksum(bits28: u32) -> u8 {
         let mut c = 0u8;
@@ -218,5 +242,54 @@ mod tests {
         let debug = alloc::format!("{:?}", addr);
         assert!(debug.contains("ChunkAddr("));
         assert!(debug.contains("hash=42"));
+    }
+
+    #[test]
+    fn from_data_produces_valid_addr() {
+        let data = b"hello athenaeum";
+        let addr = ChunkAddr::from_data(data, Depth::Blob, 0);
+        assert!(addr.verify_checksum());
+        assert_eq!(addr.depth(), Depth::Blob);
+        assert_eq!(addr.size_exponent(), 0);
+        assert_eq!(addr.algorithm(), Algorithm::Sha256Msb);
+    }
+
+    #[test]
+    fn verify_data_matches_address() {
+        let data = b"verify me";
+        let addr = ChunkAddr::from_data(data, Depth::Blob, 0);
+        assert!(addr.verify_data(data));
+        assert!(!addr.verify_data(b"wrong data"));
+    }
+
+    #[test]
+    fn from_data_with_size_exponent() {
+        let data = &[0u8; 128];
+        let addr = ChunkAddr::from_data(data, Depth::Blob, 5);
+        assert_eq!(addr.size_bytes(), 128);
+    }
+
+    #[test]
+    fn from_data_deterministic() {
+        let data = b"deterministic";
+        let a1 = ChunkAddr::from_data(data, Depth::Blob, 0);
+        let a2 = ChunkAddr::from_data(data, Depth::Blob, 0);
+        assert_eq!(a1, a2);
+    }
+
+    #[test]
+    fn from_data_with_algorithm_uses_specified_algo() {
+        let data = b"test algo selection";
+        let addr = ChunkAddr::from_data_with_algorithm(data, Depth::Blob, 0, Algorithm::Sha224Lsb);
+        assert_eq!(addr.algorithm(), Algorithm::Sha224Lsb);
+        assert!(addr.verify_data(data));
+    }
+
+    #[test]
+    fn different_algorithms_produce_different_addresses() {
+        let data = b"same data different algos";
+        let a1 = ChunkAddr::from_data_with_algorithm(data, Depth::Blob, 0, Algorithm::Sha256Msb);
+        let a2 = ChunkAddr::from_data_with_algorithm(data, Depth::Blob, 0, Algorithm::Sha224Lsb);
+        assert_ne!(a1.hash_bits(), a2.hash_bits());
     }
 }
