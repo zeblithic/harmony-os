@@ -3,29 +3,125 @@
 //! # Harmony Microkernel (Ring 2)
 //!
 //! Adds three capabilities to the unikernel foundation:
-//! - **Process isolation** — per-process virtual address spaces
-//! - **9P IPC** — every kernel object is a file in a 9P namespace
-//! - **Capability enforcement** — no ambient authority, UCAN delegation
-//!
-//! ## Three Kernel Responsibilities
-//!
-//! The microkernel does exactly three things in privileged mode:
-//! 1. Memory management (capability-gated regions)
-//! 2. Scheduling + 9P IPC dispatch
-//! 3. Capability enforcement (UCAN verification)
-//!
-//! Everything else — routing, storage, compute, drivers — runs as
-//! unprivileged userspace 9P server processes.
+//! - **Process isolation** — cooperative, trait-object-based (hardware paging is future work)
+//! - **9P-inspired IPC** — every process implements `FileServer`
+//! - **Capability enforcement** — UCAN tokens gate all cross-process IPC
 
-// TODO: Switch to #![no_std] once kernel foundations are in place.
-// #![no_std]
-// extern crate alloc;
+extern crate alloc;
+
+pub mod echo;
+pub mod kernel;
+pub mod namespace;
+pub mod serial_server;
+
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+// ── Fundamental identifiers ──────────────────────────────────────────
+
+/// File identifier — a per-session handle to an open or walked file.
+pub type Fid = u32;
+
+/// Unique file identity — like an inode number. Stable across opens.
+pub type QPath = u64;
+
+// ── Enums ────────────────────────────────────────────────────────────
+
+/// How a file is opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenMode {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+/// What kind of entry a file is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileType {
+    Regular,
+    Directory,
+}
+
+/// Errors returned by IPC operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpcError {
+    NotFound,
+    PermissionDenied,
+    NotOpen,
+    InvalidFid,
+    NotDirectory,
+    ReadOnly,
+}
+
+// ── File metadata ────────────────────────────────────────────────────
+
+/// Metadata about a file (like 9P's stat).
+#[derive(Debug, Clone)]
+pub struct FileStat {
+    pub qpath: QPath,
+    pub name: Arc<str>,
+    pub size: u64,
+    pub file_type: FileType,
+}
+
+// ── FileServer trait ─────────────────────────────────────────────────
+
+/// The heart of Ring 2: every process implements this trait.
+///
+/// Mirrors 9P2000 semantics (walk, open, read, write, clunk, stat)
+/// but uses Rust types instead of wire-format bytes.
+pub trait FileServer {
+    /// Walk from `fid` to a child named `name`, assigning `new_fid`.
+    /// Returns the new file's QPath.
+    fn walk(&mut self, fid: Fid, new_fid: Fid, name: &str) -> Result<QPath, IpcError>;
+
+    /// Open `fid` with the given mode.
+    fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError>;
+
+    /// Read up to `count` bytes at `offset` from an open fid.
+    fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError>;
+
+    /// Write `data` at `offset` to an open fid. Returns bytes written.
+    fn write(&mut self, fid: Fid, offset: u64, data: &[u8]) -> Result<u32, IpcError>;
+
+    /// Release a fid (like 9P's clunk).
+    fn clunk(&mut self, fid: Fid) -> Result<(), IpcError>;
+
+    /// Stat a fid — returns name, size, type.
+    fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError>;
+}
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// Verify that FileServer is object-safe (can be used as Box<dyn FileServer>).
+    struct NullServer;
+
+    impl FileServer for NullServer {
+        fn walk(&mut self, _: Fid, _: Fid, _: &str) -> Result<QPath, IpcError> {
+            Err(IpcError::NotFound)
+        }
+        fn open(&mut self, _: Fid, _: OpenMode) -> Result<(), IpcError> {
+            Err(IpcError::InvalidFid)
+        }
+        fn read(&mut self, _: Fid, _: u64, _: u32) -> Result<Vec<u8>, IpcError> {
+            Err(IpcError::InvalidFid)
+        }
+        fn write(&mut self, _: Fid, _: u64, _: &[u8]) -> Result<u32, IpcError> {
+            Err(IpcError::InvalidFid)
+        }
+        fn clunk(&mut self, _: Fid) -> Result<(), IpcError> {
+            Err(IpcError::InvalidFid)
+        }
+        fn stat(&mut self, _: Fid) -> Result<FileStat, IpcError> {
+            Err(IpcError::InvalidFid)
+        }
+    }
+
     #[test]
-    fn ring2_placeholder() {
-        // Ring 2 scaffold compiles and runs
-        assert!(true);
+    fn file_server_is_object_safe() {
+        let mut server: Box<dyn FileServer> = Box::new(NullServer);
+        assert!(server.stat(0).is_err());
     }
 }
