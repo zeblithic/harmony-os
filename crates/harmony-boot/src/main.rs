@@ -9,6 +9,9 @@
 
 extern crate alloc;
 
+mod pci;
+mod virtio;
+
 use bootloader_api::config::Mapping;
 use bootloader_api::info::MemoryRegionKind;
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
@@ -18,8 +21,9 @@ use linked_list_allocator::LockedHeap;
 use x86_64::instructions::port::Port;
 
 use harmony_identity::PrivateIdentity;
+use harmony_platform::NetworkInterface;
 use harmony_unikernel::serial::{hex_encode, SerialWriter};
-use harmony_unikernel::{KernelEntropy, MemoryState, UnikernelRuntime};
+use harmony_unikernel::{KernelEntropy, MemoryState, NodeAction, UnikernelRuntime};
 
 // ---------------------------------------------------------------------------
 // Bootloader configuration
@@ -221,9 +225,43 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let hex_str = core::str::from_utf8(&hex_buf).unwrap_or("????????????????????????????????");
     serial.log("IDENTITY", hex_str);
 
+    // 5.5 VirtIO-net init
+    let mut virtio_net = match pci::find_virtio_net() {
+        Some(pci_dev) => {
+            pci_dev.enable_bus_master();
+            match virtio::pci_cap::parse_capabilities(&pci_dev, phys_offset) {
+                Some(caps) => match virtio::net::VirtioNet::init(caps, phys_offset) {
+                    Ok(net) => {
+                        let mut mac_buf = [0u8; 17];
+                        net.mac_str(&mut mac_buf);
+                        let mac_str = core::str::from_utf8(&mac_buf).unwrap_or("??:??:??:??:??:??");
+                        serial.log("VIRTIO", mac_str);
+                        Some(net)
+                    }
+                    Err(e) => {
+                        serial.log("VIRTIO", e);
+                        None
+                    }
+                },
+                None => {
+                    serial.log("VIRTIO", "no capabilities found");
+                    None
+                }
+            }
+        }
+        None => {
+            serial.log("VIRTIO", "no device found");
+            None
+        }
+    };
+
     // 6. Event loop
     let persistence = MemoryState::new();
     let mut runtime = UnikernelRuntime::new(identity, entropy, persistence);
+
+    if virtio_net.is_some() {
+        runtime.register_interface("virtio0");
+    }
 
     serial.log("READY", "entering event loop");
 
@@ -236,10 +274,46 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // so protocol timing (announce intervals, link timeouts) works.
     let mut tick: u64 = 0;
     loop {
-        let _actions = runtime.tick(tick);
-        // TODO(harmony-bpo): dispatch NodeActions to VirtIO-net interfaces
+        // Poll network for inbound packets
+        if let Some(ref mut net) = virtio_net {
+            while let Some(data) = NetworkInterface::receive(net) {
+                let rx_actions = runtime.handle_packet("virtio0", data, tick);
+                for action in &rx_actions {
+                    if let NodeAction::SendOnInterface {
+                        interface_name,
+                        raw,
+                    } = action
+                    {
+                        if interface_name.as_ref() == "virtio0" {
+                            let _ = NetworkInterface::send(net, raw);
+                        }
+                    }
+                }
+            }
+        }
+
+        let actions = runtime.tick(tick);
+
+        // Dispatch outbound packets
+        if let Some(ref mut net) = virtio_net {
+            for action in &actions {
+                if let NodeAction::SendOnInterface {
+                    interface_name,
+                    raw,
+                } = action
+                {
+                    if interface_name.as_ref() == "virtio0" {
+                        let _ = NetworkInterface::send(net, raw);
+                    }
+                }
+            }
+        }
+
         tick += 1;
-        x86_64::instructions::hlt();
+        // TODO(harmony-timer): replace spin-loop with hlt once a timer interrupt
+        // source (PIT/HPET/LAPIC) is configured; without one, hlt halts forever
+        // because VirtIO is in pure poll mode with no MSI-X/INTx interrupts.
+        core::hint::spin_loop();
     }
 }
 
