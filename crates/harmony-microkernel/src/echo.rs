@@ -98,6 +98,7 @@ impl FileServer for EchoServer {
         }
 
         let data: &[u8] = match state.qpath {
+            ROOT => return Err(IpcError::NotDirectory),
             HELLO => HELLO_GREETING,
             ECHO => &self.echo_data,
             _ => return Err(IpcError::NotFound),
@@ -124,6 +125,7 @@ impl FileServer for EchoServer {
         }
 
         match state.qpath {
+            ROOT => Err(IpcError::NotDirectory),
             HELLO => Err(IpcError::ReadOnly),
             ECHO => {
                 let len = data.len() as u32;
@@ -272,6 +274,20 @@ mod tests {
             server.write(1, 0, b"nope"),
             Err(IpcError::PermissionDenied)
         );
+    }
+
+    #[test]
+    fn read_directory_returns_not_directory() {
+        let mut server = EchoServer::new();
+        server.open(0, OpenMode::Read).unwrap();
+        assert_eq!(server.read(0, 0, 256), Err(IpcError::NotDirectory));
+    }
+
+    #[test]
+    fn write_directory_returns_not_directory() {
+        let mut server = EchoServer::new();
+        server.open(0, OpenMode::Write).unwrap();
+        assert_eq!(server.write(0, 0, b"nope"), Err(IpcError::NotDirectory));
     }
 
     #[test]

@@ -59,12 +59,16 @@ impl Kernel {
 
     /// Allocate a unique server-side fid. Returns an error if the
     /// fid counter is exhausted (after ~4 billion allocations).
+    ///
+    /// Counter values are monotonic and never recycled. On walk failure,
+    /// pre-allocated fid values are "lost" — this is intentional: the u32
+    /// space is enormous and recycling would add error-prone complexity.
     fn allocate_server_fid(&mut self) -> Result<Fid, IpcError> {
         let fid = self.next_server_fid;
         self.next_server_fid = self
             .next_server_fid
             .checked_add(1)
-            .ok_or(IpcError::NotFound)?;
+            .ok_or(IpcError::ResourceExhausted)?;
         Ok(fid)
     }
 
@@ -82,7 +86,7 @@ impl Kernel {
         self.next_pid = self
             .next_pid
             .checked_add(1)
-            .ok_or(IpcError::NotFound)?;
+            .ok_or(IpcError::ResourceExhausted)?;
 
         // Derive a simple address hash from the pid.
         let mut address_hash = [0u8; 16];
@@ -189,6 +193,11 @@ impl Kernel {
 
     /// Walk a path on behalf of `from_pid`. Resolves the namespace,
     /// checks capabilities, and dispatches to the target FileServer.
+    ///
+    /// `_root_fid` is intentionally unused: the kernel resolves the
+    /// server's root fid from the namespace mount table, not from
+    /// the client's fid space. Retained in the signature for future
+    /// relative-walk support (walking from a non-root fid).
     pub fn walk(
         &mut self,
         from_pid: u32,
@@ -648,6 +657,47 @@ mod tests {
             kernel.walk(client, "/echo/echo", 0, 1, 0),
             Err(IpcError::InvalidFid)
         );
+    }
+
+    #[test]
+    fn capability_check_expired_token_rejected() {
+        let mut entropy = make_test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+
+        let process_addr = [0x01u8; 16];
+        // Token that expires at time 100
+        let cap = kernel_id
+            .issue_root_token(
+                &mut entropy,
+                &process_addr,
+                CapabilityType::Endpoint,
+                b"pid:1",
+                0,   // not_before: immediate
+                100, // expires_at: time 100
+            )
+            .unwrap();
+
+        let kernel = Kernel::new(kernel_id);
+
+        // At time 50 — token is valid
+        assert!(kernel
+            .check_endpoint_cap(&[cap.clone()], &process_addr, 1, 50)
+            .is_ok());
+
+        // At time 200 — token has expired
+        assert_eq!(
+            kernel.check_endpoint_cap(&[cap], &process_addr, 1, 200),
+            Err(IpcError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn ipc_walk_with_nonzero_now() {
+        let (mut kernel, client, _server) = setup_kernel_with_echo();
+        // Tokens are issued with expires_at=0 (never expires),
+        // so a non-zero now should still work.
+        let qpath = kernel.walk(client, "/echo/hello", 0, 1, 1_000_000).unwrap();
+        assert_eq!(qpath, 1);
     }
 
     #[test]

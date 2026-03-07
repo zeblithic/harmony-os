@@ -54,6 +54,7 @@ pub enum IpcError {
     InvalidFid,
     NotDirectory,
     ReadOnly,
+    ResourceExhausted,
 }
 
 // ── File metadata ────────────────────────────────────────────────────

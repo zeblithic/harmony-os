@@ -14,6 +14,8 @@ use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
 const QPATH_ROOT: QPath = 0;
 const QPATH_LOG: QPath = 1;
 
+// TODO: FidState and open/clunk/clone_fid are duplicated with EchoServer.
+// Extract a shared FidTracker helper when a third server appears.
 struct FidState {
     qpath: QPath,
     is_open: bool,
