@@ -21,15 +21,24 @@ use rand_core::CryptoRngCore;
 #[derive(Debug)]
 pub enum RuntimeAction {
     /// Send raw bytes on a named interface.
-    SendOnInterface { interface_name: Arc<str>, raw: Vec<u8> },
+    SendOnInterface {
+        interface_name: Arc<str>,
+        raw: Vec<u8>,
+    },
     /// A new peer was discovered via announce.
     PeerDiscovered { address_hash: [u8; 16], hops: u8 },
     /// A previously known peer has gone silent.
     PeerLost { address_hash: [u8; 16] },
     /// A heartbeat was received from a peer.
-    HeartbeatReceived { address_hash: [u8; 16], uptime_ms: u64 },
+    HeartbeatReceived {
+        address_hash: [u8; 16],
+        uptime_ms: u64,
+    },
     /// A non-heartbeat packet was delivered locally.
-    DeliverLocally { destination_hash: [u8; 16], payload: Vec<u8> },
+    DeliverLocally {
+        destination_hash: [u8; 16],
+        payload: Vec<u8>,
+    },
 }
 
 /// Tracked state for a discovered peer.
@@ -85,24 +94,36 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
         let mut out = Vec::new();
 
         let now_secs = now / 1000;
-        let node_actions = self.node.handle_event(NodeEvent::TimerTick { now: now_secs });
+        let node_actions = self
+            .node
+            .handle_event(NodeEvent::TimerTick { now: now_secs });
 
         for action in node_actions {
             match action {
                 NodeAction::AnnounceNeeded { dest_hash } => {
-                    let announce_actions = self.node.announce(
-                        &dest_hash,
-                        &mut self.entropy,
-                        now_secs,
-                    );
+                    let announce_actions =
+                        self.node.announce(&dest_hash, &mut self.entropy, now_secs);
                     for aa in announce_actions {
-                        if let NodeAction::SendOnInterface { interface_name, raw } = aa {
-                            out.push(RuntimeAction::SendOnInterface { interface_name, raw });
+                        if let NodeAction::SendOnInterface {
+                            interface_name,
+                            raw,
+                        } = aa
+                        {
+                            out.push(RuntimeAction::SendOnInterface {
+                                interface_name,
+                                raw,
+                            });
                         }
                     }
                 }
-                NodeAction::SendOnInterface { interface_name, raw } => {
-                    out.push(RuntimeAction::SendOnInterface { interface_name, raw });
+                NodeAction::SendOnInterface {
+                    interface_name,
+                    raw,
+                } => {
+                    out.push(RuntimeAction::SendOnInterface {
+                        interface_name,
+                        raw,
+                    });
                 }
                 _ => {} // PathsExpired etc. — diagnostic, skip
             }
@@ -122,8 +143,15 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
                     if let Some(raw) = Self::build_data_packet(dest_hash, &hbt) {
                         let send_actions = self.node.route_packet(dest_hash, raw);
                         for sa in send_actions {
-                            if let NodeAction::SendOnInterface { interface_name, raw } = sa {
-                                out.push(RuntimeAction::SendOnInterface { interface_name, raw });
+                            if let NodeAction::SendOnInterface {
+                                interface_name,
+                                raw,
+                            } = sa
+                            {
+                                out.push(RuntimeAction::SendOnInterface {
+                                    interface_name,
+                                    raw,
+                                });
                             }
                         }
                         // One broadcast covers all peers on the same LAN.
@@ -136,7 +164,8 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
 
         // Check peer timeouts.
         let timeout = self.peer_timeout_ms;
-        let timed_out: Vec<[u8; 16]> = self.peers
+        let timed_out: Vec<[u8; 16]> = self
+            .peers
             .iter()
             .filter(|(_, p)| now.saturating_sub(p.last_seen_ms) > timeout)
             .map(|(k, _)| *k)
@@ -303,14 +332,10 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
                 } => {
                     let payload: &[u8] = &packet.data;
                     // Check for heartbeat magic: "HBT\x01"
-                    if payload.len() >= 28
-                        && payload[0..4] == [0x48, 0x42, 0x54, 0x01]
-                    {
+                    if payload.len() >= 28 && payload[0..4] == [0x48, 0x42, 0x54, 0x01] {
                         let mut sender = [0u8; 16];
                         sender.copy_from_slice(&payload[4..20]);
-                        let uptime_ms = u64::from_be_bytes(
-                            payload[20..28].try_into().unwrap(),
-                        );
+                        let uptime_ms = u64::from_be_bytes(payload[20..28].try_into().unwrap());
                         // Update last_seen for this peer.
                         if let Some(peer) = self.peers.get_mut(&sender) {
                             peer.last_seen_ms = now;
@@ -419,8 +444,13 @@ mod tests {
         // announce_interval=1s, next_announce_at=0, so announce fires.
         let actions = runtime.tick(1_000);
 
-        let has_send = actions.iter().any(|a| matches!(a, RuntimeAction::SendOnInterface { .. }));
-        assert!(has_send, "tick should resolve announces into SendOnInterface");
+        let has_send = actions
+            .iter()
+            .any(|a| matches!(a, RuntimeAction::SendOnInterface { .. }));
+        assert!(
+            has_send,
+            "tick should resolve announces into SendOnInterface"
+        );
     }
 
     #[test]
@@ -429,18 +459,23 @@ mod tests {
         runtime.register_interface("test0");
 
         // Manually insert a peer.
-        runtime.peers.insert([0xAA; 16], PeerInfo {
-            address_hash: [0xAA; 16],
-            last_seen_ms: 0,
-            hops: 1,
-            discovered_at_ms: 0,
-        });
+        runtime.peers.insert(
+            [0xAA; 16],
+            PeerInfo {
+                address_hash: [0xAA; 16],
+                last_seen_ms: 0,
+                hops: 1,
+                discovered_at_ms: 0,
+            },
+        );
         assert_eq!(runtime.peer_count(), 1);
 
         // Tick at 16_000ms — peer_timeout_ms is 15_000.
         let actions = runtime.tick(16_000);
         assert_eq!(runtime.peer_count(), 0);
-        let has_lost = actions.iter().any(|a| matches!(a, RuntimeAction::PeerLost { .. }));
+        let has_lost = actions
+            .iter()
+            .any(|a| matches!(a, RuntimeAction::PeerLost { .. }));
         assert!(has_lost, "should emit PeerLost");
     }
 
@@ -467,27 +502,32 @@ mod tests {
         let _ = runtime.tick(1_000);
 
         // Insert a fake peer.
-        runtime.peers.insert([0xBB; 16], PeerInfo {
-            address_hash: [0xBB; 16],
-            last_seen_ms: 0,
-            hops: 1,
-            discovered_at_ms: 0,
-        });
+        runtime.peers.insert(
+            [0xBB; 16],
+            PeerInfo {
+                address_hash: [0xBB; 16],
+                last_seen_ms: 0,
+                hops: 1,
+                discovered_at_ms: 0,
+            },
+        );
 
         // Tick at 6 seconds — past heartbeat_interval_ms (5000).
         // The announce won't fire again (next_announce_at is ~300s out).
         let actions = runtime.tick(6_000);
 
         // Should have at least one SendOnInterface for the heartbeat.
-        let send_count = actions.iter().filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. })).count();
+        let send_count = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
+            .count();
         assert!(send_count > 0, "should emit heartbeat SendOnInterface");
     }
 
     #[test]
     fn register_announcing_destination_sets_dest_hash() {
         let mut runtime = make_runtime();
-        let dest_hash =
-            runtime.register_announcing_destination("harmony", &["node"], 300_000, 0);
+        let dest_hash = runtime.register_announcing_destination("harmony", &["node"], 300_000, 0);
         assert_ne!(dest_hash, [0u8; 16]);
         assert_eq!(runtime.node.announcing_destination_count(), 1);
     }
@@ -509,11 +549,9 @@ mod tests {
         let mut entropy2 = test_entropy();
         let peer_identity = PrivateIdentity::generate(&mut entropy2);
         let peer_addr = peer_identity.public_identity().address_hash;
-        let dest_name = harmony_reticulum::destination::DestinationName::from_name(
-            "harmony",
-            &["node"],
-        )
-        .unwrap();
+        let dest_name =
+            harmony_reticulum::destination::DestinationName::from_name("harmony", &["node"])
+                .unwrap();
 
         let announce_packet = harmony_reticulum::announce::build_announce(
             &peer_identity,
@@ -535,7 +573,10 @@ mod tests {
                 } if *address_hash == peer_addr
             )
         });
-        assert!(has_discovered, "should emit PeerDiscovered on valid announce");
+        assert!(
+            has_discovered,
+            "should emit PeerDiscovered on valid announce"
+        );
         assert_eq!(runtime.peer_count(), 1);
     }
 }
