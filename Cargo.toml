@@ -4,7 +4,6 @@ members = [
     "crates/harmony-unikernel",
     "crates/harmony-microkernel",
     "crates/harmony-os",
-    "crates/harmony-athenaeum",
 ]
 # harmony-boot is excluded from the workspace because it targets bare metal
 # (x86_64-unknown-none) and Cargo's workspace feature unification would force
@@ -31,13 +30,13 @@ harmony-zenoh = { git = "https://github.com/zeblithic/harmony.git", branch = "ma
 harmony-content = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
 harmony-compute = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
 harmony-workflow = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
+harmony-athenaeum = { git = "https://github.com/zeblithic/harmony.git", branch = "main", default-features = false }
 # Note: harmony-node is a binary crate (no lib target), not usable as a dependency
 
 # Internal workspace crates
 harmony-unikernel = { path = "crates/harmony-unikernel", default-features = false }
 harmony-microkernel = { path = "crates/harmony-microkernel" }
 harmony-os = { path = "crates/harmony-os" }
-harmony-athenaeum = { path = "crates/harmony-athenaeum", default-features = false }
 
 # Shared dependencies
 rand_core = { version = "0.6", default-features = false }
