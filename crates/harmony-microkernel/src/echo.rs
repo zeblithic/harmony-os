@@ -90,6 +90,11 @@ impl FileServer for EchoServer {
         if state.is_open {
             return Err(IpcError::PermissionDenied);
         }
+        // Reject write modes on the read-only "hello" file at open time,
+        // rather than deferring to write() — matches 9P open semantics.
+        if state.qpath == HELLO && matches!(mode, OpenMode::Write | OpenMode::ReadWrite) {
+            return Err(IpcError::ReadOnly);
+        }
         state.is_open = true;
         state.mode = Some(mode);
         Ok(())
@@ -251,12 +256,18 @@ mod tests {
     }
 
     #[test]
-    fn write_hello_is_read_only() {
+    fn open_hello_write_mode_rejected() {
         let mut server = EchoServer::new();
         server.walk(0, 1, "hello").unwrap();
-        server.open(1, OpenMode::Write).unwrap();
-        let err = server.write(1, 0, b"nope").unwrap_err();
-        assert_eq!(err, IpcError::ReadOnly);
+        // Write mode rejected at open time — matches 9P semantics
+        assert_eq!(server.open(1, OpenMode::Write), Err(IpcError::ReadOnly));
+    }
+
+    #[test]
+    fn open_hello_readwrite_mode_rejected() {
+        let mut server = EchoServer::new();
+        server.walk(0, 1, "hello").unwrap();
+        assert_eq!(server.open(1, OpenMode::ReadWrite), Err(IpcError::ReadOnly));
     }
 
     #[test]
@@ -271,7 +282,7 @@ mod tests {
     #[test]
     fn read_denied_in_write_mode() {
         let mut server = EchoServer::new();
-        server.walk(0, 1, "hello").unwrap();
+        server.walk(0, 1, "echo").unwrap();
         server.open(1, OpenMode::Write).unwrap();
         assert_eq!(server.read(1, 0, 256), Err(IpcError::PermissionDenied));
     }

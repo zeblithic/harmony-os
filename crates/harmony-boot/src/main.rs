@@ -339,20 +339,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let mut echo = EchoServer::new();
 
         // Walk to hello
-        let qpath = echo.walk(0, 1, "hello").unwrap();
+        let qpath = echo.walk(0, 1, "hello").expect("ring2: walk hello");
         let _ = writeln!(serial, "[IPC]  walk hello qpath={}", qpath);
 
         // Open and read
-        echo.open(1, OpenMode::Read).unwrap();
-        let data = echo.read(1, 0, 256).unwrap();
+        echo.open(1, OpenMode::Read).expect("ring2: open hello");
+        let data = echo.read(1, 0, 256).expect("ring2: read hello");
         let msg = core::str::from_utf8(&data).unwrap_or("(non-utf8)");
         let _ = writeln!(serial, "[IPC]  read: \"{}\"", msg);
 
         // Walk to echo, write, read back
-        echo.walk(0, 2, "echo").unwrap();
-        echo.open(2, OpenMode::ReadWrite).unwrap();
-        echo.write(2, 0, b"Harmony Ring 2!").unwrap();
-        let data = echo.read(2, 0, 256).unwrap();
+        echo.walk(0, 2, "echo").expect("ring2: walk echo");
+        echo.open(2, OpenMode::ReadWrite).expect("ring2: open echo");
+        echo.write(2, 0, b"Harmony Ring 2!").expect("ring2: write echo");
+        let data = echo.read(2, 0, 256).expect("ring2: read echo");
         let msg = core::str::from_utf8(&data).unwrap_or("(non-utf8)");
         let _ = writeln!(serial, "[IPC]  echo: \"{}\"", msg);
 

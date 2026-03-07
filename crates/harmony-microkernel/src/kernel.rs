@@ -36,7 +36,7 @@ pub struct Kernel {
     processes: BTreeMap<u32, Process>,
     next_pid: u32,
     identity: PrivateIdentity,
-    pub(crate) identity_store: MemoryIdentityStore,
+    identity_store: MemoryIdentityStore,
     proof_store: MemoryProofStore,
     revocations: MemoryRevocationSet,
     /// Maps (client_pid, client_fid) -> (target_pid, server_fid).

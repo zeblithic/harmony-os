@@ -11,21 +11,23 @@ rust-version.workspace = true
 default = ["kernel"]
 std = [
     "harmony-unikernel/std",
-    "harmony-crypto/std",
-    "harmony-identity/std",
-    "harmony-platform/std",
 ]
 # Kernel struct + IPC dispatch. Requires in-memory identity stores from
 # harmony-identity/test-utils (production-grade despite the feature name).
-kernel = ["std", "harmony-identity/test-utils"]
+kernel = [
+    "std",
+    "dep:harmony-crypto", "harmony-crypto/std",
+    "dep:harmony-identity", "harmony-identity/std", "harmony-identity/test-utils",
+    "dep:harmony-platform", "harmony-platform/std",
+]
 
 [dependencies]
 # Ring 1
 harmony-unikernel = { workspace = true }
 
-# Ring 0 — protocol crates needed at the kernel level
-harmony-crypto = { workspace = true }
-harmony-identity = { workspace = true }
-harmony-platform = { workspace = true }
+# Ring 0 — protocol crates, only needed for kernel IPC dispatch
+harmony-crypto = { workspace = true, optional = true }
+harmony-identity = { workspace = true, optional = true }
+harmony-platform = { workspace = true, optional = true }
 
 [dev-dependencies]
