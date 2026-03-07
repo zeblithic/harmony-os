@@ -55,6 +55,7 @@ pub enum IpcError {
     NotDirectory,
     ReadOnly,
     ResourceExhausted,
+    NotSupported,
 }
 
 // ── File metadata ────────────────────────────────────────────────────
@@ -96,8 +97,12 @@ pub trait FileServer {
 
     /// Clone a fid — create `new_fid` as a closed duplicate of `fid`.
     /// Equivalent to a 9P walk with zero path components.
+    ///
+    /// **Must be overridden** by any `FileServer` that will be mounted
+    /// as a namespace root; the default returns `NotSupported` to
+    /// distinguish "operation unsupported" from `InvalidFid`.
     fn clone_fid(&mut self, _fid: Fid, _new_fid: Fid) -> Result<QPath, IpcError> {
-        Err(IpcError::InvalidFid)
+        Err(IpcError::NotSupported)
     }
 }
 

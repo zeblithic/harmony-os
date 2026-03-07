@@ -66,6 +66,10 @@ impl FileServer for EchoServer {
             return Err(IpcError::NotDirectory);
         }
 
+        if self.fids.contains_key(&new_fid) {
+            return Err(IpcError::InvalidFid);
+        }
+
         let qpath = match name {
             "hello" => HELLO,
             "echo" => ECHO,
@@ -128,7 +132,8 @@ impl FileServer for EchoServer {
             ROOT => Err(IpcError::NotDirectory),
             HELLO => Err(IpcError::ReadOnly),
             ECHO => {
-                let len = data.len() as u32;
+                let len = u32::try_from(data.len())
+                    .map_err(|_| IpcError::ResourceExhausted)?;
                 self.echo_data = data.to_vec();
                 Ok(len)
             }
@@ -274,6 +279,13 @@ mod tests {
             server.write(1, 0, b"nope"),
             Err(IpcError::PermissionDenied)
         );
+    }
+
+    #[test]
+    fn walk_duplicate_fid_rejected() {
+        let mut server = EchoServer::new();
+        server.walk(0, 1, "hello").unwrap();
+        assert_eq!(server.walk(0, 1, "echo"), Err(IpcError::InvalidFid));
     }
 
     #[test]

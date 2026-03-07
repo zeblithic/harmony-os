@@ -56,6 +56,9 @@ impl FileServer for SerialServer {
         if state.qpath != QPATH_ROOT {
             return Err(IpcError::NotDirectory);
         }
+        if self.fids.contains_key(&new_fid) {
+            return Err(IpcError::InvalidFid);
+        }
         if name != "log" {
             return Err(IpcError::NotFound);
         }
@@ -100,8 +103,10 @@ impl FileServer for SerialServer {
         if matches!(state.mode, Some(OpenMode::Read)) {
             return Err(IpcError::PermissionDenied);
         }
+        let len = u32::try_from(data.len())
+            .map_err(|_| IpcError::ResourceExhausted)?;
         self.buf.extend_from_slice(data);
-        Ok(data.len() as u32)
+        Ok(len)
     }
 
     fn clunk(&mut self, fid: Fid) -> Result<(), IpcError> {

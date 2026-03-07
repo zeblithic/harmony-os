@@ -345,22 +345,42 @@ impl Kernel {
         target.server.write(server_fid, offset, data)
     }
 
-    /// Release a fid.
+    /// Stat a previously walked fid. Does not require the fid to be open.
+    pub fn stat(
+        &mut self,
+        from_pid: u32,
+        fid: Fid,
+        _now: u64,
+    ) -> Result<crate::FileStat, IpcError> {
+        let &(target_pid, server_fid) = self
+            .fid_owners
+            .get(&(from_pid, fid))
+            .ok_or(IpcError::InvalidFid)?;
+        let target = self
+            .processes
+            .get_mut(&target_pid)
+            .ok_or(IpcError::NotFound)?;
+        target.server.stat(server_fid)
+    }
+
+    /// Release a fid. Confirms server-side clunk before removing tracking.
     pub fn clunk(
         &mut self,
         from_pid: u32,
         fid: Fid,
         _now: u64,
     ) -> Result<(), IpcError> {
-        let (target_pid, server_fid) = self
+        let &(target_pid, server_fid) = self
             .fid_owners
-            .remove(&(from_pid, fid))
+            .get(&(from_pid, fid))
             .ok_or(IpcError::InvalidFid)?;
         let target = self
             .processes
             .get_mut(&target_pid)
             .ok_or(IpcError::NotFound)?;
-        target.server.clunk(server_fid)
+        target.server.clunk(server_fid)?;
+        self.fid_owners.remove(&(from_pid, fid));
+        Ok(())
     }
 }
 
@@ -511,6 +531,15 @@ mod tests {
             .unwrap();
 
         (kernel, client_pid, server_pid)
+    }
+
+    #[test]
+    fn ipc_stat_through_namespace() {
+        let (mut kernel, client, _server) = setup_kernel_with_echo();
+        kernel.walk(client, "/echo/hello", 0, 1, 0).unwrap();
+        let stat = kernel.stat(client, 1, 0).unwrap();
+        assert_eq!(&*stat.name, "hello");
+        assert_eq!(stat.file_type, crate::FileType::Regular);
     }
 
     #[test]
