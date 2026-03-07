@@ -14,7 +14,7 @@ mod athenaeum;
 mod book;
 
 pub use addr::{ChunkAddr, Algorithm, Depth};
-pub use athenaeum::{Athenaeum, CollisionError, MissingChunkError};
+pub use athenaeum::{Athenaeum, CollisionError, MissingChunkError, MAX_BLOB_SIZE};
 pub use book::{Book, BookEntry, BookError};
 pub use hash::{sha256_hash, sha224_hash};
 
@@ -25,10 +25,13 @@ mod tests {
 
     #[test]
     fn end_to_end_1mb_blob() {
-        // Create a 1MB blob with varied content
+        // Create a 1MB blob with unique chunks.
+        // Use all 4 bytes of the position index so the pattern doesn't
+        // repeat at 4KB boundaries (unlike `(i * 7) as u8` which wraps).
         let mut data = alloc::vec![0u8; 1024 * 1024];
         for (i, byte) in data.iter_mut().enumerate() {
-            *byte = (i.wrapping_mul(7).wrapping_add(13)) as u8;
+            let pos = i as u32;
+            *byte = (pos ^ (pos >> 8) ^ (pos >> 16)) as u8;
         }
 
         // Chunk it

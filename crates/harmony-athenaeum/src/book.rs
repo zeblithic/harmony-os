@@ -9,6 +9,7 @@ use crate::athenaeum::Athenaeum;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BookError {
     TooShort,
+    InvalidChecksum,
 }
 
 /// A single blob entry in a book.
@@ -31,10 +32,12 @@ pub struct Book {
 impl Book {
     /// Create a book from a single athenaeum.
     pub fn from_athenaeum(ath: &Athenaeum) -> Self {
+        let blob_size = u32::try_from(ath.blob_size)
+            .expect("blob_size exceeds u32::MAX");
         Book {
             entries: alloc::vec![BookEntry {
                 cid: ath.cid,
-                blob_size: ath.blob_size as u32,
+                blob_size,
                 chunks: ath.chunks.clone(),
             }],
         }
@@ -42,9 +45,11 @@ impl Book {
 
     /// Add another athenaeum to this book.
     pub fn add_athenaeum(&mut self, ath: &Athenaeum) {
+        let blob_size = u32::try_from(ath.blob_size)
+            .expect("blob_size exceeds u32::MAX");
         self.entries.push(BookEntry {
             cid: ath.cid,
-            blob_size: ath.blob_size as u32,
+            blob_size,
             chunks: ath.chunks.clone(),
         });
     }
@@ -99,7 +104,11 @@ impl Book {
                 let raw = u32::from_le_bytes(
                     data[pos..pos + 4].try_into().map_err(|_| BookError::TooShort)?,
                 );
-                chunks.push(ChunkAddr(raw));
+                let addr = ChunkAddr(raw);
+                if !addr.verify_checksum() {
+                    return Err(BookError::InvalidChecksum);
+                }
+                chunks.push(addr);
                 pos += 4;
             }
 

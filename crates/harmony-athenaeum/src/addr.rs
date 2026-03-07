@@ -45,10 +45,12 @@ impl ChunkAddr {
         size_exponent: u8,
         _checksum: u8,
     ) -> Self {
+        debug_assert!(hash_bits <= 0x1F_FFFF, "hash_bits must fit in 21 bits");
+        debug_assert!(size_exponent <= 7, "size_exponent must fit in 3 bits");
         let algo = algorithm as u32;
         let d = depth as u32;
-        let se = size_exponent as u32;
-        let bits28 = (hash_bits << 7) | (algo << 5) | (d << 3) | se;
+        let se = (size_exponent & 0x7) as u32;
+        let bits28 = ((hash_bits & 0x1F_FFFF) << 7) | (algo << 5) | (d << 3) | se;
         let checksum = Self::compute_checksum(bits28);
         ChunkAddr((bits28 << 4) | checksum as u32)
     }

@@ -8,8 +8,7 @@ use alloc::vec::Vec;
 use crate::addr::{Algorithm, ChunkAddr, Depth};
 
 /// Maximum blob size (1MB).
-#[allow(dead_code)] // Used by book.rs (future task)
-pub(crate) const MAX_BLOB_SIZE: usize = 1024 * 1024;
+pub const MAX_BLOB_SIZE: usize = 1024 * 1024;
 
 /// Standard chunk size (4KB).
 pub(crate) const CHUNK_SIZE: usize = 4096;
@@ -22,10 +21,13 @@ const ALGORITHMS: [Algorithm; 4] = [
     Algorithm::Sha224Lsb,
 ];
 
-/// Error when all 4 algorithms produce collisions for a chunk.
+/// Error when chunking a blob fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CollisionError {
-    pub chunk_index: usize,
+pub enum CollisionError {
+    /// All 4 algorithms produced collisions for this chunk.
+    AllAlgorithmsCollide { chunk_index: usize },
+    /// Blob exceeds `MAX_BLOB_SIZE`.
+    BlobTooLarge { size: usize },
 }
 
 /// Error when a chunk is missing during reassembly.
@@ -52,6 +54,9 @@ impl Athenaeum {
     /// chunk, tries algorithms in order until a collision-free address
     /// is found.
     pub fn from_blob(cid: [u8; 32], data: &[u8]) -> Result<Self, CollisionError> {
+        if data.len() > MAX_BLOB_SIZE {
+            return Err(CollisionError::BlobTooLarge { size: data.len() });
+        }
         if data.is_empty() {
             return Ok(Athenaeum {
                 cid,
@@ -80,7 +85,7 @@ impl Athenaeum {
 
             let addr =
                 address_with_collision_resolution(&padded, Depth::Blob, size_exp, &used_addrs)
-                    .ok_or(CollisionError { chunk_index: i })?;
+                    .ok_or(CollisionError::AllAlgorithmsCollide { chunk_index: i })?;
 
             used_addrs.insert(addr.hash_bits());
             content_cache.insert(content_hash, addr);
@@ -230,7 +235,8 @@ mod tests {
     fn reassemble_round_trip() {
         let mut data = vec![0u8; 4096 * 3];
         for (i, b) in data.iter_mut().enumerate() {
-            *b = (i.wrapping_mul(7)) as u8;
+            let pos = i as u32;
+            *b = (pos ^ (pos >> 8) ^ (pos >> 16)) as u8;
         }
         let ath = Athenaeum::from_blob(test_cid(), &data).unwrap();
 
