@@ -95,7 +95,7 @@ impl Kernel {
         let mut namespace = Namespace::new();
         for &(path, target_pid, root_fid) in mounts {
             if !self.processes.contains_key(&target_pid) {
-                return Err(IpcError::NotFound);
+                return Err(IpcError::InvalidArgument);
             }
             namespace.mount(path, target_pid, root_fid)?;
         }
