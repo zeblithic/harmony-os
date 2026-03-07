@@ -43,6 +43,15 @@ pub struct UnikernelRuntime<E: EntropySource, P: PersistentState> {
     entropy: E,
     persistence: P,
     tick_count: u64,
+    // Announcing
+    dest_name: Option<DestinationName>,
+    dest_hash: Option<DestinationHash>,
+    // Peer tracking
+    peers: BTreeMap<[u8; 16], PeerInfo>,
+    heartbeat_interval_ms: u64,
+    peer_timeout_ms: u64,
+    last_heartbeat_ms: u64,
+    boot_time_ms: u64,
 }
 
 impl<E: EntropySource, P: PersistentState> UnikernelRuntime<E, P> {
@@ -54,6 +63,13 @@ impl<E: EntropySource, P: PersistentState> UnikernelRuntime<E, P> {
             entropy,
             persistence,
             tick_count: 0,
+            dest_name: None,
+            dest_hash: None,
+            peers: BTreeMap::new(),
+            heartbeat_interval_ms: 5_000,
+            peer_timeout_ms: 15_000,
+            last_heartbeat_ms: 0,
+            boot_time_ms: 0,
         }
     }
 
@@ -76,6 +92,11 @@ impl<E: EntropySource, P: PersistentState> UnikernelRuntime<E, P> {
 
     pub fn persistence(&mut self) -> &mut P {
         &mut self.persistence
+    }
+
+    /// Number of currently tracked peers.
+    pub fn peer_count(&self) -> usize {
+        self.peers.len()
     }
 
     /// Register a network interface with the node's routing table.
@@ -153,6 +174,12 @@ mod tests {
         let runtime = make_runtime();
         let addr = runtime.identity().public_identity().address_hash;
         assert_ne!(addr, [0u8; 16]);
+    }
+
+    #[test]
+    fn runtime_has_no_peers_initially() {
+        let runtime = make_runtime();
+        assert_eq!(runtime.peer_count(), 0);
     }
 
     #[test]
