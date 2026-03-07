@@ -24,12 +24,13 @@ struct FidState {
 
 /// A FileServer that captures writes to a buffer.
 ///
+/// **Warning:** The internal buffer grows without bound on each write
+/// and is never truncated. On bare-metal targets with a fixed-size heap,
+/// a logging loop will exhaust memory. Callers must drain the buffer
+/// periodically via `buffer()` or impose an external write budget.
+///
 /// In tests, call `buffer()` to inspect what was written.
 /// In the boot crate, the buffer can be drained to a real serial port.
-///
-/// **Note:** The internal buffer grows without bound on each write.
-/// For long-running bare-metal use, the caller should periodically
-/// drain via `buffer()` or impose an external write budget.
 pub struct SerialServer {
     fids: BTreeMap<Fid, FidState>,
     buf: Vec<u8>,

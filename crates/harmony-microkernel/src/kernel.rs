@@ -19,6 +19,10 @@ use crate::{Fid, FileServer, IpcError, OpenMode, QPath};
 /// where all tokens are root-issued (depth 0).
 const MAX_DELEGATION_DEPTH: usize = 5;
 
+/// Default capability TTL in abstract time units. Generous for milestone A;
+/// production should use shorter, context-appropriate TTLs.
+const DEFAULT_CAP_TTL: u64 = 1_000_000_000;
+
 /// A process in the microkernel.
 pub struct Process {
     pub pid: u32,
@@ -132,7 +136,7 @@ impl Kernel {
         entropy: &mut impl EntropySource,
         process_pid: u32,
         target_pid: u32,
-        _now: u64,
+        now: u64,
     ) -> Result<(), IpcError> {
         if !self.processes.contains_key(&target_pid) {
             return Err(IpcError::InvalidArgument);
@@ -148,9 +152,8 @@ impl Kernel {
                 &audience,
                 CapabilityType::Endpoint,
                 resource.as_bytes(),
-                0, // not_before: immediate
-                // TODO: wire in expiry (e.g. now + ttl) for production use
-                0, // expires_at: 0 = never expires (milestone A only)
+                now,
+                now.saturating_add(DEFAULT_CAP_TTL),
             )
             .map_err(|_| IpcError::PermissionDenied)?;
 
@@ -260,10 +263,19 @@ impl Kernel {
         }
 
         // Pre-allocate all server-side fids before borrowing target mutably.
-        let server_fid = self.allocate_server_fid()?;
+        // Skip any allocation that collides with server_root_fid to prevent
+        // clone_fid/walk failures when the monotonic counter reaches that value.
+        let mut server_fid = self.allocate_server_fid()?;
+        if server_fid == server_root_fid {
+            server_fid = self.allocate_server_fid()?;
+        }
         let mut intermediate_fids = Vec::new();
         for _ in 0..components.len().saturating_sub(1) {
-            intermediate_fids.push(self.allocate_server_fid()?);
+            let mut fid = self.allocate_server_fid()?;
+            if fid == server_root_fid {
+                fid = self.allocate_server_fid()?;
+            }
+            intermediate_fids.push(fid);
         }
 
         let target = self
