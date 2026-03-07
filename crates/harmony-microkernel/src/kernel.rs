@@ -19,8 +19,10 @@ use crate::{Fid, FileServer, IpcError, OpenMode, QPath};
 /// where all tokens are root-issued (depth 0).
 const MAX_DELEGATION_DEPTH: usize = 5;
 
-/// Default capability TTL in abstract time units. Generous for milestone A;
-/// production should use shorter, context-appropriate TTLs.
+/// Default capability TTL in **milliseconds** of abstract kernel time.
+/// A value of `1_000_000_000` gives a ~11.5-day window, generous for
+/// milestone A where short-lived processes are the norm.
+/// Production builds should use context-appropriate, shorter TTLs.
 const DEFAULT_CAP_TTL: u64 = 1_000_000_000;
 
 /// A process in the microkernel.
@@ -790,8 +792,8 @@ mod tests {
     #[test]
     fn ipc_walk_with_nonzero_now() {
         let (mut kernel, client, _server) = setup_kernel_with_echo();
-        // Tokens are issued with expires_at=0 (never expires),
-        // so a non-zero now should still work.
+        // Tokens are issued with expires_at = DEFAULT_CAP_TTL (1_000_000_000).
+        // Walking at now=1_000_000 is well within the TTL, so the walk succeeds.
         let qpath = kernel.walk(client, "/echo/hello", 0, 1, 1_000_000).unwrap();
         assert_eq!(qpath, 1);
     }
