@@ -57,40 +57,10 @@ impl Athenaeum {
         if data.len() > MAX_BLOB_SIZE {
             return Err(CollisionError::BlobTooLarge { size: data.len() });
         }
-        if data.is_empty() {
-            return Ok(Athenaeum {
-                cid,
-                chunks: Vec::new(),
-                blob_size: 0,
-            });
-        }
 
-        let mut chunks = Vec::new();
         let mut used_addrs = BTreeSet::new();
-        // Cache: content hash → already-assigned address (deduplication).
-        let mut content_cache: BTreeMap<[u8; 32], ChunkAddr> = BTreeMap::new();
-
-        for (i, chunk_data) in data.chunks(CHUNK_SIZE).enumerate() {
-            let size_exp = chunk_size_exponent(chunk_data.len());
-            let padded_size = CHUNK_SIZE >> (size_exp as usize);
-            let mut padded = alloc::vec![0u8; padded_size];
-            padded[..chunk_data.len()].copy_from_slice(chunk_data);
-
-            // If we've already seen identical content, reuse the address.
-            let content_hash = crate::hash::sha256_hash(&padded);
-            if let Some(&cached) = content_cache.get(&content_hash) {
-                chunks.push(cached);
-                continue;
-            }
-
-            let addr =
-                address_with_collision_resolution(&padded, Depth::Blob, size_exp, &used_addrs)
-                    .ok_or(CollisionError::AllAlgorithmsCollide { chunk_index: i })?;
-
-            used_addrs.insert(addr.hash_bits());
-            content_cache.insert(content_hash, addr);
-            chunks.push(addr);
-        }
+        let mut content_cache = BTreeMap::new();
+        let chunks = chunk_blob(data, &mut used_addrs, &mut content_cache)?;
 
         Ok(Athenaeum {
             cid,
@@ -115,6 +85,47 @@ impl Athenaeum {
         result.truncate(self.blob_size);
         Ok(result)
     }
+}
+
+/// Chunk a blob into addressed pieces, resolving collisions against
+/// cumulative state. Identical chunks across calls reuse the same address
+/// (content deduplication).
+///
+/// This is the shared core used by both `Athenaeum::from_blob()` (fresh state
+/// per blob) and `Book::from_blobs()` (shared state across blobs).
+pub(crate) fn chunk_blob(
+    data: &[u8],
+    used_addrs: &mut BTreeSet<u32>,
+    content_cache: &mut BTreeMap<[u8; 32], ChunkAddr>,
+) -> Result<Vec<ChunkAddr>, CollisionError> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut chunks = Vec::new();
+    for (i, chunk_data) in data.chunks(CHUNK_SIZE).enumerate() {
+        let size_exp = chunk_size_exponent(chunk_data.len());
+        let padded_size = CHUNK_SIZE >> (size_exp as usize);
+        let mut padded = alloc::vec![0u8; padded_size];
+        padded[..chunk_data.len()].copy_from_slice(chunk_data);
+
+        // If we've already seen identical content, reuse the address.
+        let content_hash = crate::hash::sha256_hash(&padded);
+        if let Some(&cached) = content_cache.get(&content_hash) {
+            chunks.push(cached);
+            continue;
+        }
+
+        let addr =
+            address_with_collision_resolution(&padded, Depth::Blob, size_exp, used_addrs)
+                .ok_or(CollisionError::AllAlgorithmsCollide { chunk_index: i })?;
+
+        used_addrs.insert(addr.hash_bits());
+        content_cache.insert(content_hash, addr);
+        chunks.push(addr);
+    }
+
+    Ok(chunks)
 }
 
 /// Try all 4 algorithms to find a collision-free address.
