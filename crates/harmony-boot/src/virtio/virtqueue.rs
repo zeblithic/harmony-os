@@ -15,9 +15,6 @@ pub const QUEUE_SIZE: u16 = 32;
 /// Size of each pre-allocated packet buffer in bytes.
 pub const BUF_SIZE: usize = 2048;
 
-/// Descriptor flag: buffer continues via the `next` field.
-pub const VIRTQ_DESC_F_NEXT: u16 = 1;
-
 /// Descriptor flag: buffer is device-writable (host reads, device writes).
 pub const VIRTQ_DESC_F_WRITE: u16 = 2;
 
@@ -216,9 +213,10 @@ impl Virtqueue {
             desc.flags = VIRTQ_DESC_F_WRITE;
             desc.next = 0;
 
-            // Use volatile for avail ring since the device reads it via DMA.
+            // Volatile writes for avail ring — device reads via DMA.
             let avail_idx = ptr::read_volatile(&(*self.avail).idx);
-            (*self.avail).ring[(avail_idx % self.queue_size) as usize] = idx;
+            let ring_slot = &mut (*self.avail).ring[(avail_idx % self.queue_size) as usize];
+            ptr::write_volatile(ring_slot, idx);
 
             // Ensure descriptor writes are visible before the device sees
             // the updated available index.
@@ -251,9 +249,10 @@ impl Virtqueue {
             desc.flags = 0; // device-readable
             desc.next = 0;
 
-            // Use volatile for avail ring since the device reads it via DMA.
+            // Volatile writes for avail ring — device reads via DMA.
             let avail_idx = ptr::read_volatile(&(*self.avail).idx);
-            (*self.avail).ring[(avail_idx % self.queue_size) as usize] = idx;
+            let ring_slot = &mut (*self.avail).ring[(avail_idx % self.queue_size) as usize];
+            ptr::write_volatile(ring_slot, idx);
 
             // Ensure descriptor + data writes are visible before the device
             // sees the updated available index.
