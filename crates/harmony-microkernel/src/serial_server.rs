@@ -68,6 +68,9 @@ impl FileServer for SerialServer {
 
     fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
         let state = self.fids.get_mut(&fid).ok_or(IpcError::InvalidFid)?;
+        if state.is_open {
+            return Err(IpcError::PermissionDenied);
+        }
         state.is_open = true;
         state.mode = Some(mode);
         Ok(())
@@ -80,8 +83,8 @@ impl FileServer for SerialServer {
         if !state.is_open {
             return Err(IpcError::NotOpen);
         }
-        if state.qpath != QPATH_LOG {
-            return Err(IpcError::PermissionDenied);
+        if state.qpath == QPATH_ROOT {
+            return Err(IpcError::IsDirectory);
         }
         if matches!(state.mode, Some(OpenMode::Write)) {
             return Err(IpcError::PermissionDenied);
@@ -97,8 +100,8 @@ impl FileServer for SerialServer {
         if !state.is_open {
             return Err(IpcError::NotOpen);
         }
-        if state.qpath != QPATH_LOG {
-            return Err(IpcError::PermissionDenied);
+        if state.qpath == QPATH_ROOT {
+            return Err(IpcError::IsDirectory);
         }
         if matches!(state.mode, Some(OpenMode::Read)) {
             return Err(IpcError::PermissionDenied);
@@ -115,6 +118,9 @@ impl FileServer for SerialServer {
     }
 
     fn clone_fid(&mut self, fid: Fid, new_fid: Fid) -> Result<QPath, IpcError> {
+        if self.fids.contains_key(&new_fid) {
+            return Err(IpcError::InvalidFid);
+        }
         let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
         let qpath = state.qpath;
         self.fids.insert(new_fid, FidState { qpath, is_open: false, mode: None });
@@ -187,14 +193,14 @@ mod tests {
     fn read_directory_denied() {
         let mut srv = SerialServer::new();
         srv.open(0, OpenMode::Read).unwrap();
-        assert_eq!(srv.read(0, 0, 256), Err(IpcError::PermissionDenied));
+        assert_eq!(srv.read(0, 0, 256), Err(IpcError::IsDirectory));
     }
 
     #[test]
     fn write_directory_denied() {
         let mut srv = SerialServer::new();
         srv.open(0, OpenMode::Write).unwrap();
-        assert_eq!(srv.write(0, 0, b"nope"), Err(IpcError::PermissionDenied));
+        assert_eq!(srv.write(0, 0, b"nope"), Err(IpcError::IsDirectory));
     }
 
     #[test]

@@ -53,6 +53,7 @@ pub enum IpcError {
     NotOpen,
     InvalidFid,
     NotDirectory,
+    IsDirectory,
     ReadOnly,
     ResourceExhausted,
     NotSupported,

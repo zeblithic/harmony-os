@@ -87,6 +87,9 @@ impl FileServer for EchoServer {
 
     fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
         let state = self.fids.get_mut(&fid).ok_or(IpcError::InvalidFid)?;
+        if state.is_open {
+            return Err(IpcError::PermissionDenied);
+        }
         state.is_open = true;
         state.mode = Some(mode);
         Ok(())
@@ -102,7 +105,7 @@ impl FileServer for EchoServer {
         }
 
         let data: &[u8] = match state.qpath {
-            ROOT => return Err(IpcError::NotDirectory),
+            ROOT => return Err(IpcError::IsDirectory),
             HELLO => HELLO_GREETING,
             ECHO => &self.echo_data,
             _ => return Err(IpcError::NotFound),
@@ -129,7 +132,7 @@ impl FileServer for EchoServer {
         }
 
         match state.qpath {
-            ROOT => Err(IpcError::NotDirectory),
+            ROOT => Err(IpcError::IsDirectory),
             HELLO => Err(IpcError::ReadOnly),
             ECHO => {
                 let len = u32::try_from(data.len())
@@ -147,6 +150,9 @@ impl FileServer for EchoServer {
     }
 
     fn clone_fid(&mut self, fid: Fid, new_fid: Fid) -> Result<QPath, IpcError> {
+        if self.fids.contains_key(&new_fid) {
+            return Err(IpcError::InvalidFid);
+        }
         let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
         let qpath = state.qpath;
         self.fids.insert(new_fid, FidState {
@@ -289,17 +295,25 @@ mod tests {
     }
 
     #[test]
-    fn read_directory_returns_not_directory() {
+    fn read_directory_returns_is_directory() {
         let mut server = EchoServer::new();
         server.open(0, OpenMode::Read).unwrap();
-        assert_eq!(server.read(0, 0, 256), Err(IpcError::NotDirectory));
+        assert_eq!(server.read(0, 0, 256), Err(IpcError::IsDirectory));
     }
 
     #[test]
-    fn write_directory_returns_not_directory() {
+    fn write_directory_returns_is_directory() {
         let mut server = EchoServer::new();
         server.open(0, OpenMode::Write).unwrap();
-        assert_eq!(server.write(0, 0, b"nope"), Err(IpcError::NotDirectory));
+        assert_eq!(server.write(0, 0, b"nope"), Err(IpcError::IsDirectory));
+    }
+
+    #[test]
+    fn double_open_rejected() {
+        let mut server = EchoServer::new();
+        server.walk(0, 1, "hello").unwrap();
+        server.open(1, OpenMode::Read).unwrap();
+        assert_eq!(server.open(1, OpenMode::ReadWrite), Err(IpcError::PermissionDenied));
     }
 
     #[test]
