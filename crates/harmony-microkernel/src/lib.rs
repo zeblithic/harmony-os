@@ -13,6 +13,8 @@ extern crate alloc;
 
 pub mod echo;
 #[cfg(feature = "kernel")]
+pub mod content_server;
+#[cfg(feature = "kernel")]
 pub mod kernel;
 pub mod namespace;
 pub mod serial_server;
