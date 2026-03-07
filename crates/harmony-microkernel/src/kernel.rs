@@ -12,7 +12,7 @@ use harmony_identity::{
 use harmony_platform::EntropySource;
 
 use crate::namespace::Namespace;
-use crate::{Fid, FileServer, IpcError};
+use crate::{Fid, FileServer, IpcError, OpenMode, QPath};
 
 /// A process in the microkernel.
 pub struct Process {
@@ -163,6 +163,132 @@ impl Kernel {
 
         Err(IpcError::PermissionDenied)
     }
+
+    /// Walk a path on behalf of `from_pid`. Resolves the namespace,
+    /// checks capabilities, and dispatches to the target FileServer.
+    pub fn walk(
+        &mut self,
+        from_pid: u32,
+        path: &str,
+        _root_fid: Fid,
+        new_fid: Fid,
+        now: u64,
+    ) -> Result<QPath, IpcError> {
+        // Extract everything from the immutable borrow up front (copying
+        // remainder into an owned String) so the borrow is released before
+        // we take a mutable borrow on the target process.
+        let (target_pid, server_root_fid, remainder, caps, addr) = {
+            let process = self.processes.get(&from_pid).ok_or(IpcError::NotFound)?;
+            let (mount, rem) = process
+                .namespace
+                .resolve(path)
+                .ok_or(IpcError::NotFound)?;
+            (
+                mount.target_pid,
+                mount.root_fid,
+                alloc::string::String::from(rem),
+                process.capabilities.clone(),
+                process.address_hash,
+            )
+        };
+
+        // Capability check
+        self.check_endpoint_cap(&caps, &addr, target_pid, now)?;
+
+        // Walk on the target server: from root fid to remainder
+        let target = self
+            .processes
+            .get_mut(&target_pid)
+            .ok_or(IpcError::NotFound)?;
+
+        let qpath = if remainder.is_empty() {
+            // Walking to the mount root itself — just return its root qpath
+            target.server.stat(server_root_fid).map(|st| st.qpath)?
+        } else {
+            target.server.walk(server_root_fid, new_fid, &remainder)?
+        };
+
+        // Record fid ownership
+        self.fid_owners.insert((from_pid, new_fid), target_pid);
+        Ok(qpath)
+    }
+
+    /// Open a previously walked fid.
+    pub fn open(
+        &mut self,
+        from_pid: u32,
+        fid: Fid,
+        mode: OpenMode,
+        _now: u64,
+    ) -> Result<(), IpcError> {
+        let &target_pid = self
+            .fid_owners
+            .get(&(from_pid, fid))
+            .ok_or(IpcError::InvalidFid)?;
+        let target = self
+            .processes
+            .get_mut(&target_pid)
+            .ok_or(IpcError::NotFound)?;
+        target.server.open(fid, mode)
+    }
+
+    /// Read from a previously opened fid.
+    pub fn read(
+        &mut self,
+        from_pid: u32,
+        fid: Fid,
+        offset: u64,
+        count: u32,
+        _now: u64,
+    ) -> Result<Vec<u8>, IpcError> {
+        let &target_pid = self
+            .fid_owners
+            .get(&(from_pid, fid))
+            .ok_or(IpcError::InvalidFid)?;
+        let target = self
+            .processes
+            .get_mut(&target_pid)
+            .ok_or(IpcError::NotFound)?;
+        target.server.read(fid, offset, count)
+    }
+
+    /// Write to a previously opened fid.
+    pub fn write(
+        &mut self,
+        from_pid: u32,
+        fid: Fid,
+        offset: u64,
+        data: &[u8],
+        _now: u64,
+    ) -> Result<u32, IpcError> {
+        let &target_pid = self
+            .fid_owners
+            .get(&(from_pid, fid))
+            .ok_or(IpcError::InvalidFid)?;
+        let target = self
+            .processes
+            .get_mut(&target_pid)
+            .ok_or(IpcError::NotFound)?;
+        target.server.write(fid, offset, data)
+    }
+
+    /// Release a fid.
+    pub fn clunk(
+        &mut self,
+        from_pid: u32,
+        fid: Fid,
+        _now: u64,
+    ) -> Result<(), IpcError> {
+        let target_pid = self
+            .fid_owners
+            .remove(&(from_pid, fid))
+            .ok_or(IpcError::InvalidFid)?;
+        let target = self
+            .processes
+            .get_mut(&target_pid)
+            .ok_or(IpcError::NotFound)?;
+        target.server.clunk(fid)
+    }
 }
 
 #[cfg(test)]
@@ -286,5 +412,99 @@ mod tests {
         assert!(kernel
             .check_endpoint_cap(&[cap], &process_addr, 99, 0)
             .is_ok());
+    }
+
+    // ── IPC dispatch tests ──────────────────────────────────────────
+
+    fn setup_kernel_with_echo() -> (Kernel, u32, u32) {
+        let mut entropy = make_test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let mut kernel = Kernel::new(kernel_id);
+
+        // pid 0 = echo server
+        let server_pid =
+            kernel.spawn_process("echo-server", Box::new(EchoServer::new()), &[]);
+
+        // pid 1 = client (also an echo server, but we don't use its server)
+        let client_pid = kernel.spawn_process(
+            "client",
+            Box::new(EchoServer::new()),
+            &[("/echo", server_pid, 0)],
+        );
+
+        // Grant client access to server
+        kernel
+            .grant_endpoint_cap(&mut entropy, client_pid, server_pid, 0)
+            .unwrap();
+
+        (kernel, client_pid, server_pid)
+    }
+
+    #[test]
+    fn ipc_walk_through_namespace() {
+        let (mut kernel, client, _server) = setup_kernel_with_echo();
+        let qpath = kernel.walk(client, "/echo/hello", 0, 1, 0).unwrap();
+        assert_eq!(qpath, 1); // hello's qpath
+    }
+
+    #[test]
+    fn ipc_read_through_namespace() {
+        let (mut kernel, client, _server) = setup_kernel_with_echo();
+        kernel.walk(client, "/echo/hello", 0, 1, 0).unwrap();
+        kernel.open(client, 1, OpenMode::Read, 0).unwrap();
+        let data = kernel.read(client, 1, 0, 256, 0).unwrap();
+        assert_eq!(data, b"Hello from echo server!");
+    }
+
+    #[test]
+    fn ipc_write_and_read_echo() {
+        let (mut kernel, client, _server) = setup_kernel_with_echo();
+        kernel.walk(client, "/echo/echo", 0, 1, 0).unwrap();
+        kernel.open(client, 1, OpenMode::ReadWrite, 0).unwrap();
+        kernel.write(client, 1, 0, b"round trip", 0).unwrap();
+        let data = kernel.read(client, 1, 0, 256, 0).unwrap();
+        assert_eq!(data, b"round trip");
+    }
+
+    #[test]
+    fn ipc_denied_without_capability() {
+        let mut entropy = make_test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let mut kernel = Kernel::new(kernel_id);
+
+        let server_pid =
+            kernel.spawn_process("echo-server", Box::new(EchoServer::new()), &[]);
+        // Client has mount but NO capability
+        let client_pid = kernel.spawn_process(
+            "client",
+            Box::new(EchoServer::new()),
+            &[("/echo", server_pid, 0)],
+        );
+
+        assert_eq!(
+            kernel.walk(client_pid, "/echo/hello", 0, 1, 0),
+            Err(IpcError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn ipc_unmounted_path() {
+        let (mut kernel, client, _server) = setup_kernel_with_echo();
+        assert_eq!(
+            kernel.walk(client, "/nonexistent/file", 0, 1, 0),
+            Err(IpcError::NotFound)
+        );
+    }
+
+    #[test]
+    fn ipc_clunk_then_read_fails() {
+        let (mut kernel, client, _server) = setup_kernel_with_echo();
+        kernel.walk(client, "/echo/hello", 0, 1, 0).unwrap();
+        kernel.open(client, 1, OpenMode::Read, 0).unwrap();
+        kernel.clunk(client, 1, 0).unwrap();
+        assert_eq!(
+            kernel.read(client, 1, 0, 256, 0),
+            Err(IpcError::InvalidFid)
+        );
     }
 }
