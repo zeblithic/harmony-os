@@ -126,11 +126,124 @@ impl ContentServer {
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
     }
+
+    /// Find a chunk by its `hash_bits` value.
+    fn find_chunk(&self, hash_bits: u32) -> Option<&ChunkAddr> {
+        self.chunks
+            .iter()
+            .find(|(addr, _)| addr.hash_bits() == hash_bits)
+            .map(|(addr, _)| addr)
+    }
 }
 
 impl Default for ContentServer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── Hex helpers ─────────────────────────────────────────────────────
+
+/// Parse a 64-character hex string into a 32-byte CID.
+fn parse_hex_cid(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut cid = [0u8; 32];
+    for i in 0..32 {
+        cid[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(cid)
+}
+
+/// Format a 32-byte CID as 64-character lowercase hex.
+pub(crate) fn format_cid_hex(cid: &[u8; 32]) -> alloc::string::String {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::with_capacity(64);
+    for byte in cid {
+        write!(s, "{:02x}", byte).unwrap();
+    }
+    s
+}
+
+/// Format a `ChunkAddr`'s `hash_bits` as 8-character lowercase hex.
+pub(crate) fn format_addr_hex(addr: &ChunkAddr) -> alloc::string::String {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::with_capacity(8);
+    write!(s, "{:08x}", addr.hash_bits()).unwrap();
+    s
+}
+
+// ── FileServer impl ────────────────────────────────────────────────
+
+impl FileServer for ContentServer {
+    fn walk(&mut self, fid: Fid, new_fid: Fid, name: &str) -> Result<QPath, IpcError> {
+        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
+        let parent_node = state.node.clone();
+
+        if self.fids.contains_key(&new_fid) {
+            return Err(IpcError::InvalidFid);
+        }
+
+        let (qpath, node) = match &parent_node {
+            NodeKind::Root => match name {
+                "blobs" => (BLOBS_DIR, NodeKind::BlobsDir),
+                "chunks" => (CHUNKS_DIR, NodeKind::ChunksDir),
+                "ingest" => (INGEST, NodeKind::Ingest),
+                _ => return Err(IpcError::NotFound),
+            },
+            NodeKind::BlobsDir => {
+                let cid = parse_hex_cid(name).ok_or(IpcError::NotFound)?;
+                if !self.blobs.contains_key(&cid) {
+                    return Err(IpcError::NotFound);
+                }
+                (Self::blob_qpath(&cid), NodeKind::Blob(cid))
+            }
+            NodeKind::ChunksDir => {
+                if name.len() != 8 {
+                    return Err(IpcError::NotFound);
+                }
+                let hash_bits =
+                    u32::from_str_radix(name, 16).map_err(|_| IpcError::NotFound)?;
+                let addr = *self.find_chunk(hash_bits).ok_or(IpcError::NotFound)?;
+                (Self::chunk_qpath(&addr), NodeKind::Chunk(addr))
+            }
+            // Leaf nodes are not directories — cannot walk into them.
+            NodeKind::Blob(_) | NodeKind::Chunk(_) | NodeKind::Ingest => {
+                return Err(IpcError::NotDirectory);
+            }
+        };
+
+        self.fids.insert(
+            new_fid,
+            FidState {
+                qpath,
+                node,
+                is_open: false,
+                mode: None,
+            },
+        );
+        Ok(qpath)
+    }
+
+    fn open(&mut self, _fid: Fid, _mode: OpenMode) -> Result<(), IpcError> {
+        Err(IpcError::NotSupported)
+    }
+
+    fn read(&mut self, _fid: Fid, _offset: u64, _count: u32) -> Result<Vec<u8>, IpcError> {
+        Err(IpcError::NotSupported)
+    }
+
+    fn write(&mut self, _fid: Fid, _offset: u64, _data: &[u8]) -> Result<u32, IpcError> {
+        Err(IpcError::NotSupported)
+    }
+
+    fn clunk(&mut self, _fid: Fid) -> Result<(), IpcError> {
+        Err(IpcError::NotSupported)
+    }
+
+    fn stat(&mut self, _fid: Fid) -> Result<FileStat, IpcError> {
+        Err(IpcError::NotSupported)
     }
 }
 
@@ -177,5 +290,62 @@ mod tests {
         let addr = ChunkAddr::from_data(b"test chunk data for qpath", Depth::Blob, 0);
         let q = ContentServer::chunk_qpath(&addr);
         assert!(q >= CHUNK_QPATH_BASE);
+    }
+
+    // ── walk() tests ────────────────────────────────────────────────
+
+    #[test]
+    fn walk_root_to_blobs() {
+        let mut server = ContentServer::new();
+        let qpath = server.walk(0, 1, "blobs").unwrap();
+        assert_eq!(qpath, BLOBS_DIR);
+    }
+
+    #[test]
+    fn walk_root_to_chunks() {
+        let mut server = ContentServer::new();
+        let qpath = server.walk(0, 1, "chunks").unwrap();
+        assert_eq!(qpath, CHUNKS_DIR);
+    }
+
+    #[test]
+    fn walk_root_to_ingest() {
+        let mut server = ContentServer::new();
+        let qpath = server.walk(0, 1, "ingest").unwrap();
+        assert_eq!(qpath, INGEST);
+    }
+
+    #[test]
+    fn walk_root_not_found() {
+        let mut server = ContentServer::new();
+        assert_eq!(server.walk(0, 1, "nonexistent"), Err(IpcError::NotFound));
+    }
+
+    #[test]
+    fn walk_invalid_source_fid() {
+        let mut server = ContentServer::new();
+        assert_eq!(server.walk(99, 1, "blobs"), Err(IpcError::InvalidFid));
+    }
+
+    #[test]
+    fn walk_duplicate_new_fid() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "blobs").unwrap();
+        assert_eq!(server.walk(0, 1, "chunks"), Err(IpcError::InvalidFid));
+    }
+
+    #[test]
+    fn walk_from_non_directory() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "ingest").unwrap();
+        assert_eq!(server.walk(1, 2, "anything"), Err(IpcError::NotDirectory));
+    }
+
+    #[test]
+    fn walk_blobs_dir_missing_cid() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "blobs").unwrap();
+        let fake_cid = "aa".repeat(32); // 64 hex chars
+        assert_eq!(server.walk(1, 2, &fake_cid), Err(IpcError::NotFound));
     }
 }
