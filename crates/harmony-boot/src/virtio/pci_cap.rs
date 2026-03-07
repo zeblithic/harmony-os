@@ -78,7 +78,7 @@ pub fn parse_capabilities(dev: &PciDevice, phys_offset: u64) -> Option<VirtioPci
 
             // Validate bar_index is within the 6-entry BAR array.
             if bar_index as usize >= dev.bars.len() {
-                cap_ptr = cap_next;
+                cap_ptr = cap_next & 0xFC;
                 continue;
             }
 
@@ -115,7 +115,7 @@ pub fn parse_capabilities(dev: &PciDevice, phys_offset: u64) -> Option<VirtioPci
             }
         }
 
-        cap_ptr = cap_next;
+        cap_ptr = cap_next & 0xFC;
     }
 
     Some(VirtioPciCaps {
