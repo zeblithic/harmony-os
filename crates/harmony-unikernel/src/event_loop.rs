@@ -99,6 +99,39 @@ impl<E: EntropySource, P: PersistentState> UnikernelRuntime<E, P> {
         self.peers.len()
     }
 
+    /// Register this node's identity as an announcing destination.
+    ///
+    /// Creates a `DestinationName`, registers it on the inner `Node`,
+    /// and stores the destination hash for heartbeat routing.
+    /// `announce_interval_ms` is in milliseconds; converted to seconds for the Node.
+    pub fn register_announcing_destination(
+        &mut self,
+        app_name: &str,
+        aspects: &[&str],
+        announce_interval_ms: u64,
+        now: u64,
+    ) -> DestinationHash {
+        let dest_name =
+            DestinationName::from_name(app_name, aspects).expect("invalid destination name");
+        // Node takes ownership of identity, so we round-trip through bytes.
+        let identity_bytes = self.identity.to_private_bytes();
+        let identity_clone = PrivateIdentity::from_private_bytes(&identity_bytes)
+            .expect("identity round-trip failed");
+        let announce_interval_secs = announce_interval_ms / 1000;
+        let now_secs = now / 1000;
+        let dest_hash = self.node.register_announcing_destination(
+            identity_clone,
+            dest_name.clone(),
+            Vec::new(), // no app_data
+            Some(announce_interval_secs),
+            now_secs,
+        );
+        self.dest_name = Some(dest_name);
+        self.dest_hash = Some(dest_hash);
+        self.boot_time_ms = now;
+        dest_hash
+    }
+
     /// Register a network interface with the node's routing table.
     pub fn register_interface(&mut self, name: &str) {
         self.node
@@ -180,6 +213,15 @@ mod tests {
     fn runtime_has_no_peers_initially() {
         let runtime = make_runtime();
         assert_eq!(runtime.peer_count(), 0);
+    }
+
+    #[test]
+    fn register_announcing_destination_sets_dest_hash() {
+        let mut runtime = make_runtime();
+        let dest_hash =
+            runtime.register_announcing_destination("harmony", &["node"], 300_000, 0);
+        assert_ne!(dest_hash, [0u8; 16]);
+        assert_eq!(runtime.node.announcing_destination_count(), 1);
     }
 
     #[test]
