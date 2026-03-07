@@ -166,7 +166,6 @@ fn dispatch_actions(
     serial: &mut SerialWriter<impl FnMut(u8)>,
 ) {
     use core::fmt::Write;
-    use harmony_unikernel::serial::hex_encode;
 
     for action in actions {
         match action {

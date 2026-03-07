@@ -147,6 +147,7 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
             // DeliverLocally fires on the receiving node.
             let peer_dest_hashes: Vec<[u8; 16]> =
                 self.peers.values().map(|p| p.dest_hash).collect();
+            let mut any_sent = false;
             for peer_dest in &peer_dest_hashes {
                 if let Some(raw) = Self::build_data_packet(peer_dest, &hbt) {
                     let send_actions = self.node.route_packet(peer_dest, raw);
@@ -160,11 +161,14 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
                                 interface_name,
                                 raw,
                             });
+                            any_sent = true;
                         }
                     }
                 }
             }
-            self.last_heartbeat_ms = now;
+            if any_sent {
+                self.last_heartbeat_ms = now;
+            }
         }
 
         out
@@ -251,7 +255,7 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
         let now_secs = now / 1000;
         let dest_hash = self.node.register_announcing_destination(
             identity_clone,
-            dest_name.clone(),
+            dest_name,
             Vec::new(), // no app_data
             Some(announce_interval_secs),
             now_secs,
