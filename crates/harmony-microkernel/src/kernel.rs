@@ -57,11 +57,15 @@ impl Kernel {
         }
     }
 
-    /// Allocate a unique server-side fid.
-    fn allocate_server_fid(&mut self) -> Fid {
+    /// Allocate a unique server-side fid. Returns an error if the
+    /// fid counter is exhausted (after ~4 billion allocations).
+    fn allocate_server_fid(&mut self) -> Result<Fid, IpcError> {
         let fid = self.next_server_fid;
-        self.next_server_fid += 1;
-        fid
+        self.next_server_fid = self
+            .next_server_fid
+            .checked_add(1)
+            .ok_or(IpcError::NotFound)?;
+        Ok(fid)
     }
 
     /// Spawn a process. Returns the assigned PID.
@@ -122,7 +126,8 @@ impl Kernel {
                 CapabilityType::Endpoint,
                 resource.as_bytes(),
                 0, // not_before: immediate
-                0, // expires_at: 0 = never expires
+                // TODO: wire in expiry (e.g. now + ttl) for production use
+                0, // expires_at: 0 = never expires (milestone A only)
             )
             .map_err(|_| IpcError::PermissionDenied)?;
 
@@ -207,20 +212,39 @@ impl Kernel {
         // Capability check
         self.check_endpoint_cap(&caps, &addr, target_pid, now)?;
 
-        // Allocate a kernel-scoped server-side fid to avoid collisions
-        // when multiple clients share the same server.
-        let server_fid = self.allocate_server_fid();
+        // Split remainder into path components for multi-level walks.
+        let components: Vec<&str> = remainder.split('/').filter(|s| !s.is_empty()).collect();
+
+        // Pre-allocate all server-side fids before borrowing target mutably.
+        let server_fid = self.allocate_server_fid()?;
+        let mut intermediate_fids = Vec::new();
+        for _ in 0..components.len().saturating_sub(1) {
+            intermediate_fids.push(self.allocate_server_fid()?);
+        }
 
         let target = self
             .processes
             .get_mut(&target_pid)
             .ok_or(IpcError::NotFound)?;
 
-        let qpath = if remainder.is_empty() {
+        let qpath = if components.is_empty() {
             // Walking to the mount root — clone the root fid
             target.server.clone_fid(server_root_fid, server_fid)?
         } else {
-            target.server.walk(server_root_fid, server_fid, &remainder)?
+            // Walk each path component, clunking intermediate fids
+            intermediate_fids.push(server_fid);
+            let mut current_fid = server_root_fid;
+            let mut qpath = 0;
+            for (i, component) in components.iter().enumerate() {
+                qpath = target
+                    .server
+                    .walk(current_fid, intermediate_fids[i], component)?;
+                if current_fid != server_root_fid {
+                    target.server.clunk(current_fid)?;
+                }
+                current_fid = intermediate_fids[i];
+            }
+            qpath
         };
 
         // Record fid ownership with the server-side fid translation

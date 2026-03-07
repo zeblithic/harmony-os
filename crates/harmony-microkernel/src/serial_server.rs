@@ -17,6 +17,7 @@ const QPATH_LOG: QPath = 1;
 struct FidState {
     qpath: QPath,
     is_open: bool,
+    mode: Option<OpenMode>,
 }
 
 /// A FileServer that captures writes to a buffer.
@@ -37,7 +38,7 @@ impl Default for SerialServer {
 impl SerialServer {
     pub fn new() -> Self {
         let mut fids = BTreeMap::new();
-        fids.insert(0, FidState { qpath: QPATH_ROOT, is_open: false });
+        fids.insert(0, FidState { qpath: QPATH_ROOT, is_open: false, mode: None });
         SerialServer { fids, buf: Vec::new() }
     }
 
@@ -56,13 +57,14 @@ impl FileServer for SerialServer {
         if name != "log" {
             return Err(IpcError::NotFound);
         }
-        self.fids.insert(new_fid, FidState { qpath: QPATH_LOG, is_open: false });
+        self.fids.insert(new_fid, FidState { qpath: QPATH_LOG, is_open: false, mode: None });
         Ok(QPATH_LOG)
     }
 
-    fn open(&mut self, fid: Fid, _mode: OpenMode) -> Result<(), IpcError> {
+    fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
         let state = self.fids.get_mut(&fid).ok_or(IpcError::InvalidFid)?;
         state.is_open = true;
+        state.mode = Some(mode);
         Ok(())
     }
 
@@ -73,14 +75,28 @@ impl FileServer for SerialServer {
         if !state.is_open {
             return Err(IpcError::NotOpen);
         }
+        if state.qpath != QPATH_LOG {
+            return Err(IpcError::PermissionDenied);
+        }
+        if matches!(state.mode, Some(OpenMode::Write)) {
+            return Err(IpcError::PermissionDenied);
+        }
         let end = core::cmp::min(self.buf.len(), count as usize);
         Ok(self.buf[..end].to_vec())
     }
 
+    /// Write appends data to the log buffer. Offset is intentionally
+    /// ignored — this is an append-only log.
     fn write(&mut self, fid: Fid, _offset: u64, data: &[u8]) -> Result<u32, IpcError> {
         let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
         if !state.is_open {
             return Err(IpcError::NotOpen);
+        }
+        if state.qpath != QPATH_LOG {
+            return Err(IpcError::PermissionDenied);
+        }
+        if matches!(state.mode, Some(OpenMode::Read)) {
+            return Err(IpcError::PermissionDenied);
         }
         self.buf.extend_from_slice(data);
         Ok(data.len() as u32)
@@ -94,7 +110,7 @@ impl FileServer for SerialServer {
     fn clone_fid(&mut self, fid: Fid, new_fid: Fid) -> Result<QPath, IpcError> {
         let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
         let qpath = state.qpath;
-        self.fids.insert(new_fid, FidState { qpath, is_open: false });
+        self.fids.insert(new_fid, FidState { qpath, is_open: false, mode: None });
         Ok(qpath)
     }
 
@@ -158,5 +174,28 @@ mod tests {
     fn walk_invalid_name() {
         let mut srv = SerialServer::new();
         assert_eq!(srv.walk(0, 1, "nonexistent"), Err(IpcError::NotFound));
+    }
+
+    #[test]
+    fn read_directory_denied() {
+        let mut srv = SerialServer::new();
+        srv.open(0, OpenMode::Read).unwrap();
+        assert_eq!(srv.read(0, 0, 256), Err(IpcError::PermissionDenied));
+    }
+
+    #[test]
+    fn write_directory_denied() {
+        let mut srv = SerialServer::new();
+        srv.open(0, OpenMode::Write).unwrap();
+        assert_eq!(srv.write(0, 0, b"nope"), Err(IpcError::PermissionDenied));
+    }
+
+    #[test]
+    fn read_denied_in_write_mode() {
+        let mut srv = SerialServer::new();
+        srv.walk(0, 1, "log").unwrap();
+        srv.open(1, OpenMode::Write).unwrap();
+        srv.write(1, 0, b"data").unwrap();
+        assert_eq!(srv.read(1, 0, 256), Err(IpcError::PermissionDenied));
     }
 }

@@ -93,6 +93,9 @@ impl FileServer for EchoServer {
         if !state.is_open {
             return Err(IpcError::NotOpen);
         }
+        if matches!(state.mode, Some(OpenMode::Write)) {
+            return Err(IpcError::PermissionDenied);
+        }
 
         let data: &[u8] = match state.qpath {
             HELLO => HELLO_GREETING,
@@ -108,10 +111,16 @@ impl FileServer for EchoServer {
         Ok(data[offset..end].to_vec())
     }
 
+    /// Write to the echo file. Replaces the entire buffer (offset is
+    /// intentionally ignored — this is a simple echo device, not a
+    /// seekable file).
     fn write(&mut self, fid: Fid, _offset: u64, data: &[u8]) -> Result<u32, IpcError> {
         let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
         if !state.is_open {
             return Err(IpcError::NotOpen);
+        }
+        if matches!(state.mode, Some(OpenMode::Read)) {
+            return Err(IpcError::PermissionDenied);
         }
 
         match state.qpath {
@@ -244,6 +253,25 @@ mod tests {
         server.clunk(1).unwrap();
         let err = server.open(1, OpenMode::Read).unwrap_err();
         assert_eq!(err, IpcError::InvalidFid);
+    }
+
+    #[test]
+    fn read_denied_in_write_mode() {
+        let mut server = EchoServer::new();
+        server.walk(0, 1, "hello").unwrap();
+        server.open(1, OpenMode::Write).unwrap();
+        assert_eq!(server.read(1, 0, 256), Err(IpcError::PermissionDenied));
+    }
+
+    #[test]
+    fn write_denied_in_read_mode() {
+        let mut server = EchoServer::new();
+        server.walk(0, 1, "echo").unwrap();
+        server.open(1, OpenMode::Read).unwrap();
+        assert_eq!(
+            server.write(1, 0, b"nope"),
+            Err(IpcError::PermissionDenied)
+        );
     }
 
     #[test]
