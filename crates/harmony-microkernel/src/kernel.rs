@@ -507,4 +507,67 @@ mod tests {
             Err(IpcError::InvalidFid)
         );
     }
+
+    #[test]
+    fn integration_two_processes_full_ipc() {
+        let mut entropy = make_test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let mut kernel = Kernel::new(kernel_id);
+
+        // Spawn echo server as pid 0
+        let server_pid = kernel.spawn_process(
+            "echo-server",
+            Box::new(EchoServer::new()),
+            &[],
+        );
+
+        // Spawn client as pid 1, with echo server mounted at /svc/echo
+        let client_pid = kernel.spawn_process(
+            "harmony-node",
+            Box::new(EchoServer::new()),  // client also serves, but we test as client
+            &[("/svc/echo", server_pid, 0)],
+        );
+
+        // Grant client capability to access echo server
+        kernel.grant_endpoint_cap(&mut entropy, client_pid, server_pid, 0).unwrap();
+
+        // -- Full IPC sequence: walk → open → read → clunk --
+
+        // 1. Walk to /svc/echo/hello
+        let qpath = kernel.walk(client_pid, "/svc/echo/hello", 0, 1, 0).unwrap();
+        assert_eq!(qpath, 1); // hello qpath
+
+        // 2. Open for reading
+        kernel.open(client_pid, 1, OpenMode::Read, 0).unwrap();
+
+        // 3. Read the greeting
+        let data = kernel.read(client_pid, 1, 0, 256, 0).unwrap();
+        assert_eq!(data, b"Hello from echo server!");
+
+        // 4. Clunk the fid
+        kernel.clunk(client_pid, 1, 0).unwrap();
+
+        // -- Echo round-trip: walk → open → write → read → clunk --
+
+        // 5. Walk to /svc/echo/echo
+        kernel.walk(client_pid, "/svc/echo/echo", 0, 2, 0).unwrap();
+
+        // 6. Open for read/write
+        kernel.open(client_pid, 2, OpenMode::ReadWrite, 0).unwrap();
+
+        // 7. Write data
+        let written = kernel.write(client_pid, 2, 0, b"Harmony Ring 2!", 0).unwrap();
+        assert_eq!(written, 15);
+
+        // 8. Read it back
+        let data = kernel.read(client_pid, 2, 0, 256, 0).unwrap();
+        assert_eq!(data, b"Harmony Ring 2!");
+
+        // 9. Clunk
+        kernel.clunk(client_pid, 2, 0).unwrap();
+
+        // Verify clunked fids are invalid
+        assert_eq!(kernel.read(client_pid, 1, 0, 256, 0), Err(IpcError::InvalidFid));
+        assert_eq!(kernel.read(client_pid, 2, 0, 256, 0), Err(IpcError::InvalidFid));
+    }
 }
