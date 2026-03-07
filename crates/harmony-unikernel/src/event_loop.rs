@@ -233,8 +233,8 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
 
     /// Register this node's identity as an announcing destination.
     ///
-    /// Creates a `DestinationName`, registers it on the inner `Node`,
-    /// and stores the destination hash for heartbeat routing.
+    /// Creates a `DestinationName`, registers it on the inner `Node`, and
+    /// returns the destination hash. Sets `boot_time_ms` on first call.
     /// `announce_interval_ms` is in milliseconds; converted to seconds for the Node.
     pub fn register_announcing_destination(
         &mut self,
@@ -308,6 +308,9 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
                     } else {
                         self.peers[&addr].discovered_at_ms
                     };
+                    // NOTE: unconditionally overwrites dest_hash/hops — a re-announce
+                    // via a longer path replaces a shorter one. Acceptable for the
+                    // current two-node LAN; multi-hop path quality is future work.
                     self.peers.insert(
                         addr,
                         PeerInfo {
