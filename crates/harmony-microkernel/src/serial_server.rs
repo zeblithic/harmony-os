@@ -71,6 +71,10 @@ impl FileServer for SerialServer {
         if state.is_open {
             return Err(IpcError::PermissionDenied);
         }
+        // Reject write modes on directories at open time (9P semantics).
+        if state.qpath == QPATH_ROOT && matches!(mode, OpenMode::Write | OpenMode::ReadWrite) {
+            return Err(IpcError::IsDirectory);
+        }
         state.is_open = true;
         state.mode = Some(mode);
         Ok(())
@@ -197,10 +201,11 @@ mod tests {
     }
 
     #[test]
-    fn write_directory_denied() {
+    fn open_directory_write_rejected() {
         let mut srv = SerialServer::new();
-        srv.open(0, OpenMode::Write).unwrap();
-        assert_eq!(srv.write(0, 0, b"nope"), Err(IpcError::IsDirectory));
+        // Write mode on a directory is rejected at open time
+        assert_eq!(srv.open(0, OpenMode::Write), Err(IpcError::IsDirectory));
+        assert_eq!(srv.open(0, OpenMode::ReadWrite), Err(IpcError::IsDirectory));
     }
 
     #[test]

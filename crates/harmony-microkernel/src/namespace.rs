@@ -33,11 +33,14 @@ impl Namespace {
     /// Mount a server at `path`. Subsequent resolves matching this prefix
     /// will route to `target_pid`.
     ///
-    /// # Panics
-    /// Panics if `path` does not start with `/`.
-    pub fn mount(&mut self, path: &str, target_pid: u32, root_fid: Fid) {
-        assert!(path.starts_with('/'), "mount path must start with '/'");
+    /// Returns `Err(IpcError::PermissionDenied)` if `path` does not start
+    /// with `/`.
+    pub fn mount(&mut self, path: &str, target_pid: u32, root_fid: Fid) -> Result<(), crate::IpcError> {
+        if !path.starts_with('/') {
+            return Err(crate::IpcError::PermissionDenied);
+        }
         self.mounts.insert(Arc::from(path), MountPoint { target_pid, root_fid });
+        Ok(())
     }
 
     /// Resolve `path` to a mount point and remainder.
@@ -85,7 +88,7 @@ mod tests {
     #[test]
     fn resolve_simple_mount() {
         let mut ns = Namespace::new();
-        ns.mount("/echo", 1, 0);
+        ns.mount("/echo", 1, 0).unwrap();
         let (mp, remainder) = ns.resolve("/echo/hello").unwrap();
         assert_eq!(mp.target_pid, 1);
         assert_eq!(remainder, "hello");
@@ -94,7 +97,7 @@ mod tests {
     #[test]
     fn resolve_mount_root() {
         let mut ns = Namespace::new();
-        ns.mount("/echo", 1, 0);
+        ns.mount("/echo", 1, 0).unwrap();
         // Accessing the mount point itself — remainder is empty
         let (mp, remainder) = ns.resolve("/echo").unwrap();
         assert_eq!(mp.target_pid, 1);
@@ -104,7 +107,7 @@ mod tests {
     #[test]
     fn resolve_nested_path() {
         let mut ns = Namespace::new();
-        ns.mount("/dev/serial", 0, 0);
+        ns.mount("/dev/serial", 0, 0).unwrap();
         let (mp, remainder) = ns.resolve("/dev/serial").unwrap();
         assert_eq!(mp.target_pid, 0);
         assert_eq!(remainder, "");
@@ -113,8 +116,8 @@ mod tests {
     #[test]
     fn resolve_longest_prefix_match() {
         let mut ns = Namespace::new();
-        ns.mount("/a", 1, 0);
-        ns.mount("/a/b", 2, 0);
+        ns.mount("/a", 1, 0).unwrap();
+        ns.mount("/a/b", 2, 0).unwrap();
         // "/a/b/c" should match "/a/b" (longer), not "/a"
         let (mp, remainder) = ns.resolve("/a/b/c").unwrap();
         assert_eq!(mp.target_pid, 2);
@@ -130,7 +133,7 @@ mod tests {
     #[test]
     fn resolve_partial_prefix_no_match() {
         let mut ns = Namespace::new();
-        ns.mount("/echo", 1, 0);
+        ns.mount("/echo", 1, 0).unwrap();
         // "/echooo" should NOT match "/echo" — must be exact prefix + "/" boundary
         assert!(ns.resolve("/echooo").is_none());
     }
@@ -138,8 +141,8 @@ mod tests {
     #[test]
     fn resolve_root_mount() {
         let mut ns = Namespace::new();
-        ns.mount("/", 0, 0);
-        ns.mount("/echo", 1, 0);
+        ns.mount("/", 0, 0).unwrap();
+        ns.mount("/echo", 1, 0).unwrap();
         // Longer prefix wins over root
         let (mp, remainder) = ns.resolve("/echo/hello").unwrap();
         assert_eq!(mp.target_pid, 1);
@@ -151,16 +154,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "mount path must start with '/'")]
     fn mount_rejects_path_without_leading_slash() {
         let mut ns = Namespace::new();
-        ns.mount("echo", 1, 0);
+        assert_eq!(ns.mount("echo", 1, 0), Err(crate::IpcError::PermissionDenied));
     }
 
     #[test]
     fn mount_preserves_root_fid() {
         let mut ns = Namespace::new();
-        ns.mount("/data", 3, 42);
+        ns.mount("/data", 3, 42).unwrap();
         let (mp, _) = ns.resolve("/data/file").unwrap();
         assert_eq!(mp.root_fid, 42);
     }

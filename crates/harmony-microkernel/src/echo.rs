@@ -90,8 +90,10 @@ impl FileServer for EchoServer {
         if state.is_open {
             return Err(IpcError::PermissionDenied);
         }
-        // Reject write modes on the read-only "hello" file at open time,
-        // rather than deferring to write() — matches 9P open semantics.
+        // Reject incompatible modes at open time (9P semantics).
+        if state.qpath == ROOT && matches!(mode, OpenMode::Write | OpenMode::ReadWrite) {
+            return Err(IpcError::IsDirectory);
+        }
         if state.qpath == HELLO && matches!(mode, OpenMode::Write | OpenMode::ReadWrite) {
             return Err(IpcError::ReadOnly);
         }
@@ -313,10 +315,11 @@ mod tests {
     }
 
     #[test]
-    fn write_directory_returns_is_directory() {
+    fn open_directory_write_rejected() {
         let mut server = EchoServer::new();
-        server.open(0, OpenMode::Write).unwrap();
-        assert_eq!(server.write(0, 0, b"nope"), Err(IpcError::IsDirectory));
+        // Write mode on a directory is rejected at open time
+        assert_eq!(server.open(0, OpenMode::Write), Err(IpcError::IsDirectory));
+        assert_eq!(server.open(0, OpenMode::ReadWrite), Err(IpcError::IsDirectory));
     }
 
     #[test]

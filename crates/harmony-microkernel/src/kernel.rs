@@ -101,7 +101,7 @@ impl Kernel {
 
         let mut namespace = Namespace::new();
         for &(path, target_pid, root_fid) in mounts {
-            namespace.mount(path, target_pid, root_fid);
+            namespace.mount(path, target_pid, root_fid)?;
         }
 
         self.processes.insert(
