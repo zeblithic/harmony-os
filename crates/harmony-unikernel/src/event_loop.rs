@@ -10,7 +10,10 @@ use harmony_platform::{EntropySource, PersistentState};
 use harmony_reticulum::destination::DestinationName;
 use harmony_reticulum::interface::InterfaceMode;
 use harmony_reticulum::path_table::DestinationHash;
-use harmony_reticulum::{Node, NodeAction, NodeEvent};
+use harmony_reticulum::{
+    DestinationType, HeaderType, Node, NodeAction, NodeEvent, Packet, PacketContext, PacketFlags,
+    PacketHeader, PacketType, PropagationType,
+};
 use rand_core::CryptoRngCore;
 
 /// Runtime-level output actions. The caller dispatches these — no
@@ -105,6 +108,32 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
             }
         }
 
+        // Emit heartbeats if interval has elapsed and we have a destination.
+        if !self.peers.is_empty()
+            && now.saturating_sub(self.last_heartbeat_ms) >= self.heartbeat_interval_ms
+        {
+            if let Some(ref dest_hash) = self.dest_hash {
+                let hbt = self.build_heartbeat(now);
+                // Send heartbeat to each peer's destination.
+                // For now, broadcast — peers learn our dest_hash from announces.
+                // We use route_packet which broadcasts if no path is known.
+                let peer_addrs: Vec<[u8; 16]> = self.peers.keys().copied().collect();
+                for _peer_addr in &peer_addrs {
+                    if let Some(raw) = Self::build_data_packet(dest_hash, &hbt) {
+                        let send_actions = self.node.route_packet(dest_hash, raw);
+                        for sa in send_actions {
+                            if let NodeAction::SendOnInterface { interface_name, raw } = sa {
+                                out.push(RuntimeAction::SendOnInterface { interface_name, raw });
+                            }
+                        }
+                        // One broadcast covers all peers on the same LAN.
+                        break;
+                    }
+                }
+            }
+            self.last_heartbeat_ms = now;
+        }
+
         // Check peer timeouts.
         let timeout = self.peer_timeout_ms;
         let timed_out: Vec<[u8; 16]> = self.peers
@@ -139,6 +168,42 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
     /// Number of currently tracked peers.
     pub fn peer_count(&self) -> usize {
         self.peers.len()
+    }
+
+    /// Build a 28-byte heartbeat payload.
+    fn build_heartbeat(&self, now: u64) -> [u8; 28] {
+        let mut buf = [0u8; 28];
+        // Magic: "HBT\x01"
+        buf[0..4].copy_from_slice(&[0x48, 0x42, 0x54, 0x01]);
+        // Sender address hash
+        buf[4..20].copy_from_slice(&self.identity.public_identity().address_hash);
+        // Uptime
+        let uptime = now.saturating_sub(self.boot_time_ms);
+        buf[20..28].copy_from_slice(&uptime.to_be_bytes());
+        buf
+    }
+
+    /// Build a Type1 broadcast data packet addressed to `dest_hash`
+    /// containing the given payload.
+    fn build_data_packet(dest_hash: &DestinationHash, payload: &[u8]) -> Option<Vec<u8>> {
+        let packet = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type1,
+                    context_flag: false,
+                    propagation: PropagationType::Broadcast,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Data,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: *dest_hash,
+                context: PacketContext::None,
+            },
+            data: Arc::from(payload),
+        };
+        packet.to_bytes().ok()
     }
 
     /// Register this node's identity as an announcing destination.
@@ -390,6 +455,32 @@ mod tests {
     fn runtime_has_no_peers_initially() {
         let runtime = make_runtime();
         assert_eq!(runtime.peer_count(), 0);
+    }
+
+    #[test]
+    fn tick_emits_heartbeats_to_peers() {
+        let mut runtime = make_runtime();
+        runtime.register_interface("test0");
+        runtime.register_announcing_destination("harmony", &["node"], 300_000, 0);
+
+        // Consume the initial announce by ticking at 1 second.
+        let _ = runtime.tick(1_000);
+
+        // Insert a fake peer.
+        runtime.peers.insert([0xBB; 16], PeerInfo {
+            address_hash: [0xBB; 16],
+            last_seen_ms: 0,
+            hops: 1,
+            discovered_at_ms: 0,
+        });
+
+        // Tick at 6 seconds — past heartbeat_interval_ms (5000).
+        // The announce won't fire again (next_announce_at is ~300s out).
+        let actions = runtime.tick(6_000);
+
+        // Should have at least one SendOnInterface for the heartbeat.
+        let send_count = actions.iter().filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. })).count();
+        assert!(send_count > 0, "should emit heartbeat SendOnInterface");
     }
 
     #[test]
