@@ -10,6 +10,7 @@
 extern crate alloc;
 
 mod pci;
+mod pit;
 mod virtio;
 
 use bootloader_api::config::Mapping;
