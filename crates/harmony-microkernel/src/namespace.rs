@@ -32,7 +32,11 @@ impl Namespace {
 
     /// Mount a server at `path`. Subsequent resolves matching this prefix
     /// will route to `target_pid`.
+    ///
+    /// # Panics
+    /// Panics if `path` does not start with `/`.
     pub fn mount(&mut self, path: &str, target_pid: u32, root_fid: Fid) {
+        assert!(path.starts_with('/'), "mount path must start with '/'");
         self.mounts.insert(Arc::from(path), MountPoint { target_pid, root_fid });
     }
 
@@ -144,6 +148,13 @@ mod tests {
         let (mp, remainder) = ns.resolve("/other").unwrap();
         assert_eq!(mp.target_pid, 0);
         assert_eq!(remainder, "other");
+    }
+
+    #[test]
+    #[should_panic(expected = "mount path must start with '/'")]
+    fn mount_rejects_path_without_leading_slash() {
+        let mut ns = Namespace::new();
+        ns.mount("echo", 1, 0);
     }
 
     #[test]

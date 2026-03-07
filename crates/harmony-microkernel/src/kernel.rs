@@ -128,6 +128,9 @@ impl Kernel {
         target_pid: u32,
         _now: u64,
     ) -> Result<(), IpcError> {
+        if !self.processes.contains_key(&target_pid) {
+            return Err(IpcError::NotFound);
+        }
         let process = self.processes.get(&process_pid).ok_or(IpcError::NotFound)?;
         let audience = process.address_hash;
 
@@ -242,7 +245,11 @@ impl Kernel {
         }
 
         // Split remainder into path components for multi-level walks.
+        // Reject ".." to prevent traversal above the mount root.
         let components: Vec<&str> = remainder.split('/').filter(|s| !s.is_empty()).collect();
+        if components.contains(&"..") {
+            return Err(IpcError::PermissionDenied);
+        }
 
         // Pre-allocate all server-side fids before borrowing target mutably.
         let server_fid = self.allocate_server_fid()?;
@@ -377,23 +384,25 @@ impl Kernel {
         target.server.stat(server_fid)
     }
 
-    /// Release a fid. Confirms server-side clunk before removing tracking.
+    /// Release a fid. Always removes the kernel-side tracking entry,
+    /// even if the server-side clunk fails — this prevents the client
+    /// from being stuck with an unclunkable fid.
     pub fn clunk(
         &mut self,
         from_pid: u32,
         fid: Fid,
         _now: u64,
     ) -> Result<(), IpcError> {
-        let &(target_pid, server_fid) = self
+        let (target_pid, server_fid) = self
             .fid_owners
-            .get(&(from_pid, fid))
+            .remove(&(from_pid, fid))
             .ok_or(IpcError::InvalidFid)?;
         let target = self
             .processes
             .get_mut(&target_pid)
             .ok_or(IpcError::NotFound)?;
-        target.server.clunk(server_fid)?;
-        self.fid_owners.remove(&(from_pid, fid));
+        // Best-effort server clunk — tracking is already removed
+        let _ = target.server.clunk(server_fid);
         Ok(())
     }
 }
@@ -699,6 +708,29 @@ mod tests {
         assert_eq!(
             kernel.walk(client, "/echo/echo", 0, 1, 0),
             Err(IpcError::InvalidFid)
+        );
+    }
+
+    #[test]
+    fn ipc_walk_dotdot_rejected() {
+        let (mut kernel, client, _server) = setup_kernel_with_echo();
+        assert_eq!(
+            kernel.walk(client, "/echo/../etc/passwd", 0, 1, 0),
+            Err(IpcError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn grant_cap_nonexistent_target_rejected() {
+        let mut entropy = make_test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let mut kernel = Kernel::new(kernel_id);
+
+        let pid = kernel.spawn_process("test", Box::new(EchoServer::new()), &[]).unwrap();
+        // target pid 99 doesn't exist
+        assert_eq!(
+            kernel.grant_endpoint_cap(&mut entropy, pid, 99, 0),
+            Err(IpcError::NotFound)
         );
     }
 
