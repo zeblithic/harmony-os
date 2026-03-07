@@ -242,10 +242,12 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
         let dest_name =
             DestinationName::from_name(app_name, aspects).expect("invalid destination name");
         // Node takes ownership of identity, so we round-trip through bytes.
-        let identity_bytes = self.identity.to_private_bytes();
+        let mut identity_bytes = self.identity.to_private_bytes();
         let identity_clone = PrivateIdentity::from_private_bytes(&identity_bytes)
             .expect("identity round-trip failed");
-        let announce_interval_secs = announce_interval_ms / 1000;
+        // Zero key material before dropping the buffer.
+        identity_bytes.iter_mut().for_each(|b| *b = 0);
+        let announce_interval_secs = (announce_interval_ms / 1000).max(1);
         let now_secs = now / 1000;
         let dest_hash = self.node.register_announcing_destination(
             identity_clone,

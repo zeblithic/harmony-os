@@ -64,9 +64,9 @@ impl PitTimer {
 
     /// Return monotonic milliseconds since `init()`.
     ///
-    /// Must be called at least once per ~55ms to avoid missing a
-    /// counter wraparound. The spin-loop event loop calls this every
-    /// iteration, so this is easily satisfied.
+    /// Must be called at least once per ~55ms to avoid the counter
+    /// reaching terminal count (0) and stopping. The spin-loop event
+    /// loop calls this every iteration, so this is easily satisfied.
     pub fn now_ms(&mut self) -> u64 {
         let current = Self::read_count();
 
