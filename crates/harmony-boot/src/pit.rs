@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Minimal PIT (8254) Channel 2 timer for monotonic milliseconds.
 //!
-//! Uses the "read-back" method: load a full 16-bit countdown, then
-//! read the current count to measure elapsed ticks. No interrupts.
+//! Uses the counter-latch command to freeze the current count for
+//! race-free reads, then measures elapsed ticks. No interrupts.
 
 use x86_64::instructions::port::Port;
 
@@ -50,6 +50,7 @@ impl PitTimer {
     }
 
     /// Read the current 16-bit count from Channel 2.
+    /// Uses the counter-latch command so both bytes are frozen atomically.
     fn read_count() -> u16 {
         unsafe {
             // Latch Channel 2: command 0b10_00_000_0 = 0x80

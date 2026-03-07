@@ -57,8 +57,6 @@ pub struct UnikernelRuntime<E: EntropySource, P: PersistentState> {
     entropy: E,
     persistence: P,
     tick_count: u64,
-    // Announcing
-    dest_hash: Option<DestinationHash>,
     // Peer tracking
     pub(crate) peers: BTreeMap<[u8; 16], PeerInfo>,
     heartbeat_interval_ms: u64,
@@ -76,7 +74,6 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
             entropy,
             persistence,
             tick_count: 0,
-            dest_hash: None,
             peers: BTreeMap::new(),
             heartbeat_interval_ms: 5_000,
             peer_timeout_ms: 15_000,
@@ -128,7 +125,20 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
             }
         }
 
-        // Emit heartbeats if interval has elapsed and we have peers.
+        // Check peer timeouts first — evict dead peers before sending heartbeats.
+        let timeout = self.peer_timeout_ms;
+        let timed_out: Vec<[u8; 16]> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| now.saturating_sub(p.last_seen_ms) > timeout)
+            .map(|(k, _)| *k)
+            .collect();
+        for addr in timed_out {
+            self.peers.remove(&addr);
+            out.push(RuntimeAction::PeerLost { address_hash: addr });
+        }
+
+        // Emit heartbeats if interval has elapsed and we have live peers.
         if !self.peers.is_empty()
             && now.saturating_sub(self.last_heartbeat_ms) >= self.heartbeat_interval_ms
         {
@@ -155,19 +165,6 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
                 }
             }
             self.last_heartbeat_ms = now;
-        }
-
-        // Check peer timeouts.
-        let timeout = self.peer_timeout_ms;
-        let timed_out: Vec<[u8; 16]> = self
-            .peers
-            .iter()
-            .filter(|(_, p)| now.saturating_sub(p.last_seen_ms) > timeout)
-            .map(|(k, _)| *k)
-            .collect();
-        for addr in timed_out {
-            self.peers.remove(&addr);
-            out.push(RuntimeAction::PeerLost { address_hash: addr });
         }
 
         out
@@ -257,7 +254,6 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
             Some(announce_interval_secs),
             now_secs,
         );
-        self.dest_hash = Some(dest_hash);
         self.boot_time_ms = now;
         dest_hash
     }
