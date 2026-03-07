@@ -45,6 +45,7 @@ pub enum RuntimeAction {
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
     pub address_hash: [u8; 16],
+    pub dest_hash: [u8; 16],
     pub last_seen_ms: u64,
     pub hops: u8,
     pub discovered_at_ms: u64,
@@ -57,7 +58,6 @@ pub struct UnikernelRuntime<E: EntropySource, P: PersistentState> {
     persistence: P,
     tick_count: u64,
     // Announcing
-    dest_name: Option<DestinationName>,
     dest_hash: Option<DestinationHash>,
     // Peer tracking
     pub(crate) peers: BTreeMap<[u8; 16], PeerInfo>,
@@ -76,7 +76,6 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
             entropy,
             persistence,
             tick_count: 0,
-            dest_name: None,
             dest_hash: None,
             peers: BTreeMap::new(),
             heartbeat_interval_ms: 5_000,
@@ -129,33 +128,29 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
             }
         }
 
-        // Emit heartbeats if interval has elapsed and we have a destination.
+        // Emit heartbeats if interval has elapsed and we have peers.
         if !self.peers.is_empty()
             && now.saturating_sub(self.last_heartbeat_ms) >= self.heartbeat_interval_ms
         {
-            if let Some(ref dest_hash) = self.dest_hash {
-                let hbt = self.build_heartbeat(now);
-                // Send heartbeat to each peer's destination.
-                // For now, broadcast — peers learn our dest_hash from announces.
-                // We use route_packet which broadcasts if no path is known.
-                let peer_addrs: Vec<[u8; 16]> = self.peers.keys().copied().collect();
-                for _peer_addr in &peer_addrs {
-                    if let Some(raw) = Self::build_data_packet(dest_hash, &hbt) {
-                        let send_actions = self.node.route_packet(dest_hash, raw);
-                        for sa in send_actions {
-                            if let NodeAction::SendOnInterface {
+            let hbt = self.build_heartbeat(now);
+            // Route a heartbeat to each peer's destination hash so that
+            // DeliverLocally fires on the receiving node.
+            let peer_dest_hashes: Vec<[u8; 16]> =
+                self.peers.values().map(|p| p.dest_hash).collect();
+            for peer_dest in &peer_dest_hashes {
+                if let Some(raw) = Self::build_data_packet(peer_dest, &hbt) {
+                    let send_actions = self.node.route_packet(peer_dest, raw);
+                    for sa in send_actions {
+                        if let NodeAction::SendOnInterface {
+                            interface_name,
+                            raw,
+                        } = sa
+                        {
+                            out.push(RuntimeAction::SendOnInterface {
                                 interface_name,
                                 raw,
-                            } = sa
-                            {
-                                out.push(RuntimeAction::SendOnInterface {
-                                    interface_name,
-                                    raw,
-                                });
-                            }
+                            });
                         }
-                        // One broadcast covers all peers on the same LAN.
-                        break;
                     }
                 }
             }
@@ -262,7 +257,6 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
             Some(announce_interval_secs),
             now_secs,
         );
-        self.dest_name = Some(dest_name);
         self.dest_hash = Some(dest_hash);
         self.boot_time_ms = now;
         dest_hash
@@ -298,6 +292,7 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
         for action in node_actions {
             match action {
                 NodeAction::AnnounceReceived {
+                    destination_hash,
                     validated_announce,
                     hops,
                     ..
@@ -313,6 +308,7 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
                         addr,
                         PeerInfo {
                             address_hash: addr,
+                            dest_hash: destination_hash,
                             last_seen_ms: now,
                             hops,
                             discovered_at_ms: discovered_at,
@@ -463,6 +459,7 @@ mod tests {
             [0xAA; 16],
             PeerInfo {
                 address_hash: [0xAA; 16],
+                dest_hash: [0xAA; 16],
                 last_seen_ms: 0,
                 hops: 1,
                 discovered_at_ms: 0,
@@ -506,6 +503,7 @@ mod tests {
             [0xBB; 16],
             PeerInfo {
                 address_hash: [0xBB; 16],
+                dest_hash: [0xBB; 16],
                 last_seen_ms: 0,
                 hops: 1,
                 discovered_at_ms: 0,

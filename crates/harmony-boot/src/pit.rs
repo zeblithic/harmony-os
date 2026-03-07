@@ -74,7 +74,8 @@ impl PitTimer {
         let elapsed = if current <= self.last_count {
             self.last_count - current
         } else {
-            // Wrapped: last_count ticks down to 0, then 0xFFFF down to current.
+            // Dead code in mode 0 (counter stops at 0), but kept as a
+            // safety net in case of read glitches.
             self.last_count + (0xFFFF - current) + 1
         };
 
@@ -83,6 +84,8 @@ impl PitTimer {
 
         // Reload the counter if it's getting low, to avoid
         // reaching 0 and stopping (mode 0 stops at terminal count).
+        // Note: up to ~1000 residual ticks (~0.84ms) may be lost per
+        // reload. Acceptable for Ring 1's 5s/15s protocol intervals.
         if current < 1000 {
             unsafe {
                 Port::new(COMMAND).write(0xB0u8);

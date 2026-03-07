@@ -7,7 +7,6 @@ pub mod platform;
 pub mod serial;
 
 pub use event_loop::{PeerInfo, RuntimeAction, UnikernelRuntime};
-pub use harmony_reticulum::NodeAction;
 pub use platform::entropy::KernelEntropy;
 pub use platform::persistence::MemoryState;
 pub use serial::SerialWriter;
