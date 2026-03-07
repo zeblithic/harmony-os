@@ -57,6 +57,7 @@ pub enum IpcError {
     ReadOnly,
     ResourceExhausted,
     NotSupported,
+    InvalidArgument,
 }
 
 // ── File metadata ────────────────────────────────────────────────────

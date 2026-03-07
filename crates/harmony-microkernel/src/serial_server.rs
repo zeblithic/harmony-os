@@ -80,9 +80,10 @@ impl FileServer for SerialServer {
         Ok(())
     }
 
-    /// Read from the log buffer. Offset is intentionally ignored —
-    /// this is an append-only log that always reads from the start.
-    fn read(&mut self, fid: Fid, _offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
+    /// Read from the log buffer. Offset is honored so callers can
+    /// page through the accumulated log. Write offset is still ignored
+    /// (append-only).
+    fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
         let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
         if !state.is_open {
             return Err(IpcError::NotOpen);
@@ -93,8 +94,9 @@ impl FileServer for SerialServer {
         if matches!(state.mode, Some(OpenMode::Write)) {
             return Err(IpcError::PermissionDenied);
         }
-        let end = core::cmp::min(self.buf.len(), count as usize);
-        Ok(self.buf[..end].to_vec())
+        let start = core::cmp::min(offset as usize, self.buf.len());
+        let end = core::cmp::min(start + count as usize, self.buf.len());
+        Ok(self.buf[start..end].to_vec())
     }
 
     /// Write appends data to the log buffer. Offset is intentionally

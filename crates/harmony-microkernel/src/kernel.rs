@@ -395,12 +395,10 @@ impl Kernel {
             .fid_owners
             .remove(&(from_pid, fid))
             .ok_or(IpcError::InvalidFid)?;
-        let target = self
-            .processes
-            .get_mut(&target_pid)
-            .ok_or(IpcError::NotFound)?;
-        // Best-effort server clunk — tracking is already removed
-        let _ = target.server.clunk(server_fid);
+        // Best-effort — process may be gone; fid_owners tracking is already removed
+        if let Some(target) = self.processes.get_mut(&target_pid) {
+            let _ = target.server.clunk(server_fid);
+        }
         Ok(())
     }
 }
