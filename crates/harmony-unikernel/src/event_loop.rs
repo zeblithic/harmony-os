@@ -180,18 +180,118 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
             .register_interface(String::from(name), InterfaceMode::Full, None);
     }
 
-    /// Feed an inbound packet from a network interface into the node.
+    /// Feed an inbound packet into the node and translate results.
+    ///
+    /// Intercepts `AnnounceReceived` to update the peer table and
+    /// `DeliverLocally` to parse heartbeat payloads.
+    ///
+    /// `now` is monotonic milliseconds.
     pub fn handle_packet(
         &mut self,
         interface_name: &str,
         data: Vec<u8>,
         now: u64,
-    ) -> Vec<NodeAction> {
-        self.node.handle_event(NodeEvent::InboundPacket {
+    ) -> Vec<RuntimeAction> {
+        let now_secs = now / 1000;
+        let node_actions = self.node.handle_event(NodeEvent::InboundPacket {
             interface_name: String::from(interface_name),
             raw: data,
-            now,
-        })
+            now: now_secs,
+        });
+
+        let mut out = Vec::new();
+
+        for action in node_actions {
+            match action {
+                NodeAction::AnnounceReceived {
+                    validated_announce,
+                    hops,
+                    ..
+                } => {
+                    let addr = validated_announce.identity.address_hash;
+                    let is_new = !self.peers.contains_key(&addr);
+                    let discovered_at = if is_new {
+                        now
+                    } else {
+                        self.peers[&addr].discovered_at_ms
+                    };
+                    self.peers.insert(
+                        addr,
+                        PeerInfo {
+                            address_hash: addr,
+                            last_seen_ms: now,
+                            hops,
+                            discovered_at_ms: discovered_at,
+                        },
+                    );
+                    if is_new {
+                        out.push(RuntimeAction::PeerDiscovered {
+                            address_hash: addr,
+                            hops,
+                        });
+                    }
+                }
+                NodeAction::DeliverLocally {
+                    packet,
+                    destination_hash,
+                    ..
+                } => {
+                    let payload: &[u8] = &packet.data;
+                    // Check for heartbeat magic: "HBT\x01"
+                    if payload.len() >= 28
+                        && payload[0..4] == [0x48, 0x42, 0x54, 0x01]
+                    {
+                        let mut sender = [0u8; 16];
+                        sender.copy_from_slice(&payload[4..20]);
+                        let uptime_ms = u64::from_be_bytes(
+                            payload[20..28].try_into().unwrap(),
+                        );
+                        // Update last_seen for this peer.
+                        if let Some(peer) = self.peers.get_mut(&sender) {
+                            peer.last_seen_ms = now;
+                        }
+                        out.push(RuntimeAction::HeartbeatReceived {
+                            address_hash: sender,
+                            uptime_ms,
+                        });
+                    } else {
+                        out.push(RuntimeAction::DeliverLocally {
+                            destination_hash,
+                            payload: payload.to_vec(),
+                        });
+                    }
+                }
+                NodeAction::AnnounceNeeded { dest_hash } => {
+                    // Resolve inline (can happen on inbound too).
+                    let announce_actions =
+                        self.node.announce(&dest_hash, &mut self.entropy, now_secs);
+                    for aa in announce_actions {
+                        if let NodeAction::SendOnInterface {
+                            interface_name,
+                            raw,
+                        } = aa
+                        {
+                            out.push(RuntimeAction::SendOnInterface {
+                                interface_name,
+                                raw,
+                            });
+                        }
+                    }
+                }
+                NodeAction::SendOnInterface {
+                    interface_name,
+                    raw,
+                } => {
+                    out.push(RuntimeAction::SendOnInterface {
+                        interface_name,
+                        raw,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        out
     }
 }
 
@@ -306,5 +406,45 @@ mod tests {
         let mut runtime = make_runtime();
         runtime.persistence().save("test", b"data").unwrap();
         assert_eq!(runtime.persistence().load("test").unwrap(), b"data");
+    }
+
+    #[test]
+    fn handle_packet_emits_peer_discovered_on_announce() {
+        let mut runtime = make_runtime();
+        runtime.register_interface("test0");
+        runtime.register_announcing_destination("harmony", &["node"], 300_000, 0);
+
+        // Build a valid announce from a second identity.
+        let mut entropy2 = test_entropy();
+        let peer_identity = PrivateIdentity::generate(&mut entropy2);
+        let peer_addr = peer_identity.public_identity().address_hash;
+        let dest_name = harmony_reticulum::destination::DestinationName::from_name(
+            "harmony",
+            &["node"],
+        )
+        .unwrap();
+
+        let announce_packet = harmony_reticulum::announce::build_announce(
+            &peer_identity,
+            &dest_name,
+            &mut entropy2,
+            0,
+            &[],
+            None,
+        )
+        .unwrap();
+        let raw = announce_packet.to_bytes().unwrap();
+
+        let actions = runtime.handle_packet("test0", raw, 1_000);
+        let has_discovered = actions.iter().any(|a| {
+            matches!(
+                a,
+                RuntimeAction::PeerDiscovered {
+                    address_hash, ..
+                } if *address_hash == peer_addr
+            )
+        });
+        assert!(has_discovered, "should emit PeerDiscovered on valid announce");
+        assert_eq!(runtime.peer_count(), 1);
     }
 }
