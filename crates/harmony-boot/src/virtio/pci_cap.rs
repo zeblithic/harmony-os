@@ -30,8 +30,9 @@ pub struct VirtioPciCaps {
     pub notify_off_multiplier: u32,
     /// Virtual address of the device-specific configuration registers.
     pub device_cfg: usize,
-    /// Virtual address of the ISR status register.
-    pub isr_cfg: usize,
+    /// Virtual address of the ISR status register (optional — only needed
+    /// when interrupt handling is enabled; the driver currently uses poll mode).
+    pub isr_cfg: Option<usize>,
 }
 
 /// Walk the PCI capability list for a VirtIO device and resolve MMIO
@@ -46,7 +47,7 @@ pub struct VirtioPciCaps {
 /// # Returns
 ///
 /// `Some(VirtioPciCaps)` if all required capabilities (common, notify,
-/// ISR, device) were found; `None` otherwise.
+/// device) were found; `None` otherwise. ISR is optional.
 pub fn parse_capabilities(dev: &PciDevice, phys_offset: u64) -> Option<VirtioPciCaps> {
     let mut common_cfg: Option<usize> = None;
     let mut notify_base: Option<usize> = None;
@@ -123,6 +124,6 @@ pub fn parse_capabilities(dev: &PciDevice, phys_offset: u64) -> Option<VirtioPci
         notify_base: notify_base?,
         notify_off_multiplier,
         device_cfg: device_cfg?,
-        isr_cfg: isr_cfg?,
+        isr_cfg,
     })
 }

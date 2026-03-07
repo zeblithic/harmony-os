@@ -207,11 +207,12 @@ impl Virtqueue {
         let idx = self.alloc_desc()?;
 
         unsafe {
-            let desc = &mut *self.desc.add(idx as usize);
-            desc.addr = self.buffer_phys(idx);
-            desc.len = BUF_SIZE as u32;
-            desc.flags = VIRTQ_DESC_F_WRITE;
-            desc.next = 0;
+            // Volatile writes for descriptor table — device reads via DMA.
+            let desc = self.desc.add(idx as usize);
+            ptr::write_volatile(&raw mut (*desc).addr, self.buffer_phys(idx));
+            ptr::write_volatile(&raw mut (*desc).len, BUF_SIZE as u32);
+            ptr::write_volatile(&raw mut (*desc).flags, VIRTQ_DESC_F_WRITE);
+            ptr::write_volatile(&raw mut (*desc).next, 0);
 
             // Volatile writes for avail ring — device reads via DMA.
             let avail_idx = ptr::read_volatile(&(*self.avail).idx);
@@ -243,11 +244,12 @@ impl Virtqueue {
             let buf = self.buffer_ptr(idx);
             ptr::copy_nonoverlapping(data.as_ptr(), buf, data.len());
 
-            let desc = &mut *self.desc.add(idx as usize);
-            desc.addr = self.buffer_phys(idx);
-            desc.len = data.len() as u32;
-            desc.flags = 0; // device-readable
-            desc.next = 0;
+            // Volatile writes for descriptor table — device reads via DMA.
+            let desc = self.desc.add(idx as usize);
+            ptr::write_volatile(&raw mut (*desc).addr, self.buffer_phys(idx));
+            ptr::write_volatile(&raw mut (*desc).len, data.len() as u32);
+            ptr::write_volatile(&raw mut (*desc).flags, 0u16);
+            ptr::write_volatile(&raw mut (*desc).next, 0u16);
 
             // Volatile writes for avail ring — device reads via DMA.
             let avail_idx = ptr::read_volatile(&(*self.avail).idx);
