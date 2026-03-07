@@ -130,6 +130,17 @@ impl FileServer for EchoServer {
         Ok(())
     }
 
+    fn clone_fid(&mut self, fid: Fid, new_fid: Fid) -> Result<QPath, IpcError> {
+        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
+        let qpath = state.qpath;
+        self.fids.insert(new_fid, FidState {
+            qpath,
+            is_open: false,
+            mode: None,
+        });
+        Ok(qpath)
+    }
+
     fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
         let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
 

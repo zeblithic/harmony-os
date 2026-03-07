@@ -8,14 +8,16 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["std"]
+default = ["kernel"]
 std = [
     "harmony-unikernel/std",
     "harmony-crypto/std",
     "harmony-identity/std",
-    "harmony-identity/test-utils",
     "harmony-platform/std",
 ]
+# Kernel struct + IPC dispatch. Requires in-memory identity stores from
+# harmony-identity/test-utils (production-grade despite the feature name).
+kernel = ["std", "harmony-identity/test-utils"]
 
 [dependencies]
 # Ring 1

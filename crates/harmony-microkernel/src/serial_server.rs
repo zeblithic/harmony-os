@@ -66,6 +66,8 @@ impl FileServer for SerialServer {
         Ok(())
     }
 
+    /// Read from the log buffer. Offset is intentionally ignored —
+    /// this is an append-only log that always reads from the start.
     fn read(&mut self, fid: Fid, _offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
         let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
         if !state.is_open {
@@ -87,6 +89,13 @@ impl FileServer for SerialServer {
     fn clunk(&mut self, fid: Fid) -> Result<(), IpcError> {
         self.fids.remove(&fid).ok_or(IpcError::InvalidFid)?;
         Ok(())
+    }
+
+    fn clone_fid(&mut self, fid: Fid, new_fid: Fid) -> Result<QPath, IpcError> {
+        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
+        let qpath = state.qpath;
+        self.fids.insert(new_fid, FidState { qpath, is_open: false });
+        Ok(qpath)
     }
 
     fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {

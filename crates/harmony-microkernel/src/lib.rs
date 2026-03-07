@@ -12,7 +12,7 @@
 extern crate alloc;
 
 pub mod echo;
-#[cfg(feature = "std")]
+#[cfg(feature = "kernel")]
 pub mod kernel;
 pub mod namespace;
 pub mod serial_server;
@@ -92,6 +92,12 @@ pub trait FileServer {
 
     /// Stat a fid — returns name, size, type.
     fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError>;
+
+    /// Clone a fid — create `new_fid` as a closed duplicate of `fid`.
+    /// Equivalent to a 9P walk with zero path components.
+    fn clone_fid(&mut self, _fid: Fid, _new_fid: Fid) -> Result<QPath, IpcError> {
+        Err(IpcError::InvalidFid)
+    }
 }
 
 #[cfg(test)]

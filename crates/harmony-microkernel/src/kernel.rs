@@ -32,8 +32,12 @@ pub struct Kernel {
     pub(crate) identity_store: MemoryIdentityStore,
     proof_store: MemoryProofStore,
     revocations: MemoryRevocationSet,
-    /// Maps (client_pid, client_fid) -> target_pid for open fids.
-    fid_owners: BTreeMap<(u32, Fid), u32>,
+    /// Maps (client_pid, client_fid) -> (target_pid, server_fid).
+    /// The kernel translates client fids to server-local fids to prevent
+    /// collisions when multiple clients share a server.
+    fid_owners: BTreeMap<(u32, Fid), (u32, Fid)>,
+    /// Monotonic counter for allocating server-side fids.
+    next_server_fid: Fid,
 }
 
 impl Kernel {
@@ -49,7 +53,15 @@ impl Kernel {
             proof_store: MemoryProofStore::new(),
             revocations: MemoryRevocationSet::new(),
             fid_owners: BTreeMap::new(),
+            next_server_fid: 1,
         }
+    }
+
+    /// Allocate a unique server-side fid.
+    fn allocate_server_fid(&mut self) -> Fid {
+        let fid = self.next_server_fid;
+        self.next_server_fid += 1;
+        fid
     }
 
     /// Spawn a process. Returns the assigned PID.
@@ -195,21 +207,25 @@ impl Kernel {
         // Capability check
         self.check_endpoint_cap(&caps, &addr, target_pid, now)?;
 
-        // Walk on the target server: from root fid to remainder
+        // Allocate a kernel-scoped server-side fid to avoid collisions
+        // when multiple clients share the same server.
+        let server_fid = self.allocate_server_fid();
+
         let target = self
             .processes
             .get_mut(&target_pid)
             .ok_or(IpcError::NotFound)?;
 
         let qpath = if remainder.is_empty() {
-            // Walking to the mount root itself — just return its root qpath
-            target.server.stat(server_root_fid).map(|st| st.qpath)?
+            // Walking to the mount root — clone the root fid
+            target.server.clone_fid(server_root_fid, server_fid)?
         } else {
-            target.server.walk(server_root_fid, new_fid, &remainder)?
+            target.server.walk(server_root_fid, server_fid, &remainder)?
         };
 
-        // Record fid ownership
-        self.fid_owners.insert((from_pid, new_fid), target_pid);
+        // Record fid ownership with the server-side fid translation
+        self.fid_owners
+            .insert((from_pid, new_fid), (target_pid, server_fid));
         Ok(qpath)
     }
 
@@ -221,7 +237,7 @@ impl Kernel {
         mode: OpenMode,
         _now: u64,
     ) -> Result<(), IpcError> {
-        let &target_pid = self
+        let &(target_pid, server_fid) = self
             .fid_owners
             .get(&(from_pid, fid))
             .ok_or(IpcError::InvalidFid)?;
@@ -229,7 +245,7 @@ impl Kernel {
             .processes
             .get_mut(&target_pid)
             .ok_or(IpcError::NotFound)?;
-        target.server.open(fid, mode)
+        target.server.open(server_fid, mode)
     }
 
     /// Read from a previously opened fid.
@@ -241,7 +257,7 @@ impl Kernel {
         count: u32,
         _now: u64,
     ) -> Result<Vec<u8>, IpcError> {
-        let &target_pid = self
+        let &(target_pid, server_fid) = self
             .fid_owners
             .get(&(from_pid, fid))
             .ok_or(IpcError::InvalidFid)?;
@@ -249,7 +265,7 @@ impl Kernel {
             .processes
             .get_mut(&target_pid)
             .ok_or(IpcError::NotFound)?;
-        target.server.read(fid, offset, count)
+        target.server.read(server_fid, offset, count)
     }
 
     /// Write to a previously opened fid.
@@ -261,7 +277,7 @@ impl Kernel {
         data: &[u8],
         _now: u64,
     ) -> Result<u32, IpcError> {
-        let &target_pid = self
+        let &(target_pid, server_fid) = self
             .fid_owners
             .get(&(from_pid, fid))
             .ok_or(IpcError::InvalidFid)?;
@@ -269,7 +285,7 @@ impl Kernel {
             .processes
             .get_mut(&target_pid)
             .ok_or(IpcError::NotFound)?;
-        target.server.write(fid, offset, data)
+        target.server.write(server_fid, offset, data)
     }
 
     /// Release a fid.
@@ -279,7 +295,7 @@ impl Kernel {
         fid: Fid,
         _now: u64,
     ) -> Result<(), IpcError> {
-        let target_pid = self
+        let (target_pid, server_fid) = self
             .fid_owners
             .remove(&(from_pid, fid))
             .ok_or(IpcError::InvalidFid)?;
@@ -287,7 +303,7 @@ impl Kernel {
             .processes
             .get_mut(&target_pid)
             .ok_or(IpcError::NotFound)?;
-        target.server.clunk(fid)
+        target.server.clunk(server_fid)
     }
 }
 
@@ -506,6 +522,73 @@ mod tests {
             kernel.read(client, 1, 0, 256, 0),
             Err(IpcError::InvalidFid)
         );
+    }
+
+    #[test]
+    fn ipc_walk_mount_root() {
+        let (mut kernel, client, _server) = setup_kernel_with_echo();
+        // Walk to the mount root itself (no file after mount point)
+        let qpath = kernel.walk(client, "/echo", 0, 1, 0).unwrap();
+        assert_eq!(qpath, 0); // root qpath
+
+        // The fid should be usable — open succeeds
+        kernel.open(client, 1, OpenMode::Read, 0).unwrap();
+        kernel.clunk(client, 1, 0).unwrap();
+    }
+
+    #[test]
+    fn ipc_multi_client_fid_isolation() {
+        let mut entropy = make_test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let mut kernel = Kernel::new(kernel_id);
+
+        // Shared echo server
+        let server_pid =
+            kernel.spawn_process("echo-server", Box::new(EchoServer::new()), &[]);
+
+        // Two clients, both mounting the same server
+        let client_a = kernel.spawn_process(
+            "client-a",
+            Box::new(EchoServer::new()),
+            &[("/echo", server_pid, 0)],
+        );
+        let client_b = kernel.spawn_process(
+            "client-b",
+            Box::new(EchoServer::new()),
+            &[("/echo", server_pid, 0)],
+        );
+
+        kernel
+            .grant_endpoint_cap(&mut entropy, client_a, server_pid, 0)
+            .unwrap();
+        kernel
+            .grant_endpoint_cap(&mut entropy, client_b, server_pid, 0)
+            .unwrap();
+
+        // Both clients walk to /echo/hello using the SAME client fid (1).
+        // Without fid virtualization, the second walk would overwrite the first.
+        kernel.walk(client_a, "/echo/hello", 0, 1, 0).unwrap();
+        kernel.walk(client_b, "/echo/hello", 0, 1, 0).unwrap();
+
+        // Both open and read independently
+        kernel.open(client_a, 1, OpenMode::Read, 0).unwrap();
+        kernel.open(client_b, 1, OpenMode::Read, 0).unwrap();
+
+        let data_a = kernel.read(client_a, 1, 0, 256, 0).unwrap();
+        let data_b = kernel.read(client_b, 1, 0, 256, 0).unwrap();
+        assert_eq!(data_a, b"Hello from echo server!");
+        assert_eq!(data_b, b"Hello from echo server!");
+
+        // Client A clunks — client B's fid is unaffected
+        kernel.clunk(client_a, 1, 0).unwrap();
+        assert_eq!(
+            kernel.read(client_a, 1, 0, 256, 0),
+            Err(IpcError::InvalidFid)
+        );
+
+        // Client B still works
+        let data_b2 = kernel.read(client_b, 1, 0, 256, 0).unwrap();
+        assert_eq!(data_b2, b"Hello from echo server!");
     }
 
     #[test]
