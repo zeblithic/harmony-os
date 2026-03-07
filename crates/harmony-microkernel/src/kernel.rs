@@ -216,6 +216,11 @@ impl Kernel {
         new_fid: Fid,
         now: u64,
     ) -> Result<QPath, IpcError> {
+        // Cheap validation first, before expensive crypto checks.
+        if self.fid_owners.contains_key(&(from_pid, new_fid)) {
+            return Err(IpcError::InvalidFid);
+        }
+
         // Resolve namespace and check capabilities while holding only
         // shared borrows. Copy scalars and remainder into locals so the
         // borrow is released before the mutable borrow on the target.
@@ -239,14 +244,12 @@ impl Kernel {
             (target_pid, server_root_fid, remainder)
         };
 
-        // Reject if new_fid is already in use (prevents orphaning server fids)
-        if self.fid_owners.contains_key(&(from_pid, new_fid)) {
-            return Err(IpcError::InvalidFid);
-        }
-
         // Split remainder into path components for multi-level walks.
-        // Reject ".." to prevent traversal above the mount root.
-        let components: Vec<&str> = remainder.split('/').filter(|s| !s.is_empty()).collect();
+        // Filter "." (no-op) and reject ".." (traversal above mount root).
+        let components: Vec<&str> = remainder
+            .split('/')
+            .filter(|s| !s.is_empty() && *s != ".")
+            .collect();
         if components.contains(&"..") {
             return Err(IpcError::PermissionDenied);
         }
@@ -718,6 +721,14 @@ mod tests {
             kernel.walk(client, "/echo/../etc/passwd", 0, 1, 0),
             Err(IpcError::PermissionDenied)
         );
+    }
+
+    #[test]
+    fn ipc_walk_dot_ignored() {
+        let (mut kernel, client, _server) = setup_kernel_with_echo();
+        // "." components should be silently stripped
+        let qpath = kernel.walk(client, "/echo/./hello", 0, 1, 0).unwrap();
+        assert_eq!(qpath, 1); // hello's qpath
     }
 
     #[test]
