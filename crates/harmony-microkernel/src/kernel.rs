@@ -135,7 +135,7 @@ impl Kernel {
         _now: u64,
     ) -> Result<(), IpcError> {
         if !self.processes.contains_key(&target_pid) {
-            return Err(IpcError::NotFound);
+            return Err(IpcError::InvalidArgument);
         }
         let process = self.processes.get(&process_pid).ok_or(IpcError::NotFound)?;
         let audience = process.address_hash;
@@ -739,7 +739,7 @@ mod tests {
         // target pid 99 doesn't exist
         assert_eq!(
             kernel.grant_endpoint_cap(&mut entropy, pid, 99, 0),
-            Err(IpcError::NotFound)
+            Err(IpcError::InvalidArgument)
         );
     }
 
