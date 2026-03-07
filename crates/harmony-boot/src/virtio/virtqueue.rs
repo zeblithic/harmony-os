@@ -47,6 +47,9 @@ pub struct VirtqAvail {
     pub idx: u16,
     /// Ring of descriptor chain head indices.
     pub ring: [u16; QUEUE_SIZE as usize],
+    /// Used event index (§2.6.7) — always present, only meaningful when
+    /// `VIRTIO_F_EVENT_IDX` is negotiated.
+    pub used_event: u16,
 }
 
 /// Element in the used ring, written by the device.
@@ -67,6 +70,9 @@ pub struct VirtqUsed {
     pub idx: u16,
     /// Ring of used elements.
     pub ring: [VirtqUsedElem; QUEUE_SIZE as usize],
+    /// Available event index (§2.6.8) — always present, only meaningful when
+    /// `VIRTIO_F_EVENT_IDX` is negotiated.
+    pub avail_event: u16,
 }
 
 // ---------------------------------------------------------------------------

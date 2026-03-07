@@ -25,11 +25,6 @@ pub fn pci_config_read32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
     }
 }
 
-pub fn pci_config_read16(bus: u8, device: u8, function: u8, offset: u8) -> u16 {
-    let val = pci_config_read32(bus, device, function, offset);
-    ((val >> ((offset & 2) * 8)) & 0xFFFF) as u16
-}
-
 pub fn pci_config_read8(bus: u8, device: u8, function: u8, offset: u8) -> u8 {
     let val = pci_config_read32(bus, device, function, offset);
     ((val >> ((offset & 3) * 8)) & 0xFF) as u8
@@ -40,14 +35,6 @@ pub fn pci_config_write32(bus: u8, device: u8, function: u8, offset: u8, value: 
         Port::new(CONFIG_ADDRESS).write(config_address(bus, device, function, offset));
         Port::new(CONFIG_DATA).write(value);
     }
-}
-
-pub fn pci_config_write16(bus: u8, device: u8, function: u8, offset: u8, value: u16) {
-    let current = pci_config_read32(bus, device, function, offset);
-    let shift = (offset & 2) * 8;
-    let mask = !(0xFFFF_u32 << shift);
-    let new_val = (current & mask) | ((value as u32) << shift);
-    pci_config_write32(bus, device, function, offset, new_val);
 }
 
 pub struct PciDevice {
@@ -61,7 +48,8 @@ pub struct PciDevice {
 
 impl PciDevice {
     pub fn capabilities_ptr(&self) -> u8 {
-        pci_config_read8(self.bus, self.device, self.function, 0x34)
+        // §6.7: bits [1:0] are reserved; mask to ensure DWORD alignment.
+        pci_config_read8(self.bus, self.device, self.function, 0x34) & 0xFC
     }
 
     pub fn enable_bus_master(&self) {
