@@ -307,7 +307,7 @@ impl Kernel {
 
     /// Open a previously walked fid.
     ///
-    /// Note: capability tokens are validated at walk time only, not on
+    /// Capability tokens are validated at walk time only, not on
     /// subsequent operations. Once a fid is established, it remains
     /// usable even if the originating token expires. This matches 9P
     /// semantics where authentication gates session setup, not every I/O.
@@ -316,7 +316,6 @@ impl Kernel {
         from_pid: u32,
         fid: Fid,
         mode: OpenMode,
-        _now: u64,
     ) -> Result<(), IpcError> {
         let &(target_pid, server_fid) = self
             .fid_owners
@@ -336,7 +335,6 @@ impl Kernel {
         fid: Fid,
         offset: u64,
         count: u32,
-        _now: u64,
     ) -> Result<Vec<u8>, IpcError> {
         let &(target_pid, server_fid) = self
             .fid_owners
@@ -356,7 +354,6 @@ impl Kernel {
         fid: Fid,
         offset: u64,
         data: &[u8],
-        _now: u64,
     ) -> Result<u32, IpcError> {
         let &(target_pid, server_fid) = self
             .fid_owners
@@ -374,7 +371,6 @@ impl Kernel {
         &mut self,
         from_pid: u32,
         fid: Fid,
-        _now: u64,
     ) -> Result<crate::FileStat, IpcError> {
         let &(target_pid, server_fid) = self
             .fid_owners
@@ -394,7 +390,6 @@ impl Kernel {
         &mut self,
         from_pid: u32,
         fid: Fid,
-        _now: u64,
     ) -> Result<(), IpcError> {
         let (target_pid, server_fid) = self
             .fid_owners
@@ -563,7 +558,7 @@ mod tests {
     fn ipc_stat_through_namespace() {
         let (mut kernel, client, _server) = setup_kernel_with_echo();
         kernel.walk(client, "/echo/hello", 0, 1, 0).unwrap();
-        let stat = kernel.stat(client, 1, 0).unwrap();
+        let stat = kernel.stat(client, 1).unwrap();
         assert_eq!(&*stat.name, "hello");
         assert_eq!(stat.file_type, crate::FileType::Regular);
     }
@@ -579,8 +574,8 @@ mod tests {
     fn ipc_read_through_namespace() {
         let (mut kernel, client, _server) = setup_kernel_with_echo();
         kernel.walk(client, "/echo/hello", 0, 1, 0).unwrap();
-        kernel.open(client, 1, OpenMode::Read, 0).unwrap();
-        let data = kernel.read(client, 1, 0, 256, 0).unwrap();
+        kernel.open(client, 1, OpenMode::Read).unwrap();
+        let data = kernel.read(client, 1, 0, 256).unwrap();
         assert_eq!(data, b"Hello from echo server!");
     }
 
@@ -588,9 +583,9 @@ mod tests {
     fn ipc_write_and_read_echo() {
         let (mut kernel, client, _server) = setup_kernel_with_echo();
         kernel.walk(client, "/echo/echo", 0, 1, 0).unwrap();
-        kernel.open(client, 1, OpenMode::ReadWrite, 0).unwrap();
-        kernel.write(client, 1, 0, b"round trip", 0).unwrap();
-        let data = kernel.read(client, 1, 0, 256, 0).unwrap();
+        kernel.open(client, 1, OpenMode::ReadWrite).unwrap();
+        kernel.write(client, 1, 0, b"round trip").unwrap();
+        let data = kernel.read(client, 1, 0, 256).unwrap();
         assert_eq!(data, b"round trip");
     }
 
@@ -628,10 +623,10 @@ mod tests {
     fn ipc_clunk_then_read_fails() {
         let (mut kernel, client, _server) = setup_kernel_with_echo();
         kernel.walk(client, "/echo/hello", 0, 1, 0).unwrap();
-        kernel.open(client, 1, OpenMode::Read, 0).unwrap();
-        kernel.clunk(client, 1, 0).unwrap();
+        kernel.open(client, 1, OpenMode::Read).unwrap();
+        kernel.clunk(client, 1).unwrap();
         assert_eq!(
-            kernel.read(client, 1, 0, 256, 0),
+            kernel.read(client, 1, 0, 256),
             Err(IpcError::InvalidFid)
         );
     }
@@ -644,8 +639,8 @@ mod tests {
         assert_eq!(qpath, 0); // root qpath
 
         // The fid should be usable — open succeeds
-        kernel.open(client, 1, OpenMode::Read, 0).unwrap();
-        kernel.clunk(client, 1, 0).unwrap();
+        kernel.open(client, 1, OpenMode::Read).unwrap();
+        kernel.clunk(client, 1).unwrap();
     }
 
     #[test]
@@ -683,23 +678,23 @@ mod tests {
         kernel.walk(client_b, "/echo/hello", 0, 1, 0).unwrap();
 
         // Both open and read independently
-        kernel.open(client_a, 1, OpenMode::Read, 0).unwrap();
-        kernel.open(client_b, 1, OpenMode::Read, 0).unwrap();
+        kernel.open(client_a, 1, OpenMode::Read).unwrap();
+        kernel.open(client_b, 1, OpenMode::Read).unwrap();
 
-        let data_a = kernel.read(client_a, 1, 0, 256, 0).unwrap();
-        let data_b = kernel.read(client_b, 1, 0, 256, 0).unwrap();
+        let data_a = kernel.read(client_a, 1, 0, 256).unwrap();
+        let data_b = kernel.read(client_b, 1, 0, 256).unwrap();
         assert_eq!(data_a, b"Hello from echo server!");
         assert_eq!(data_b, b"Hello from echo server!");
 
         // Client A clunks — client B's fid is unaffected
-        kernel.clunk(client_a, 1, 0).unwrap();
+        kernel.clunk(client_a, 1).unwrap();
         assert_eq!(
-            kernel.read(client_a, 1, 0, 256, 0),
+            kernel.read(client_a, 1, 0, 256),
             Err(IpcError::InvalidFid)
         );
 
         // Client B still works
-        let data_b2 = kernel.read(client_b, 1, 0, 256, 0).unwrap();
+        let data_b2 = kernel.read(client_b, 1, 0, 256).unwrap();
         assert_eq!(data_b2, b"Hello from echo server!");
     }
 
@@ -816,14 +811,14 @@ mod tests {
         assert_eq!(qpath, 1); // hello qpath
 
         // 2. Open for reading
-        kernel.open(client_pid, 1, OpenMode::Read, 0).unwrap();
+        kernel.open(client_pid, 1, OpenMode::Read).unwrap();
 
         // 3. Read the greeting
-        let data = kernel.read(client_pid, 1, 0, 256, 0).unwrap();
+        let data = kernel.read(client_pid, 1, 0, 256).unwrap();
         assert_eq!(data, b"Hello from echo server!");
 
         // 4. Clunk the fid
-        kernel.clunk(client_pid, 1, 0).unwrap();
+        kernel.clunk(client_pid, 1).unwrap();
 
         // -- Echo round-trip: walk → open → write → read → clunk --
 
@@ -831,21 +826,21 @@ mod tests {
         kernel.walk(client_pid, "/svc/echo/echo", 0, 2, 0).unwrap();
 
         // 6. Open for read/write
-        kernel.open(client_pid, 2, OpenMode::ReadWrite, 0).unwrap();
+        kernel.open(client_pid, 2, OpenMode::ReadWrite).unwrap();
 
         // 7. Write data
-        let written = kernel.write(client_pid, 2, 0, b"Harmony Ring 2!", 0).unwrap();
+        let written = kernel.write(client_pid, 2, 0, b"Harmony Ring 2!").unwrap();
         assert_eq!(written, 15);
 
         // 8. Read it back
-        let data = kernel.read(client_pid, 2, 0, 256, 0).unwrap();
+        let data = kernel.read(client_pid, 2, 0, 256).unwrap();
         assert_eq!(data, b"Harmony Ring 2!");
 
         // 9. Clunk
-        kernel.clunk(client_pid, 2, 0).unwrap();
+        kernel.clunk(client_pid, 2).unwrap();
 
         // Verify clunked fids are invalid
-        assert_eq!(kernel.read(client_pid, 1, 0, 256, 0), Err(IpcError::InvalidFid));
-        assert_eq!(kernel.read(client_pid, 2, 0, 256, 0), Err(IpcError::InvalidFid));
+        assert_eq!(kernel.read(client_pid, 1, 0, 256), Err(IpcError::InvalidFid));
+        assert_eq!(kernel.read(client_pid, 2, 0, 256), Err(IpcError::InvalidFid));
     }
 }
