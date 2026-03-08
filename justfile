@@ -120,7 +120,7 @@ test-mesh: build
         sleep 1
         # Bail early if either node has exited (e.g., kernel panic).
         if ! kill -0 "$PID_A" 2>/dev/null || ! kill -0 "$PID_B" 2>/dev/null; then
-            echo "  [${i}s] A node exited unexpectedly"
+            echo "  [${i}s] One or both nodes exited unexpectedly"
             break
         fi
         A_PEER=$(grep -c '\[PEER+\]' "$LOG_A" 2>/dev/null || echo 0)
