@@ -15,7 +15,6 @@ use harmony_microkernel::{Fid, FileStat, FileType, IpcError, OpenMode, QPath};
 // ── Linux errno constants ───────────────────────────────────────────
 
 const EBADF: i64 = -9;
-const EIO: i64 = -5;
 const ENOSYS: i64 = -38;
 const ENOMEM: i64 = -12;
 const EINVAL: i64 = -22;
@@ -389,7 +388,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         match self.backend.write(fid, 0, data) {
             Ok(n) => n as i64,
-            Err(_) => EIO,
+            Err(e) => ipc_err_to_errno(e),
         }
     }
 
