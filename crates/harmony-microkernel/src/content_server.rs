@@ -226,8 +226,34 @@ impl FileServer for ContentServer {
         Ok(qpath)
     }
 
-    fn open(&mut self, _fid: Fid, _mode: OpenMode) -> Result<(), IpcError> {
-        Err(IpcError::NotSupported)
+    fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
+        let state = self.fids.get_mut(&fid).ok_or(IpcError::InvalidFid)?;
+        if state.is_open {
+            return Err(IpcError::PermissionDenied);
+        }
+        match &state.node {
+            NodeKind::Root | NodeKind::BlobsDir | NodeKind::ChunksDir => {
+                if matches!(mode, OpenMode::Write | OpenMode::ReadWrite) {
+                    return Err(IpcError::IsDirectory);
+                }
+            }
+            NodeKind::Blob(_) | NodeKind::Chunk(_) => {
+                if matches!(mode, OpenMode::Write | OpenMode::ReadWrite) {
+                    return Err(IpcError::ReadOnly);
+                }
+            }
+            NodeKind::Ingest => {
+                if !matches!(mode, OpenMode::ReadWrite) {
+                    return Err(IpcError::PermissionDenied);
+                }
+                self.ingest_buffers.insert(fid, IngestState::Writing(Vec::new()));
+            }
+        }
+        // Re-borrow mutably after the match (ingest_buffers insert released the borrow).
+        let state = self.fids.get_mut(&fid).unwrap();
+        state.is_open = true;
+        state.mode = Some(mode);
+        Ok(())
     }
 
     fn read(&mut self, _fid: Fid, _offset: u64, _count: u32) -> Result<Vec<u8>, IpcError> {
@@ -238,12 +264,81 @@ impl FileServer for ContentServer {
         Err(IpcError::NotSupported)
     }
 
-    fn clunk(&mut self, _fid: Fid) -> Result<(), IpcError> {
-        Err(IpcError::NotSupported)
+    fn clunk(&mut self, fid: Fid) -> Result<(), IpcError> {
+        if fid == 0 {
+            return Err(IpcError::PermissionDenied);
+        }
+        self.fids.remove(&fid).ok_or(IpcError::InvalidFid)?;
+        self.ingest_buffers.remove(&fid);
+        Ok(())
     }
 
-    fn stat(&mut self, _fid: Fid) -> Result<FileStat, IpcError> {
-        Err(IpcError::NotSupported)
+    fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
+        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
+        match &state.node {
+            NodeKind::Root => Ok(FileStat {
+                qpath: ROOT,
+                name: Arc::from("store"),
+                size: 0,
+                file_type: FileType::Directory,
+            }),
+            NodeKind::BlobsDir => Ok(FileStat {
+                qpath: BLOBS_DIR,
+                name: Arc::from("blobs"),
+                size: 0,
+                file_type: FileType::Directory,
+            }),
+            NodeKind::ChunksDir => Ok(FileStat {
+                qpath: CHUNKS_DIR,
+                name: Arc::from("chunks"),
+                size: 0,
+                file_type: FileType::Directory,
+            }),
+            NodeKind::Ingest => Ok(FileStat {
+                qpath: INGEST,
+                name: Arc::from("ingest"),
+                size: 0,
+                file_type: FileType::Regular,
+            }),
+            NodeKind::Blob(cid) => {
+                let ath = self.blobs.get(cid).ok_or(IpcError::NotFound)?;
+                Ok(FileStat {
+                    qpath: Self::blob_qpath(cid),
+                    name: Arc::from(format_cid_hex(cid).as_str()),
+                    size: ath.blob_size as u64,
+                    file_type: FileType::Regular,
+                })
+            }
+            NodeKind::Chunk(addr) => {
+                let (_, data) = self
+                    .chunks
+                    .iter()
+                    .find(|(a, _)| *a == *addr)
+                    .ok_or(IpcError::NotFound)?;
+                Ok(FileStat {
+                    qpath: Self::chunk_qpath(addr),
+                    name: Arc::from(format_addr_hex(addr).as_str()),
+                    size: data.len() as u64,
+                    file_type: FileType::Regular,
+                })
+            }
+        }
+    }
+
+    fn clone_fid(&mut self, fid: Fid, new_fid: Fid) -> Result<QPath, IpcError> {
+        if self.fids.contains_key(&new_fid) {
+            return Err(IpcError::InvalidFid);
+        }
+        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
+        let qpath = state.qpath;
+        let node = state.node.clone();
+        self.fids.insert(new_fid, FidState {
+            qpath,
+            node,
+            is_open: false,
+            mode: None,
+        });
+        Ok(qpath)
     }
 }
 
@@ -347,5 +442,89 @@ mod tests {
         server.walk(0, 1, "blobs").unwrap();
         let fake_cid = "aa".repeat(32); // 64 hex chars
         assert_eq!(server.walk(1, 2, &fake_cid), Err(IpcError::NotFound));
+    }
+
+    // ── open/clunk/clone_fid/stat tests ────────────────────────────────
+
+    #[test]
+    fn open_and_clunk_ingest() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "ingest").unwrap();
+        server.open(1, OpenMode::ReadWrite).unwrap();
+        server.clunk(1).unwrap();
+    }
+
+    #[test]
+    fn open_ingest_read_only_rejected() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "ingest").unwrap();
+        assert_eq!(server.open(1, OpenMode::Read), Err(IpcError::PermissionDenied));
+    }
+
+    #[test]
+    fn open_directory_write_rejected() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "blobs").unwrap();
+        assert_eq!(server.open(1, OpenMode::Write), Err(IpcError::IsDirectory));
+    }
+
+    #[test]
+    fn open_directory_read_ok() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "blobs").unwrap();
+        server.open(1, OpenMode::Read).unwrap();
+    }
+
+    #[test]
+    fn double_open_rejected() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "ingest").unwrap();
+        server.open(1, OpenMode::ReadWrite).unwrap();
+        assert_eq!(server.open(1, OpenMode::ReadWrite), Err(IpcError::PermissionDenied));
+    }
+
+    #[test]
+    fn clunk_root_rejected() {
+        let mut server = ContentServer::new();
+        assert_eq!(server.clunk(0), Err(IpcError::PermissionDenied));
+    }
+
+    #[test]
+    fn clunk_invalid_fid() {
+        let mut server = ContentServer::new();
+        assert_eq!(server.clunk(99), Err(IpcError::InvalidFid));
+    }
+
+    #[test]
+    fn clone_fid_root() {
+        let mut server = ContentServer::new();
+        let qpath = server.clone_fid(0, 5).unwrap();
+        assert_eq!(qpath, ROOT);
+    }
+
+    #[test]
+    fn stat_root() {
+        let mut server = ContentServer::new();
+        let stat = server.stat(0).unwrap();
+        assert_eq!(stat.file_type, FileType::Directory);
+        assert_eq!(&*stat.name, "store");
+    }
+
+    #[test]
+    fn stat_ingest() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "ingest").unwrap();
+        let stat = server.stat(1).unwrap();
+        assert_eq!(stat.file_type, FileType::Regular);
+        assert_eq!(&*stat.name, "ingest");
+    }
+
+    #[test]
+    fn stat_blobs_dir() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "blobs").unwrap();
+        let stat = server.stat(1).unwrap();
+        assert_eq!(stat.file_type, FileType::Directory);
+        assert_eq!(&*stat.name, "blobs");
     }
 }
