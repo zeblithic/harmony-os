@@ -597,4 +597,73 @@ mod tests {
         );
         assert_eq!(runtime.peer_count(), 1);
     }
+
+    #[test]
+    fn two_runtimes_discover_each_other() {
+        let mut rt_a = make_runtime_with_seed(42);
+        let mut rt_b = make_runtime_with_seed(99);
+
+        // Verify distinct identities (same seed = same keypair = useless test).
+        assert_ne!(
+            rt_a.identity().public_identity().address_hash,
+            rt_b.identity().public_identity().address_hash,
+            "runtimes must have distinct identities"
+        );
+
+        rt_a.register_interface("net0");
+        rt_b.register_interface("net0");
+        rt_a.register_announcing_destination("harmony", &["node"], 300_000, 0);
+        rt_b.register_announcing_destination("harmony", &["node"], 300_000, 0);
+
+        let mut a_discovered_b = false;
+        let mut b_discovered_a = false;
+
+        let addr_a = rt_a.identity().public_identity().address_hash;
+        let addr_b = rt_b.identity().public_identity().address_hash;
+
+        for tick in 0..100u64 {
+            let now = tick * 1_000; // 1 second per tick
+
+            // Tick both runtimes — collects announces and heartbeats.
+            let actions_a = rt_a.tick(now);
+            let actions_b = rt_b.tick(now);
+
+            // Shuttle A's outbound packets to B.
+            for action in &actions_a {
+                if let RuntimeAction::SendOnInterface { raw, .. } = action {
+                    let results = rt_b.handle_packet("net0", raw.clone(), now);
+                    for r in &results {
+                        if let RuntimeAction::PeerDiscovered { address_hash, .. } = r {
+                            if *address_hash == addr_a {
+                                b_discovered_a = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Shuttle B's outbound packets to A.
+            for action in &actions_b {
+                if let RuntimeAction::SendOnInterface { raw, .. } = action {
+                    let results = rt_a.handle_packet("net0", raw.clone(), now);
+                    for r in &results {
+                        if let RuntimeAction::PeerDiscovered { address_hash, .. } = r {
+                            if *address_hash == addr_b {
+                                a_discovered_b = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if a_discovered_b && b_discovered_a {
+                break;
+            }
+        }
+
+        assert!(b_discovered_a, "B should have discovered A via announce");
+        assert!(a_discovered_b, "A should have discovered B via announce");
+        assert_eq!(rt_a.peer_count(), 1);
+        assert_eq!(rt_b.peer_count(), 1);
+    }
 }
