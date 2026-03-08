@@ -26,7 +26,10 @@ const ROOT: QPath = 0;
 const BLOBS_DIR: QPath = 1;
 const CHUNKS_DIR: QPath = 2;
 const INGEST: QPath = 3;
-const BLOB_QPATH_BASE: QPath = 0x1000;
+/// Blob QPaths: `0x1_0000_0000 + u32_from_cid[0..4]`.
+/// Chunk QPaths: `0x100_0000 + hash_bits` (hash_bits is 21 bits, max 0x1F_FFFF).
+/// These ranges are disjoint: chunks top out at 0x11F_FFFF, blobs start at 0x1_0000_0000.
+const BLOB_QPATH_BASE: QPath = 0x1_0000_0000;
 const CHUNK_QPATH_BASE: QPath = 0x100_0000;
 
 // ── Node taxonomy ───────────────────────────────────────────────────
@@ -70,9 +73,10 @@ enum IngestState {
 ///
 /// Stores blobs (identified by 256-bit CID) and their constituent
 /// chunks (identified by `ChunkAddr`). New content enters via the
-/// `/ingest` pseudo-file: write the raw blob bytes, then clunk to
+/// `/ingest` pseudo-file: write the raw blob bytes, then **read** to
 /// finalize. The server chunks the data, computes the CID, and stores
-/// both the blob manifest and individual chunk data.
+/// both the blob manifest and individual chunk data. Clunking the
+/// ingest fid without reading first silently discards the buffer.
 pub struct ContentServer {
     /// Chunk data indexed by (hash_bits, raw ChunkAddr fields).
     /// Uses a Vec because ChunkAddr does not implement Ord.
@@ -128,6 +132,13 @@ impl ContentServer {
     }
 
     /// Find a chunk by its `hash_bits` value.
+    ///
+    /// Returns the first chunk whose 21-bit `hash_bits` matches. Within a
+    /// single `Athenaeum`, addresses are unique by construction (collision
+    /// resolution). Across independently ingested blobs a hash_bits collision
+    /// is theoretically possible; in that case the first stored match wins.
+    /// The `/chunks/<addr>` namespace inherits this: two chunks sharing
+    /// hash_bits would map to the same filename and only the first is reachable.
     fn find_chunk(&self, hash_bits: u32) -> Option<&ChunkAddr> {
         self.chunks
             .iter()
@@ -141,11 +152,12 @@ impl ContentServer {
             .ingest_buffers
             .get_mut(&fid)
             .ok_or(IpcError::InvalidArgument)?;
+        // Peek before transitioning — a read-before-write must not poison the fid.
+        if matches!(buf, IngestState::Writing(v) if v.is_empty()) {
+            return Err(IpcError::InvalidArgument);
+        }
         match core::mem::replace(buf, IngestState::Done) {
             IngestState::Writing(data) => {
-                if data.is_empty() {
-                    return Err(IpcError::InvalidArgument); // read before write
-                }
                 if data.len() > MAX_BLOB_SIZE {
                     return Err(IpcError::ResourceExhausted);
                 }
@@ -364,7 +376,10 @@ impl FileServer for ContentServer {
         }
         match &state.node {
             NodeKind::Root | NodeKind::BlobsDir | NodeKind::ChunksDir => Err(IpcError::IsDirectory),
-            NodeKind::Ingest => self.finalize_ingest(fid),
+            NodeKind::Ingest => {
+                let response = self.finalize_ingest(fid)?;
+                Ok(slice_data(&response, offset, count))
+            }
             NodeKind::Blob(cid) => {
                 let cid = *cid;
                 self.read_blob(&cid, offset, count)
@@ -376,6 +391,9 @@ impl FileServer for ContentServer {
         }
     }
 
+    // NOTE: `_offset` is intentionally ignored for the ingest ctl-file.
+    // Writes are always appended to the accumulation buffer regardless of
+    // the requested offset, matching Plan 9 ctl-file conventions.
     fn write(&mut self, fid: Fid, _offset: u64, data: &[u8]) -> Result<u32, IpcError> {
         let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
         if !state.is_open {
@@ -747,6 +765,36 @@ mod tests {
         server.walk(0, 1, "ingest").unwrap();
         server.open(1, OpenMode::ReadWrite).unwrap();
         assert_eq!(server.read(1, 0, 256), Err(IpcError::InvalidArgument));
+    }
+
+    #[test]
+    fn ingest_read_before_write_does_not_poison_fid() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "ingest").unwrap();
+        server.open(1, OpenMode::ReadWrite).unwrap();
+        // Read before write — should fail but NOT poison the fid.
+        assert_eq!(server.read(1, 0, 256), Err(IpcError::InvalidArgument));
+        // Fid should still be usable: write then read to finalize.
+        let blob_data = alloc::vec![0xBBu8; 4096];
+        server.write(1, 0, &blob_data).unwrap();
+        let response = server.read(1, 0, 256).unwrap();
+        assert_eq!(response.len(), 40);
+    }
+
+    #[test]
+    fn ingest_read_honors_offset_and_count() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "ingest").unwrap();
+        server.open(1, OpenMode::ReadWrite).unwrap();
+        let blob_data = alloc::vec![0xCCu8; 4096];
+        server.write(1, 0, &blob_data).unwrap();
+        // Read only bytes 32..40 (chunk_count + blob_size portion of response)
+        let slice = server.read(1, 32, 8).unwrap();
+        assert_eq!(slice.len(), 8);
+        let chunk_count = u32::from_le_bytes(slice[0..4].try_into().unwrap());
+        let blob_size = u32::from_le_bytes(slice[4..8].try_into().unwrap());
+        assert_eq!(chunk_count, 1);
+        assert_eq!(blob_size, 4096);
     }
 
     #[test]
