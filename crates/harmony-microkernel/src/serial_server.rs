@@ -45,8 +45,18 @@ impl Default for SerialServer {
 impl SerialServer {
     pub fn new() -> Self {
         let mut fids = BTreeMap::new();
-        fids.insert(0, FidState { qpath: QPATH_ROOT, is_open: false, mode: None });
-        SerialServer { fids, buf: Vec::new() }
+        fids.insert(
+            0,
+            FidState {
+                qpath: QPATH_ROOT,
+                is_open: false,
+                mode: None,
+            },
+        );
+        SerialServer {
+            fids,
+            buf: Vec::new(),
+        }
     }
 
     /// Access the accumulated write buffer.
@@ -67,7 +77,14 @@ impl FileServer for SerialServer {
         if name != "log" {
             return Err(IpcError::NotFound);
         }
-        self.fids.insert(new_fid, FidState { qpath: QPATH_LOG, is_open: false, mode: None });
+        self.fids.insert(
+            new_fid,
+            FidState {
+                qpath: QPATH_LOG,
+                is_open: false,
+                mode: None,
+            },
+        );
         Ok(QPATH_LOG)
     }
 
@@ -117,8 +134,7 @@ impl FileServer for SerialServer {
         if matches!(state.mode, Some(OpenMode::Read)) {
             return Err(IpcError::PermissionDenied);
         }
-        let len = u32::try_from(data.len())
-            .map_err(|_| IpcError::ResourceExhausted)?;
+        let len = u32::try_from(data.len()).map_err(|_| IpcError::ResourceExhausted)?;
         self.buf.extend_from_slice(data);
         Ok(len)
     }
@@ -137,7 +153,14 @@ impl FileServer for SerialServer {
         }
         let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
         let qpath = state.qpath;
-        self.fids.insert(new_fid, FidState { qpath, is_open: false, mode: None });
+        self.fids.insert(
+            new_fid,
+            FidState {
+                qpath,
+                is_open: false,
+                mode: None,
+            },
+        );
         Ok(qpath)
     }
 

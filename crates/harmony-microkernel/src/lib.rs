@@ -11,6 +11,8 @@
 
 extern crate alloc;
 
+#[cfg(feature = "kernel")]
+pub mod content_server;
 pub mod echo;
 #[cfg(feature = "kernel")]
 pub mod kernel;
@@ -56,6 +58,9 @@ pub enum IpcError {
     IsDirectory,
     ReadOnly,
     ResourceExhausted,
+    /// The operation conflicts with existing state (e.g. cross-blob chunk
+    /// address collision — different content at the same 21-bit address).
+    Conflict,
     NotSupported,
     InvalidArgument,
 }

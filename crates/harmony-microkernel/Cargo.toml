@@ -19,6 +19,7 @@ kernel = [
     "dep:harmony-crypto", "harmony-crypto/std",
     "dep:harmony-identity", "harmony-identity/std", "harmony-identity/test-utils",
     "dep:harmony-platform", "harmony-platform/std",
+    "dep:harmony-athenaeum", "harmony-athenaeum/std",
 ]
 
 [dependencies]
@@ -29,5 +30,6 @@ harmony-unikernel = { workspace = true }
 harmony-crypto = { workspace = true, optional = true }
 harmony-identity = { workspace = true, optional = true }
 harmony-platform = { workspace = true, optional = true }
+harmony-athenaeum = { workspace = true, optional = true }
 
 [dev-dependencies]
