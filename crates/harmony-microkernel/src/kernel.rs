@@ -1970,9 +1970,7 @@ mod tests {
         kernel.lyll_mut().set_nakaiah_state_hash(nakaiah_hash);
 
         // Simulate Nakaiah compromise -- change its state hash to something unexpected.
-        kernel
-            .nakaiah_mut()
-            .set_state_hash(ContentHash([0xFF; 32]));
+        kernel.nakaiah_mut().set_state_hash(ContentHash([0xFF; 32]));
 
         // Lyll detects it.
         let verdict = kernel

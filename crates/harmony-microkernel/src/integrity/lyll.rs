@@ -147,6 +147,11 @@ impl Lyll {
             return IntegrityVerdict::Allow;
         }
 
+        let zone = match record.entry {
+            HashEntry::CidBacked { .. } => MemoryZone::PublicDurable,
+            HashEntry::Snapshot { .. } => MemoryZone::PublicEphemeral,
+        };
+
         self.quarantine.add(QuarantineRecord {
             paddr,
             expected_hash: expected,
@@ -154,7 +159,7 @@ impl Lyll {
             owner_pid: record.owner_pid,
             mapped_pids: Vec::new(),
             timestamp,
-            zone: MemoryZone::PublicDurable,
+            zone,
         });
 
         IntegrityVerdict::Quarantine {
@@ -200,7 +205,7 @@ impl Lyll {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::{ContentHash, PhysAddr};
+    use crate::vm::{ContentHash, MemoryZone, PhysAddr};
 
     fn test_config() -> LyllConfig {
         LyllConfig {
@@ -306,6 +311,34 @@ mod tests {
         ));
         assert!(lyll.quarantine.is_quarantined(PhysAddr(0x1000)));
         assert_eq!(lyll.quarantine.records()[0].timestamp, 42);
+    }
+
+    #[test]
+    fn quarantine_zone_matches_entry_type() {
+        let mut lyll = Lyll::new(test_config());
+        // Snapshot entry → PublicEphemeral zone in quarantine.
+        lyll.register_frame(
+            PhysAddr(0x1000),
+            HashEntry::Snapshot {
+                hash: [0xAA; 32],
+                generation: 0,
+            },
+            1,
+        );
+        lyll.verify_frame(PhysAddr(0x1000), [0xBB; 32], 0);
+        assert_eq!(
+            lyll.quarantine.records()[0].zone,
+            MemoryZone::PublicEphemeral
+        );
+
+        // CidBacked entry → PublicDurable zone in quarantine.
+        lyll.register_frame(
+            PhysAddr(0x2000),
+            HashEntry::CidBacked { cid: [0xCC; 32] },
+            2,
+        );
+        lyll.verify_frame(PhysAddr(0x2000), [0xDD; 32], 0);
+        assert_eq!(lyll.quarantine.records()[1].zone, MemoryZone::PublicDurable);
     }
 
     #[test]
