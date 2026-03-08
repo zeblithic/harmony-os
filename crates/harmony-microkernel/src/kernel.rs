@@ -1775,6 +1775,221 @@ mod tests {
         assert_eq!(kernel.nakaiah().integrity_registry_len(), 1);
     }
 
+    use crate::integrity::nakaiah::CapChain;
+    use crate::integrity::IntegrityVerdict;
+    use crate::vm::{AccessOp, ViolationReason};
+
+    #[test]
+    fn public_corruption_detected_and_quarantined() {
+        let mut kernel = make_kernel();
+        let pid = spawn_test_process(&mut kernel);
+        kernel
+            .vm_create_space(
+                pid,
+                default_budget(),
+                MockPageTable::new(PhysAddr(0x20_0000)),
+            )
+            .unwrap();
+
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize,
+                rw_user_flags(),
+                FrameClassification::empty(),
+            )
+            .unwrap();
+
+        // Get the physical address of the mapped frame.
+        let paddr = kernel
+            .vm()
+            .space(pid)
+            .unwrap()
+            .regions
+            .get(&VirtAddr(0x1000))
+            .unwrap()
+            .frames[0];
+
+        // Simulate Lyll spot-checking and finding tampered content.
+        let tampered_hash = [0xFF; 32];
+        let verdict = kernel.lyll_mut().verify_frame(paddr, tampered_hash, 100);
+        assert!(
+            matches!(verdict, IntegrityVerdict::Quarantine { .. }),
+            "expected Quarantine, got {:?}",
+            verdict
+        );
+        assert!(kernel.lyll().quarantine.is_quarantined(paddr));
+    }
+
+    #[test]
+    fn private_corruption_kills_process() {
+        let mut kernel = make_kernel();
+        let pid = spawn_test_process(&mut kernel);
+        kernel
+            .vm_create_space(
+                pid,
+                default_budget(),
+                MockPageTable::new(PhysAddr(0x20_0000)),
+            )
+            .unwrap();
+
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize,
+                rw_user_flags(),
+                FrameClassification::ENCRYPTED,
+            )
+            .unwrap();
+
+        let paddr = kernel
+            .vm()
+            .space(pid)
+            .unwrap()
+            .regions
+            .get(&VirtAddr(0x1000))
+            .unwrap()
+            .frames[0];
+
+        // Grant access.
+        kernel
+            .nakaiah_mut()
+            .grant_access(pid, paddr, CapChain::Owner);
+
+        // Tampered content -> kill.
+        let verdict = kernel.nakaiah().verify_access(
+            pid,
+            paddr,
+            AccessOp::Read,
+            [0xFF; 32], // Wrong hash -- content was zeroed at map time.
+        );
+        assert!(
+            matches!(
+                verdict,
+                IntegrityVerdict::Kill {
+                    reason: ViolationReason::ContentTampered,
+                    ..
+                }
+            ),
+            "expected Kill/ContentTampered, got {:?}",
+            verdict
+        );
+    }
+
+    #[test]
+    fn unauthorized_access_kills_process() {
+        let mut kernel = make_kernel();
+        let pid = spawn_test_process(&mut kernel);
+        kernel
+            .vm_create_space(
+                pid,
+                default_budget(),
+                MockPageTable::new(PhysAddr(0x20_0000)),
+            )
+            .unwrap();
+
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize,
+                rw_user_flags(),
+                FrameClassification::ENCRYPTED,
+            )
+            .unwrap();
+
+        let paddr = kernel
+            .vm()
+            .space(pid)
+            .unwrap()
+            .regions
+            .get(&VirtAddr(0x1000))
+            .unwrap()
+            .frames[0];
+
+        // No capability granted -- unauthorized.
+        let verdict = kernel.nakaiah().verify_access(
+            pid,
+            paddr,
+            AccessOp::Read,
+            [0u8; 32], // Content matches (it's zeroed).
+        );
+        assert!(
+            matches!(
+                verdict,
+                IntegrityVerdict::Kill {
+                    reason: ViolationReason::UnauthorizedAccess,
+                    ..
+                }
+            ),
+            "expected Kill/UnauthorizedAccess, got {:?}",
+            verdict
+        );
+    }
+
+    #[test]
+    fn destroy_process_cleans_up_integrity() {
+        let mut kernel = make_kernel();
+        let pid = spawn_test_process(&mut kernel);
+        kernel
+            .vm_create_space(
+                pid,
+                default_budget(),
+                MockPageTable::new(PhysAddr(0x20_0000)),
+            )
+            .unwrap();
+
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize * 3,
+                rw_user_flags(),
+                FrameClassification::ENCRYPTED,
+            )
+            .unwrap();
+
+        assert_eq!(kernel.lyll().registry_len(), 3);
+        assert_eq!(kernel.nakaiah().integrity_registry_len(), 3);
+
+        kernel.destroy_process(pid).unwrap();
+
+        // Both guardians should have cleaned up.
+        assert_eq!(kernel.lyll().registry_len(), 0);
+        assert_eq!(kernel.nakaiah().integrity_registry_len(), 0);
+    }
+
+    #[test]
+    fn guardian_compromise_panics() {
+        let mut kernel = make_kernel();
+
+        // Exchange initial state hashes.
+        let nakaiah_hash = kernel.nakaiah().state_hash();
+        kernel.lyll_mut().set_nakaiah_state_hash(nakaiah_hash);
+
+        // Simulate Nakaiah compromise -- change its state hash to something unexpected.
+        kernel
+            .nakaiah_mut()
+            .set_state_hash(ContentHash([0xFF; 32]));
+
+        // Lyll detects it.
+        let verdict = kernel
+            .lyll()
+            .co_verify_nakaiah(kernel.nakaiah().state_hash());
+        assert!(
+            matches!(
+                verdict,
+                IntegrityVerdict::Panic {
+                    reason: ViolationReason::GuardianStateCorrupted
+                }
+            ),
+            "expected Panic/GuardianStateCorrupted, got {:?}",
+            verdict
+        );
+    }
+
     #[test]
     fn unmap_region_unregisters_from_guardians() {
         let mut kernel = make_kernel();
