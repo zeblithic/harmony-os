@@ -20,6 +20,9 @@ x86_64 = { version = "0.15", default-features = false, features = ["instructions
 # Ring 2 microkernel (optional — only with `ring2` feature)
 harmony-microkernel = { path = "../harmony-microkernel", default-features = false, optional = true }
 
+# Ring 3 OS layer (optional — only with `ring3` feature)
+harmony-os = { path = "../harmony-os", default-features = false, optional = true }
+
 # Force software crypto — cross-compiling from aarch64 to x86_64-unknown-none
 # causes LLVM crashes with hardware-accelerated SHA and Poly1305 backends.
 sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
@@ -30,3 +33,5 @@ default = []
 qemu-test = []
 # Ring 2 microkernel IPC demo on boot.
 ring2 = ["dep:harmony-microkernel"]
+# Ring 3 Linuxulator — run Linux binaries via syscall translation.
+ring3 = ["ring2", "dep:harmony-os"]

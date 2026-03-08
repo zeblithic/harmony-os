@@ -1071,9 +1071,7 @@ mod tests {
 
         // Plant a conflicting chunk at that address with different data.
         let conflict = alloc::vec![0x00u8; ath.chunks[0].size_bytes()];
-        server
-            .chunks
-            .insert(target_hb, (ath.chunks[0], conflict));
+        server.chunks.insert(target_hb, (ath.chunks[0], conflict));
 
         // Ingest the blob — should detect the collision and reject.
         server.walk(0, 1, "ingest").unwrap();
