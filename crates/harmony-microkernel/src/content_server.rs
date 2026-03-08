@@ -236,6 +236,11 @@ impl ContentServer {
                             // Conflict (not ResourceExhausted) distinguishes this from
                             // capacity errors — callers know the data is valid but clashes
                             // with existing chunk state.
+                            //
+                            // This is permanent for this blob on this server instance:
+                            // the colliding chunk at `hb` won't change. Retrying the
+                            // same blob data will always fail. The fid is restored to
+                            // Writing so the caller can re-open for different data.
                             *self.ingest_buffers.get_mut(&fid).unwrap() =
                                 IngestState::Writing(data);
                             return Err(IpcError::Conflict);
@@ -386,6 +391,11 @@ impl FileServer for ContentServer {
             }
             NodeKind::ChunksDir => {
                 if name.len() != 8 {
+                    return Err(IpcError::NotFound);
+                }
+                // Enforce lowercase hex to match the canonical format produced
+                // by format_addr_hex (e.g. "001fffff", not "001FFFFF").
+                if name.bytes().any(|b| b.is_ascii_uppercase()) {
                     return Err(IpcError::NotFound);
                 }
                 let hash_bits = u32::from_str_radix(name, 16).map_err(|_| IpcError::NotFound)?;
