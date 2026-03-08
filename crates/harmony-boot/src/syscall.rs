@@ -167,6 +167,11 @@ extern "C" fn syscall_entry() {
         "pop r11",           // return RFLAGS
         "pop rcx",           // return RIP
 
+        // Restore RFLAGS from R11 (syscall saved original RFLAGS there,
+        // and FMASK cleared IF on entry — must re-enable interrupts).
+        "push r11",
+        "popfq",
+
         // In our flat Ring 0 MVP (no privilege separation), we use jmp
         // instead of sysretq. sysretq forces RPL=3 on CS which requires
         // valid Ring 3 GDT entries and user-accessible page mappings.

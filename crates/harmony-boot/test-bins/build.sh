@@ -10,16 +10,16 @@ cd "$(dirname "$0")"
 AS="${AS:-}"
 LD="${LD:-}"
 
-if [ -z "$AS" ]; then
+if [ -z "$AS" ] || [ -z "$LD" ]; then
     if command -v x86_64-linux-gnu-as >/dev/null 2>&1; then
-        AS=x86_64-linux-gnu-as
-        LD=x86_64-linux-gnu-ld
+        AS="${AS:-x86_64-linux-gnu-as}"
+        LD="${LD:-x86_64-linux-gnu-ld}"
     elif command -v x86_64-elf-as >/dev/null 2>&1; then
-        AS=x86_64-elf-as
-        LD=x86_64-elf-ld
+        AS="${AS:-x86_64-elf-as}"
+        LD="${LD:-x86_64-elf-ld}"
     elif command -v as >/dev/null 2>&1; then
-        AS=as
-        LD=ld
+        AS="${AS:-as}"
+        LD="${LD:-ld}"
     else
         echo "No x86_64 assembler found. Install x86_64-elf-binutils." >&2
         exit 1

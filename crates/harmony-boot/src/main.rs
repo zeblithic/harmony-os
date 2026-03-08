@@ -466,12 +466,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             .map(|s| s.vaddr)
             .min()
             .unwrap();
-        let vaddr_max = parsed
+        let vaddr_max = match parsed
             .segments
             .iter()
-            .map(|s| s.vaddr.saturating_add(s.memsz))
-            .max()
-            .unwrap();
+            .try_fold(0u64, |acc, s| {
+                s.vaddr.checked_add(s.memsz).map(|end| acc.max(end))
+            }) {
+            Some(max) => max,
+            None => {
+                let _ = writeln!(serial, "[LINUX] segment vaddr+memsz overflow");
+                loop {
+                    x86_64::instructions::hlt();
+                }
+            }
+        };
         let total_size = (vaddr_max - vaddr_min) as usize;
         let mut mem = alloc::vec![0u8; total_size];
 
@@ -485,7 +493,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
         // Compute entry point with checked arithmetic
         let real_entry = match parsed.entry_point.checked_sub(vaddr_min) {
-            Some(offset) => mem.as_ptr() as usize + offset as usize,
+            Some(offset) if (offset as usize) < total_size => {
+                mem.as_ptr() as usize + offset as usize
+            }
+            Some(_) => {
+                let _ = writeln!(serial, "[LINUX] entry_point beyond loaded region");
+                loop {
+                    x86_64::instructions::hlt();
+                }
+            }
             None => {
                 let _ = writeln!(serial, "[LINUX] entry_point < vaddr_min");
                 loop {
@@ -498,7 +514,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // 3. Allocate stack
         let stack_size = 64 * 1024; // 64 KiB
         let stack = alloc::vec![0u8; stack_size];
-        let stack_top = stack.as_ptr() as usize + stack_size;
+        let stack_top = (stack.as_ptr() as usize + stack_size) & !0xF;
         let _ = writeln!(serial, "[LINUX] stack_top=0x{:x}", stack_top);
 
         // 4. Create Linuxulator with global storage
