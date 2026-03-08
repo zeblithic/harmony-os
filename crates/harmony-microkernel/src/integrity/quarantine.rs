@@ -55,6 +55,15 @@ impl QuarantineRegistry {
     pub fn records(&self) -> &[QuarantineRecord] {
         &self.records
     }
+
+    /// Enrich a quarantine record with the list of processes that had the
+    /// frame mapped. Called by the Kernel layer which has access to the
+    /// CapTracker (Lyll itself doesn't know about process mappings).
+    pub fn set_mapped_pids(&mut self, paddr: PhysAddr, pids: Vec<u32>) {
+        if let Some(record) = self.records.iter_mut().find(|r| r.paddr == paddr) {
+            record.mapped_pids = pids;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -110,5 +119,23 @@ mod tests {
     fn quarantine_release_nonexistent_returns_none() {
         let mut q = QuarantineRegistry::new();
         assert!(q.release(PhysAddr(0x9000)).is_none());
+    }
+
+    #[test]
+    fn set_mapped_pids_enriches_record() {
+        let mut q = QuarantineRegistry::new();
+        q.add(QuarantineRecord {
+            paddr: PhysAddr(0x1000),
+            expected_hash: [0xAA; 32],
+            actual_hash: [0xBB; 32],
+            owner_pid: 1,
+            mapped_pids: Vec::new(),
+            timestamp: 0,
+            zone: MemoryZone::PublicDurable,
+        });
+        assert!(q.records()[0].mapped_pids.is_empty());
+
+        q.set_mapped_pids(PhysAddr(0x1000), vec![1, 3, 7]);
+        assert_eq!(q.records()[0].mapped_pids, vec![1, 3, 7]);
     }
 }
