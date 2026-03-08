@@ -11,9 +11,9 @@
 
 extern crate alloc;
 
-pub mod echo;
 #[cfg(feature = "kernel")]
 pub mod content_server;
+pub mod echo;
 #[cfg(feature = "kernel")]
 pub mod kernel;
 pub mod namespace;

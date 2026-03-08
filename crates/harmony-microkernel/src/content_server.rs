@@ -16,9 +16,9 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use harmony_athenaeum::{Athenaeum, ChunkAddr, sha256_hash, MAX_BLOB_SIZE};
+use harmony_athenaeum::{sha256_hash, Athenaeum, ChunkAddr, MAX_BLOB_SIZE};
 
-use crate::{Fid, QPath, OpenMode, FileType, FileStat, IpcError, FileServer};
+use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
 
 // ── QPath constants ─────────────────────────────────────────────────
 
@@ -89,12 +89,15 @@ impl ContentServer {
     /// Create a new, empty ContentServer with fid 0 attached to the root.
     pub fn new() -> Self {
         let mut fids = BTreeMap::new();
-        fids.insert(0, FidState {
-            qpath: ROOT,
-            node: NodeKind::Root,
-            is_open: false,
-            mode: None,
-        });
+        fids.insert(
+            0,
+            FidState {
+                qpath: ROOT,
+                node: NodeKind::Root,
+                is_open: false,
+                mode: None,
+            },
+        );
         Self {
             chunks: Vec::new(),
             blobs: BTreeMap::new(),
@@ -154,8 +157,8 @@ impl ContentServer {
                     return Ok(self.build_ingest_response(&cid, ath));
                 }
 
-                let ath = Athenaeum::from_blob(cid, &data)
-                    .map_err(|_| IpcError::ResourceExhausted)?;
+                let ath =
+                    Athenaeum::from_blob(cid, &data).map_err(|_| IpcError::ResourceExhausted)?;
 
                 // Store chunks — iterate blob data in 4096-byte pieces,
                 // pad each to addr.size_bytes()
@@ -298,8 +301,7 @@ impl FileServer for ContentServer {
                 if name.len() != 8 {
                     return Err(IpcError::NotFound);
                 }
-                let hash_bits =
-                    u32::from_str_radix(name, 16).map_err(|_| IpcError::NotFound)?;
+                let hash_bits = u32::from_str_radix(name, 16).map_err(|_| IpcError::NotFound)?;
                 let addr = *self.find_chunk(hash_bits).ok_or(IpcError::NotFound)?;
                 (Self::chunk_qpath(&addr), NodeKind::Chunk(addr))
             }
@@ -341,7 +343,8 @@ impl FileServer for ContentServer {
                 if !matches!(mode, OpenMode::ReadWrite) {
                     return Err(IpcError::PermissionDenied);
                 }
-                self.ingest_buffers.insert(fid, IngestState::Writing(Vec::new()));
+                self.ingest_buffers
+                    .insert(fid, IngestState::Writing(Vec::new()));
             }
         }
         // Re-borrow mutably after the match (ingest_buffers insert released the borrow).
@@ -376,14 +379,13 @@ impl FileServer for ContentServer {
             return Err(IpcError::NotOpen);
         }
         match &state.node {
-            NodeKind::Root | NodeKind::BlobsDir | NodeKind::ChunksDir => {
-                Err(IpcError::IsDirectory)
-            }
-            NodeKind::Blob(_) | NodeKind::Chunk(_) => {
-                Err(IpcError::ReadOnly)
-            }
+            NodeKind::Root | NodeKind::BlobsDir | NodeKind::ChunksDir => Err(IpcError::IsDirectory),
+            NodeKind::Blob(_) | NodeKind::Chunk(_) => Err(IpcError::ReadOnly),
             NodeKind::Ingest => {
-                let buf = self.ingest_buffers.get_mut(&fid).ok_or(IpcError::InvalidArgument)?;
+                let buf = self
+                    .ingest_buffers
+                    .get_mut(&fid)
+                    .ok_or(IpcError::InvalidArgument)?;
                 match buf {
                     IngestState::Writing(ref mut v) => {
                         v.extend_from_slice(data);
@@ -463,12 +465,15 @@ impl FileServer for ContentServer {
         let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
         let qpath = state.qpath;
         let node = state.node.clone();
-        self.fids.insert(new_fid, FidState {
-            qpath,
-            node,
-            is_open: false,
-            mode: None,
-        });
+        self.fids.insert(
+            new_fid,
+            FidState {
+                qpath,
+                node,
+                is_open: false,
+                mode: None,
+            },
+        );
         Ok(qpath)
     }
 }
@@ -589,7 +594,10 @@ mod tests {
     fn open_ingest_read_only_rejected() {
         let mut server = ContentServer::new();
         server.walk(0, 1, "ingest").unwrap();
-        assert_eq!(server.open(1, OpenMode::Read), Err(IpcError::PermissionDenied));
+        assert_eq!(
+            server.open(1, OpenMode::Read),
+            Err(IpcError::PermissionDenied)
+        );
     }
 
     #[test]
@@ -611,7 +619,10 @@ mod tests {
         let mut server = ContentServer::new();
         server.walk(0, 1, "ingest").unwrap();
         server.open(1, OpenMode::ReadWrite).unwrap();
-        assert_eq!(server.open(1, OpenMode::ReadWrite), Err(IpcError::PermissionDenied));
+        assert_eq!(
+            server.open(1, OpenMode::ReadWrite),
+            Err(IpcError::PermissionDenied)
+        );
     }
 
     #[test]

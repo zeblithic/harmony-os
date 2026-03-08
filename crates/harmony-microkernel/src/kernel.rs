@@ -237,10 +237,7 @@ impl Kernel {
         // so no heap allocation is needed to release the process borrow.
         let (target_pid, server_root_fid, remainder) = {
             let process = self.processes.get(&from_pid).ok_or(IpcError::NotFound)?;
-            let (mount, remainder) = process
-                .namespace
-                .resolve(path)
-                .ok_or(IpcError::NotFound)?;
+            let (mount, remainder) = process.namespace.resolve(path).ok_or(IpcError::NotFound)?;
             let target_pid = mount.target_pid;
             let server_root_fid = mount.root_fid;
             // Capability check uses &self — compatible with the shared
@@ -330,12 +327,7 @@ impl Kernel {
     /// subsequent operations. Once a fid is established, it remains
     /// usable even if the originating token expires. This matches 9P
     /// semantics where authentication gates session setup, not every I/O.
-    pub fn open(
-        &mut self,
-        from_pid: u32,
-        fid: Fid,
-        mode: OpenMode,
-    ) -> Result<(), IpcError> {
+    pub fn open(&mut self, from_pid: u32, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
         let &(target_pid, server_fid) = self
             .fid_owners
             .get(&(from_pid, fid))
@@ -386,11 +378,7 @@ impl Kernel {
     }
 
     /// Stat a previously walked fid. Does not require the fid to be open.
-    pub fn stat(
-        &mut self,
-        from_pid: u32,
-        fid: Fid,
-    ) -> Result<crate::FileStat, IpcError> {
+    pub fn stat(&mut self, from_pid: u32, fid: Fid) -> Result<crate::FileStat, IpcError> {
         let &(target_pid, server_fid) = self
             .fid_owners
             .get(&(from_pid, fid))
@@ -405,11 +393,7 @@ impl Kernel {
     /// Release a fid. Always removes the kernel-side tracking entry,
     /// even if the server-side clunk fails — this prevents the client
     /// from being stuck with an unclunkable fid.
-    pub fn clunk(
-        &mut self,
-        from_pid: u32,
-        fid: Fid,
-    ) -> Result<(), IpcError> {
+    pub fn clunk(&mut self, from_pid: u32, fid: Fid) -> Result<(), IpcError> {
         let (target_pid, server_fid) = self
             .fid_owners
             .remove(&(from_pid, fid))
@@ -444,10 +428,14 @@ mod tests {
         let kernel_id = PrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id);
 
-        let pid = kernel.spawn_process("echo", Box::new(EchoServer::new()), &[]).unwrap();
+        let pid = kernel
+            .spawn_process("echo", Box::new(EchoServer::new()), &[])
+            .unwrap();
         assert_eq!(pid, 0);
 
-        let pid2 = kernel.spawn_process("echo2", Box::new(EchoServer::new()), &[]).unwrap();
+        let pid2 = kernel
+            .spawn_process("echo2", Box::new(EchoServer::new()), &[])
+            .unwrap();
         assert_eq!(pid2, 1);
     }
 
@@ -553,15 +541,18 @@ mod tests {
         let mut kernel = Kernel::new(kernel_id);
 
         // pid 0 = echo server
-        let server_pid =
-            kernel.spawn_process("echo-server", Box::new(EchoServer::new()), &[]).unwrap();
+        let server_pid = kernel
+            .spawn_process("echo-server", Box::new(EchoServer::new()), &[])
+            .unwrap();
 
         // pid 1 = client (also an echo server, but we don't use its server)
-        let client_pid = kernel.spawn_process(
-            "client",
-            Box::new(EchoServer::new()),
-            &[("/echo", server_pid, 0)],
-        ).unwrap();
+        let client_pid = kernel
+            .spawn_process(
+                "client",
+                Box::new(EchoServer::new()),
+                &[("/echo", server_pid, 0)],
+            )
+            .unwrap();
 
         // Grant client access to server
         kernel
@@ -612,14 +603,17 @@ mod tests {
         let kernel_id = PrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id);
 
-        let server_pid =
-            kernel.spawn_process("echo-server", Box::new(EchoServer::new()), &[]).unwrap();
+        let server_pid = kernel
+            .spawn_process("echo-server", Box::new(EchoServer::new()), &[])
+            .unwrap();
         // Client has mount but NO capability
-        let client_pid = kernel.spawn_process(
-            "client",
-            Box::new(EchoServer::new()),
-            &[("/echo", server_pid, 0)],
-        ).unwrap();
+        let client_pid = kernel
+            .spawn_process(
+                "client",
+                Box::new(EchoServer::new()),
+                &[("/echo", server_pid, 0)],
+            )
+            .unwrap();
 
         assert_eq!(
             kernel.walk(client_pid, "/echo/hello", 0, 1, 0),
@@ -642,10 +636,7 @@ mod tests {
         kernel.walk(client, "/echo/hello", 0, 1, 0).unwrap();
         kernel.open(client, 1, OpenMode::Read).unwrap();
         kernel.clunk(client, 1).unwrap();
-        assert_eq!(
-            kernel.read(client, 1, 0, 256),
-            Err(IpcError::InvalidFid)
-        );
+        assert_eq!(kernel.read(client, 1, 0, 256), Err(IpcError::InvalidFid));
     }
 
     #[test]
@@ -667,20 +658,25 @@ mod tests {
         let mut kernel = Kernel::new(kernel_id);
 
         // Shared echo server
-        let server_pid =
-            kernel.spawn_process("echo-server", Box::new(EchoServer::new()), &[]).unwrap();
+        let server_pid = kernel
+            .spawn_process("echo-server", Box::new(EchoServer::new()), &[])
+            .unwrap();
 
         // Two clients, both mounting the same server
-        let client_a = kernel.spawn_process(
-            "client-a",
-            Box::new(EchoServer::new()),
-            &[("/echo", server_pid, 0)],
-        ).unwrap();
-        let client_b = kernel.spawn_process(
-            "client-b",
-            Box::new(EchoServer::new()),
-            &[("/echo", server_pid, 0)],
-        ).unwrap();
+        let client_a = kernel
+            .spawn_process(
+                "client-a",
+                Box::new(EchoServer::new()),
+                &[("/echo", server_pid, 0)],
+            )
+            .unwrap();
+        let client_b = kernel
+            .spawn_process(
+                "client-b",
+                Box::new(EchoServer::new()),
+                &[("/echo", server_pid, 0)],
+            )
+            .unwrap();
 
         kernel
             .grant_endpoint_cap(&mut entropy, client_a, server_pid, 0)
@@ -705,10 +701,7 @@ mod tests {
 
         // Client A clunks — client B's fid is unaffected
         kernel.clunk(client_a, 1).unwrap();
-        assert_eq!(
-            kernel.read(client_a, 1, 0, 256),
-            Err(IpcError::InvalidFid)
-        );
+        assert_eq!(kernel.read(client_a, 1, 0, 256), Err(IpcError::InvalidFid));
 
         // Client B still works
         let data_b2 = kernel.read(client_b, 1, 0, 256).unwrap();
@@ -749,7 +742,9 @@ mod tests {
         let kernel_id = PrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id);
 
-        let pid = kernel.spawn_process("test", Box::new(EchoServer::new()), &[]).unwrap();
+        let pid = kernel
+            .spawn_process("test", Box::new(EchoServer::new()), &[])
+            .unwrap();
         // target pid 99 doesn't exist
         assert_eq!(
             kernel.grant_endpoint_cap(&mut entropy, pid, 99, 0),
@@ -805,21 +800,23 @@ mod tests {
         let mut kernel = Kernel::new(kernel_id);
 
         // Spawn echo server as pid 0
-        let server_pid = kernel.spawn_process(
-            "echo-server",
-            Box::new(EchoServer::new()),
-            &[],
-        ).unwrap();
+        let server_pid = kernel
+            .spawn_process("echo-server", Box::new(EchoServer::new()), &[])
+            .unwrap();
 
         // Spawn client as pid 1, with echo server mounted at /svc/echo
-        let client_pid = kernel.spawn_process(
-            "harmony-node",
-            Box::new(EchoServer::new()),  // client also serves, but we test as client
-            &[("/svc/echo", server_pid, 0)],
-        ).unwrap();
+        let client_pid = kernel
+            .spawn_process(
+                "harmony-node",
+                Box::new(EchoServer::new()), // client also serves, but we test as client
+                &[("/svc/echo", server_pid, 0)],
+            )
+            .unwrap();
 
         // Grant client capability to access echo server
-        kernel.grant_endpoint_cap(&mut entropy, client_pid, server_pid, 0).unwrap();
+        kernel
+            .grant_endpoint_cap(&mut entropy, client_pid, server_pid, 0)
+            .unwrap();
 
         // -- Full IPC sequence: walk → open → read → clunk --
 
@@ -857,8 +854,14 @@ mod tests {
         kernel.clunk(client_pid, 2).unwrap();
 
         // Verify clunked fids are invalid
-        assert_eq!(kernel.read(client_pid, 1, 0, 256), Err(IpcError::InvalidFid));
-        assert_eq!(kernel.read(client_pid, 2, 0, 256), Err(IpcError::InvalidFid));
+        assert_eq!(
+            kernel.read(client_pid, 1, 0, 256),
+            Err(IpcError::InvalidFid)
+        );
+        assert_eq!(
+            kernel.read(client_pid, 2, 0, 256),
+            Err(IpcError::InvalidFid)
+        );
     }
 
     #[test]

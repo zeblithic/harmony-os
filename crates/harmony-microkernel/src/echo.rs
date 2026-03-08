@@ -3,11 +3,11 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use alloc::collections::BTreeMap;
 
-use crate::{Fid, QPath, FileServer, FileStat, FileType, IpcError, OpenMode};
+use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
 
 // ── QPath constants ─────────────────────────────────────────────────
 
@@ -39,11 +39,14 @@ impl EchoServer {
     /// Create a new EchoServer with fid 0 pre-attached to the root directory.
     pub fn new() -> Self {
         let mut fids = BTreeMap::new();
-        fids.insert(0, FidState {
-            qpath: ROOT,
-            is_open: false,
-            mode: None,
-        });
+        fids.insert(
+            0,
+            FidState {
+                qpath: ROOT,
+                is_open: false,
+                mode: None,
+            },
+        );
         Self {
             fids,
             echo_data: Vec::new(),
@@ -76,11 +79,14 @@ impl FileServer for EchoServer {
             _ => return Err(IpcError::NotFound),
         };
 
-        self.fids.insert(new_fid, FidState {
-            qpath,
-            is_open: false,
-            mode: None,
-        });
+        self.fids.insert(
+            new_fid,
+            FidState {
+                qpath,
+                is_open: false,
+                mode: None,
+            },
+        );
 
         Ok(qpath)
     }
@@ -142,8 +148,7 @@ impl FileServer for EchoServer {
             ROOT => Err(IpcError::IsDirectory),
             HELLO => Err(IpcError::ReadOnly),
             ECHO => {
-                let len = u32::try_from(data.len())
-                    .map_err(|_| IpcError::ResourceExhausted)?;
+                let len = u32::try_from(data.len()).map_err(|_| IpcError::ResourceExhausted)?;
                 self.echo_data = data.to_vec();
                 Ok(len)
             }
@@ -165,11 +170,14 @@ impl FileServer for EchoServer {
         }
         let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
         let qpath = state.qpath;
-        self.fids.insert(new_fid, FidState {
-            qpath,
-            is_open: false,
-            mode: None,
-        });
+        self.fids.insert(
+            new_fid,
+            FidState {
+                qpath,
+                is_open: false,
+                mode: None,
+            },
+        );
         Ok(qpath)
     }
 
@@ -297,10 +305,7 @@ mod tests {
         let mut server = EchoServer::new();
         server.walk(0, 1, "echo").unwrap();
         server.open(1, OpenMode::Read).unwrap();
-        assert_eq!(
-            server.write(1, 0, b"nope"),
-            Err(IpcError::PermissionDenied)
-        );
+        assert_eq!(server.write(1, 0, b"nope"), Err(IpcError::PermissionDenied));
     }
 
     #[test]
@@ -322,7 +327,10 @@ mod tests {
         let mut server = EchoServer::new();
         // Write mode on a directory is rejected at open time
         assert_eq!(server.open(0, OpenMode::Write), Err(IpcError::IsDirectory));
-        assert_eq!(server.open(0, OpenMode::ReadWrite), Err(IpcError::IsDirectory));
+        assert_eq!(
+            server.open(0, OpenMode::ReadWrite),
+            Err(IpcError::IsDirectory)
+        );
     }
 
     #[test]
@@ -330,7 +338,10 @@ mod tests {
         let mut server = EchoServer::new();
         server.walk(0, 1, "hello").unwrap();
         server.open(1, OpenMode::Read).unwrap();
-        assert_eq!(server.open(1, OpenMode::ReadWrite), Err(IpcError::PermissionDenied));
+        assert_eq!(
+            server.open(1, OpenMode::ReadWrite),
+            Err(IpcError::PermissionDenied)
+        );
     }
 
     #[test]

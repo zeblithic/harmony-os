@@ -27,7 +27,9 @@ impl Default for Namespace {
 
 impl Namespace {
     pub fn new() -> Self {
-        Namespace { mounts: BTreeMap::new() }
+        Namespace {
+            mounts: BTreeMap::new(),
+        }
     }
 
     /// Mount a server at `path`. Subsequent resolves matching this prefix
@@ -35,14 +37,25 @@ impl Namespace {
     ///
     /// Returns `Err(InvalidArgument)` if `path` does not start with `/`,
     /// or if a mount already exists at `path`.
-    pub fn mount(&mut self, path: &str, target_pid: u32, root_fid: Fid) -> Result<(), crate::IpcError> {
+    pub fn mount(
+        &mut self,
+        path: &str,
+        target_pid: u32,
+        root_fid: Fid,
+    ) -> Result<(), crate::IpcError> {
         if !path.starts_with('/') {
             return Err(crate::IpcError::InvalidArgument);
         }
         if self.mounts.contains_key(path) {
             return Err(crate::IpcError::InvalidArgument);
         }
-        self.mounts.insert(Arc::from(path), MountPoint { target_pid, root_fid });
+        self.mounts.insert(
+            Arc::from(path),
+            MountPoint {
+                target_pid,
+                root_fid,
+            },
+        );
         Ok(())
     }
 
@@ -159,7 +172,10 @@ mod tests {
     #[test]
     fn mount_rejects_path_without_leading_slash() {
         let mut ns = Namespace::new();
-        assert_eq!(ns.mount("echo", 1, 0), Err(crate::IpcError::InvalidArgument));
+        assert_eq!(
+            ns.mount("echo", 1, 0),
+            Err(crate::IpcError::InvalidArgument)
+        );
     }
 
     #[test]
