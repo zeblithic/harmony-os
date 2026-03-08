@@ -666,4 +666,58 @@ mod tests {
         assert_eq!(rt_a.peer_count(), 1);
         assert_eq!(rt_b.peer_count(), 1);
     }
+
+    #[test]
+    fn two_runtimes_exchange_heartbeats() {
+        let mut rt_a = make_runtime_with_seed(42);
+        let mut rt_b = make_runtime_with_seed(99);
+
+        rt_a.register_interface("net0");
+        rt_b.register_interface("net0");
+        rt_a.register_announcing_destination("harmony", &["node"], 300_000, 0);
+        rt_b.register_announcing_destination("harmony", &["node"], 300_000, 0);
+
+        let mut a_got_heartbeat = false;
+        let mut b_got_heartbeat = false;
+
+        // Run for 10 simulated seconds (heartbeat_interval_ms = 5000).
+        // Discovery happens on tick 0-1. Heartbeats fire at ~6s.
+        for tick in 0..100u64 {
+            let now = tick * 100; // 100ms per tick, 100 ticks = 10 seconds
+
+            let actions_a = rt_a.tick(now);
+            let actions_b = rt_b.tick(now);
+
+            // Shuttle A → B
+            for action in &actions_a {
+                if let RuntimeAction::SendOnInterface { raw, .. } = action {
+                    let results = rt_b.handle_packet("net0", raw.clone(), now);
+                    for r in &results {
+                        if matches!(r, RuntimeAction::HeartbeatReceived { .. }) {
+                            b_got_heartbeat = true;
+                        }
+                    }
+                }
+            }
+
+            // Shuttle B → A
+            for action in &actions_b {
+                if let RuntimeAction::SendOnInterface { raw, .. } = action {
+                    let results = rt_a.handle_packet("net0", raw.clone(), now);
+                    for r in &results {
+                        if matches!(r, RuntimeAction::HeartbeatReceived { .. }) {
+                            a_got_heartbeat = true;
+                        }
+                    }
+                }
+            }
+
+            if a_got_heartbeat && b_got_heartbeat {
+                break;
+            }
+        }
+
+        assert!(a_got_heartbeat, "A should have received a heartbeat from B");
+        assert!(b_got_heartbeat, "B should have received a heartbeat from A");
+    }
 }
