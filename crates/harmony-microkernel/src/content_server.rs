@@ -275,6 +275,10 @@ impl ContentServer {
     }
 
     /// Read blob data by reassembling from stored chunks.
+    ///
+    /// Note: reassembles the full blob on every call (O(N) chunk lookups,
+    /// O(blob_size) allocation). Callers reading large blobs in small
+    /// chunks should prefer a single large read or cache locally.
     fn read_blob(&self, cid: &[u8; 32], offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
         let ath = self.blobs.get(cid).ok_or(IpcError::NotFound)?;
         let chunks = &self.chunks;
@@ -340,7 +344,10 @@ pub(crate) fn format_cid_hex(cid: &[u8; 32]) -> alloc::string::String {
     s
 }
 
-/// Format a `ChunkAddr`'s `hash_bits` as 8-character lowercase hex.
+/// Format a `ChunkAddr`'s `hash_bits` as an 8-character zero-padded lowercase hex string.
+///
+/// This is the canonical filename used under `/chunks/` — e.g. `hash_bits = 0x1FFFFF`
+/// → `"001fffff"`. Clients must use this exact 8-character format when walking.
 pub(crate) fn format_addr_hex(addr: &ChunkAddr) -> alloc::string::String {
     use core::fmt::Write;
     let mut s = alloc::string::String::with_capacity(8);

@@ -909,14 +909,7 @@ mod tests {
         cid.copy_from_slice(&response[..32]);
 
         // Format CID as hex for the walk path
-        let cid_hex = {
-            use core::fmt::Write;
-            let mut s = alloc::string::String::with_capacity(64);
-            for byte in &cid {
-                write!(s, "{:02x}", byte).unwrap();
-            }
-            s
-        };
+        let cid_hex = crate::content_server::format_cid_hex(&cid);
 
         kernel.clunk(client_pid, 1).unwrap();
 
