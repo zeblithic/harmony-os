@@ -30,7 +30,8 @@ const ROOT: QPath = 0;
 const BLOBS_DIR: QPath = 1;
 const CHUNKS_DIR: QPath = 2;
 const INGEST: QPath = 3;
-/// Blob QPaths: `0x1_0000_0000 + u32_from_cid[0..4]`.
+/// Blob QPaths: `BLOB_QPATH_BASE | u64_from_cid[0..8] & 0x7FFF_FFFF_FFFF_FFFF`.
+/// Bit 32 is always set (via OR), so minimum blob QPath is `0x1_0000_0000`.
 /// Chunk QPaths: `0x100_0000 + hash_bits` (hash_bits is 21 bits, max 0x1F_FFFF).
 /// These ranges are disjoint: chunks top out at 0x11F_FFFF, blobs start at 0x1_0000_0000.
 const BLOB_QPATH_BASE: QPath = 0x1_0000_0000;
@@ -115,9 +116,12 @@ impl ContentServer {
     }
 
     /// Compute the QPath for a blob given its CID.
+    ///
+    /// Uses 8 CID bytes (63 usable bits) to minimise collision probability.
+    /// With 32 bits the birthday bound was ~65K blobs; with 63 bits it's ~3 billion.
     fn blob_qpath(cid: &[u8; 32]) -> QPath {
-        let bits = u32::from_le_bytes([cid[0], cid[1], cid[2], cid[3]]);
-        BLOB_QPATH_BASE + bits as u64
+        let bits = u64::from_le_bytes(cid[0..8].try_into().unwrap());
+        BLOB_QPATH_BASE | (bits & 0x7FFF_FFFF_FFFF_FFFF)
     }
 
     /// Compute the QPath for a chunk given its address.
@@ -187,10 +191,18 @@ impl ContentServer {
                     }
                 };
 
-                // Store chunks — iterate blob data in CHUNK_SIZE pieces,
-                // pad each to addr.size_bytes()
+                // Build response before committing chunks — if this fails,
+                // no side effects have occurred and we can restore the buffer.
+                let response = match self.build_ingest_response(&cid, &ath) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        *self.ingest_buffers.get_mut(&fid).unwrap() = IngestState::Writing(data);
+                        return Err(e);
+                    }
+                };
+
+                // Everything validated. Commit chunks and blob (infallible from here).
                 for (i, addr) in ath.chunks.iter().enumerate() {
-                    // Only store if not already present (chunk-level dedup)
                     if !self.chunks.iter().any(|(a, _)| *a == *addr) {
                         let chunk_start = i * CHUNK_SIZE;
                         let chunk_end = (chunk_start + CHUNK_SIZE).min(data.len());
@@ -202,7 +214,6 @@ impl ContentServer {
                     }
                 }
 
-                let response = self.build_ingest_response(&cid, &ath)?;
                 self.blobs.insert(cid, ath);
                 Ok(response)
             }
@@ -262,8 +273,10 @@ impl Default for ContentServer {
 
 /// Extract a sub-slice from `data` bounded by `offset` and `count`, clamped to data length.
 fn slice_data(data: &[u8], offset: u64, count: u32) -> Vec<u8> {
-    let off = (offset as usize).min(data.len());
-    let end = (off.saturating_add(count as usize)).min(data.len());
+    let off = usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .min(data.len());
+    let end = off.saturating_add(count as usize).min(data.len());
     data[off..end].to_vec()
 }
 
@@ -429,6 +442,9 @@ impl FileServer for ContentServer {
                     .ok_or(IpcError::InvalidArgument)?;
                 match buf {
                     IngestState::Writing(ref mut v) => {
+                        if v.len().saturating_add(data.len()) > MAX_BLOB_SIZE {
+                            return Err(IpcError::ResourceExhausted);
+                        }
                         v.extend_from_slice(data);
                         u32::try_from(data.len()).map_err(|_| IpcError::ResourceExhausted)
                     }
@@ -881,27 +897,37 @@ mod tests {
     }
 
     #[test]
-    fn ingest_oversized_blob_rejected() {
+    fn ingest_oversized_blob_rejected_at_write_time() {
         let mut server = ContentServer::new();
         server.walk(0, 1, "ingest").unwrap();
         server.open(1, OpenMode::ReadWrite).unwrap();
-        let big = alloc::vec![0u8; harmony_athenaeum::MAX_BLOB_SIZE + 1];
-        server.write(1, 0, &big).unwrap();
-        assert_eq!(server.read(1, 0, 256), Err(IpcError::ResourceExhausted));
+        // Write up to exactly MAX_BLOB_SIZE — should succeed.
+        let max = alloc::vec![0u8; harmony_athenaeum::MAX_BLOB_SIZE];
+        server.write(1, 0, &max).unwrap();
+        // One more byte exceeds the limit — rejected eagerly at write time.
+        assert_eq!(
+            server.write(1, 0, &[0xFF]),
+            Err(IpcError::ResourceExhausted)
+        );
     }
 
     #[test]
-    fn ingest_oversized_blob_does_not_poison_fid() {
+    fn ingest_oversized_write_does_not_poison_fid() {
         let mut server = ContentServer::new();
         server.walk(0, 1, "ingest").unwrap();
         server.open(1, OpenMode::ReadWrite).unwrap();
-        let big = alloc::vec![0u8; harmony_athenaeum::MAX_BLOB_SIZE + 1];
-        server.write(1, 0, &big).unwrap();
-        // First read rejects — oversized.
-        assert_eq!(server.read(1, 0, 256), Err(IpcError::ResourceExhausted));
-        // Fid is NOT poisoned — subsequent read should still return the same error,
-        // not silently succeed with an empty response.
-        assert_eq!(server.read(1, 0, 256), Err(IpcError::ResourceExhausted));
+        // Fill to exactly MAX_BLOB_SIZE.
+        let max = alloc::vec![0u8; harmony_athenaeum::MAX_BLOB_SIZE];
+        server.write(1, 0, &max).unwrap();
+        // Exceed limit — rejected at write time.
+        assert_eq!(
+            server.write(1, 0, &[0xFF]),
+            Err(IpcError::ResourceExhausted)
+        );
+        // Fid is NOT poisoned — the valid data is still in the buffer.
+        // Reading should finalize successfully with the MAX_BLOB_SIZE data.
+        let response = server.read(1, 0, 256).unwrap();
+        assert_eq!(response.len(), 40);
     }
 
     #[test]
