@@ -169,10 +169,11 @@ impl fmt::Debug for ContentHash {
 
 /// What kind of access is being performed on a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum AccessOp {
-    Read,
-    Write,
-    Execute,
+    Read = 0,
+    Write = 1,
+    Execute = 2,
 }
 
 /// Reason for an integrity violation.

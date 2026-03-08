@@ -71,7 +71,7 @@ impl<P: PageTable> Kernel<P> {
     pub fn new(identity: PrivateIdentity, vm: AddressSpaceManager<P>) -> Self {
         let mut identity_store = MemoryIdentityStore::new();
         identity_store.insert(identity.public_identity().clone());
-        Kernel {
+        let mut kernel = Kernel {
             processes: BTreeMap::new(),
             next_pid: 0,
             identity,
@@ -85,8 +85,18 @@ impl<P: PageTable> Kernel<P> {
                 sampling_rate_percent: 5,
                 sweep_interval_ticks: 100,
             }),
-            nakaiah: Nakaiah::new(0.01),
-        }
+            nakaiah: Nakaiah::new(100), // 100 bps = 1%
+        };
+        kernel.sync_guardian_state_hashes();
+        kernel
+    }
+
+    /// Exchange state hashes between Lyll and Nakaiah so each guardian
+    /// holds an up-to-date snapshot of the other's state for mutual
+    /// verification.
+    fn sync_guardian_state_hashes(&mut self) {
+        self.lyll.set_nakaiah_state_hash(self.nakaiah.state_hash());
+        self.nakaiah.set_lyll_state_hash(self.lyll.state_hash());
     }
 
     /// Allocate a unique server-side fid. Returns an error if the
@@ -212,6 +222,8 @@ impl<P: PageTable> Kernel<P> {
         // Destroy VM space. Ignore NoSuchProcess — the process may
         // have been spawned without a VM config.
         let _ = self.vm.destroy_space(pid);
+
+        self.sync_guardian_state_hashes();
 
         Ok(())
     }
@@ -570,6 +582,7 @@ impl<P: PageTable> Kernel<P> {
             }
         }
 
+        self.sync_guardian_state_hashes();
         Ok(())
     }
 
@@ -595,6 +608,7 @@ impl<P: PageTable> Kernel<P> {
             }
         }
 
+        self.sync_guardian_state_hashes();
         Ok(())
     }
 
@@ -1962,14 +1976,25 @@ mod tests {
     }
 
     #[test]
+    fn kernel_syncs_guardian_state_hashes_on_construction() {
+        let kernel = make_kernel();
+        // After construction, Lyll should hold Nakaiah's state hash and vice versa.
+        assert_eq!(
+            kernel.lyll().nakaiah_state_hash(),
+            kernel.nakaiah().state_hash()
+        );
+        assert_eq!(
+            kernel.nakaiah().lyll_state_hash(),
+            kernel.lyll().state_hash()
+        );
+    }
+
+    #[test]
     fn guardian_compromise_panics() {
         let mut kernel = make_kernel();
 
-        // Exchange initial state hashes.
-        let nakaiah_hash = kernel.nakaiah().state_hash();
-        kernel.lyll_mut().set_nakaiah_state_hash(nakaiah_hash);
-
-        // Simulate Nakaiah compromise -- change its state hash to something unexpected.
+        // Kernel::new already exchanges initial state hashes.
+        // Simulate Nakaiah compromise — change its state hash to something unexpected.
         kernel.nakaiah_mut().set_state_hash(ContentHash([0xFF; 32]));
 
         // Lyll detects it.

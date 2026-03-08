@@ -57,18 +57,21 @@ pub struct Nakaiah {
     access_log: Vec<AccessLogEntry>,
     state_hash: ContentHash,
     lyll_state_hash: ContentHash,
-    lyll_checkin_rate: f32,
+    /// Check-in rate in basis points (100 = 1%, 10000 = 100%).
+    lyll_checkin_rate_bps: u32,
 }
 
 impl Nakaiah {
-    pub fn new(lyll_checkin_rate: f32) -> Self {
+    /// Create a new Nakaiah. `lyll_checkin_rate_bps` is in basis points
+    /// (100 = 1% of operations trigger a Lyll check-in).
+    pub fn new(lyll_checkin_rate_bps: u32) -> Self {
         Self {
             integrity_registry: BTreeMap::new(),
             capability_chains: BTreeMap::new(),
             access_log: Vec::new(),
             state_hash: ContentHash::ZERO,
             lyll_state_hash: ContentHash::ZERO,
-            lyll_checkin_rate,
+            lyll_checkin_rate_bps,
         }
     }
 
@@ -180,17 +183,21 @@ impl Nakaiah {
         }
     }
 
-    pub fn lyll_checkin_rate(&self) -> f32 {
-        self.lyll_checkin_rate
+    pub fn lyll_checkin_rate_bps(&self) -> u32 {
+        self.lyll_checkin_rate_bps
     }
 }
 
 /// Simple deterministic hash of a log entry for chaining.
+///
+/// NOTE: This is a placeholder XOR-based hash, NOT collision-resistant.
+/// Will be replaced with BLAKE3 once the crypto integration is wired up.
 fn simple_hash_entry(entry: &AccessLogEntry) -> [u8; 32] {
     let mut hash = [0u8; 32];
     let pid_bytes = entry.receipt.pid.to_le_bytes();
     let addr_bytes = entry.receipt.paddr.as_u64().to_le_bytes();
     let ts_bytes = entry.receipt.timestamp.to_le_bytes();
+    let op_byte = entry.receipt.operation as u8;
 
     for (i, &b) in pid_bytes.iter().enumerate() {
         hash[i] ^= b;
@@ -201,6 +208,7 @@ fn simple_hash_entry(entry: &AccessLogEntry) -> [u8; 32] {
     for (i, &b) in ts_bytes.iter().enumerate() {
         hash[12 + i] ^= b;
     }
+    hash[20] ^= op_byte;
     for (i, &b) in entry.prev_hash.iter().enumerate() {
         hash[i] ^= b;
     }
@@ -214,7 +222,7 @@ mod tests {
     use crate::vm::{AccessOp, ContentHash, PhysAddr};
 
     fn test_nakaiah() -> Nakaiah {
-        Nakaiah::new(0.01)
+        Nakaiah::new(100)
     }
 
     // Task 6 tests: core lifecycle

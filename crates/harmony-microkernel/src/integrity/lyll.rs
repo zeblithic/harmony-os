@@ -62,6 +62,10 @@ pub struct Lyll {
 
 impl Lyll {
     pub fn new(config: LyllConfig) -> Self {
+        assert!(
+            config.sweep_interval_ticks > 0,
+            "sweep_interval_ticks must be > 0"
+        );
         Self {
             hash_registry: BTreeMap::new(),
             nakaiah_state_hash: ContentHash::ZERO,
@@ -152,15 +156,17 @@ impl Lyll {
             HashEntry::Snapshot { .. } => MemoryZone::PublicEphemeral,
         };
 
-        self.quarantine.add(QuarantineRecord {
-            paddr,
-            expected_hash: expected,
-            actual_hash,
-            owner_pid: record.owner_pid,
-            mapped_pids: Vec::new(),
-            timestamp,
-            zone,
-        });
+        if !self.quarantine.is_quarantined(paddr) {
+            self.quarantine.add(QuarantineRecord {
+                paddr,
+                expected_hash: expected,
+                actual_hash,
+                owner_pid: record.owner_pid,
+                mapped_pids: Vec::new(),
+                timestamp,
+                zone,
+            });
+        }
 
         IntegrityVerdict::Quarantine {
             paddr,
@@ -411,6 +417,32 @@ mod tests {
         let lyll = Lyll::new(test_config());
         assert_eq!(lyll.config().sampling_rate_percent, 5);
         assert_eq!(lyll.config().sweep_interval_ticks, 10);
+    }
+
+    #[test]
+    #[should_panic(expected = "sweep_interval_ticks must be > 0")]
+    fn zero_sweep_interval_panics() {
+        Lyll::new(LyllConfig {
+            sampling_rate_percent: 5,
+            sweep_interval_ticks: 0,
+        });
+    }
+
+    #[test]
+    fn duplicate_quarantine_not_added() {
+        let mut lyll = Lyll::new(test_config());
+        lyll.register_frame(
+            PhysAddr(0x1000),
+            HashEntry::CidBacked { cid: [0xAA; 32] },
+            1,
+        );
+        // First verify — quarantines.
+        lyll.verify_frame(PhysAddr(0x1000), [0xBB; 32], 0);
+        assert_eq!(lyll.quarantine.len(), 1);
+
+        // Second verify on same address — no duplicate.
+        lyll.verify_frame(PhysAddr(0x1000), [0xCC; 32], 1);
+        assert_eq!(lyll.quarantine.len(), 1);
     }
 
     #[test]

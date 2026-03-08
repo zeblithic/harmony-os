@@ -105,7 +105,7 @@ mod tests {
     }
 
     fn test_nakaiah() -> Nakaiah {
-        Nakaiah::new(0.01)
+        Nakaiah::new(100)
     }
 
     #[test]
