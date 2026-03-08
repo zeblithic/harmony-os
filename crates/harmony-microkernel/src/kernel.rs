@@ -860,4 +860,71 @@ mod tests {
         assert_eq!(kernel.read(client_pid, 1, 0, 256), Err(IpcError::InvalidFid));
         assert_eq!(kernel.read(client_pid, 2, 0, 256), Err(IpcError::InvalidFid));
     }
+
+    #[test]
+    fn content_server_ingest_and_read_via_kernel() {
+        use crate::content_server::ContentServer;
+
+        let mut entropy = make_test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let mut kernel = Kernel::new(kernel_id);
+
+        // Spawn content server
+        let server_pid = kernel
+            .spawn_process("content-store", Box::new(ContentServer::new()), &[])
+            .unwrap();
+
+        // Spawn client with /store mounted to content server
+        let client_pid = kernel
+            .spawn_process(
+                "test-client",
+                Box::new(crate::echo::EchoServer::new()),
+                &[("/store", server_pid, 0)],
+            )
+            .unwrap();
+
+        // Grant capability
+        kernel
+            .grant_endpoint_cap(&mut entropy, client_pid, server_pid, 0)
+            .unwrap();
+
+        // Walk to /store/ingest and open for ReadWrite
+        kernel.walk(client_pid, "/store/ingest", 0, 1, 0).unwrap();
+        kernel.open(client_pid, 1, OpenMode::ReadWrite).unwrap();
+
+        // Write blob data
+        let blob_data = alloc::vec![0x42u8; 4096];
+        let written = kernel.write(client_pid, 1, 0, &blob_data).unwrap();
+        assert_eq!(written, 4096);
+
+        // Read to finalize — get back CID + metadata
+        let response = kernel.read(client_pid, 1, 0, 256).unwrap();
+        assert_eq!(response.len(), 40);
+
+        // Parse the CID from response
+        let mut cid = [0u8; 32];
+        cid.copy_from_slice(&response[..32]);
+
+        // Format CID as hex for the walk path
+        let cid_hex = {
+            use core::fmt::Write;
+            let mut s = alloc::string::String::with_capacity(64);
+            for byte in &cid {
+                write!(s, "{:02x}", byte).unwrap();
+            }
+            s
+        };
+
+        kernel.clunk(client_pid, 1).unwrap();
+
+        // Now walk to /store/blobs/<cid> and read the blob back
+        let blob_path = alloc::format!("/store/blobs/{}", cid_hex);
+        kernel.walk(client_pid, &blob_path, 0, 2, 0).unwrap();
+        kernel.open(client_pid, 2, OpenMode::Read).unwrap();
+
+        let read_back = kernel.read(client_pid, 2, 0, 16384).unwrap();
+        assert_eq!(read_back, blob_data);
+
+        kernel.clunk(client_pid, 2).unwrap();
+    }
 }
