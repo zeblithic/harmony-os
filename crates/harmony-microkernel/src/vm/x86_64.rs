@@ -106,14 +106,14 @@ impl X86_64PageTable {
 
     /// Translate [`PageFlags`] to x86_64 PTE bits.
     ///
+    /// `PTE_PRESENT` is set unconditionally: on x86_64 all mapped pages are
+    /// inherently readable (there is no read-disable bit). The only way to
+    /// remove a page is [`PageTable::unmap`].
+    ///
     /// Note the NX inversion: `EXECUTABLE` means *clear* the NX bit.
     /// If the flag is absent, NX is set.
     fn flags_to_pte(flags: PageFlags) -> u64 {
-        let mut pte: u64 = 0;
-
-        if flags.contains(PageFlags::READABLE) {
-            pte |= PTE_PRESENT;
-        }
+        let mut pte: u64 = PTE_PRESENT;
         if flags.contains(PageFlags::WRITABLE) {
             pte |= PTE_WRITABLE;
         }
@@ -334,5 +334,47 @@ impl PageTable for X86_64PageTable {
 
     fn root_paddr(&self) -> PhysAddr {
         self.root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flags_to_pte_always_sets_present() {
+        // On x86_64, all mapped pages are inherently readable — PTE_PRESENT
+        // must be set regardless of which PageFlags are requested.
+        let empty = X86_64PageTable::flags_to_pte(PageFlags::empty());
+        assert_ne!(empty & PTE_PRESENT, 0, "empty flags must still set PRESENT");
+
+        let write_only = X86_64PageTable::flags_to_pte(PageFlags::WRITABLE);
+        assert_ne!(
+            write_only & PTE_PRESENT,
+            0,
+            "WRITABLE without READABLE must still set PRESENT"
+        );
+
+        let exec_only = X86_64PageTable::flags_to_pte(PageFlags::EXECUTABLE);
+        assert_ne!(
+            exec_only & PTE_PRESENT,
+            0,
+            "EXECUTABLE without READABLE must still set PRESENT"
+        );
+    }
+
+    #[test]
+    fn pte_roundtrip_preserves_readable() {
+        // READABLE should always appear in the roundtrip since PRESENT is
+        // always set and pte_to_flags maps PRESENT → READABLE.
+        let flags = PageFlags::WRITABLE | PageFlags::EXECUTABLE;
+        let pte = X86_64PageTable::flags_to_pte(flags);
+        let back = X86_64PageTable::pte_to_flags(pte);
+        assert!(
+            back.contains(PageFlags::READABLE),
+            "roundtrip must include READABLE (x86_64 pages are always readable)"
+        );
+        assert!(back.contains(PageFlags::WRITABLE));
+        assert!(back.contains(PageFlags::EXECUTABLE));
     }
 }
