@@ -12,6 +12,9 @@ use harmony_identity::{
 use harmony_platform::EntropySource;
 
 use crate::namespace::Namespace;
+use crate::vm::cap_tracker::MemoryBudget;
+use crate::vm::manager::AddressSpaceManager;
+use crate::vm::page_table::PageTable;
 use crate::{Fid, FileServer, IpcError, OpenMode, QPath};
 
 /// Maximum UCAN delegation chain depth for capability verification.
@@ -38,7 +41,7 @@ pub struct Process {
 }
 
 /// The microkernel: process table, IPC dispatch, capability enforcement.
-pub struct Kernel {
+pub struct Kernel<P: PageTable> {
     processes: BTreeMap<u32, Process>,
     next_pid: u32,
     identity: PrivateIdentity,
@@ -51,11 +54,14 @@ pub struct Kernel {
     fid_owners: BTreeMap<(u32, Fid), (u32, Fid)>,
     /// Monotonic counter for allocating server-side fids.
     next_server_fid: Fid,
+    /// Virtual memory manager — owns per-process address spaces, the buddy
+    /// allocator, and capability tracker.
+    vm: AddressSpaceManager<P>,
 }
 
-impl Kernel {
-    /// Create a new microkernel with the given identity.
-    pub fn new(identity: PrivateIdentity) -> Self {
+impl<P: PageTable> Kernel<P> {
+    /// Create a new microkernel with the given identity and VM manager.
+    pub fn new(identity: PrivateIdentity, vm: AddressSpaceManager<P>) -> Self {
         let mut identity_store = MemoryIdentityStore::new();
         identity_store.insert(identity.public_identity().clone());
         Kernel {
@@ -67,6 +73,7 @@ impl Kernel {
             revocations: MemoryRevocationSet::new(),
             fid_owners: BTreeMap::new(),
             next_server_fid: 1,
+            vm,
         }
     }
 
@@ -91,11 +98,16 @@ impl Kernel {
     /// the process's namespace. `target_pid` must refer to an already-spawned
     /// process. `root_fid` is trusted — it is not validated against the
     /// target server's fid table (by convention, 0 = root directory).
+    ///
+    /// When `vm_config` is `Some`, a VM address space is created for the
+    /// process with the given budget and page table. When `None`, no VM
+    /// space is created (suitable for kernel-internal processes).
     pub fn spawn_process(
         &mut self,
         name: &str,
         server: Box<dyn FileServer>,
         mounts: &[(&str, u32, Fid)],
+        vm_config: Option<(MemoryBudget, P)>,
     ) -> Result<u32, IpcError> {
         // Validate mounts before allocating a PID so failures don't waste IDs.
         let mut namespace = Namespace::new();
@@ -111,6 +123,13 @@ impl Kernel {
             .next_pid
             .checked_add(1)
             .ok_or(IpcError::ResourceExhausted)?;
+
+        // Create VM address space if configured.
+        if let Some((budget, page_table)) = vm_config {
+            self.vm
+                .create_space(pid, budget, page_table)
+                .map_err(|_| IpcError::ResourceExhausted)?;
+        }
 
         // Derive a simple address hash from the pid.
         let mut address_hash = [0u8; 16];
@@ -129,6 +148,26 @@ impl Kernel {
         );
 
         Ok(pid)
+    }
+
+    /// Destroy a process, removing it from the process table and
+    /// cleaning up its VM address space (if one exists).
+    ///
+    /// Returns `Err(IpcError::NotFound)` if the PID does not exist.
+    /// VM cleanup is best-effort — if the process has no VM space,
+    /// the error is silently ignored.
+    pub fn destroy_process(&mut self, pid: u32) -> Result<(), IpcError> {
+        self.processes.remove(&pid).ok_or(IpcError::NotFound)?;
+
+        // Clean up fid ownership entries: both where this process is the
+        // client (key side) and where it is the target server (value side).
+        self.fid_owners.retain(|&(p, _), &mut (tp, _)| p != pid && tp != pid);
+
+        // Destroy VM space. Ignore NoSuchProcess — the process may
+        // have been spawned without a VM config.
+        let _ = self.vm.destroy_space(pid);
+
+        Ok(())
     }
 
     /// Grant an endpoint capability to a process, allowing it to access
@@ -410,6 +449,9 @@ impl Kernel {
 mod tests {
     use super::*;
     use crate::echo::EchoServer;
+    use crate::vm::buddy::BuddyAllocator;
+    use crate::vm::mock::MockPageTable;
+    use crate::vm::PhysAddr;
     use harmony_unikernel::KernelEntropy;
 
     fn make_test_entropy() -> KernelEntropy<impl FnMut(&mut [u8])> {
@@ -422,19 +464,25 @@ mod tests {
         })
     }
 
+    /// Create a test VM manager with 64 frames.
+    fn make_test_vm() -> AddressSpaceManager<MockPageTable> {
+        let buddy = BuddyAllocator::new(PhysAddr(0x10_0000), 64).unwrap();
+        AddressSpaceManager::new(buddy)
+    }
+
     #[test]
     fn spawn_process_assigns_pid() {
         let mut entropy = make_test_entropy();
         let kernel_id = PrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id);
+        let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         let pid = kernel
-            .spawn_process("echo", Box::new(EchoServer::new()), &[])
+            .spawn_process("echo", Box::new(EchoServer::new()), &[], None)
             .unwrap();
         assert_eq!(pid, 0);
 
         let pid2 = kernel
-            .spawn_process("echo2", Box::new(EchoServer::new()), &[])
+            .spawn_process("echo2", Box::new(EchoServer::new()), &[], None)
             .unwrap();
         assert_eq!(pid2, 1);
     }
@@ -457,7 +505,7 @@ mod tests {
             )
             .unwrap();
 
-        let kernel = Kernel::new(kernel_id);
+        let kernel = Kernel::new(kernel_id, make_test_vm());
 
         assert!(kernel
             .check_endpoint_cap(&[cap], &process_addr, 1, 0)
@@ -468,7 +516,7 @@ mod tests {
     fn capability_check_no_cap() {
         let mut entropy = make_test_entropy();
         let kernel_id = PrivateIdentity::generate(&mut entropy);
-        let kernel = Kernel::new(kernel_id);
+        let kernel = Kernel::new(kernel_id, make_test_vm());
 
         let process_addr = [0x01u8; 16];
         assert_eq!(
@@ -495,7 +543,7 @@ mod tests {
             )
             .unwrap();
 
-        let kernel = Kernel::new(kernel_id);
+        let kernel = Kernel::new(kernel_id, make_test_vm());
 
         // Cap is for pid:1, trying to access pid:2
         assert_eq!(
@@ -522,7 +570,7 @@ mod tests {
             )
             .unwrap();
 
-        let kernel = Kernel::new(kernel_id);
+        let kernel = Kernel::new(kernel_id, make_test_vm());
 
         // Wildcard should match any pid
         assert!(kernel
@@ -535,14 +583,14 @@ mod tests {
 
     // ── IPC dispatch tests ──────────────────────────────────────────
 
-    fn setup_kernel_with_echo() -> (Kernel, u32, u32) {
+    fn setup_kernel_with_echo() -> (Kernel<MockPageTable>, u32, u32) {
         let mut entropy = make_test_entropy();
         let kernel_id = PrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id);
+        let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         // pid 0 = echo server
         let server_pid = kernel
-            .spawn_process("echo-server", Box::new(EchoServer::new()), &[])
+            .spawn_process("echo-server", Box::new(EchoServer::new()), &[], None)
             .unwrap();
 
         // pid 1 = client (also an echo server, but we don't use its server)
@@ -551,6 +599,7 @@ mod tests {
                 "client",
                 Box::new(EchoServer::new()),
                 &[("/echo", server_pid, 0)],
+                None,
             )
             .unwrap();
 
@@ -601,10 +650,10 @@ mod tests {
     fn ipc_denied_without_capability() {
         let mut entropy = make_test_entropy();
         let kernel_id = PrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id);
+        let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         let server_pid = kernel
-            .spawn_process("echo-server", Box::new(EchoServer::new()), &[])
+            .spawn_process("echo-server", Box::new(EchoServer::new()), &[], None)
             .unwrap();
         // Client has mount but NO capability
         let client_pid = kernel
@@ -612,6 +661,7 @@ mod tests {
                 "client",
                 Box::new(EchoServer::new()),
                 &[("/echo", server_pid, 0)],
+                None,
             )
             .unwrap();
 
@@ -655,11 +705,11 @@ mod tests {
     fn ipc_multi_client_fid_isolation() {
         let mut entropy = make_test_entropy();
         let kernel_id = PrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id);
+        let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         // Shared echo server
         let server_pid = kernel
-            .spawn_process("echo-server", Box::new(EchoServer::new()), &[])
+            .spawn_process("echo-server", Box::new(EchoServer::new()), &[], None)
             .unwrap();
 
         // Two clients, both mounting the same server
@@ -668,6 +718,7 @@ mod tests {
                 "client-a",
                 Box::new(EchoServer::new()),
                 &[("/echo", server_pid, 0)],
+                None,
             )
             .unwrap();
         let client_b = kernel
@@ -675,6 +726,7 @@ mod tests {
                 "client-b",
                 Box::new(EchoServer::new()),
                 &[("/echo", server_pid, 0)],
+                None,
             )
             .unwrap();
 
@@ -740,10 +792,10 @@ mod tests {
     fn grant_cap_nonexistent_target_rejected() {
         let mut entropy = make_test_entropy();
         let kernel_id = PrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id);
+        let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         let pid = kernel
-            .spawn_process("test", Box::new(EchoServer::new()), &[])
+            .spawn_process("test", Box::new(EchoServer::new()), &[], None)
             .unwrap();
         // target pid 99 doesn't exist
         assert_eq!(
@@ -770,7 +822,7 @@ mod tests {
             )
             .unwrap();
 
-        let kernel = Kernel::new(kernel_id);
+        let kernel = Kernel::new(kernel_id, make_test_vm());
 
         // At time 50 — token is valid
         assert!(kernel
@@ -797,11 +849,11 @@ mod tests {
     fn integration_two_processes_full_ipc() {
         let mut entropy = make_test_entropy();
         let kernel_id = PrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id);
+        let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         // Spawn echo server as pid 0
         let server_pid = kernel
-            .spawn_process("echo-server", Box::new(EchoServer::new()), &[])
+            .spawn_process("echo-server", Box::new(EchoServer::new()), &[], None)
             .unwrap();
 
         // Spawn client as pid 1, with echo server mounted at /svc/echo
@@ -810,6 +862,7 @@ mod tests {
                 "harmony-node",
                 Box::new(EchoServer::new()), // client also serves, but we test as client
                 &[("/svc/echo", server_pid, 0)],
+                None,
             )
             .unwrap();
 
@@ -870,11 +923,11 @@ mod tests {
 
         let mut entropy = make_test_entropy();
         let kernel_id = PrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id);
+        let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         // Spawn content server
         let server_pid = kernel
-            .spawn_process("content-store", Box::new(ContentServer::new()), &[])
+            .spawn_process("content-store", Box::new(ContentServer::new()), &[], None)
             .unwrap();
 
         // Spawn client with /store mounted to content server
@@ -883,6 +936,7 @@ mod tests {
                 "test-client",
                 Box::new(crate::echo::EchoServer::new()),
                 &[("/store", server_pid, 0)],
+                None,
             )
             .unwrap();
 
@@ -922,5 +976,172 @@ mod tests {
         assert_eq!(read_back, blob_data);
 
         kernel.clunk(client_pid, 2).unwrap();
+    }
+
+    // ── VM integration tests ──────────────────────────────────────────
+
+    #[test]
+    fn spawn_with_vm_config_creates_address_space() {
+        use crate::vm::{FrameClassification, PAGE_SIZE};
+
+        let mut entropy = make_test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+
+        let budget = MemoryBudget::new(PAGE_SIZE as usize * 16, FrameClassification::all());
+        let page_table = MockPageTable::new(PhysAddr(0x20_0000));
+
+        let pid = kernel
+            .spawn_process(
+                "vm-process",
+                Box::new(EchoServer::new()),
+                &[],
+                Some((budget, page_table)),
+            )
+            .unwrap();
+
+        // The VM manager should now have a space for this PID.
+        assert!(kernel.vm.space(pid).is_some());
+    }
+
+    #[test]
+    fn spawn_without_vm_config_no_address_space() {
+        let mut entropy = make_test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+
+        let pid = kernel
+            .spawn_process("no-vm", Box::new(EchoServer::new()), &[], None)
+            .unwrap();
+
+        // No VM space should exist.
+        assert!(kernel.vm.space(pid).is_none());
+    }
+
+    #[test]
+    fn destroy_process_removes_from_table() {
+        let mut entropy = make_test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+
+        let pid = kernel
+            .spawn_process("doomed", Box::new(EchoServer::new()), &[], None)
+            .unwrap();
+
+        kernel.destroy_process(pid).unwrap();
+
+        // Process should be gone — spawning a new one should get the next PID.
+        let pid2 = kernel
+            .spawn_process("replacement", Box::new(EchoServer::new()), &[], None)
+            .unwrap();
+        assert_eq!(pid2, 1); // PID counter is monotonic, not recycled.
+    }
+
+    #[test]
+    fn destroy_process_cleans_up_vm_space() {
+        use crate::vm::{FrameClassification, PAGE_SIZE};
+
+        let mut entropy = make_test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+
+        let budget = MemoryBudget::new(PAGE_SIZE as usize * 16, FrameClassification::all());
+        let page_table = MockPageTable::new(PhysAddr(0x20_0000));
+
+        let pid = kernel
+            .spawn_process(
+                "vm-process",
+                Box::new(EchoServer::new()),
+                &[],
+                Some((budget, page_table)),
+            )
+            .unwrap();
+
+        assert!(kernel.vm.space(pid).is_some());
+
+        kernel.destroy_process(pid).unwrap();
+
+        // VM space should be destroyed.
+        assert!(kernel.vm.space(pid).is_none());
+    }
+
+    #[test]
+    fn destroy_process_cleans_up_fid_ownership() {
+        let (mut kernel, client, _server) = setup_kernel_with_echo();
+
+        // Walk to create a fid mapping.
+        kernel.walk(client, "/echo/hello", 0, 1, 0).unwrap();
+
+        // Destroy the client process.
+        kernel.destroy_process(client).unwrap();
+
+        // The fid should no longer be tracked — operations should fail with NotFound
+        // (process gone), not InvalidFid (fid tracking stale).
+        assert_eq!(kernel.read(client, 1, 0, 256), Err(IpcError::InvalidFid));
+    }
+
+    #[test]
+    fn destroy_nonexistent_process_fails() {
+        let mut entropy = make_test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+
+        assert_eq!(kernel.destroy_process(99), Err(IpcError::NotFound));
+    }
+
+    #[test]
+    fn destroy_process_without_vm_succeeds() {
+        let mut entropy = make_test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+
+        let pid = kernel
+            .spawn_process("no-vm", Box::new(EchoServer::new()), &[], None)
+            .unwrap();
+
+        // destroy_process should succeed even though there's no VM space.
+        kernel.destroy_process(pid).unwrap();
+    }
+
+    #[test]
+    fn ipc_still_works_with_vm_enabled_processes() {
+        use crate::vm::{FrameClassification, PAGE_SIZE};
+
+        let mut entropy = make_test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+
+        let budget = MemoryBudget::new(PAGE_SIZE as usize * 16, FrameClassification::all());
+
+        // Spawn server with VM space.
+        let server_pid = kernel
+            .spawn_process(
+                "echo-server",
+                Box::new(EchoServer::new()),
+                &[],
+                Some((budget.clone(), MockPageTable::new(PhysAddr(0x20_0000)))),
+            )
+            .unwrap();
+
+        // Spawn client with VM space.
+        let client_pid = kernel
+            .spawn_process(
+                "client",
+                Box::new(EchoServer::new()),
+                &[("/echo", server_pid, 0)],
+                Some((budget, MockPageTable::new(PhysAddr(0x30_0000)))),
+            )
+            .unwrap();
+
+        kernel
+            .grant_endpoint_cap(&mut entropy, client_pid, server_pid, 0)
+            .unwrap();
+
+        // Full IPC round trip should work identically to without VM.
+        kernel.walk(client_pid, "/echo/hello", 0, 1, 0).unwrap();
+        kernel.open(client_pid, 1, OpenMode::Read).unwrap();
+        let data = kernel.read(client_pid, 1, 0, 256).unwrap();
+        assert_eq!(data, b"Hello from echo server!");
+        kernel.clunk(client_pid, 1).unwrap();
     }
 }

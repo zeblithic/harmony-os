@@ -1198,21 +1198,31 @@ mod integration_tests {
     use harmony_microkernel::echo::EchoServer;
     use harmony_microkernel::kernel::Kernel;
     use harmony_microkernel::serial_server::SerialServer;
+    use harmony_microkernel::vm::buddy::BuddyAllocator;
+    use harmony_microkernel::vm::manager::AddressSpaceManager;
+    use harmony_microkernel::vm::mock::MockPageTable;
+    use harmony_microkernel::vm::PhysAddr;
     use harmony_unikernel::KernelEntropy;
 
+    /// Create a test VM manager with 64 frames.
+    fn make_test_vm() -> AddressSpaceManager<MockPageTable> {
+        let buddy = BuddyAllocator::new(PhysAddr(0x10_0000), 64).unwrap();
+        AddressSpaceManager::new(buddy)
+    }
+
     /// SyscallBackend backed by a real Ring 2 Kernel.
-    struct KernelBackend<'a> {
-        kernel: &'a mut Kernel,
+    struct KernelBackend<'a, P: harmony_microkernel::vm::page_table::PageTable> {
+        kernel: &'a mut Kernel<P>,
         pid: u32,
     }
 
-    impl<'a> KernelBackend<'a> {
-        fn new(kernel: &'a mut Kernel, pid: u32) -> Self {
+    impl<'a, P: harmony_microkernel::vm::page_table::PageTable> KernelBackend<'a, P> {
+        fn new(kernel: &'a mut Kernel<P>, pid: u32) -> Self {
             Self { kernel, pid }
         }
     }
 
-    impl SyscallBackend for KernelBackend<'_> {
+    impl<P: harmony_microkernel::vm::page_table::PageTable> SyscallBackend for KernelBackend<'_, P> {
         fn walk(&mut self, path: &str, new_fid: Fid) -> Result<QPath, IpcError> {
             self.kernel.walk(self.pid, path, 0, new_fid, 0)
         }
@@ -1247,11 +1257,11 @@ mod integration_tests {
     fn linuxulator_writes_hello_through_kernel_to_serial() {
         let mut entropy = test_entropy();
         let kernel_id = PrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id);
+        let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         // Spawn SerialServer
         let serial_pid = kernel
-            .spawn_process("serial", Box::new(SerialServer::new()), &[])
+            .spawn_process("serial", Box::new(SerialServer::new()), &[], None)
             .unwrap();
 
         // Spawn a "linux process" with SerialServer mounted at /dev/serial
@@ -1260,6 +1270,7 @@ mod integration_tests {
                 "hello-linux",
                 Box::new(EchoServer::new()), // placeholder server
                 &[("/dev/serial", serial_pid, 0)],
+                None,
             )
             .unwrap();
 
@@ -1296,10 +1307,10 @@ mod integration_tests {
     fn linuxulator_full_fd_lifecycle() {
         let mut entropy = test_entropy();
         let kernel_id = PrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id);
+        let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         let serial_pid = kernel
-            .spawn_process("serial", Box::new(SerialServer::new()), &[])
+            .spawn_process("serial", Box::new(SerialServer::new()), &[], None)
             .unwrap();
 
         let linux_pid = kernel
@@ -1307,6 +1318,7 @@ mod integration_tests {
                 "hello-linux",
                 Box::new(EchoServer::new()),
                 &[("/dev/serial", serial_pid, 0)],
+                None,
             )
             .unwrap();
 
