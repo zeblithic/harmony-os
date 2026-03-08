@@ -628,30 +628,44 @@ mod tests {
             let actions_a = rt_a.tick(now);
             let actions_b = rt_b.tick(now);
 
-            // Shuttle A's outbound packets to B.
+            // Shuttle A's outbound packets to B, forwarding any responses back.
             for action in &actions_a {
                 if let RuntimeAction::SendOnInterface { raw, .. } = action {
                     let results = rt_b.handle_packet("net0", raw.clone(), now);
+                    let mut responses = Vec::new();
                     for r in &results {
                         if let RuntimeAction::PeerDiscovered { address_hash, .. } = r {
                             if *address_hash == addr_a {
                                 b_discovered_a = true;
                             }
                         }
+                        if let RuntimeAction::SendOnInterface { raw: resp, .. } = r {
+                            responses.push(resp.clone());
+                        }
+                    }
+                    for resp in responses {
+                        let _ = rt_a.handle_packet("net0", resp, now);
                     }
                 }
             }
 
-            // Shuttle B's outbound packets to A.
+            // Shuttle B's outbound packets to A, forwarding any responses back.
             for action in &actions_b {
                 if let RuntimeAction::SendOnInterface { raw, .. } = action {
                     let results = rt_a.handle_packet("net0", raw.clone(), now);
+                    let mut responses = Vec::new();
                     for r in &results {
                         if let RuntimeAction::PeerDiscovered { address_hash, .. } = r {
                             if *address_hash == addr_b {
                                 a_discovered_b = true;
                             }
                         }
+                        if let RuntimeAction::SendOnInterface { raw: resp, .. } = r {
+                            responses.push(resp.clone());
+                        }
+                    }
+                    for resp in responses {
+                        let _ = rt_b.handle_packet("net0", resp, now);
                     }
                 }
             }
@@ -693,17 +707,18 @@ mod tests {
         let addr_b = rt_b.identity().public_identity().address_hash;
 
         // Run for 10 simulated seconds (heartbeat_interval_ms = 5000).
-        // Discovery happens on tick 0-1. Heartbeats fire at ~6s.
+        // Discovery happens on tick 0-1. Heartbeats fire at ~5s.
         for tick in 0..100u64 {
             let now = tick * 100; // 100ms per tick, 100 ticks = 10 seconds
 
             let actions_a = rt_a.tick(now);
             let actions_b = rt_b.tick(now);
 
-            // Shuttle A → B
+            // Shuttle A → B, forwarding any responses back.
             for action in &actions_a {
                 if let RuntimeAction::SendOnInterface { raw, .. } = action {
                     let results = rt_b.handle_packet("net0", raw.clone(), now);
+                    let mut responses = Vec::new();
                     for r in &results {
                         if let RuntimeAction::PeerDiscovered { address_hash, .. } = r {
                             if *address_hash == addr_a {
@@ -713,14 +728,21 @@ mod tests {
                         if matches!(r, RuntimeAction::HeartbeatReceived { .. }) {
                             b_got_heartbeat = true;
                         }
+                        if let RuntimeAction::SendOnInterface { raw: resp, .. } = r {
+                            responses.push(resp.clone());
+                        }
+                    }
+                    for resp in responses {
+                        let _ = rt_a.handle_packet("net0", resp, now);
                     }
                 }
             }
 
-            // Shuttle B → A
+            // Shuttle B → A, forwarding any responses back.
             for action in &actions_b {
                 if let RuntimeAction::SendOnInterface { raw, .. } = action {
                     let results = rt_a.handle_packet("net0", raw.clone(), now);
+                    let mut responses = Vec::new();
                     for r in &results {
                         if let RuntimeAction::PeerDiscovered { address_hash, .. } = r {
                             if *address_hash == addr_b {
@@ -730,6 +752,12 @@ mod tests {
                         if matches!(r, RuntimeAction::HeartbeatReceived { .. }) {
                             a_got_heartbeat = true;
                         }
+                        if let RuntimeAction::SendOnInterface { raw: resp, .. } = r {
+                            responses.push(resp.clone());
+                        }
+                    }
+                    for resp in responses {
+                        let _ = rt_b.handle_packet("net0", resp, now);
                     }
                 }
             }

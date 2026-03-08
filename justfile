@@ -83,7 +83,8 @@ test-qemu: build-image-test
 test-mesh: build
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "Two-node mesh test: launching peers..."
+    MCAST_PORT=$(( ( RANDOM % 10000 ) + 20000 ))
+    echo "Two-node mesh test: launching peers (mcast port $MCAST_PORT)..."
     LOG_A=$(mktemp)
     LOG_B=$(mktemp)
     PID_A=""
@@ -103,7 +104,7 @@ test-mesh: build
         -display none \
         -cpu qemu64,+rdrand \
         -device virtio-net-pci,netdev=n0 \
-        -netdev socket,id=n0,mcast=230.0.0.1:1234 &
+        -netdev socket,id=n0,mcast=230.0.0.1:$MCAST_PORT &
     PID_A=$!
 
     qemu-system-x86_64 \
@@ -112,11 +113,16 @@ test-mesh: build
         -display none \
         -cpu qemu64,+rdrand \
         -device virtio-net-pci,netdev=n0 \
-        -netdev socket,id=n0,mcast=230.0.0.1:1234 &
+        -netdev socket,id=n0,mcast=230.0.0.1:$MCAST_PORT &
     PID_B=$!
 
     for i in $(seq 1 30); do
         sleep 1
+        # Bail early if either node has exited (e.g., kernel panic).
+        if ! kill -0 "$PID_A" 2>/dev/null || ! kill -0 "$PID_B" 2>/dev/null; then
+            echo "  [${i}s] A node exited unexpectedly"
+            break
+        fi
         A_PEER=$(grep -c '\[PEER+\]' "$LOG_A" 2>/dev/null || echo 0)
         B_PEER=$(grep -c '\[PEER+\]' "$LOG_B" 2>/dev/null || echo 0)
         A_HBT=$(grep -c '\[HBT\]' "$LOG_A" 2>/dev/null || echo 0)
