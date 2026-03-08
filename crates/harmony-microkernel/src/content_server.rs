@@ -175,10 +175,18 @@ impl ContentServer {
             IngestState::Writing(data) => {
                 let cid = sha256_hash(&data);
 
-                // Dedup: skip if blob already exists
+                // Dedup: skip if blob already exists.
                 if self.blobs.contains_key(&cid) {
                     let ath = &self.blobs[&cid];
-                    let response = self.build_ingest_response(&cid, ath)?;
+                    let response = match self.build_ingest_response(&cid, ath) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            // Restore buffer so the fid isn't poisoned.
+                            *self.ingest_buffers.get_mut(&fid).unwrap() =
+                                IngestState::Writing(data);
+                            return Err(e);
+                        }
+                    };
                     *self.ingest_buffers.get_mut(&fid).unwrap() =
                         IngestState::Done(response.clone());
                     return Ok(response);
@@ -207,18 +215,36 @@ impl ContentServer {
                     }
                 };
 
-                // Everything validated. Commit chunks and blob (infallible from here).
+                // Two-pass chunk commit: validate first, then insert.
+                // Detects cross-blob hash_bits collisions (different data at the
+                // same 21-bit address) that would corrupt blob reassembly.
+                let mut to_insert = Vec::new();
                 for (i, addr) in ath.chunks.iter().enumerate() {
                     let hb = addr.hash_bits();
-                    self.chunks.entry(hb).or_insert_with(|| {
-                        let chunk_start = i * CHUNK_SIZE;
-                        let chunk_end = (chunk_start + CHUNK_SIZE).min(data.len());
-                        let raw = &data[chunk_start..chunk_end];
-                        let padded_size = addr.size_bytes();
-                        let mut padded = alloc::vec![0u8; padded_size];
-                        padded[..raw.len()].copy_from_slice(raw);
-                        (*addr, padded)
-                    });
+                    let chunk_start = i * CHUNK_SIZE;
+                    let chunk_end = (chunk_start + CHUNK_SIZE).min(data.len());
+                    let raw = &data[chunk_start..chunk_end];
+                    let padded_size = addr.size_bytes();
+                    let mut padded = alloc::vec![0u8; padded_size];
+                    padded[..raw.len()].copy_from_slice(raw);
+
+                    if let Some((_, existing)) = self.chunks.get(&hb) {
+                        if *existing != padded {
+                            // Cross-blob collision: same hash_bits, different content.
+                            // Storing would silently corrupt reassembly for this blob.
+                            *self.ingest_buffers.get_mut(&fid).unwrap() =
+                                IngestState::Writing(data);
+                            return Err(IpcError::ResourceExhausted);
+                        }
+                        // Same content at same address — cross-blob dedup, skip.
+                    } else {
+                        to_insert.push((hb, *addr, padded));
+                    }
+                }
+
+                // All validated — commit chunks and blob (infallible from here).
+                for (hb, addr, padded) in to_insert {
+                    self.chunks.insert(hb, (addr, padded));
                 }
 
                 self.blobs.insert(cid, ath);
@@ -980,6 +1006,32 @@ mod tests {
         // Reading should finalize successfully with the MAX_BLOB_SIZE data.
         let response = server.read(1, 0, 256).unwrap();
         assert_eq!(response.len(), 40);
+    }
+
+    #[test]
+    fn ingest_detects_cross_blob_chunk_collision() {
+        let mut server = ContentServer::new();
+
+        // Determine what hash_bits a known blob's chunk would get.
+        let blob_data = alloc::vec![0xFFu8; 4096];
+        let cid = sha256_hash(&blob_data);
+        let ath = Athenaeum::from_blob(cid, &blob_data).unwrap();
+        let target_hb = ath.chunks[0].hash_bits();
+
+        // Plant a conflicting chunk at that address with different data.
+        let conflict = alloc::vec![0x00u8; ath.chunks[0].size_bytes()];
+        server
+            .chunks
+            .insert(target_hb, (ath.chunks[0], conflict));
+
+        // Ingest the blob — should detect the collision and reject.
+        server.walk(0, 1, "ingest").unwrap();
+        server.open(1, OpenMode::ReadWrite).unwrap();
+        server.write(1, 0, &blob_data).unwrap();
+        assert_eq!(server.read(1, 0, 256), Err(IpcError::ResourceExhausted));
+
+        // Blob was not stored (no side effects from the failed ingest).
+        assert_eq!(server.blob_count(), 0);
     }
 
     #[test]
