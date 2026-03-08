@@ -179,13 +179,17 @@ impl ContentServer {
 
                 // Dedup: skip if blob already exists.
                 if self.blobs.contains_key(&cid) {
+                    // Drop blob data early — only the CID is needed from here.
+                    // Avoids holding up to 1 MB during the response build.
+                    drop(data);
                     let ath = &self.blobs[&cid];
                     let response = match self.build_ingest_response(&cid, ath) {
                         Ok(r) => r,
                         Err(e) => {
-                            // Restore buffer so the fid isn't poisoned.
+                            // Restore with empty buffer. In practice unreachable:
+                            // the Athenaeum was valid when first stored.
                             *self.ingest_buffers.get_mut(&fid).unwrap() =
-                                IngestState::Writing(data);
+                                IngestState::Writing(Vec::new());
                             return Err(e);
                         }
                     };
