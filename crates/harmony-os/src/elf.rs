@@ -149,8 +149,8 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, ElfError> {
         return Err(ElfError::InvalidPhdr);
     }
 
-    // Validate program header table fits
-    if e_phentsize < ELF64_PHDR_SIZE {
+    // Validate program header table fits (only when headers exist)
+    if e_phnum > 0 && e_phentsize < ELF64_PHDR_SIZE {
         return Err(ElfError::InvalidPhdr);
     }
     let ph_end = e_phoff

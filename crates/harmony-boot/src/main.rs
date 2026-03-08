@@ -480,7 +480,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 }
             }
         };
-        let total_size = (vaddr_max - vaddr_min) as usize;
+        let total_size = match vaddr_max.checked_sub(vaddr_min) {
+            Some(sz) => sz as usize,
+            None => {
+                let _ = writeln!(serial, "[LINUX] vaddr range overflow");
+                loop {
+                    x86_64::instructions::hlt();
+                }
+            }
+        };
         let mut mem = alloc::vec![0u8; total_size];
 
         // Load each segment at its correct offset within the allocation

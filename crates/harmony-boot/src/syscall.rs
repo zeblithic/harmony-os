@@ -131,17 +131,18 @@ extern "C" fn syscall_entry() {
         "push r14",
         "push r15",
 
+        // Force 16-byte stack alignment for SysV ABI.
+        // User RSP may not be aligned when syscall fires.
+        // Save original RSP, align, and restore after the call.
+        "mov rbp, rsp",      // save original RSP in rbp (already saved above)
+        "and rsp, -16",      // force 16-byte alignment
+
         // Set up arguments for rust_syscall_handler(nr, a1, a2, a3, a4, a5, a6)
         // SysV calling convention: rdi, rsi, rdx, rcx, r8, r9, [stack]
         //
         // Current:  RAX=nr, RDI=a1, RSI=a2, RDX=a3, R10=a4, R8=a5, R9=a6
         // Need:     RDI=nr, RSI=a1, RDX=a2, RCX=a3, R8=a4, R9=a5, [stack]=a6
-        // Set up 7th arg (a6) on stack for rust_syscall_handler.
-        // After 8 callee-saved pushes (64 bytes), RSP mod 16 = 0.
-        // We need: [rsp] = a6, then call (which pushes return addr).
-        // But we also need 16-byte alignment before call.
-        // 64 + 8 (padding) + 8 (a6) = 80 bytes → aligned.
-        "sub rsp, 8",        // alignment padding
+        "sub rsp, 8",        // alignment: aligned - 8 - 8(a6) = aligned - 16, then call pushes 8 → -24 mod 16 = 8...
         "push r9",           // a6 as 7th stack arg at [rsp]
 
         // Shuffle registers: Linux ABI → SysV calling convention
@@ -154,8 +155,8 @@ extern "C" fn syscall_entry() {
 
         "call rust_syscall_handler",
 
-        // Return value is in RAX
-        "add rsp, 16",       // pop alignment padding + a6
+        // Return value is in RAX. Restore original RSP.
+        "mov rsp, rbp",
 
         // Restore callee-saved registers
         "pop r15",

@@ -197,6 +197,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux write(2): write to a file descriptor.
     fn sys_write(&mut self, fd: i32, buf_ptr: usize, count: usize) -> i64 {
+        // POSIX: write with count == 0 is a no-op.
+        if count == 0 {
+            return 0;
+        }
+
         let fid = match self.fd_table.get(&fd) {
             Some(&fid) => fid,
             None => return EBADF,

@@ -17,7 +17,7 @@ if [ -z "$AS" ] || [ -z "$LD" ]; then
     elif command -v x86_64-elf-as >/dev/null 2>&1; then
         AS="${AS:-x86_64-elf-as}"
         LD="${LD:-x86_64-elf-ld}"
-    elif command -v as >/dev/null 2>&1; then
+    elif command -v as >/dev/null 2>&1 && [ "$(uname)" != "Darwin" ]; then
         AS="${AS:-as}"
         LD="${LD:-ld}"
     else
