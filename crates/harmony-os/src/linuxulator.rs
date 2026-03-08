@@ -122,10 +122,9 @@ impl SyscallBackend for MockBackend {
 const PAGE_SIZE: usize = 4096;
 
 struct MemoryArena {
-    /// Backing allocation — held to keep the memory alive.
-    /// Accessed via raw pointer (`base`) for direct addressability.
-    #[allow(dead_code)]
-    pages: Vec<u8>,
+    /// Backing allocation — boxed slice so it cannot be accidentally
+    /// resized (which would invalidate the `base` pointer).
+    _pages: alloc::boxed::Box<[u8]>,
     base: usize,
     brk_offset: usize,
     /// Tracked for future munmap implementation. Currently unused by
@@ -140,11 +139,19 @@ impl MemoryArena {
         let size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         // Over-allocate by one page so we can align base up to a page boundary.
         // Vec<u8> has alignment 1 — the raw pointer is not guaranteed page-aligned.
-        let pages = alloc::vec![0u8; size + PAGE_SIZE];
+        // Convert to Box<[u8]> immediately so the allocation cannot be resized.
+        let pages = alloc::vec![0u8; size + PAGE_SIZE].into_boxed_slice();
         let raw_base = pages.as_ptr() as usize;
         let base = (raw_base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        // musl treats brk/mmap return values as signed — addresses in the upper
+        // half of the 64-bit address space (>= 2^63) become negative i64 values,
+        // which musl interprets as errors. Assert we're in the lower half.
+        assert!(
+            base <= i64::MAX as usize,
+            "arena must be in lower address half for musl compatibility"
+        );
         Self {
-            pages,
+            _pages: pages,
             base,
             brk_offset: 0,
             mmap_regions: Vec::new(),
@@ -157,16 +164,21 @@ impl MemoryArena {
 
 /// Read a null-terminated C string from process memory.
 ///
+/// Returns an owned `String` to avoid a false `'static` lifetime on
+/// memory that is actually owned by the process address space.
+///
 /// # Safety
 /// `ptr` must point to valid memory containing a null-terminated string.
-unsafe fn read_c_string(ptr: usize) -> &'static str {
+unsafe fn read_c_string(ptr: usize) -> alloc::string::String {
     const PATH_MAX: usize = 4096;
     let p = ptr as *const u8;
     let mut len = 0;
     while len < PATH_MAX && *p.add(len) != 0 {
         len += 1;
     }
-    core::str::from_utf8_unchecked(core::slice::from_raw_parts(p, len))
+    alloc::string::String::from(core::str::from_utf8_unchecked(
+        core::slice::from_raw_parts(p, len),
+    ))
 }
 
 /// Map Linux open(2) flags to 9P OpenMode.
@@ -508,7 +520,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         let fid = self.alloc_fid();
         let mode = flags_to_open_mode(flags);
 
-        if let Err(e) = self.backend.walk(path, fid) {
+        if let Err(e) = self.backend.walk(&path, fid) {
             return ipc_err_to_errno(e);
         }
         if let Err(e) = self.backend.open(fid, mode) {
@@ -580,9 +592,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if flags & map_anonymous == 0 {
             return EINVAL; // file-backed mmap not supported
         }
-        if flags & map_fixed != 0 && addr != 0 {
+        if flags & map_fixed != 0 {
             return ENOMEM; // arena allocator cannot place at fixed address
         }
+        let _ = addr; // hint addr is intentionally unused (no MAP_FIXED support)
         let len = ((length as usize) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         if len > self.arena.mmap_top.saturating_sub(self.arena.brk_offset) {
             return ENOMEM;
@@ -605,7 +618,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Linux ioctl(2): device control.
     ///
     /// Validates the fd first. TIOCGWINSZ returns ENOTTY (no terminal).
-    /// All other requests return ENOSYS.
+    /// Unknown requests return EINVAL (not ENOSYS — ENOSYS means "syscall
+    /// does not exist", while EINVAL means "unsupported request on this fd").
     fn sys_ioctl(&self, fd: i32, request: u64) -> i64 {
         if !self.fd_table.contains_key(&fd) {
             return EBADF;
@@ -613,7 +627,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         const TIOCGWINSZ: u64 = 0x5413;
         match request {
             TIOCGWINSZ => ENOTTY,
-            _ => ENOSYS,
+            _ => EINVAL,
         }
     }
 
@@ -912,6 +926,15 @@ mod tests {
     }
 
     #[test]
+    fn arena_mmap_fixed_at_zero_also_returns_enomem() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::with_arena(mock, 64 * 1024);
+        // MAP_FIXED with addr=0 should also be rejected
+        let result = lx.handle_syscall(9, [0, 4096, 3, 0x30, u64::MAX, 0]);
+        assert_eq!(result, ENOMEM);
+    }
+
+    #[test]
     fn arena_munmap_returns_success() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::with_arena(mock, 64 * 1024);
@@ -1060,12 +1083,12 @@ mod tests {
     }
 
     #[test]
-    fn sys_ioctl_unknown_returns_enosys() {
+    fn sys_ioctl_unknown_returns_einval() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
         lx.init_stdio().unwrap();
         let result = lx.handle_syscall(16, [1, 0xFFFF, 0, 0, 0, 0]);
-        assert_eq!(result, ENOSYS);
+        assert_eq!(result, EINVAL);
     }
 
     #[test]
