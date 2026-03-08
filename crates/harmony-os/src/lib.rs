@@ -8,6 +8,8 @@
 
 extern crate alloc;
 
+pub mod elf;
+
 #[cfg(test)]
 mod tests {
     #[test]
