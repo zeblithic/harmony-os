@@ -20,6 +20,10 @@ use harmony_athenaeum::{sha256_hash, Athenaeum, ChunkAddr, MAX_BLOB_SIZE};
 
 use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
 
+/// Raw chunk size used by Athenaeum for blob chunking (4 KiB).
+/// Must match `harmony_athenaeum::CHUNK_SIZE` (which is `pub(crate)`).
+const CHUNK_SIZE: usize = 4096;
+
 // ── QPath constants ─────────────────────────────────────────────────
 
 const ROOT: QPath = 0;
@@ -152,33 +156,44 @@ impl ContentServer {
             .ingest_buffers
             .get_mut(&fid)
             .ok_or(IpcError::InvalidArgument)?;
-        // Peek before transitioning — a read-before-write must not poison the fid.
-        if matches!(buf, IngestState::Writing(v) if v.is_empty()) {
-            return Err(IpcError::InvalidArgument);
+        // Peek before transitioning — errors must not poison the fid.
+        match buf {
+            IngestState::Writing(v) if v.is_empty() => {
+                return Err(IpcError::InvalidArgument); // read before write
+            }
+            IngestState::Writing(v) if v.len() > MAX_BLOB_SIZE => {
+                return Err(IpcError::ResourceExhausted);
+            }
+            IngestState::Writing(_) => {} // validation passed, proceed
+            IngestState::Done => return Ok(Vec::new()),
         }
+        // All peeks passed — safe to transition.
         match core::mem::replace(buf, IngestState::Done) {
             IngestState::Writing(data) => {
-                if data.len() > MAX_BLOB_SIZE {
-                    return Err(IpcError::ResourceExhausted);
-                }
                 let cid = sha256_hash(&data);
 
                 // Dedup: skip if blob already exists
                 if self.blobs.contains_key(&cid) {
                     let ath = &self.blobs[&cid];
-                    return Ok(self.build_ingest_response(&cid, ath));
+                    return self.build_ingest_response(&cid, ath); // ? propagated by return
                 }
 
-                let ath =
-                    Athenaeum::from_blob(cid, &data).map_err(|_| IpcError::ResourceExhausted)?;
+                let ath = match Athenaeum::from_blob(cid, &data) {
+                    Ok(ath) => ath,
+                    Err(_) => {
+                        // Restore buffer so the fid isn't poisoned.
+                        *self.ingest_buffers.get_mut(&fid).unwrap() = IngestState::Writing(data);
+                        return Err(IpcError::ResourceExhausted);
+                    }
+                };
 
-                // Store chunks — iterate blob data in 4096-byte pieces,
+                // Store chunks — iterate blob data in CHUNK_SIZE pieces,
                 // pad each to addr.size_bytes()
                 for (i, addr) in ath.chunks.iter().enumerate() {
                     // Only store if not already present (chunk-level dedup)
                     if !self.chunks.iter().any(|(a, _)| *a == *addr) {
-                        let chunk_start = i * 4096;
-                        let chunk_end = (chunk_start + 4096).min(data.len());
+                        let chunk_start = i * CHUNK_SIZE;
+                        let chunk_end = (chunk_start + CHUNK_SIZE).min(data.len());
                         let raw = &data[chunk_start..chunk_end];
                         let padded_size = addr.size_bytes();
                         let mut padded = alloc::vec![0u8; padded_size];
@@ -187,23 +202,23 @@ impl ContentServer {
                     }
                 }
 
-                let response = self.build_ingest_response(&cid, &ath);
+                let response = self.build_ingest_response(&cid, &ath)?;
                 self.blobs.insert(cid, ath);
                 Ok(response)
             }
-            IngestState::Done => {
-                // Already finalized — return empty
-                Ok(Vec::new())
-            }
+            IngestState::Done => unreachable!(), // handled by peek above
         }
     }
 
-    fn build_ingest_response(&self, cid: &[u8; 32], ath: &Athenaeum) -> Vec<u8> {
+    fn build_ingest_response(&self, cid: &[u8; 32], ath: &Athenaeum) -> Result<Vec<u8>, IpcError> {
+        let chunk_count =
+            u32::try_from(ath.chunks.len()).map_err(|_| IpcError::ResourceExhausted)?;
+        let blob_size = u32::try_from(ath.blob_size).map_err(|_| IpcError::ResourceExhausted)?;
         let mut response = Vec::with_capacity(40);
         response.extend_from_slice(cid);
-        response.extend_from_slice(&(ath.chunks.len() as u32).to_le_bytes());
-        response.extend_from_slice(&(ath.blob_size as u32).to_le_bytes());
-        response
+        response.extend_from_slice(&chunk_count.to_le_bytes());
+        response.extend_from_slice(&blob_size.to_le_bytes());
+        Ok(response)
     }
 
     /// Read blob data by reassembling from stored chunks.
@@ -352,6 +367,8 @@ impl FileServer for ContentServer {
                 }
             }
             NodeKind::Ingest => {
+                // Ingest requires ReadWrite: writes accumulate blob data,
+                // then a read triggers finalization and returns the CID.
                 if !matches!(mode, OpenMode::ReadWrite) {
                     return Err(IpcError::PermissionDenied);
                 }
@@ -871,6 +888,35 @@ mod tests {
         let big = alloc::vec![0u8; harmony_athenaeum::MAX_BLOB_SIZE + 1];
         server.write(1, 0, &big).unwrap();
         assert_eq!(server.read(1, 0, 256), Err(IpcError::ResourceExhausted));
+    }
+
+    #[test]
+    fn ingest_oversized_blob_does_not_poison_fid() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "ingest").unwrap();
+        server.open(1, OpenMode::ReadWrite).unwrap();
+        let big = alloc::vec![0u8; harmony_athenaeum::MAX_BLOB_SIZE + 1];
+        server.write(1, 0, &big).unwrap();
+        // First read rejects — oversized.
+        assert_eq!(server.read(1, 0, 256), Err(IpcError::ResourceExhausted));
+        // Fid is NOT poisoned — subsequent read should still return the same error,
+        // not silently succeed with an empty response.
+        assert_eq!(server.read(1, 0, 256), Err(IpcError::ResourceExhausted));
+    }
+
+    #[test]
+    fn chunk_size_matches_athenaeum() {
+        // Validate that our local CHUNK_SIZE matches Athenaeum's behavior:
+        // a blob of exactly CHUNK_SIZE bytes should produce exactly 1 chunk.
+        let data = alloc::vec![0xAAu8; CHUNK_SIZE];
+        let cid = harmony_athenaeum::sha256_hash(&data);
+        let ath = harmony_athenaeum::Athenaeum::from_blob(cid, &data).unwrap();
+        assert_eq!(ath.chunks.len(), 1);
+        // A blob of CHUNK_SIZE + 1 should produce exactly 2 chunks.
+        let data2 = alloc::vec![0xBBu8; CHUNK_SIZE + 1];
+        let cid2 = harmony_athenaeum::sha256_hash(&data2);
+        let ath2 = harmony_athenaeum::Athenaeum::from_blob(cid2, &data2).unwrap();
+        assert_eq!(ath2.chunks.len(), 2);
     }
 
     #[test]
