@@ -10,13 +10,33 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use harmony_microkernel::{Fid, IpcError, OpenMode, QPath};
+use harmony_microkernel::{Fid, FileStat, FileType, IpcError, OpenMode, QPath};
 
 // ── Linux errno constants ───────────────────────────────────────────
 
 const EBADF: i64 = -9;
 const EIO: i64 = -5;
 const ENOSYS: i64 = -38;
+const ENOMEM: i64 = -12;
+const EINVAL: i64 = -22;
+const ENOTTY: i64 = -25;
+const ESRCH: i64 = -3;
+
+fn ipc_err_to_errno(e: IpcError) -> i64 {
+    match e {
+        IpcError::NotFound => -2,           // ENOENT
+        IpcError::PermissionDenied => -13,  // EACCES
+        IpcError::NotOpen => -9,            // EBADF
+        IpcError::InvalidFid => -9,         // EBADF
+        IpcError::NotDirectory => -20,      // ENOTDIR
+        IpcError::IsDirectory => -21,       // EISDIR
+        IpcError::ReadOnly => -30,          // EROFS
+        IpcError::ResourceExhausted => -12, // ENOMEM
+        IpcError::Conflict => -17,          // EEXIST
+        IpcError::NotSupported => -38,      // ENOSYS
+        IpcError::InvalidArgument => -22,   // EINVAL
+    }
+}
 
 // ── SyscallBackend trait ────────────────────────────────────────────
 
@@ -29,6 +49,7 @@ pub trait SyscallBackend {
     fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError>;
     fn write(&mut self, fid: Fid, offset: u64, data: &[u8]) -> Result<u32, IpcError>;
     fn clunk(&mut self, fid: Fid) -> Result<(), IpcError>;
+    fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError>;
 }
 
 // ── MockBackend ─────────────────────────────────────────────────────
@@ -41,6 +62,7 @@ pub struct MockBackend {
     pub writes: Vec<(Fid, Vec<u8>)>,
     pub reads: Vec<(Fid, u64, u32)>,
     pub clunks: Vec<Fid>,
+    pub stats: Vec<Fid>,
 }
 
 #[cfg(test)]
@@ -52,6 +74,7 @@ impl MockBackend {
             writes: Vec::new(),
             reads: Vec::new(),
             clunks: Vec::new(),
+            stats: Vec::new(),
         }
     }
 }
@@ -82,6 +105,16 @@ impl SyscallBackend for MockBackend {
     fn clunk(&mut self, fid: Fid) -> Result<(), IpcError> {
         self.clunks.push(fid);
         Ok(())
+    }
+
+    fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
+        self.stats.push(fid);
+        Ok(FileStat {
+            qpath: 0,
+            name: alloc::sync::Arc::from("mock"),
+            size: 0,
+            file_type: FileType::Regular,
+        })
     }
 }
 
@@ -338,6 +371,21 @@ mod tests {
     }
 
     #[test]
+    fn ipc_err_to_errno_maps_all_variants() {
+        assert_eq!(ipc_err_to_errno(IpcError::NotFound), -2);
+        assert_eq!(ipc_err_to_errno(IpcError::PermissionDenied), -13);
+        assert_eq!(ipc_err_to_errno(IpcError::NotOpen), -9);
+        assert_eq!(ipc_err_to_errno(IpcError::InvalidFid), -9);
+        assert_eq!(ipc_err_to_errno(IpcError::NotDirectory), -20);
+        assert_eq!(ipc_err_to_errno(IpcError::IsDirectory), -21);
+        assert_eq!(ipc_err_to_errno(IpcError::ReadOnly), -30);
+        assert_eq!(ipc_err_to_errno(IpcError::ResourceExhausted), -12);
+        assert_eq!(ipc_err_to_errno(IpcError::Conflict), -17);
+        assert_eq!(ipc_err_to_errno(IpcError::NotSupported), -38);
+        assert_eq!(ipc_err_to_errno(IpcError::InvalidArgument), -22);
+    }
+
+    #[test]
     fn sys_write_to_stderr() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
@@ -385,6 +433,9 @@ mod integration_tests {
         }
         fn clunk(&mut self, fid: Fid) -> Result<(), IpcError> {
             self.kernel.clunk(self.pid, fid)
+        }
+        fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
+            self.kernel.stat(self.pid, fid)
         }
     }
 
