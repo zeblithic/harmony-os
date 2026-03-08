@@ -165,6 +165,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
         &self.backend
     }
 
+    /// Mutable access to the backend (for integration tests).
+    #[cfg(test)]
+    pub fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
+    }
+
     /// Look up the fid for a Linux fd (for testing).
     #[cfg(test)]
     pub fn fid_for_fd(&self, fd: i32) -> Option<Fid> {
@@ -329,5 +335,104 @@ mod tests {
         let msg = b"err";
         let result = lx.handle_syscall(1, [2, msg.as_ptr() as u64, 3, 0, 0, 0]);
         assert_eq!(result, 3);
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use harmony_microkernel::echo::EchoServer;
+    use harmony_microkernel::kernel::Kernel;
+    use harmony_microkernel::serial_server::SerialServer;
+    use harmony_identity::PrivateIdentity;
+    use harmony_unikernel::KernelEntropy;
+
+    /// SyscallBackend backed by a real Ring 2 Kernel.
+    struct KernelBackend<'a> {
+        kernel: &'a mut Kernel,
+        pid: u32,
+    }
+
+    impl<'a> KernelBackend<'a> {
+        fn new(kernel: &'a mut Kernel, pid: u32) -> Self {
+            Self { kernel, pid }
+        }
+    }
+
+    impl SyscallBackend for KernelBackend<'_> {
+        fn walk(&mut self, path: &str, new_fid: Fid) -> Result<QPath, IpcError> {
+            self.kernel.walk(self.pid, path, 0, new_fid, 0)
+        }
+        fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
+            self.kernel.open(self.pid, fid, mode)
+        }
+        fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
+            self.kernel.read(self.pid, fid, offset, count)
+        }
+        fn write(&mut self, fid: Fid, offset: u64, data: &[u8]) -> Result<u32, IpcError> {
+            self.kernel.write(self.pid, fid, offset, data)
+        }
+        fn clunk(&mut self, fid: Fid) -> Result<(), IpcError> {
+            self.kernel.clunk(self.pid, fid)
+        }
+    }
+
+    fn test_entropy() -> KernelEntropy<impl FnMut(&mut [u8])> {
+        let mut seed = 99u64;
+        KernelEntropy::new(move |buf: &mut [u8]| {
+            for b in buf.iter_mut() {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *b = (seed >> 33) as u8;
+            }
+        })
+    }
+
+    #[test]
+    fn linuxulator_writes_hello_through_kernel_to_serial() {
+        let mut entropy = test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let mut kernel = Kernel::new(kernel_id);
+
+        // Spawn SerialServer
+        let serial_pid = kernel
+            .spawn_process("serial", Box::new(SerialServer::new()), &[])
+            .unwrap();
+
+        // Spawn a "linux process" with SerialServer mounted at /dev/serial
+        let linux_pid = kernel
+            .spawn_process(
+                "hello-linux",
+                Box::new(EchoServer::new()), // placeholder server
+                &[("/dev/serial", serial_pid, 0)],
+            )
+            .unwrap();
+
+        // Grant the linux process access to the serial server
+        kernel
+            .grant_endpoint_cap(&mut entropy, linux_pid, serial_pid, 0)
+            .unwrap();
+
+        // Create Linuxulator with KernelBackend
+        let backend = KernelBackend::new(&mut kernel, linux_pid);
+        let mut lx = Linuxulator::new(backend);
+        lx.init_stdio().unwrap();
+
+        // Simulate the hello binary's syscalls
+        let msg = b"Hello\n";
+        let result = lx.handle_syscall(1, [1, msg.as_ptr() as u64, 6, 0, 0, 0]);
+        assert_eq!(result, 6);
+
+        // Verify "Hello\n" reached the SerialServer's buffer
+        // Read back through the kernel via the linux process
+        let read_fid = 200;
+        lx.backend_mut().walk("/dev/serial/log", read_fid).unwrap();
+        lx.backend_mut().open(read_fid, OpenMode::Read).unwrap();
+        let data = lx.backend_mut().read(read_fid, 0, 256).unwrap();
+        assert_eq!(data, b"Hello\n");
+
+        // Verify exit_group
+        lx.handle_syscall(231, [0, 0, 0, 0, 0, 0]);
+        assert!(lx.exited());
+        assert_eq!(lx.exit_code(), Some(0));
     }
 }

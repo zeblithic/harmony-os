@@ -34,3 +34,5 @@ harmony-compute = { workspace = true, optional = true }
 harmony-workflow = { workspace = true, optional = true }
 
 [dev-dependencies]
+harmony-identity = { workspace = true, features = ["std"] }
+harmony-unikernel = { workspace = true, features = ["std"] }
