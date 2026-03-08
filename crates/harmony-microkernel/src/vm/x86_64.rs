@@ -317,12 +317,12 @@ impl PageTable for X86_64PageTable {
     }
 
     fn activate(&mut self) {
-        // Load the PML4 physical address into CR3.
+        // Load the PML4 physical address into CR3. Writing CR3 on x86_64
+        // automatically flushes all non-global TLB entries.
         //
-        // This is guarded by cfg(target_arch) at the module level, so this
-        // code only compiles on x86_64 targets. On other architectures the
-        // entire module is excluded.
-        #[cfg(target_arch = "x86_64")]
+        // Guarded by target_os = "none" so this privileged instruction
+        // only compiles for bare-metal targets, not hosted test builds.
+        #[cfg(target_os = "none")]
         unsafe {
             core::arch::asm!(
                 "mov cr3, {}",

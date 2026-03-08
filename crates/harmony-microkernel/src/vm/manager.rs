@@ -68,7 +68,7 @@ impl<P: PageTable> AddressSpaceManager<P> {
 
     /// Create a new process address space.
     ///
-    /// Rejects duplicate PIDs with [`VmError::RegionConflict`].
+    /// Rejects duplicate PIDs with [`VmError::ProcessExists`].
     pub fn create_space(
         &mut self,
         pid: u32,
@@ -76,8 +76,7 @@ impl<P: PageTable> AddressSpaceManager<P> {
         page_table: P,
     ) -> Result<(), VmError> {
         if self.spaces.contains_key(&pid) {
-            // Use RegionConflict to signal "already exists".
-            return Err(VmError::RegionConflict(VirtAddr(pid as u64)));
+            return Err(VmError::ProcessExists(pid));
         }
         self.cap_tracker.set_budget(pid, budget);
         self.spaces.insert(
@@ -149,21 +148,34 @@ impl<P: PageTable> AddressSpaceManager<P> {
             }
         }
 
-        // Map each page via page_table.
+        // Map each page via page_table. Split borrow: `spaces` and `buddy`
+        // are disjoint fields, so we can mutably borrow both simultaneously.
+        // The buddy allocator provides frames for intermediate page table
+        // levels (PDP/PD/PT on x86_64, L1/L2/L3 on aarch64).
         {
-            let space = self.spaces.get_mut(&pid).unwrap();
+            let Self { spaces, buddy, .. } = self;
+            let space = spaces.get_mut(&pid).unwrap();
+            let mut intermediate_frames: Vec<PhysAddr> = Vec::new();
             for (i, &paddr) in frames.iter().enumerate() {
                 let page_vaddr = VirtAddr(vaddr.as_u64() + (i as u64) * PAGE_SIZE);
-                let result = space.page_table.map(page_vaddr, paddr, flags, &mut || None);
+                let result = space.page_table.map(page_vaddr, paddr, flags, &mut || {
+                    let frame = buddy.alloc_frame()?;
+                    intermediate_frames.push(frame);
+                    Some(frame)
+                });
                 if let Err(e) = result {
                     // Roll back page table mappings already done.
                     for j in 0..i {
                         let rollback_vaddr = VirtAddr(vaddr.as_u64() + (j as u64) * PAGE_SIZE);
                         let _ = space.page_table.unmap(rollback_vaddr);
                     }
-                    // Free all allocated frames.
+                    // Free all allocated data frames.
                     for frame in &frames {
-                        let _ = self.buddy.free_frame(*frame);
+                        let _ = buddy.free_frame(*frame);
+                    }
+                    // Free intermediate page table frames allocated so far.
+                    for frame in &intermediate_frames {
+                        let _ = buddy.free_frame(*frame);
                     }
                     return Err(e);
                 }
@@ -256,18 +268,22 @@ impl<P: PageTable> AddressSpaceManager<P> {
     /// Unmaps all regions, frees all physical frames, and removes the
     /// process's budget from the capability tracker.
     pub fn destroy_space(&mut self, pid: u32) -> Result<(), VmError> {
-        let space = self
+        let mut space = self
             .spaces
             .remove(&pid)
             .ok_or(VmError::NoSuchProcess(pid))?;
 
         for (vaddr, region) in &space.regions {
+            // Unmap each page from the page table. This clears leaf entries
+            // so the page table is in a consistent state before drop.
+            // TODO(harmony-qv2): intermediate page table frames (PDP/PD/PT
+            // levels) are not freed by unmap — they need a dedicated
+            // PageTable::destroy() method to walk and reclaim.
             let page_count = region.len / PAGE_SIZE as usize;
-            // We already removed the space, so we can't unmap via page_table
-            // (it's consumed). But we still need to free frames and update
-            // cap_tracker.
-            let _ = page_count;
-            let _ = vaddr;
+            for i in 0..page_count {
+                let page_vaddr = VirtAddr(vaddr.as_u64() + (i as u64) * PAGE_SIZE);
+                let _ = space.page_table.unmap(page_vaddr);
+            }
 
             for &paddr in &region.frames {
                 let _ = self.cap_tracker.remove_mapping(paddr, pid);
@@ -291,13 +307,12 @@ impl<P: PageTable> AddressSpaceManager<P> {
 
         let mut candidate = USER_SPACE_START;
 
-        // Collect and sort regions by start address for first-fit scan.
-        let mut sorted_regions: Vec<(u64, u64)> = space
+        // BTreeMap iterates in sorted order, so no extra sort needed.
+        let sorted_regions: Vec<(u64, u64)> = space
             .regions
             .iter()
             .map(|(va, r)| (va.as_u64(), va.as_u64() + r.len as u64))
             .collect();
-        sorted_regions.sort_by_key(|&(start, _)| start);
 
         for &(region_start, region_end) in &sorted_regions {
             if candidate + aligned_len <= region_start {

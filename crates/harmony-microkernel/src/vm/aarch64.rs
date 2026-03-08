@@ -379,6 +379,17 @@ impl PageTable for Aarch64PageTable {
                 in(reg) self.root.as_u64(),
                 options(nostack),
             );
+            // ISB ensures the TTBR0 write completes before any further
+            // instruction fetch.
+            core::arch::asm!("isb", options(nostack));
+            // Invalidate all TLB entries for ASID 0 (inner-shareable).
+            // Without this, stale entries from the previous address space
+            // could allow cross-process memory access.
+            core::arch::asm!("tlbi vmalle1is", options(nostack));
+            // DSB ensures the TLB invalidation broadcast completes across
+            // all cores before we continue.
+            core::arch::asm!("dsb ish", options(nostack));
+            // Final ISB synchronizes the instruction pipeline.
             core::arch::asm!("isb", options(nostack));
         }
     }

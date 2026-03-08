@@ -160,7 +160,24 @@ impl<P: PageTable> Kernel<P> {
     pub fn destroy_process(&mut self, pid: u32) -> Result<(), IpcError> {
         self.processes.remove(&pid).ok_or(IpcError::NotFound)?;
 
-        // Clean up fid ownership entries: both where this process is the
+        // Collect client-side fids so we can notify the target servers.
+        // These are fids where the destroyed process was the client.
+        let client_fids: Vec<(u32, Fid)> = self
+            .fid_owners
+            .iter()
+            .filter(|&(&(p, _), _)| p == pid)
+            .map(|(&(_, _), &(target_pid, server_fid))| (target_pid, server_fid))
+            .collect();
+
+        // Clunk each client-side fid against its target server to release
+        // server-side resources (open file handles, buffers, etc.).
+        for &(target_pid, server_fid) in &client_fids {
+            if let Some(target) = self.processes.get_mut(&target_pid) {
+                let _ = target.server.clunk(server_fid);
+            }
+        }
+
+        // Remove all fid ownership entries: both where this process is the
         // client (key side) and where it is the target server (value side).
         self.fid_owners
             .retain(|&(p, _), &mut (tp, _)| p != pid && tp != pid);

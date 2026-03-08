@@ -50,6 +50,7 @@ fn vm_err_to_errno(e: VmError) -> i64 {
         VmError::Unaligned(_) => EINVAL,
         VmError::InvalidOrder(_) => EINVAL,
         VmError::PageTableError => ENOMEM,
+        VmError::ProcessExists(_) => EINVAL,
     }
 }
 

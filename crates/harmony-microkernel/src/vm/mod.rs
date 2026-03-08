@@ -140,6 +140,8 @@ pub enum VmError {
     Unaligned(u64),
     /// The requested buddy order is out of range.
     InvalidOrder(usize),
+    /// A process space with this PID already exists.
+    ProcessExists(u32),
 }
 
 // ── Submodules ───────────────────────────────────────────────────────
