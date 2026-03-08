@@ -20,6 +20,9 @@ pub mod namespace;
 pub mod serial_server;
 pub mod vm;
 
+#[cfg(feature = "kernel")]
+pub mod integrity;
+
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
