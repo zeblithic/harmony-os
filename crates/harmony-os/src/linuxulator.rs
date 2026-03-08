@@ -143,6 +143,32 @@ impl MemoryArena {
     }
 }
 
+// ── Helper functions ────────────────────────────────────────────────
+
+/// Read a null-terminated C string from process memory.
+///
+/// # Safety
+/// `ptr` must point to valid memory containing a null-terminated string.
+unsafe fn read_c_string(ptr: usize) -> &'static str {
+    let p = ptr as *const u8;
+    let mut len = 0;
+    while *p.add(len) != 0 {
+        len += 1;
+    }
+    core::str::from_utf8_unchecked(core::slice::from_raw_parts(p, len))
+}
+
+/// Map Linux open(2) flags to 9P OpenMode.
+fn flags_to_open_mode(flags: i32) -> OpenMode {
+    let accmode = flags & 0x03;
+    match accmode {
+        0 => OpenMode::Read,
+        1 => OpenMode::Write,
+        2 => OpenMode::ReadWrite,
+        _ => OpenMode::Read,
+    }
+}
+
 // ── Linuxulator ─────────────────────────────────────────────────────
 
 /// Linux syscall-to-9P translation engine.
@@ -183,6 +209,15 @@ impl<B: SyscallBackend> Linuxulator<B> {
         let fid = self.next_fid;
         self.next_fid += 1;
         fid
+    }
+
+    /// Allocate the lowest available Linux fd.
+    fn alloc_fd(&self) -> i32 {
+        let mut fd = 0;
+        while self.fd_table.contains_key(&fd) {
+            fd += 1;
+        }
+        fd
     }
 
     /// Pre-populate fd 0 (stdin), 1 (stdout), 2 (stderr) by walking
@@ -261,7 +296,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// In the MVP flat address space, this is a direct pointer dereference.
     pub fn handle_syscall(&mut self, nr: u64, args: [u64; 6]) -> i64 {
         match nr {
+            0 => self.sys_read(args[0] as i32, args[1] as usize, args[2] as usize),
             1 => self.sys_write(args[0] as i32, args[1] as usize, args[2] as usize),
+            3 => self.sys_close(args[0] as i32),
             9 => self.sys_mmap(
                 args[0],
                 args[1],
@@ -272,7 +309,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
             ),
             11 => self.sys_munmap(args[0], args[1]),
             12 => self.sys_brk(args[0]),
+            60 => self.sys_exit(args[0] as i32),
             231 => self.sys_exit_group(args[0] as i32),
+            257 => self.sys_openat(args[0] as i32, args[1] as usize, args[2] as i32),
             _ => ENOSYS,
         }
     }
@@ -299,6 +338,75 @@ impl<B: SyscallBackend> Linuxulator<B> {
             Ok(n) => n as i64,
             Err(_) => EIO,
         }
+    }
+
+    /// Linux read(2): read from a file descriptor.
+    fn sys_read(&mut self, fd: i32, buf_ptr: usize, count: usize) -> i64 {
+        if count == 0 {
+            return 0;
+        }
+
+        let fid = match self.fd_table.get(&fd) {
+            Some(&fid) => fid,
+            None => return EBADF,
+        };
+
+        match self.backend.read(fid, 0, count as u32) {
+            Ok(data) => {
+                let n = data.len();
+                if n > 0 {
+                    // Safety: caller guarantees buf_ptr points to valid memory of at
+                    // least `count` bytes. Same trust model as sys_write.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr as *mut u8, n);
+                    }
+                }
+                n as i64
+            }
+            Err(e) => ipc_err_to_errno(e),
+        }
+    }
+
+    /// Linux close(2): close a file descriptor.
+    fn sys_close(&mut self, fd: i32) -> i64 {
+        let fid = match self.fd_table.remove(&fd) {
+            Some(f) => f,
+            None => return EBADF,
+        };
+        let _ = self.backend.clunk(fid);
+        0
+    }
+
+    /// Linux openat(2): open a file relative to a directory fd.
+    fn sys_openat(&mut self, dirfd: i32, pathname_ptr: usize, flags: i32) -> i64 {
+        let path = unsafe { read_c_string(pathname_ptr) };
+
+        let at_fdcwd: i32 = -100;
+        if dirfd != at_fdcwd && !self.fd_table.contains_key(&dirfd) {
+            return EBADF;
+        }
+
+        let fid = self.alloc_fid();
+        let mode = flags_to_open_mode(flags);
+
+        if let Err(e) = self.backend.walk(path, fid) {
+            return ipc_err_to_errno(e);
+        }
+        if let Err(e) = self.backend.open(fid, mode) {
+            let _ = self.backend.clunk(fid);
+            return ipc_err_to_errno(e);
+        }
+
+        let fd = self.alloc_fd();
+        self.fd_table.insert(fd, fid);
+        fd as i64
+    }
+
+    /// Linux exit(2): terminate the calling thread.
+    ///
+    /// In our single-threaded model, this is equivalent to exit_group.
+    fn sys_exit(&mut self, code: i32) -> i64 {
+        self.sys_exit_group(code)
     }
 
     /// Linux exit_group(2): terminate the process.
@@ -580,6 +688,86 @@ mod tests {
         let addr = lx.handle_syscall(9, [0, 4096, 3, 0x22, u64::MAX, 0]) as u64;
         let result = lx.handle_syscall(11, [addr, 4096, 0, 0, 0, 0]);
         assert_eq!(result, 0);
+    }
+
+    // ── sys_read tests ────────────────────────────────────────────────
+
+    #[test]
+    fn sys_read_copies_data_to_buffer() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+        let mut buf = [0xFFu8; 64];
+        let result = lx.handle_syscall(0, [0, buf.as_mut_ptr() as u64, 64, 0, 0, 0]);
+        assert_eq!(result, 0); // MockBackend returns empty Vec
+    }
+
+    #[test]
+    fn sys_read_bad_fd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let mut buf = [0u8; 64];
+        let result = lx.handle_syscall(0, [99, buf.as_mut_ptr() as u64, 64, 0, 0, 0]);
+        assert_eq!(result, EBADF);
+    }
+
+    #[test]
+    fn sys_read_zero_count() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+        let result = lx.handle_syscall(0, [0, 0, 0, 0, 0, 0]);
+        assert_eq!(result, 0);
+    }
+
+    // ── sys_close tests ───────────────────────────────────────────────
+
+    #[test]
+    fn sys_close_removes_fd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+        assert!(lx.has_fd(1));
+        let result = lx.handle_syscall(3, [1, 0, 0, 0, 0, 0]);
+        assert_eq!(result, 0);
+        assert!(!lx.has_fd(1));
+        assert_eq!(lx.backend().clunks.len(), 1);
+    }
+
+    #[test]
+    fn sys_close_bad_fd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.handle_syscall(3, [99, 0, 0, 0, 0, 0]);
+        assert_eq!(result, EBADF);
+    }
+
+    // ── sys_openat tests ──────────────────────────────────────────────
+
+    #[test]
+    fn sys_openat_walks_and_opens() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+        let path = b"/dev/serial/log\0";
+        let at_fdcwd = (-100i32) as u64;
+        let result = lx.handle_syscall(257, [at_fdcwd, path.as_ptr() as u64, 0, 0, 0, 0]);
+        assert!(result >= 0);
+        assert_eq!(result, 3); // first fd after stdin/stdout/stderr
+        assert!(lx.backend().walks.len() > 3); // 3 from init_stdio + 1 from openat
+        assert!(lx.has_fd(3));
+    }
+
+    // ── sys_exit tests ────────────────────────────────────────────────
+
+    #[test]
+    fn sys_exit_is_same_as_exit_group() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.handle_syscall(60, [7, 0, 0, 0, 0, 0]);
+        assert_eq!(result, 0);
+        assert!(lx.exited());
+        assert_eq!(lx.exit_code(), Some(7));
     }
 }
 
