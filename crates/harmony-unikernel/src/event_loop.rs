@@ -394,8 +394,8 @@ mod tests {
     use crate::platform::entropy::KernelEntropy;
     use crate::platform::persistence::MemoryState;
 
-    fn test_entropy() -> KernelEntropy<impl FnMut(&mut [u8])> {
-        let mut counter: u8 = 42;
+    fn test_entropy_with_seed(seed: u8) -> KernelEntropy<impl FnMut(&mut [u8])> {
+        let mut counter: u8 = seed;
         KernelEntropy::new(move |buf: &mut [u8]| {
             for byte in buf.iter_mut() {
                 *byte = counter;
@@ -404,11 +404,21 @@ mod tests {
         })
     }
 
-    fn make_runtime() -> UnikernelRuntime<KernelEntropy<impl FnMut(&mut [u8])>, MemoryState> {
-        let mut entropy = test_entropy();
+    fn make_runtime_with_seed(
+        seed: u8,
+    ) -> UnikernelRuntime<KernelEntropy<impl FnMut(&mut [u8])>, MemoryState> {
+        let mut entropy = test_entropy_with_seed(seed);
         let identity = PrivateIdentity::generate(&mut entropy);
         let persistence = MemoryState::new();
         UnikernelRuntime::new(identity, entropy, persistence)
+    }
+
+    fn test_entropy() -> KernelEntropy<impl FnMut(&mut [u8])> {
+        test_entropy_with_seed(42)
+    }
+
+    fn make_runtime() -> UnikernelRuntime<KernelEntropy<impl FnMut(&mut [u8])>, MemoryState> {
+        make_runtime_with_seed(42)
     }
 
     #[test]
@@ -586,5 +596,181 @@ mod tests {
             "should emit PeerDiscovered on valid announce"
         );
         assert_eq!(runtime.peer_count(), 1);
+    }
+
+    #[test]
+    fn two_runtimes_discover_each_other() {
+        let mut rt_a = make_runtime_with_seed(42);
+        let mut rt_b = make_runtime_with_seed(99);
+
+        // Verify distinct identities (same seed = same keypair = useless test).
+        assert_ne!(
+            rt_a.identity().public_identity().address_hash,
+            rt_b.identity().public_identity().address_hash,
+            "runtimes must have distinct identities"
+        );
+
+        rt_a.register_interface("net0");
+        rt_b.register_interface("net0");
+        rt_a.register_announcing_destination("harmony", &["node"], 300_000, 0);
+        rt_b.register_announcing_destination("harmony", &["node"], 300_000, 0);
+
+        let mut a_discovered_b = false;
+        let mut b_discovered_a = false;
+
+        let addr_a = rt_a.identity().public_identity().address_hash;
+        let addr_b = rt_b.identity().public_identity().address_hash;
+
+        for tick in 0..100u64 {
+            let now = tick * 1_000; // 1 second per tick
+
+            // Tick both runtimes — collects announces and heartbeats.
+            let actions_a = rt_a.tick(now);
+            let actions_b = rt_b.tick(now);
+
+            // Shuttle A's outbound packets to B, forwarding any responses back.
+            for action in &actions_a {
+                if let RuntimeAction::SendOnInterface { raw, .. } = action {
+                    let results = rt_b.handle_packet("net0", raw.clone(), now);
+                    let mut responses = Vec::new();
+                    for r in &results {
+                        if let RuntimeAction::PeerDiscovered { address_hash, .. } = r {
+                            if *address_hash == addr_a {
+                                b_discovered_a = true;
+                            }
+                        }
+                        if let RuntimeAction::SendOnInterface { raw: resp, .. } = r {
+                            responses.push(resp.clone());
+                        }
+                    }
+                    for resp in responses {
+                        let _ = rt_a.handle_packet("net0", resp, now);
+                    }
+                }
+            }
+
+            // Shuttle B's outbound packets to A, forwarding any responses back.
+            for action in &actions_b {
+                if let RuntimeAction::SendOnInterface { raw, .. } = action {
+                    let results = rt_a.handle_packet("net0", raw.clone(), now);
+                    let mut responses = Vec::new();
+                    for r in &results {
+                        if let RuntimeAction::PeerDiscovered { address_hash, .. } = r {
+                            if *address_hash == addr_b {
+                                a_discovered_b = true;
+                            }
+                        }
+                        if let RuntimeAction::SendOnInterface { raw: resp, .. } = r {
+                            responses.push(resp.clone());
+                        }
+                    }
+                    for resp in responses {
+                        let _ = rt_b.handle_packet("net0", resp, now);
+                    }
+                }
+            }
+
+            if a_discovered_b && b_discovered_a {
+                break;
+            }
+        }
+
+        assert!(b_discovered_a, "B should have discovered A via announce");
+        assert!(a_discovered_b, "A should have discovered B via announce");
+        assert_eq!(rt_a.peer_count(), 1);
+        assert_eq!(rt_b.peer_count(), 1);
+    }
+
+    #[test]
+    fn two_runtimes_exchange_heartbeats() {
+        let mut rt_a = make_runtime_with_seed(42);
+        let mut rt_b = make_runtime_with_seed(99);
+
+        // Verify distinct identities — same seed = same keypair = useless test.
+        assert_ne!(
+            rt_a.identity().public_identity().address_hash,
+            rt_b.identity().public_identity().address_hash,
+            "runtimes must have distinct identities"
+        );
+
+        rt_a.register_interface("net0");
+        rt_b.register_interface("net0");
+        rt_a.register_announcing_destination("harmony", &["node"], 300_000, 0);
+        rt_b.register_announcing_destination("harmony", &["node"], 300_000, 0);
+
+        let mut a_discovered_b = false;
+        let mut b_discovered_a = false;
+        let mut a_got_heartbeat = false;
+        let mut b_got_heartbeat = false;
+
+        let addr_a = rt_a.identity().public_identity().address_hash;
+        let addr_b = rt_b.identity().public_identity().address_hash;
+
+        // Run for 10 simulated seconds (heartbeat_interval_ms = 5000).
+        // Discovery happens on tick 0-1. Heartbeats fire at ~5s.
+        for tick in 0..100u64 {
+            let now = tick * 100; // 100ms per tick, 100 ticks = 10 seconds
+
+            let actions_a = rt_a.tick(now);
+            let actions_b = rt_b.tick(now);
+
+            // Shuttle A → B, forwarding any responses back.
+            for action in &actions_a {
+                if let RuntimeAction::SendOnInterface { raw, .. } = action {
+                    let results = rt_b.handle_packet("net0", raw.clone(), now);
+                    let mut responses = Vec::new();
+                    for r in &results {
+                        if let RuntimeAction::PeerDiscovered { address_hash, .. } = r {
+                            if *address_hash == addr_a {
+                                b_discovered_a = true;
+                            }
+                        }
+                        if matches!(r, RuntimeAction::HeartbeatReceived { .. }) {
+                            b_got_heartbeat = true;
+                        }
+                        if let RuntimeAction::SendOnInterface { raw: resp, .. } = r {
+                            responses.push(resp.clone());
+                        }
+                    }
+                    for resp in responses {
+                        let _ = rt_a.handle_packet("net0", resp, now);
+                    }
+                }
+            }
+
+            // Shuttle B → A, forwarding any responses back.
+            for action in &actions_b {
+                if let RuntimeAction::SendOnInterface { raw, .. } = action {
+                    let results = rt_a.handle_packet("net0", raw.clone(), now);
+                    let mut responses = Vec::new();
+                    for r in &results {
+                        if let RuntimeAction::PeerDiscovered { address_hash, .. } = r {
+                            if *address_hash == addr_b {
+                                a_discovered_b = true;
+                            }
+                        }
+                        if matches!(r, RuntimeAction::HeartbeatReceived { .. }) {
+                            a_got_heartbeat = true;
+                        }
+                        if let RuntimeAction::SendOnInterface { raw: resp, .. } = r {
+                            responses.push(resp.clone());
+                        }
+                    }
+                    for resp in responses {
+                        let _ = rt_b.handle_packet("net0", resp, now);
+                    }
+                }
+            }
+
+            if a_got_heartbeat && b_got_heartbeat {
+                break;
+            }
+        }
+
+        // Discovery is a prerequisite — assert it first for actionable failure messages.
+        assert!(b_discovered_a, "B should have discovered A via announce");
+        assert!(a_discovered_b, "A should have discovered B via announce");
+        assert!(a_got_heartbeat, "A should have received a heartbeat from B");
+        assert!(b_got_heartbeat, "B should have received a heartbeat from A");
     }
 }

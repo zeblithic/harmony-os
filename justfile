@@ -79,6 +79,79 @@ test-qemu: build-image-test
     echo "QEMU boot test: FAILED (QEMU exit $EXIT, expected 33)"
     exit 1
 
+# Two-node mesh test — verifies peer discovery and heartbeat exchange over virtual LAN
+test-mesh: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    MCAST_PORT=$(( ( RANDOM % 10000 ) + 20000 ))
+    echo "Two-node mesh test: launching peers (mcast port $MCAST_PORT)..."
+    LOG_A=$(mktemp)
+    LOG_B=$(mktemp)
+    PID_A=""
+    PID_B=""
+    cleanup() {
+        [ -n "$PID_A" ] && kill "$PID_A" 2>/dev/null || true
+        [ -n "$PID_B" ] && kill "$PID_B" 2>/dev/null || true
+        [ -n "$PID_A" ] && wait "$PID_A" 2>/dev/null || true
+        [ -n "$PID_B" ] && wait "$PID_B" 2>/dev/null || true
+        rm -f "$LOG_A" "$LOG_B"
+    }
+    trap cleanup EXIT
+
+    qemu-system-x86_64 \
+        -drive format=raw,file=target/harmony-boot-bios.img,snapshot=on \
+        -serial file:"$LOG_A" \
+        -display none \
+        -cpu qemu64,+rdrand \
+        -device virtio-net-pci,netdev=n0 \
+        -netdev socket,id=n0,mcast=230.0.0.1:$MCAST_PORT &
+    PID_A=$!
+
+    qemu-system-x86_64 \
+        -drive format=raw,file=target/harmony-boot-bios.img,snapshot=on \
+        -serial file:"$LOG_B" \
+        -display none \
+        -cpu qemu64,+rdrand \
+        -device virtio-net-pci,netdev=n0 \
+        -netdev socket,id=n0,mcast=230.0.0.1:$MCAST_PORT &
+    PID_B=$!
+
+    for i in $(seq 1 30); do
+        sleep 1
+        # Bail early if either node has exited (e.g., kernel panic).
+        if ! kill -0 "$PID_A" 2>/dev/null || ! kill -0 "$PID_B" 2>/dev/null; then
+            echo "  [${i}s] One or both nodes exited unexpectedly"
+            break
+        fi
+        A_PEER=$(grep -c '\[PEER+\]' "$LOG_A" 2>/dev/null || echo 0)
+        B_PEER=$(grep -c '\[PEER+\]' "$LOG_B" 2>/dev/null || echo 0)
+        A_HBT=$(grep -c '\[HBT\]' "$LOG_A" 2>/dev/null || echo 0)
+        B_HBT=$(grep -c '\[HBT\]' "$LOG_B" 2>/dev/null || echo 0)
+        echo "  [${i}s] A: ${A_PEER} peers, ${A_HBT} heartbeats | B: ${B_PEER} peers, ${B_HBT} heartbeats"
+        if [ "$A_PEER" -gt 0 ] && [ "$B_PEER" -gt 0 ] \
+           && [ "$A_HBT" -gt 0 ] && [ "$B_HBT" -gt 0 ]; then
+            echo ""
+            echo "=== Node A log ==="
+            cat "$LOG_A"
+            echo ""
+            echo "=== Node B log ==="
+            cat "$LOG_B"
+            echo ""
+            echo "Two-node mesh test: PASSED"
+            exit 0
+        fi
+    done
+
+    echo ""
+    echo "=== Node A log ==="
+    cat "$LOG_A"
+    echo ""
+    echo "=== Node B log ==="
+    cat "$LOG_B"
+    echo ""
+    echo "Two-node mesh test: FAILED (timeout after 30s)"
+    exit 1
+
 # Lint workspace crates
 clippy:
     cargo clippy --workspace

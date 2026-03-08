@@ -176,9 +176,9 @@ unsafe fn read_c_string(ptr: usize) -> alloc::string::String {
     while len < PATH_MAX && *p.add(len) != 0 {
         len += 1;
     }
-    alloc::string::String::from(core::str::from_utf8_unchecked(
-        core::slice::from_raw_parts(p, len),
-    ))
+    alloc::string::String::from(core::str::from_utf8_unchecked(core::slice::from_raw_parts(
+        p, len,
+    )))
 }
 
 /// Map Linux open(2) flags to 9P OpenMode.
@@ -314,19 +314,37 @@ impl<B: SyscallBackend> Linuxulator<B> {
         let stdin_fid = self.alloc_fid();
         self.backend.walk("/dev/serial/log", stdin_fid)?;
         self.backend.open(stdin_fid, OpenMode::Read)?;
-        self.fd_table.insert(0, FdEntry { fid: stdin_fid, offset: 0 });
+        self.fd_table.insert(
+            0,
+            FdEntry {
+                fid: stdin_fid,
+                offset: 0,
+            },
+        );
 
         // stdout (fd 1) — write mode
         let stdout_fid = self.alloc_fid();
         self.backend.walk("/dev/serial/log", stdout_fid)?;
         self.backend.open(stdout_fid, OpenMode::Write)?;
-        self.fd_table.insert(1, FdEntry { fid: stdout_fid, offset: 0 });
+        self.fd_table.insert(
+            1,
+            FdEntry {
+                fid: stdout_fid,
+                offset: 0,
+            },
+        );
 
         // stderr (fd 2) — write mode
         let stderr_fid = self.alloc_fid();
         self.backend.walk("/dev/serial/log", stderr_fid)?;
         self.backend.open(stderr_fid, OpenMode::Write)?;
-        self.fd_table.insert(2, FdEntry { fid: stderr_fid, offset: 0 });
+        self.fd_table.insert(
+            2,
+            FdEntry {
+                fid: stderr_fid,
+                offset: 0,
+            },
+        );
 
         // Track stdio fids as character devices for fstat.
         self.chardev_fids
@@ -665,7 +683,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 let eight_mb = 8u64 * 1024 * 1024;
                 unsafe {
                     core::ptr::write_unaligned(old_limit_ptr as *mut u64, eight_mb); // rlim_cur
-                    core::ptr::write_unaligned((old_limit_ptr + 8) as *mut u64, eight_mb); // rlim_max
+                    core::ptr::write_unaligned((old_limit_ptr + 8) as *mut u64, eight_mb);
+                    // rlim_max
                 }
             }
             return 0;
