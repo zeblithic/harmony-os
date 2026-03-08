@@ -164,12 +164,10 @@ impl ContentServer {
             .get_mut(&fid)
             .ok_or(IpcError::InvalidArgument)?;
         // Peek before transitioning — errors must not poison the fid.
+        // Note: MAX_BLOB_SIZE is enforced in write(), so no size check needed here.
         match buf {
             IngestState::Writing(v) if v.is_empty() => {
                 return Err(IpcError::InvalidArgument); // read before write
-            }
-            IngestState::Writing(v) if v.len() > MAX_BLOB_SIZE => {
-                return Err(IpcError::ResourceExhausted);
             }
             IngestState::Writing(_) => {} // validation passed, proceed
             IngestState::Done(ref response) => return Ok(response.clone()),
@@ -197,9 +195,8 @@ impl ContentServer {
                 }
 
                 // from_blob can fail with CollisionError::AllAlgorithmsCollide
-                // (32-bit address space exhaustion). Size errors are already
-                // handled by the peek above, so ResourceExhausted is the
-                // appropriate mapping for the remaining failure mode.
+                // (32-bit address space exhaustion). Size is enforced in write(),
+                // so ResourceExhausted maps to the remaining failure mode.
                 let ath = match Athenaeum::from_blob(cid, &data) {
                     Ok(ath) => ath,
                     Err(_) => {
@@ -236,9 +233,12 @@ impl ContentServer {
                         if *existing != padded {
                             // Cross-blob collision: same hash_bits, different content.
                             // Storing would silently corrupt reassembly for this blob.
+                            // Conflict (not ResourceExhausted) distinguishes this from
+                            // capacity errors — callers know the data is valid but clashes
+                            // with existing chunk state.
                             *self.ingest_buffers.get_mut(&fid).unwrap() =
                                 IngestState::Writing(data);
-                            return Err(IpcError::ResourceExhausted);
+                            return Err(IpcError::Conflict);
                         }
                         // Same content at same address — cross-blob dedup, skip.
                     } else {
@@ -1065,7 +1065,7 @@ mod tests {
         server.walk(0, 1, "ingest").unwrap();
         server.open(1, OpenMode::ReadWrite).unwrap();
         server.write(1, 0, &blob_data).unwrap();
-        assert_eq!(server.read(1, 0, 256), Err(IpcError::ResourceExhausted));
+        assert_eq!(server.read(1, 0, 256), Err(IpcError::Conflict));
 
         // Blob was not stored (no side effects from the failed ingest).
         assert_eq!(server.blob_count(), 0);
