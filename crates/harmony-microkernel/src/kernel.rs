@@ -15,6 +15,7 @@ use crate::namespace::Namespace;
 use crate::vm::cap_tracker::MemoryBudget;
 use crate::vm::manager::AddressSpaceManager;
 use crate::vm::page_table::PageTable;
+use crate::vm::{FrameClassification, PageFlags, VirtAddr, VmError};
 use crate::{Fid, FileServer, IpcError, OpenMode, QPath};
 
 /// Maximum UCAN delegation chain depth for capability verification.
@@ -161,7 +162,8 @@ impl<P: PageTable> Kernel<P> {
 
         // Clean up fid ownership entries: both where this process is the
         // client (key side) and where it is the target server (value side).
-        self.fid_owners.retain(|&(p, _), &mut (tp, _)| p != pid && tp != pid);
+        self.fid_owners
+            .retain(|&(p, _), &mut (tp, _)| p != pid && tp != pid);
 
         // Destroy VM space. Ignore NoSuchProcess — the process may
         // have been spawned without a VM config.
@@ -442,6 +444,50 @@ impl<P: PageTable> Kernel<P> {
             let _ = target.server.clunk(server_fid);
         }
         Ok(())
+    }
+
+    // ── VM delegation ────────────────────────────────────────────────
+
+    /// Map a region of virtual memory for a process.
+    ///
+    /// Delegates to the `AddressSpaceManager`. Returns the base virtual
+    /// address on success. The process must have a VM space (created via
+    /// `spawn_process` with `vm_config`).
+    pub fn vm_map_region(
+        &mut self,
+        pid: u32,
+        vaddr: VirtAddr,
+        len: usize,
+        flags: PageFlags,
+        classification: FrameClassification,
+    ) -> Result<(), VmError> {
+        self.vm.map_region(pid, vaddr, len, flags, classification)
+    }
+
+    /// Unmap a region previously mapped at `vaddr` for process `pid`.
+    pub fn vm_unmap_region(&mut self, pid: u32, vaddr: VirtAddr) -> Result<(), VmError> {
+        self.vm.unmap_region(pid, vaddr)
+    }
+
+    /// Change the permission flags on an existing region.
+    pub fn vm_protect_region(
+        &mut self,
+        pid: u32,
+        vaddr: VirtAddr,
+        new_flags: PageFlags,
+    ) -> Result<(), VmError> {
+        self.vm.protect_region(pid, vaddr, new_flags)
+    }
+
+    /// Find a free region of at least `len` bytes in the process's
+    /// address space.
+    pub fn vm_find_free_region(&self, pid: u32, len: usize) -> Result<VirtAddr, VmError> {
+        self.vm.find_free_region(pid, len)
+    }
+
+    /// Check whether a process has a VM address space.
+    pub fn has_vm_space(&self, pid: u32) -> bool {
+        self.vm.space(pid).is_some()
     }
 }
 

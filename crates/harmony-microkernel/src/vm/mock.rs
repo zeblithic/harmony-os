@@ -134,8 +134,7 @@ mod tests {
         let vaddr = VirtAddr(PAGE);
         let paddr = PhysAddr(2 * PAGE);
 
-        pt.map(vaddr, paddr, rw_flags(), &mut noop_alloc())
-            .unwrap();
+        pt.map(vaddr, paddr, rw_flags(), &mut noop_alloc()).unwrap();
 
         let returned = pt.unmap(vaddr).unwrap();
         assert_eq!(returned, paddr);

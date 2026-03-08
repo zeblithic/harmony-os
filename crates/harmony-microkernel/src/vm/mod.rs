@@ -144,11 +144,11 @@ pub enum VmError {
 
 // ── Submodules ───────────────────────────────────────────────────────
 
-pub mod page_table;
-pub mod mock;
 pub mod buddy;
 pub mod cap_tracker;
 pub mod manager;
+pub mod mock;
+pub mod page_table;
 
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
@@ -217,8 +217,14 @@ mod tests {
         let p = PhysAddr(0x1000);
         let v_dbg = format!("{:?}", v);
         let p_dbg = format!("{:?}", p);
-        assert!(v_dbg.contains("VirtAddr"), "expected VirtAddr in debug output");
-        assert!(p_dbg.contains("PhysAddr"), "expected PhysAddr in debug output");
+        assert!(
+            v_dbg.contains("VirtAddr"),
+            "expected VirtAddr in debug output"
+        );
+        assert!(
+            p_dbg.contains("PhysAddr"),
+            "expected PhysAddr in debug output"
+        );
         assert_ne!(v_dbg, p_dbg);
     }
 }

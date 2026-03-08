@@ -103,10 +103,7 @@ impl CapTracker {
         size: usize,
         classification: FrameClassification,
     ) -> Result<(), VmError> {
-        let budget = self
-            .budgets
-            .get(&pid)
-            .ok_or(VmError::NoSuchProcess(pid))?;
+        let budget = self.budgets.get(&pid).ok_or(VmError::NoSuchProcess(pid))?;
 
         if !budget.can_map(size) {
             return Err(VmError::BudgetExceeded {
@@ -143,11 +140,14 @@ impl CapTracker {
         // Only track frames with non-empty classification in the B-tree.
         if !classification.is_empty() {
             let frame_num = paddr.as_u64() >> PAGE_SHIFT;
-            let meta = self.frame_meta.entry(frame_num).or_insert_with(|| FrameMeta {
-                owner_pid: pid,
-                classification,
-                mapped_by: Vec::new(),
-            });
+            let meta = self
+                .frame_meta
+                .entry(frame_num)
+                .or_insert_with(|| FrameMeta {
+                    owner_pid: pid,
+                    classification,
+                    mapped_by: Vec::new(),
+                });
             if !meta.mapped_by.contains(&pid) {
                 meta.mapped_by.push(pid);
             }
@@ -209,9 +209,7 @@ impl CapTracker {
         self.frame_meta
             .iter()
             .filter(|(_, meta)| meta.classification.contains(class))
-            .map(|(&frame_num, meta)| {
-                (PhysAddr(frame_num << PAGE_SHIFT), meta.mapped_by.clone())
-            })
+            .map(|(&frame_num, meta)| (PhysAddr(frame_num << PAGE_SHIFT), meta.mapped_by.clone()))
             .collect()
     }
 
@@ -242,10 +240,7 @@ mod tests {
     #[test]
     fn budget_enforcement() {
         let mut tracker = CapTracker::new();
-        let budget = MemoryBudget::new(
-            2 * PAGE_SIZE as usize,
-            FrameClassification::all(),
-        );
+        let budget = MemoryBudget::new(2 * PAGE_SIZE as usize, FrameClassification::all());
         tracker.set_budget(1, budget);
 
         // Within budget.

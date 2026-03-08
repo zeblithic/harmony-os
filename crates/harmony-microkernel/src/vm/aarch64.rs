@@ -409,7 +409,11 @@ mod tests {
         // Must have Inner Shareable.
         assert_ne!(desc & SH_INNER, 0, "SH_INNER must be set");
         // AP must be RW_ALL (EL1 + EL0 read/write).
-        assert_eq!(desc & AP_MASK, AP_RW_ALL, "AP must be RW_ALL for writable+user");
+        assert_eq!(
+            desc & AP_MASK,
+            AP_RW_ALL,
+            "AP must be RW_ALL for writable+user"
+        );
         // Not executable → both UXN and PXN set.
         assert_ne!(desc & UXN, 0, "UXN must be set when not executable");
         assert_ne!(desc & PXN, 0, "PXN must be set when not executable");
@@ -425,7 +429,11 @@ mod tests {
 
         assert_eq!(desc & 0b11, DESC_TABLE);
         assert_ne!(desc & AF, 0);
-        assert_eq!(desc & AP_MASK, AP_RO_EL1, "AP must be RO_EL1 for kernel read-only");
+        assert_eq!(
+            desc & AP_MASK,
+            AP_RO_EL1,
+            "AP must be RO_EL1 for kernel read-only"
+        );
         // Not executable.
         assert_ne!(desc & UXN, 0, "UXN set when not executable");
         assert_ne!(desc & PXN, 0, "PXN set when not executable");
@@ -439,7 +447,11 @@ mod tests {
 
         assert_eq!(desc & 0b11, DESC_TABLE);
         assert_ne!(desc & AF, 0);
-        assert_eq!(desc & AP_MASK, AP_RO_EL1, "AP must be RO_EL1 for kernel read-only");
+        assert_eq!(
+            desc & AP_MASK,
+            AP_RO_EL1,
+            "AP must be RO_EL1 for kernel read-only"
+        );
         // Executable → both XN bits clear.
         assert_eq!(desc & UXN, 0, "UXN must be clear for executable");
         assert_eq!(desc & PXN, 0, "PXN must be clear for executable");
@@ -452,7 +464,8 @@ mod tests {
         let desc = Aarch64PageTable::flags_to_desc(flags);
 
         assert_eq!(
-            desc & ATTR_IDX_MASK, ATTR_DEVICE,
+            desc & ATTR_IDX_MASK,
+            ATTR_DEVICE,
             "NO_CACHE must select device memory attribute"
         );
     }

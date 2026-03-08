@@ -252,11 +252,7 @@ impl BuddyAllocator {
     ///
     /// This is intended for boot-time use. It marks the given frames in the
     /// bitmap and rebuilds the free lists from scratch.
-    pub fn reserve_range(
-        &mut self,
-        start: PhysAddr,
-        count: usize,
-    ) -> Result<(), VmError> {
+    pub fn reserve_range(&mut self, start: PhysAddr, count: usize) -> Result<(), VmError> {
         if !start.is_page_aligned() {
             return Err(VmError::Unaligned(start.as_u64()));
         }
@@ -364,10 +360,12 @@ mod tests {
     fn alloc_single_frame() {
         let mut alloc = make_allocator(16);
         let addr = alloc.alloc_frame().expect("should allocate a frame");
-        assert!(addr.is_page_aligned(), "returned address must be page-aligned");
         assert!(
-            addr.as_u64() >= 0x10_0000
-                && addr.as_u64() < 0x10_0000 + 16 * PAGE_SIZE,
+            addr.is_page_aligned(),
+            "returned address must be page-aligned"
+        );
+        assert!(
+            addr.as_u64() >= 0x10_0000 && addr.as_u64() < 0x10_0000 + 16 * PAGE_SIZE,
             "address must be within managed region"
         );
     }
@@ -423,7 +421,9 @@ mod tests {
         assert_eq!(alloc.free_frame_count(), 4);
 
         // Allocating an order-2 block (4 frames) should succeed.
-        let block = alloc.alloc(2).expect("order-2 alloc should succeed after coalescing");
+        let block = alloc
+            .alloc(2)
+            .expect("order-2 alloc should succeed after coalescing");
         assert!(block.is_page_aligned());
         assert_eq!(alloc.free_frame_count(), 0);
     }

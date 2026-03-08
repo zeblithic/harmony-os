@@ -154,10 +154,7 @@ impl<P: PageTable> AddressSpaceManager<P> {
             let space = self.spaces.get_mut(&pid).unwrap();
             for (i, &paddr) in frames.iter().enumerate() {
                 let page_vaddr = VirtAddr(vaddr.as_u64() + (i as u64) * PAGE_SIZE);
-                let result =
-                    space
-                        .page_table
-                        .map(page_vaddr, paddr, flags, &mut || None);
+                let result = space.page_table.map(page_vaddr, paddr, flags, &mut || None);
                 if let Err(e) = result {
                     // Roll back page table mappings already done.
                     for j in 0..i {
@@ -198,7 +195,10 @@ impl<P: PageTable> AddressSpaceManager<P> {
     /// Removes page table mappings, frees physical frames, and updates
     /// the capability tracker.
     pub fn unmap_region(&mut self, pid: u32, vaddr: VirtAddr) -> Result<(), VmError> {
-        let space = self.spaces.get_mut(&pid).ok_or(VmError::NoSuchProcess(pid))?;
+        let space = self
+            .spaces
+            .get_mut(&pid)
+            .ok_or(VmError::NoSuchProcess(pid))?;
 
         let region = space
             .regions
@@ -231,7 +231,10 @@ impl<P: PageTable> AddressSpaceManager<P> {
         vaddr: VirtAddr,
         new_flags: PageFlags,
     ) -> Result<(), VmError> {
-        let space = self.spaces.get_mut(&pid).ok_or(VmError::NoSuchProcess(pid))?;
+        let space = self
+            .spaces
+            .get_mut(&pid)
+            .ok_or(VmError::NoSuchProcess(pid))?;
 
         let region = space
             .regions
@@ -317,7 +320,10 @@ impl<P: PageTable> AddressSpaceManager<P> {
 
     /// Activate the page table for the given process.
     pub fn switch_to(&mut self, pid: u32) -> Result<(), VmError> {
-        let space = self.spaces.get_mut(&pid).ok_or(VmError::NoSuchProcess(pid))?;
+        let space = self
+            .spaces
+            .get_mut(&pid)
+            .ok_or(VmError::NoSuchProcess(pid))?;
         space.page_table.activate();
         Ok(())
     }
@@ -342,8 +348,8 @@ impl<P: PageTable> AddressSpaceManager<P> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::mock::MockPageTable;
+    use super::*;
 
     fn make_manager(frame_count: usize) -> AddressSpaceManager<MockPageTable> {
         let buddy = BuddyAllocator::new(PhysAddr(0x10_0000), frame_count).unwrap();
@@ -380,8 +386,14 @@ mod tests {
 
         let vaddr = VirtAddr(0x1000);
         let flags = rw_user_flags();
-        mgr.map_region(1, vaddr, PAGE_SIZE as usize, flags, FrameClassification::empty())
-            .unwrap();
+        mgr.map_region(
+            1,
+            vaddr,
+            PAGE_SIZE as usize,
+            flags,
+            FrameClassification::empty(),
+        )
+        .unwrap();
 
         let space = mgr.space(1).unwrap();
         let (paddr, got_flags) = space.page_table.translate(vaddr).expect("should be mapped");
@@ -682,9 +694,6 @@ mod tests {
             VmError::NoSuchProcess(99)
         );
 
-        assert_eq!(
-            mgr.switch_to(99).unwrap_err(),
-            VmError::NoSuchProcess(99)
-        );
+        assert_eq!(mgr.switch_to(99).unwrap_err(), VmError::NoSuchProcess(99));
     }
 }
