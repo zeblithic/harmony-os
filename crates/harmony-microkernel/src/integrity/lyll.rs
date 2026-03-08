@@ -47,6 +47,7 @@ pub struct LyllConfig {
 struct FrameRecord {
     entry: HashEntry,
     owner_pid: u32,
+    zone: MemoryZone,
 }
 
 /// Lyll — the probabilistic memory auditor.
@@ -81,9 +82,21 @@ impl Lyll {
         }
     }
 
-    pub fn register_frame(&mut self, paddr: PhysAddr, entry: HashEntry, owner_pid: u32) {
-        self.hash_registry
-            .insert(paddr, FrameRecord { entry, owner_pid });
+    pub fn register_frame(
+        &mut self,
+        paddr: PhysAddr,
+        entry: HashEntry,
+        owner_pid: u32,
+        zone: MemoryZone,
+    ) {
+        self.hash_registry.insert(
+            paddr,
+            FrameRecord {
+                entry,
+                owner_pid,
+                zone,
+            },
+        );
     }
 
     pub fn unregister_frame(&mut self, paddr: PhysAddr) {
@@ -170,10 +183,7 @@ impl Lyll {
             return IntegrityVerdict::Allow;
         }
 
-        let zone = match record.entry {
-            HashEntry::CidBacked { .. } => MemoryZone::PublicDurable,
-            HashEntry::Snapshot { .. } => MemoryZone::PublicEphemeral,
-        };
+        let zone = record.zone;
 
         if !self.quarantine.is_quarantined(paddr) {
             self.quarantine.add(QuarantineRecord {
@@ -251,7 +261,12 @@ mod tests {
     fn register_cid_backed_frame() {
         let mut lyll = Lyll::new(test_config());
         let hash = ContentHash([0xAA; 32]);
-        lyll.register_frame(PhysAddr(0x1000), HashEntry::CidBacked { cid: hash.0 }, 1);
+        lyll.register_frame(
+            PhysAddr(0x1000),
+            HashEntry::CidBacked { cid: hash.0 },
+            1,
+            MemoryZone::PublicDurable,
+        );
         assert_eq!(lyll.registry_len(), 1);
         assert_eq!(lyll.expected_hash(PhysAddr(0x1000)), Some(hash.0));
     }
@@ -266,6 +281,7 @@ mod tests {
                 generation: 0,
             },
             1,
+            MemoryZone::PublicEphemeral,
         );
         assert_eq!(lyll.registry_len(), 1);
         assert_eq!(lyll.expected_hash(PhysAddr(0x2000)), Some([0xBB; 32]));
@@ -281,6 +297,7 @@ mod tests {
                 generation: 0,
             },
             1,
+            MemoryZone::PublicEphemeral,
         );
         lyll.update_snapshot(PhysAddr(0x1000), [0xFF; 32]);
         assert_eq!(lyll.expected_hash(PhysAddr(0x1000)), Some([0xFF; 32]));
@@ -293,6 +310,7 @@ mod tests {
             PhysAddr(0x1000),
             HashEntry::CidBacked { cid: [0xAA; 32] },
             1,
+            MemoryZone::PublicDurable,
         );
         lyll.update_snapshot(PhysAddr(0x1000), [0xFF; 32]);
         assert_eq!(lyll.expected_hash(PhysAddr(0x1000)), Some([0xAA; 32]));
@@ -305,6 +323,7 @@ mod tests {
             PhysAddr(0x1000),
             HashEntry::CidBacked { cid: [0xAA; 32] },
             1,
+            MemoryZone::PublicDurable,
         );
         lyll.promote_to_snapshot(PhysAddr(0x1000));
         // Hash preserved.
@@ -324,6 +343,7 @@ mod tests {
                 generation: 5,
             },
             1,
+            MemoryZone::PublicEphemeral,
         );
         lyll.promote_to_snapshot(PhysAddr(0x1000));
         assert_eq!(lyll.expected_hash(PhysAddr(0x1000)), Some([0xAA; 32]));
@@ -332,7 +352,12 @@ mod tests {
     #[test]
     fn unregister_frame_removes_entry() {
         let mut lyll = Lyll::new(test_config());
-        lyll.register_frame(PhysAddr(0x1000), HashEntry::CidBacked { cid: [0; 32] }, 1);
+        lyll.register_frame(
+            PhysAddr(0x1000),
+            HashEntry::CidBacked { cid: [0; 32] },
+            1,
+            MemoryZone::PublicDurable,
+        );
         assert_eq!(lyll.registry_len(), 1);
         lyll.unregister_frame(PhysAddr(0x1000));
         assert_eq!(lyll.registry_len(), 0);
@@ -344,7 +369,12 @@ mod tests {
     fn verify_frame_matching_hash_allows() {
         let mut lyll = Lyll::new(test_config());
         let hash = [0xAA; 32];
-        lyll.register_frame(PhysAddr(0x1000), HashEntry::CidBacked { cid: hash }, 1);
+        lyll.register_frame(
+            PhysAddr(0x1000),
+            HashEntry::CidBacked { cid: hash },
+            1,
+            MemoryZone::PublicDurable,
+        );
         let verdict = lyll.verify_frame(PhysAddr(0x1000), hash, 0);
         assert_eq!(verdict, IntegrityVerdict::Allow);
     }
@@ -356,6 +386,7 @@ mod tests {
             PhysAddr(0x1000),
             HashEntry::CidBacked { cid: [0xAA; 32] },
             1,
+            MemoryZone::PublicDurable,
         );
         let verdict = lyll.verify_frame(PhysAddr(0x1000), [0xBB; 32], 42);
         assert!(matches!(
@@ -370,9 +401,10 @@ mod tests {
     }
 
     #[test]
-    fn quarantine_zone_matches_entry_type() {
+    fn quarantine_zone_uses_stored_zone_not_entry_type() {
         let mut lyll = Lyll::new(test_config());
-        // Snapshot entry → PublicEphemeral zone in quarantine.
+
+        // Snapshot entry registered as PublicDurable (writable non-ephemeral frame).
         lyll.register_frame(
             PhysAddr(0x1000),
             HashEntry::Snapshot {
@@ -380,21 +412,20 @@ mod tests {
                 generation: 0,
             },
             1,
+            MemoryZone::PublicDurable,
         );
         lyll.verify_frame(PhysAddr(0x1000), [0xBB; 32], 0);
-        assert_eq!(
-            lyll.quarantine.records()[0].zone,
-            MemoryZone::PublicEphemeral
-        );
+        assert_eq!(lyll.quarantine.records()[0].zone, MemoryZone::PublicDurable);
 
-        // CidBacked entry → PublicDurable zone in quarantine.
+        // CidBacked entry registered as KernelDurable (encrypted immutable frame).
         lyll.register_frame(
             PhysAddr(0x2000),
             HashEntry::CidBacked { cid: [0xCC; 32] },
             2,
+            MemoryZone::KernelDurable,
         );
         lyll.verify_frame(PhysAddr(0x2000), [0xDD; 32], 0);
-        assert_eq!(lyll.quarantine.records()[1].zone, MemoryZone::PublicDurable);
+        assert_eq!(lyll.quarantine.records()[1].zone, MemoryZone::KernelDurable);
     }
 
     #[test]
@@ -454,7 +485,12 @@ mod tests {
     #[test]
     fn unregister_also_removes_from_samples() {
         let mut lyll = Lyll::new(test_config());
-        lyll.register_frame(PhysAddr(0x1000), HashEntry::CidBacked { cid: [0; 32] }, 1);
+        lyll.register_frame(
+            PhysAddr(0x1000),
+            HashEntry::CidBacked { cid: [0; 32] },
+            1,
+            MemoryZone::PublicDurable,
+        );
         lyll.add_sample(PhysAddr(0x1000));
         assert_eq!(lyll.sampled_count(), 1);
         lyll.unregister_frame(PhysAddr(0x1000));
@@ -485,6 +521,7 @@ mod tests {
             PhysAddr(0x1000),
             HashEntry::CidBacked { cid: [0xAA; 32] },
             1,
+            MemoryZone::PublicDurable,
         );
         // First verify — quarantines.
         lyll.verify_frame(PhysAddr(0x1000), [0xBB; 32], 0);
@@ -516,8 +553,18 @@ mod tests {
     #[test]
     fn all_registered_frames_returns_all_addrs() {
         let mut lyll = Lyll::new(test_config());
-        lyll.register_frame(PhysAddr(0x1000), HashEntry::CidBacked { cid: [0; 32] }, 1);
-        lyll.register_frame(PhysAddr(0x2000), HashEntry::CidBacked { cid: [1; 32] }, 2);
+        lyll.register_frame(
+            PhysAddr(0x1000),
+            HashEntry::CidBacked { cid: [0; 32] },
+            1,
+            MemoryZone::PublicDurable,
+        );
+        lyll.register_frame(
+            PhysAddr(0x2000),
+            HashEntry::CidBacked { cid: [1; 32] },
+            2,
+            MemoryZone::PublicDurable,
+        );
         let all = lyll.all_registered_frames();
         assert_eq!(all.len(), 2);
         assert!(all.contains(&PhysAddr(0x1000)));

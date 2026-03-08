@@ -17,7 +17,9 @@ use crate::namespace::Namespace;
 use crate::vm::cap_tracker::MemoryBudget;
 use crate::vm::manager::AddressSpaceManager;
 use crate::vm::page_table::PageTable;
-use crate::vm::{ContentHash, FrameClassification, PageFlags, PhysAddr, VirtAddr, VmError};
+use crate::vm::{
+    ContentHash, FrameClassification, MemoryZone, PageFlags, PhysAddr, VirtAddr, VmError,
+};
 use crate::{Fid, FileServer, IpcError, OpenMode, QPath};
 
 /// Maximum UCAN delegation chain depth for capability verification.
@@ -577,7 +579,8 @@ impl<P: PageTable> Kernel<P> {
                     cid: content_hash.0,
                 }
             };
-            self.lyll.register_frame(paddr, hash_entry, pid);
+            self.lyll
+                .register_frame(paddr, hash_entry, pid, MemoryZone::from(classification));
             if classification.contains(FrameClassification::ENCRYPTED) {
                 self.nakaiah.register_frame(paddr, content_hash.0);
                 self.nakaiah.grant_access(pid, paddr, CapChain::Owner);

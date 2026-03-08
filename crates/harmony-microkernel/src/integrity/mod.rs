@@ -30,7 +30,7 @@ pub enum IntegrityVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::{ContentHash, PhysAddr, ViolationReason};
+    use crate::vm::{ContentHash, MemoryZone, PhysAddr, ViolationReason};
 
     #[test]
     fn integrity_verdict_variants() {
@@ -78,7 +78,12 @@ mod tests {
 
         let paddr = PhysAddr(0x1000);
         let hash = [0xAA; 32];
-        lyll.register_frame(paddr, HashEntry::CidBacked { cid: hash }, 1);
+        lyll.register_frame(
+            paddr,
+            HashEntry::CidBacked { cid: hash },
+            1,
+            MemoryZone::PublicDurable,
+        );
         nakaiah.register_frame(paddr, hash);
         nakaiah.grant_access(1, paddr, CapChain::Owner);
 
@@ -158,8 +163,18 @@ mod tests {
     fn lyll_not_actually_sampling_detected() {
         let mut lyll = test_lyll();
 
-        lyll.register_frame(PhysAddr(0x1000), HashEntry::CidBacked { cid: [0; 32] }, 1);
-        lyll.register_frame(PhysAddr(0x2000), HashEntry::CidBacked { cid: [1; 32] }, 1);
+        lyll.register_frame(
+            PhysAddr(0x1000),
+            HashEntry::CidBacked { cid: [0; 32] },
+            1,
+            MemoryZone::PublicDurable,
+        );
+        lyll.register_frame(
+            PhysAddr(0x2000),
+            HashEntry::CidBacked { cid: [1; 32] },
+            1,
+            MemoryZone::PublicDurable,
+        );
 
         let registered = lyll.all_registered_frames();
         let has_any_samples = registered.iter().any(|p| lyll.sampled_frames().contains(p));
@@ -177,6 +192,7 @@ mod tests {
             PhysAddr(0x1000),
             HashEntry::CidBacked { cid: [0xAA; 32] },
             42,
+            MemoryZone::PublicDurable,
         );
 
         let verdict = lyll.verify_frame(PhysAddr(0x1000), [0xBB; 32], 999);
