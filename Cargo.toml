@@ -35,7 +35,7 @@ harmony-athenaeum = { git = "https://github.com/zeblithic/harmony.git", branch =
 
 # Internal workspace crates
 harmony-unikernel = { path = "crates/harmony-unikernel", default-features = false }
-harmony-microkernel = { path = "crates/harmony-microkernel" }
+harmony-microkernel = { path = "crates/harmony-microkernel", default-features = false }
 harmony-os = { path = "crates/harmony-os" }
 
 # Shared dependencies
