@@ -83,9 +83,9 @@ enum IngestState {
 /// both the blob manifest and individual chunk data. Clunking the
 /// ingest fid without reading first silently discards the buffer.
 pub struct ContentServer {
-    /// Chunk data indexed by (hash_bits, raw ChunkAddr fields).
-    /// Uses a Vec because ChunkAddr does not implement Ord.
-    chunks: Vec<(ChunkAddr, Vec<u8>)>,
+    /// Chunk data keyed by `hash_bits` (21-bit address).
+    /// O(log n) lookups instead of linear scan through a Vec.
+    chunks: BTreeMap<u32, (ChunkAddr, Vec<u8>)>,
     /// Blob manifests indexed by 256-bit CID.
     blobs: BTreeMap<[u8; 32], Athenaeum>,
     /// Active fid → state mapping.
@@ -108,7 +108,7 @@ impl ContentServer {
             },
         );
         Self {
-            chunks: Vec::new(),
+            chunks: BTreeMap::new(),
             blobs: BTreeMap::new(),
             fids,
             ingest_buffers: BTreeMap::new(),
@@ -148,10 +148,7 @@ impl ContentServer {
     /// The `/chunks/<addr>` namespace inherits this: two chunks sharing
     /// hash_bits would map to the same filename and only the first is reachable.
     fn find_chunk(&self, hash_bits: u32) -> Option<&ChunkAddr> {
-        self.chunks
-            .iter()
-            .find(|(addr, _)| addr.hash_bits() == hash_bits)
-            .map(|(addr, _)| addr)
+        self.chunks.get(&hash_bits).map(|(addr, _)| addr)
     }
 
     /// Finalize an ingest: chunk the blob, store chunks + metadata, return 40-byte response.
@@ -203,15 +200,16 @@ impl ContentServer {
 
                 // Everything validated. Commit chunks and blob (infallible from here).
                 for (i, addr) in ath.chunks.iter().enumerate() {
-                    if !self.chunks.iter().any(|(a, _)| *a == *addr) {
+                    let hb = addr.hash_bits();
+                    self.chunks.entry(hb).or_insert_with(|| {
                         let chunk_start = i * CHUNK_SIZE;
                         let chunk_end = (chunk_start + CHUNK_SIZE).min(data.len());
                         let raw = &data[chunk_start..chunk_end];
                         let padded_size = addr.size_bytes();
                         let mut padded = alloc::vec![0u8; padded_size];
                         padded[..raw.len()].copy_from_slice(raw);
-                        self.chunks.push((*addr, padded));
-                    }
+                        (*addr, padded)
+                    });
                 }
 
                 self.blobs.insert(cid, ath);
@@ -237,12 +235,7 @@ impl ContentServer {
         let ath = self.blobs.get(cid).ok_or(IpcError::NotFound)?;
         let chunks = &self.chunks;
         let data = ath
-            .reassemble(|addr| {
-                chunks
-                    .iter()
-                    .find(|(a, _)| *a == addr)
-                    .map(|(_, d)| d.clone())
-            })
+            .reassemble(|addr| chunks.get(&addr.hash_bits()).map(|(_, d)| d.clone()))
             .map_err(|_| IpcError::NotFound)?;
         Ok(slice_data(&data, offset, count))
     }
@@ -256,8 +249,7 @@ impl ContentServer {
     ) -> Result<Vec<u8>, IpcError> {
         let (_, data) = self
             .chunks
-            .iter()
-            .find(|(a, _)| *a == *addr)
+            .get(&addr.hash_bits())
             .ok_or(IpcError::NotFound)?;
         Ok(slice_data(data, offset, count))
     }
@@ -284,7 +276,7 @@ fn slice_data(data: &[u8], offset: u64, count: u32) -> Vec<u8> {
 
 /// Parse a 64-character hex string into a 32-byte CID.
 fn parse_hex_cid(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
+    if s.len() != 64 || !s.is_ascii() {
         return None;
     }
     let mut cid = [0u8; 32];
@@ -502,8 +494,7 @@ impl FileServer for ContentServer {
             NodeKind::Chunk(addr) => {
                 let (_, data) = self
                     .chunks
-                    .iter()
-                    .find(|(a, _)| *a == *addr)
+                    .get(&addr.hash_bits())
                     .ok_or(IpcError::NotFound)?;
                 Ok(FileStat {
                     qpath: Self::chunk_qpath(addr),
@@ -635,6 +626,18 @@ mod tests {
         server.walk(0, 1, "blobs").unwrap();
         let fake_cid = "aa".repeat(32); // 64 hex chars
         assert_eq!(server.walk(1, 2, &fake_cid), Err(IpcError::NotFound));
+    }
+
+    #[test]
+    fn walk_blobs_dir_multibyte_utf8_rejected() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "blobs").unwrap();
+        // 62 ASCII chars + 'é' (2-byte UTF-8) = 64 bytes but not valid ASCII hex.
+        // Must not panic — should return NotFound.
+        let mut bad = alloc::string::String::from("aa".repeat(31));
+        bad.push('é'); // 2 bytes in UTF-8
+        assert_eq!(bad.len(), 64);
+        assert_eq!(server.walk(1, 2, &bad), Err(IpcError::NotFound));
     }
 
     // ── open/clunk/clone_fid/stat tests ────────────────────────────────
@@ -957,7 +960,7 @@ mod tests {
 
         // Get the chunk address from storage
         assert_eq!(server.chunk_count(), 1);
-        let addr = &server.chunks[0].0;
+        let (addr, _) = server.chunks.values().next().unwrap();
         let addr_hex = format_addr_hex(addr);
 
         // Walk to the chunk and read it
@@ -998,9 +1001,9 @@ mod tests {
         server.read(1, 0, 256).unwrap();
         server.clunk(1).unwrap();
 
-        let addr = &server.chunks[0].0;
+        let (addr, chunk_data) = server.chunks.values().next().unwrap();
         let addr_hex = format_addr_hex(addr);
-        let expected_size = server.chunks[0].1.len() as u64;
+        let expected_size = chunk_data.len() as u64;
 
         server.walk(0, 2, "chunks").unwrap();
         server.walk(2, 3, &addr_hex).unwrap();
