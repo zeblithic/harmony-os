@@ -260,8 +260,29 @@ impl FileServer for ContentServer {
         Err(IpcError::NotSupported)
     }
 
-    fn write(&mut self, _fid: Fid, _offset: u64, _data: &[u8]) -> Result<u32, IpcError> {
-        Err(IpcError::NotSupported)
+    fn write(&mut self, fid: Fid, _offset: u64, data: &[u8]) -> Result<u32, IpcError> {
+        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
+        if !state.is_open {
+            return Err(IpcError::NotOpen);
+        }
+        match &state.node {
+            NodeKind::Root | NodeKind::BlobsDir | NodeKind::ChunksDir => {
+                Err(IpcError::IsDirectory)
+            }
+            NodeKind::Blob(_) | NodeKind::Chunk(_) => {
+                Err(IpcError::ReadOnly)
+            }
+            NodeKind::Ingest => {
+                let buf = self.ingest_buffers.get_mut(&fid).ok_or(IpcError::InvalidArgument)?;
+                match buf {
+                    IngestState::Writing(ref mut v) => {
+                        v.extend_from_slice(data);
+                        Ok(data.len() as u32)
+                    }
+                    _ => Err(IpcError::InvalidArgument), // Already finalized
+                }
+            }
+        }
     }
 
     fn clunk(&mut self, fid: Fid) -> Result<(), IpcError> {
@@ -526,5 +547,33 @@ mod tests {
         let stat = server.stat(1).unwrap();
         assert_eq!(stat.file_type, FileType::Directory);
         assert_eq!(&*stat.name, "blobs");
+    }
+
+    // ── write() tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn write_to_ingest_accumulates() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "ingest").unwrap();
+        server.open(1, OpenMode::ReadWrite).unwrap();
+        let written = server.write(1, 0, b"hello").unwrap();
+        assert_eq!(written, 5);
+        let written = server.write(1, 0, b" world").unwrap();
+        assert_eq!(written, 6);
+    }
+
+    #[test]
+    fn write_to_directory_rejected() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "blobs").unwrap();
+        server.open(1, OpenMode::Read).unwrap();
+        assert_eq!(server.write(1, 0, b"data"), Err(IpcError::IsDirectory));
+    }
+
+    #[test]
+    fn write_without_open_rejected() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "ingest").unwrap();
+        assert_eq!(server.write(1, 0, b"data"), Err(IpcError::NotOpen));
     }
 }
