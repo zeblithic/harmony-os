@@ -489,6 +489,26 @@ impl<P: PageTable> Kernel<P> {
     pub fn has_vm_space(&self, pid: u32) -> bool {
         self.vm.space(pid).is_some()
     }
+
+    /// Translate a virtual address in the given process's page table.
+    ///
+    /// Returns the mapped physical address and flags, or `None` if unmapped.
+    /// Useful for verifying page table state from outside the crate.
+    pub fn vm_translate(
+        &self,
+        pid: u32,
+        vaddr: VirtAddr,
+    ) -> Option<(crate::vm::PhysAddr, PageFlags)> {
+        self.vm.space(pid)?.page_table.translate(vaddr)
+    }
+
+    /// Read-only access to the VM manager.
+    ///
+    /// Exposes the `AddressSpaceManager` for querying buddy allocator state,
+    /// capability tracker state, and per-process region tables.
+    pub fn vm_manager(&self) -> &AddressSpaceManager<P> {
+        &self.vm
+    }
 }
 
 #[cfg(test)]
@@ -1189,5 +1209,358 @@ mod tests {
         let data = kernel.read(client_pid, 1, 0, 256).unwrap();
         assert_eq!(data, b"Hello from echo server!");
         kernel.clunk(client_pid, 1).unwrap();
+    }
+
+    // ── Cross-component integration tests ────────────────────────────
+
+    #[test]
+    fn test_two_processes_isolated() {
+        use crate::vm::{FrameClassification, PAGE_SIZE};
+
+        let mut entropy = make_test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+
+        let budget = MemoryBudget::new(PAGE_SIZE as usize * 16, FrameClassification::all());
+
+        // Spawn two VM-enabled processes with separate page tables.
+        let pid_a = kernel
+            .spawn_process(
+                "process-a",
+                Box::new(EchoServer::new()),
+                &[],
+                Some((budget.clone(), MockPageTable::new(PhysAddr(0x20_0000)))),
+            )
+            .unwrap();
+
+        let pid_b = kernel
+            .spawn_process(
+                "process-b",
+                Box::new(EchoServer::new()),
+                &[],
+                Some((budget, MockPageTable::new(PhysAddr(0x30_0000)))),
+            )
+            .unwrap();
+
+        let rw_user = PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::USER;
+
+        // Map a region in process A at 0x1000.
+        kernel
+            .vm_map_region(
+                pid_a,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize * 2,
+                rw_user,
+                FrameClassification::empty(),
+            )
+            .unwrap();
+
+        // Map a region in process B at 0x5000.
+        kernel
+            .vm_map_region(
+                pid_b,
+                VirtAddr(0x5000),
+                PAGE_SIZE as usize * 2,
+                rw_user,
+                FrameClassification::empty(),
+            )
+            .unwrap();
+
+        // Verify process A can see its own mapping.
+        let space_a = kernel.vm.space(pid_a).unwrap();
+        assert!(
+            space_a.page_table.translate(VirtAddr(0x1000)).is_some(),
+            "Process A should see its own mapping at 0x1000"
+        );
+        assert!(
+            space_a.page_table.translate(VirtAddr(0x2000)).is_some(),
+            "Process A should see its own mapping at 0x2000"
+        );
+
+        // Verify process A does NOT see process B's mapping.
+        assert!(
+            space_a.page_table.translate(VirtAddr(0x5000)).is_none(),
+            "Process A must NOT see process B's mapping at 0x5000"
+        );
+        assert!(
+            space_a.page_table.translate(VirtAddr(0x6000)).is_none(),
+            "Process A must NOT see process B's mapping at 0x6000"
+        );
+
+        // Verify process B can see its own mapping.
+        let space_b = kernel.vm.space(pid_b).unwrap();
+        assert!(
+            space_b.page_table.translate(VirtAddr(0x5000)).is_some(),
+            "Process B should see its own mapping at 0x5000"
+        );
+        assert!(
+            space_b.page_table.translate(VirtAddr(0x6000)).is_some(),
+            "Process B should see its own mapping at 0x6000"
+        );
+
+        // Verify process B does NOT see process A's mapping.
+        assert!(
+            space_b.page_table.translate(VirtAddr(0x1000)).is_none(),
+            "Process B must NOT see process A's mapping at 0x1000"
+        );
+        assert!(
+            space_b.page_table.translate(VirtAddr(0x2000)).is_none(),
+            "Process B must NOT see process A's mapping at 0x2000"
+        );
+
+        // Even at the same virtual address, mappings go to different physical frames.
+        // Map at 0x9000 in both processes — they should get different physical frames.
+        kernel
+            .vm_map_region(
+                pid_a,
+                VirtAddr(0x9000),
+                PAGE_SIZE as usize,
+                rw_user,
+                FrameClassification::empty(),
+            )
+            .unwrap();
+        kernel
+            .vm_map_region(
+                pid_b,
+                VirtAddr(0x9000),
+                PAGE_SIZE as usize,
+                rw_user,
+                FrameClassification::empty(),
+            )
+            .unwrap();
+
+        let (phys_a, _) = kernel
+            .vm
+            .space(pid_a)
+            .unwrap()
+            .page_table
+            .translate(VirtAddr(0x9000))
+            .unwrap();
+        let (phys_b, _) = kernel
+            .vm
+            .space(pid_b)
+            .unwrap()
+            .page_table
+            .translate(VirtAddr(0x9000))
+            .unwrap();
+        assert_ne!(
+            phys_a, phys_b,
+            "Same vaddr in different processes must map to different physical frames"
+        );
+    }
+
+    /// Verify that ENCRYPTED frames are tracked and cleaned up on unmap.
+    ///
+    /// NOTE: MockPageTable does not model frame contents, so actual zero-fill
+    /// is not verified here. On real hardware, the unmap path zeroizes frames
+    /// classified as ENCRYPTED before returning them to the buddy pool.
+    #[test]
+    fn test_encrypted_zeroize_on_unmap() {
+        use crate::vm::{FrameClassification, PAGE_SIZE};
+
+        let mut entropy = make_test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+
+        let budget = MemoryBudget::new(PAGE_SIZE as usize * 16, FrameClassification::all());
+        let pid = kernel
+            .spawn_process(
+                "enc-process",
+                Box::new(EchoServer::new()),
+                &[],
+                Some((budget, MockPageTable::new(PhysAddr(0x20_0000)))),
+            )
+            .unwrap();
+
+        let initial_free = kernel.vm.buddy().free_frame_count();
+
+        // Map 2 pages as ENCRYPTED.
+        let vaddr = VirtAddr(0x1000);
+        kernel
+            .vm_map_region(
+                pid,
+                vaddr,
+                PAGE_SIZE as usize * 2,
+                PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::USER,
+                FrameClassification::ENCRYPTED,
+            )
+            .unwrap();
+
+        // Verify the cap_tracker tracks them as ENCRYPTED.
+        let encrypted_frames = kernel
+            .vm
+            .cap_tracker()
+            .frames_with_classification(FrameClassification::ENCRYPTED);
+        assert_eq!(
+            encrypted_frames.len(),
+            2,
+            "Both frames should be tracked as ENCRYPTED"
+        );
+        for (_, pids) in &encrypted_frames {
+            assert!(
+                pids.contains(&pid),
+                "Encrypted frames should be owned by our process"
+            );
+        }
+
+        // Verify buddy allocator shows 2 fewer free frames.
+        assert_eq!(kernel.vm.buddy().free_frame_count(), initial_free - 2);
+
+        // Unmap the region — this returns classification from cap_tracker
+        // internally, signaling the caller to zeroize ENCRYPTED frames.
+        kernel.vm_unmap_region(pid, vaddr).unwrap();
+
+        // After unmap: cap_tracker should have no ENCRYPTED frames tracked.
+        let encrypted_after = kernel
+            .vm
+            .cap_tracker()
+            .frames_with_classification(FrameClassification::ENCRYPTED);
+        assert_eq!(
+            encrypted_after.len(),
+            0,
+            "No encrypted frames should be tracked after unmap"
+        );
+
+        // Frames should be returned to the buddy allocator.
+        assert_eq!(
+            kernel.vm.buddy().free_frame_count(),
+            initial_free,
+            "All frames should be freed back to the buddy allocator"
+        );
+
+        // The page table should no longer have these mappings.
+        let space = kernel.vm.space(pid).unwrap();
+        assert!(space.page_table.translate(VirtAddr(0x1000)).is_none());
+        assert!(space.page_table.translate(VirtAddr(0x2000)).is_none());
+    }
+
+    #[test]
+    fn test_process_exit_cleanup() {
+        use crate::vm::{FrameClassification, PAGE_SIZE};
+
+        let mut entropy = make_test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+
+        let initial_free = kernel.vm.buddy().free_frame_count();
+
+        let budget = MemoryBudget::new(PAGE_SIZE as usize * 32, FrameClassification::all());
+        let pid = kernel
+            .spawn_process(
+                "doomed-process",
+                Box::new(EchoServer::new()),
+                &[],
+                Some((budget, MockPageTable::new(PhysAddr(0x20_0000)))),
+            )
+            .unwrap();
+
+        // Map several regions with different sizes and classifications.
+
+        // Region 1: 4 pages, public
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize * 4,
+                PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::USER,
+                FrameClassification::empty(),
+            )
+            .unwrap();
+
+        // Region 2: 2 pages, ENCRYPTED
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x10000),
+                PAGE_SIZE as usize * 2,
+                PageFlags::READABLE | PageFlags::USER,
+                FrameClassification::ENCRYPTED,
+            )
+            .unwrap();
+
+        // Region 3: 1 page, EPHEMERAL
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x20000),
+                PAGE_SIZE as usize,
+                PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::USER,
+                FrameClassification::EPHEMERAL,
+            )
+            .unwrap();
+
+        // Region 4: 3 pages, ENCRYPTED | EPHEMERAL
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x30000),
+                PAGE_SIZE as usize * 3,
+                PageFlags::READABLE | PageFlags::EXECUTABLE | PageFlags::USER,
+                FrameClassification::ENCRYPTED | FrameClassification::EPHEMERAL,
+            )
+            .unwrap();
+
+        // Total: 4 + 2 + 1 + 3 = 10 frames consumed.
+        assert_eq!(kernel.vm.buddy().free_frame_count(), initial_free - 10);
+
+        // Verify classified frames are tracked.
+        assert!(
+            kernel
+                .vm
+                .cap_tracker()
+                .frames_with_classification(FrameClassification::ENCRYPTED)
+                .len()
+                > 0
+        );
+
+        // Destroy the process.
+        kernel.destroy_process(pid).unwrap();
+
+        // All 10 frames should be returned to the buddy allocator.
+        assert_eq!(
+            kernel.vm.buddy().free_frame_count(),
+            initial_free,
+            "All frames must be freed on process destruction"
+        );
+
+        // VM space should be gone.
+        assert!(
+            kernel.vm.space(pid).is_none(),
+            "VM space should be removed after process destruction"
+        );
+
+        // Process should be gone from the kernel.
+        assert!(
+            !kernel.has_vm_space(pid),
+            "has_vm_space should return false for destroyed process"
+        );
+
+        // Cap tracker budget should be removed.
+        assert!(
+            kernel.vm.cap_tracker().budget(pid).is_none(),
+            "Budget should be removed after process destruction"
+        );
+
+        // Cap tracker should have no frames from this process.
+        let all_encrypted = kernel
+            .vm
+            .cap_tracker()
+            .frames_with_classification(FrameClassification::ENCRYPTED);
+        for (_, pids) in &all_encrypted {
+            assert!(
+                !pids.contains(&pid),
+                "No encrypted frames should reference the destroyed process"
+            );
+        }
+        let all_ephemeral = kernel
+            .vm
+            .cap_tracker()
+            .frames_with_classification(FrameClassification::EPHEMERAL);
+        for (_, pids) in &all_ephemeral {
+            assert!(
+                !pids.contains(&pid),
+                "No ephemeral frames should reference the destroyed process"
+            );
+        }
     }
 }

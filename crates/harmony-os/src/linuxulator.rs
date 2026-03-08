@@ -2029,4 +2029,190 @@ mod integration_tests {
         let probed = lx.handle_syscall(12, [0, 0, 0, 0, 0, 0]);
         assert_eq!(probed, new_brk);
     }
+
+    #[test]
+    fn test_elf_loading_with_real_vm() {
+        use crate::elf::{parse_elf, SegmentFlags};
+        use harmony_microkernel::vm::{FrameClassification, VirtAddr};
+
+        let mut entropy = test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        // Large frame pool for ELF loading.
+        let buddy = BuddyAllocator::new(PhysAddr(0x10_0000), 256).unwrap();
+        let vm = AddressSpaceManager::new(buddy);
+        let mut kernel = Kernel::new(kernel_id, vm);
+
+        // Build a minimal ELF with two PT_LOAD segments:
+        // - .text at 0x401000 (R-X): 16 bytes of code
+        // - .data at 0x402000 (RW-): 8 bytes of data + 24 bytes BSS (memsz > filesz)
+        let code = [
+            0x48, 0x31, 0xC0, 0xB0, 0x3C, 0x0F, 0x05,
+            0xCC, // xor rax,rax; mov al,60; syscall; int3
+            0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+        ]; // nop sled
+        let data_bytes = [0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x21, 0x0A, 0x00]; // "Hello!\n\0"
+
+        // Construct a 2-segment ELF: header (64) + 2 phdrs (112) + code (16) + data (8)
+        let phdr_count = 2;
+        let phdr_start: usize = 64;
+        let code_offset = phdr_start + phdr_count * 56;
+        let data_offset = code_offset + code.len();
+        let total_size = data_offset + data_bytes.len();
+
+        let mut elf = alloc::vec![0u8; total_size];
+
+        // ELF header
+        elf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // ELFDATA2LSB
+        elf[6] = 1; // EV_CURRENT
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes()); // EM_X86_64
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        elf[24..32].copy_from_slice(&0x401000u64.to_le_bytes()); // e_entry
+        elf[32..40].copy_from_slice(&(phdr_start as u64).to_le_bytes()); // e_phoff
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        elf[56..58].copy_from_slice(&(phdr_count as u16).to_le_bytes()); // e_phnum
+
+        // Program header 1: .text (R-X)
+        let ph1 = &mut elf[phdr_start..phdr_start + 56];
+        ph1[0..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        ph1[4..8].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
+        ph1[8..16].copy_from_slice(&(code_offset as u64).to_le_bytes()); // p_offset
+        ph1[16..24].copy_from_slice(&0x401000u64.to_le_bytes()); // p_vaddr
+        ph1[24..32].copy_from_slice(&0x401000u64.to_le_bytes()); // p_paddr
+        ph1[32..40].copy_from_slice(&(code.len() as u64).to_le_bytes()); // p_filesz
+        ph1[40..48].copy_from_slice(&(code.len() as u64).to_le_bytes()); // p_memsz
+        ph1[48..56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+
+        // Program header 2: .data (RW-) with BSS extension
+        let ph2_start = phdr_start + 56;
+        let ph2 = &mut elf[ph2_start..ph2_start + 56];
+        ph2[0..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        ph2[4..8].copy_from_slice(&6u32.to_le_bytes()); // PF_R | PF_W
+        ph2[8..16].copy_from_slice(&(data_offset as u64).to_le_bytes()); // p_offset
+        ph2[16..24].copy_from_slice(&0x402000u64.to_le_bytes()); // p_vaddr
+        ph2[24..32].copy_from_slice(&0x402000u64.to_le_bytes()); // p_paddr
+        ph2[32..40].copy_from_slice(&(data_bytes.len() as u64).to_le_bytes()); // p_filesz
+        ph2[40..48].copy_from_slice(&32u64.to_le_bytes()); // p_memsz (8 file + 24 BSS)
+        ph2[48..56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+
+        // Copy segment data.
+        elf[code_offset..code_offset + code.len()].copy_from_slice(&code);
+        elf[data_offset..data_offset + data_bytes.len()].copy_from_slice(&data_bytes);
+
+        // Parse the ELF.
+        let parsed = parse_elf(&elf).expect("ELF parsing should succeed");
+        assert_eq!(parsed.entry_point, 0x401000);
+        assert_eq!(parsed.segments.len(), 2);
+
+        // Spawn a VM-enabled process.
+        let budget = MemoryBudget::new(VM_PAGE_SIZE as usize * 32, FrameClassification::all());
+        let page_table = MockPageTable::new(PhysAddr(0x20_0000));
+        let pid = kernel
+            .spawn_process(
+                "elf-process",
+                Box::new(EchoServer::new()),
+                &[],
+                Some((budget, page_table)),
+            )
+            .unwrap();
+
+        // Convert ELF segment flags to PageFlags.
+        fn seg_flags_to_page_flags(sf: &SegmentFlags) -> PageFlags {
+            let mut pf = PageFlags::USER;
+            if sf.read {
+                pf |= PageFlags::READABLE;
+            }
+            if sf.write {
+                pf |= PageFlags::WRITABLE;
+            }
+            if sf.execute {
+                pf |= PageFlags::EXECUTABLE;
+            }
+            pf
+        }
+
+        // Map each PT_LOAD segment into the process address space.
+        for seg in &parsed.segments {
+            let page_aligned_vaddr = seg.vaddr & !(VM_PAGE_SIZE - 1);
+            let page_aligned_memsz = ((seg.memsz + (seg.vaddr - page_aligned_vaddr) + VM_PAGE_SIZE
+                - 1)
+                & !(VM_PAGE_SIZE - 1)) as usize;
+            let flags = seg_flags_to_page_flags(&seg.flags);
+
+            kernel
+                .vm_map_region(
+                    pid,
+                    VirtAddr(page_aligned_vaddr),
+                    page_aligned_memsz,
+                    flags,
+                    FrameClassification::empty(),
+                )
+                .expect("mapping ELF segment should succeed");
+        }
+
+        // Verify the mappings exist with correct permissions via public API.
+
+        // .text segment at 0x401000: should be R-X (USER | READABLE | EXECUTABLE)
+        let (_, text_flags) = kernel
+            .vm_translate(pid, VirtAddr(0x401000))
+            .expect(".text page should be mapped");
+        assert!(
+            text_flags.contains(PageFlags::READABLE),
+            ".text must be readable"
+        );
+        assert!(
+            text_flags.contains(PageFlags::EXECUTABLE),
+            ".text must be executable"
+        );
+        assert!(
+            !text_flags.contains(PageFlags::WRITABLE),
+            ".text must NOT be writable"
+        );
+
+        // .data segment at 0x402000: should be RW- (USER | READABLE | WRITABLE)
+        let (_, data_flags) = kernel
+            .vm_translate(pid, VirtAddr(0x402000))
+            .expect(".data page should be mapped");
+        assert!(
+            data_flags.contains(PageFlags::READABLE),
+            ".data must be readable"
+        );
+        assert!(
+            data_flags.contains(PageFlags::WRITABLE),
+            ".data must be writable"
+        );
+        assert!(
+            !data_flags.contains(PageFlags::EXECUTABLE),
+            ".data must NOT be executable"
+        );
+
+        // Verify .text and .data map to different physical frames.
+        let (text_phys, _) = kernel.vm_translate(pid, VirtAddr(0x401000)).unwrap();
+        let (data_phys, _) = kernel.vm_translate(pid, VirtAddr(0x402000)).unwrap();
+        assert_ne!(
+            text_phys, data_phys,
+            ".text and .data must map to different physical frames"
+        );
+
+        // Verify unmapped regions between/around segments return None.
+        assert!(
+            kernel.vm_translate(pid, VirtAddr(0x400000)).is_none(),
+            "Address before .text should not be mapped"
+        );
+        assert!(
+            kernel.vm_translate(pid, VirtAddr(0x403000)).is_none(),
+            "Address after .data should not be mapped"
+        );
+
+        // Verify the process's region count via the VM manager.
+        let space = kernel.vm_manager().space(pid).unwrap();
+        assert_eq!(
+            space.regions.len(),
+            2,
+            "Process should have exactly 2 regions (text + data)"
+        );
+    }
 }
