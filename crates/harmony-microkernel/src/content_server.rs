@@ -7,7 +7,7 @@
 //! /
 //! ├── blobs/       — one file per stored blob, named by hex CID
 //! ├── chunks/      — one file per stored chunk, named by hex hash_bits
-//! └── ingest       — write-only file; write blob bytes, close to finalize
+//! └── ingest       — ctl-file; write blob bytes, read to finalize (returns CID + metadata)
 //! ```
 
 extern crate alloc;
@@ -359,6 +359,9 @@ impl FileServer for ContentServer {
         if !state.is_open {
             return Err(IpcError::NotOpen);
         }
+        if matches!(state.mode, Some(OpenMode::Write)) {
+            return Err(IpcError::PermissionDenied);
+        }
         match &state.node {
             NodeKind::Root | NodeKind::BlobsDir | NodeKind::ChunksDir => Err(IpcError::IsDirectory),
             NodeKind::Ingest => self.finalize_ingest(fid),
@@ -378,6 +381,9 @@ impl FileServer for ContentServer {
         if !state.is_open {
             return Err(IpcError::NotOpen);
         }
+        if matches!(state.mode, Some(OpenMode::Read)) {
+            return Err(IpcError::PermissionDenied);
+        }
         match &state.node {
             NodeKind::Root | NodeKind::BlobsDir | NodeKind::ChunksDir => Err(IpcError::IsDirectory),
             NodeKind::Blob(_) | NodeKind::Chunk(_) => Err(IpcError::ReadOnly),
@@ -389,7 +395,7 @@ impl FileServer for ContentServer {
                 match buf {
                     IngestState::Writing(ref mut v) => {
                         v.extend_from_slice(data);
-                        Ok(data.len() as u32)
+                        u32::try_from(data.len()).map_err(|_| IpcError::ResourceExhausted)
                     }
                     _ => Err(IpcError::InvalidArgument), // Already finalized
                 }
@@ -688,7 +694,8 @@ mod tests {
         let mut server = ContentServer::new();
         server.walk(0, 1, "blobs").unwrap();
         server.open(1, OpenMode::Read).unwrap();
-        assert_eq!(server.write(1, 0, b"data"), Err(IpcError::IsDirectory));
+        // Mode check (Read) fires before node-type check (IsDirectory)
+        assert_eq!(server.write(1, 0, b"data"), Err(IpcError::PermissionDenied));
     }
 
     #[test]
@@ -816,5 +823,70 @@ mod tests {
         let big = alloc::vec![0u8; harmony_athenaeum::MAX_BLOB_SIZE + 1];
         server.write(1, 0, &big).unwrap();
         assert_eq!(server.read(1, 0, 256), Err(IpcError::ResourceExhausted));
+    }
+
+    #[test]
+    fn read_chunk_by_address() {
+        let mut server = ContentServer::new();
+        let blob_data = alloc::vec![0x77u8; 4096]; // single chunk
+        server.walk(0, 1, "ingest").unwrap();
+        server.open(1, OpenMode::ReadWrite).unwrap();
+        server.write(1, 0, &blob_data).unwrap();
+        server.read(1, 0, 256).unwrap();
+        server.clunk(1).unwrap();
+
+        // Get the chunk address from storage
+        assert_eq!(server.chunk_count(), 1);
+        let addr = &server.chunks[0].0;
+        let addr_hex = format_addr_hex(addr);
+
+        // Walk to the chunk and read it
+        server.walk(0, 2, "chunks").unwrap();
+        server.walk(2, 3, &addr_hex).unwrap();
+        server.open(3, OpenMode::Read).unwrap();
+        let chunk_data = server.read(3, 0, 8192).unwrap();
+        // Chunk is padded to size_bytes(); first 4096 bytes should match blob data
+        assert_eq!(&chunk_data[..blob_data.len()], &blob_data[..]);
+    }
+
+    #[test]
+    fn stat_blob_after_ingest() {
+        let mut server = ContentServer::new();
+        let blob_data = alloc::vec![0x55u8; 4096];
+        server.walk(0, 1, "ingest").unwrap();
+        server.open(1, OpenMode::ReadWrite).unwrap();
+        server.write(1, 0, &blob_data).unwrap();
+        let response = server.read(1, 0, 256).unwrap();
+        let cid_hex = format_cid_hex(&response[..32].try_into().unwrap());
+        server.clunk(1).unwrap();
+
+        server.walk(0, 2, "blobs").unwrap();
+        server.walk(2, 3, &cid_hex).unwrap();
+        let stat = server.stat(3).unwrap();
+        assert_eq!(stat.file_type, FileType::Regular);
+        assert_eq!(stat.size, 4096);
+        assert_eq!(&*stat.name, &*cid_hex);
+    }
+
+    #[test]
+    fn stat_chunk_after_ingest() {
+        let mut server = ContentServer::new();
+        let blob_data = alloc::vec![0x33u8; 4096];
+        server.walk(0, 1, "ingest").unwrap();
+        server.open(1, OpenMode::ReadWrite).unwrap();
+        server.write(1, 0, &blob_data).unwrap();
+        server.read(1, 0, 256).unwrap();
+        server.clunk(1).unwrap();
+
+        let addr = &server.chunks[0].0;
+        let addr_hex = format_addr_hex(addr);
+        let expected_size = server.chunks[0].1.len() as u64;
+
+        server.walk(0, 2, "chunks").unwrap();
+        server.walk(2, 3, &addr_hex).unwrap();
+        let stat = server.stat(3).unwrap();
+        assert_eq!(stat.file_type, FileType::Regular);
+        assert_eq!(stat.size, expected_size);
+        assert_eq!(&*stat.name, &*addr_hex);
     }
 }
