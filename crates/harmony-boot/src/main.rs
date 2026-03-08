@@ -549,7 +549,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // For arch_prctl(ARCH_SET_FS), write the actual MSR before
             // handle_syscall returns — musl immediately uses FS-relative
             // addressing after the syscall.
-            if nr == 158 && args[0] == 0x1002 {
+            if nr == 158 /* SYS_arch_prctl */ && args[0] == 0x1002 /* ARCH_SET_FS */ {
                 unsafe { syscall::write_fs_base(args[1]); }
             }
             let retval = lx.handle_syscall(nr, args);

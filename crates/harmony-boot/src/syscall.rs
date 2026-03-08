@@ -227,6 +227,7 @@ pub unsafe fn write_fs_base(addr: u64) {
 ///
 /// # Safety
 /// Must be called in Ring 0.
+#[allow(dead_code)] // Symmetric pair with write_fs_base; used when ARCH_GET_FS reads from MSR.
 pub unsafe fn read_fs_base() -> u64 {
     rdmsr(IA32_FS_BASE)
 }

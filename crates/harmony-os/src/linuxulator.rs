@@ -128,6 +128,9 @@ struct MemoryArena {
     pages: Vec<u8>,
     base: usize,
     brk_offset: usize,
+    /// Tracked for future munmap implementation. Currently unused by
+    /// sys_munmap (which is a no-op stub). Will drive deallocation when
+    /// the VM layer (harmony-qv2) adds real page reclamation.
     mmap_regions: Vec<(usize, usize)>,
     mmap_top: usize,
 }
@@ -135,8 +138,11 @@ struct MemoryArena {
 impl MemoryArena {
     fn new(size: usize) -> Self {
         let size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let pages = alloc::vec![0u8; size];
-        let base = pages.as_ptr() as usize;
+        // Over-allocate by one page so we can align base up to a page boundary.
+        // Vec<u8> has alignment 1 — the raw pointer is not guaranteed page-aligned.
+        let pages = alloc::vec![0u8; size + PAGE_SIZE];
+        let raw_base = pages.as_ptr() as usize;
+        let base = (raw_base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         Self {
             pages,
             base,
@@ -154,9 +160,10 @@ impl MemoryArena {
 /// # Safety
 /// `ptr` must point to valid memory containing a null-terminated string.
 unsafe fn read_c_string(ptr: usize) -> &'static str {
+    const PATH_MAX: usize = 4096;
     let p = ptr as *const u8;
     let mut len = 0;
-    while *p.add(len) != 0 {
+    while len < PATH_MAX && *p.add(len) != 0 {
         len += 1;
     }
     core::str::from_utf8_unchecked(core::slice::from_raw_parts(p, len))
@@ -239,6 +246,9 @@ pub struct Linuxulator<B: SyscallBackend> {
     arena: MemoryArena,
     /// FS segment base register (TLS pointer for arch_prctl).
     fs_base: u64,
+    /// Fids that represent character devices (stdio).
+    /// Used by fstat to report S_IFCHR instead of S_IFREG.
+    chardev_fids: Vec<Fid>,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -256,6 +266,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             exit_code: None,
             arena: MemoryArena::new(arena_size),
             fs_base: 0,
+            chardev_fids: Vec::new(),
         }
     }
 
@@ -297,6 +308,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.backend.walk("/dev/serial/log", stderr_fid)?;
         self.backend.open(stderr_fid, OpenMode::Write)?;
         self.fd_table.insert(2, stderr_fid);
+
+        // Track stdio fids as character devices for fstat.
+        self.chardev_fids
+            .extend_from_slice(&[stdin_fid, stdout_fid, stderr_fid]);
 
         Ok(())
     }
@@ -417,7 +432,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         match self.backend.read(fid, 0, count as u32) {
             Ok(data) => {
-                let n = data.len();
+                let n = data.len().min(count);
                 if n > 0 {
                     // Safety: caller guarantees buf_ptr points to valid memory of at
                     // least `count` bytes. Same trust model as sys_write.
@@ -447,7 +462,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             Some(&fid) => fid,
             None => return EBADF,
         };
-        let is_chardev = fd <= 2; // stdin/stdout/stderr are character devices
+        let is_chardev = self.chardev_fids.contains(&fid);
         match self.backend.stat(fid) {
             Ok(stat) => {
                 write_linux_stat(statbuf_ptr, &stat, is_chardev);
@@ -628,11 +643,6 @@ impl<B: SyscallBackend> Linuxulator<B> {
             }
             _ => EINVAL,
         }
-    }
-
-    /// The current FS segment base (TLS pointer).
-    pub fn fs_base(&self) -> u64 {
-        self.fs_base
     }
 }
 
