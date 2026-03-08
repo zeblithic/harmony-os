@@ -345,7 +345,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         let len = ((length as usize) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let map_anonymous = 0x20;
         if flags & map_anonymous == 0 {
-            return ENOSYS;
+            return EINVAL; // file-backed mmap not supported
         }
         if len > self.arena.mmap_top.saturating_sub(self.arena.brk_offset) {
             return ENOMEM;
