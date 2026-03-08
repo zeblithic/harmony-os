@@ -122,6 +122,9 @@ impl SyscallBackend for MockBackend {
 const PAGE_SIZE: usize = 4096;
 
 struct MemoryArena {
+    /// Backing allocation — held to keep the memory alive.
+    /// Accessed via raw pointer (`base`) for direct addressability.
+    #[allow(dead_code)]
     pages: Vec<u8>,
     base: usize,
     brk_offset: usize,
@@ -134,11 +137,13 @@ impl MemoryArena {
         let size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let pages = alloc::vec![0u8; size];
         let base = pages.as_ptr() as usize;
-        Self { pages, base, brk_offset: 0, mmap_regions: Vec::new(), mmap_top: size }
-    }
-
-    fn size(&self) -> usize {
-        self.pages.len()
+        Self {
+            pages,
+            base,
+            brk_offset: 0,
+            mmap_regions: Vec::new(),
+            mmap_top: size,
+        }
     }
 }
 
@@ -199,7 +204,7 @@ fn write_linux_stat(buf_ptr: usize, stat: &FileStat, is_chardev: bool) {
         0o020000 | 0o666 // S_IFCHR | rw-rw-rw-
     } else {
         match stat.file_type {
-            FileType::Regular => 0o100000 | 0o644,  // S_IFREG | rw-r--r--
+            FileType::Regular => 0o100000 | 0o644,   // S_IFREG | rw-r--r--
             FileType::Directory => 0o040000 | 0o755, // S_IFDIR | rwxr-xr-x
         }
     };
@@ -212,7 +217,7 @@ fn write_linux_stat(buf_ptr: usize, stat: &FileStat, is_chardev: bool) {
     buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
 
     // st_blocks (offset 64, 8 bytes)
-    let blocks = (stat.size + 511) / 512;
+    let blocks = stat.size.div_ceil(512);
     buf[64..72].copy_from_slice(&blocks.to_le_bytes());
 }
 
@@ -346,17 +351,24 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// In the MVP flat address space, this is a direct pointer dereference.
     pub fn handle_syscall(&mut self, nr: u64, args: [u64; 6]) -> i64 {
         match nr {
-            0   => self.sys_read(args[0] as i32, args[1] as usize, args[2] as usize),
-            1   => self.sys_write(args[0] as i32, args[1] as usize, args[2] as usize),
-            3   => self.sys_close(args[0] as i32),
-            5   => self.sys_fstat(args[0] as i32, args[1] as usize),
-            9   => self.sys_mmap(args[0], args[1], args[2] as i32, args[3] as i32, args[4] as i32, args[5]),
-            11  => self.sys_munmap(args[0], args[1]),
-            12  => self.sys_brk(args[0]),
-            13  => self.sys_rt_sigaction(),
-            14  => self.sys_rt_sigprocmask(),
-            16  => self.sys_ioctl(args[0] as i32, args[1]),
-            60  => self.sys_exit(args[0] as i32),
+            0 => self.sys_read(args[0] as i32, args[1] as usize, args[2] as usize),
+            1 => self.sys_write(args[0] as i32, args[1] as usize, args[2] as usize),
+            3 => self.sys_close(args[0] as i32),
+            5 => self.sys_fstat(args[0] as i32, args[1] as usize),
+            9 => self.sys_mmap(
+                args[0],
+                args[1],
+                args[2] as i32,
+                args[3] as i32,
+                args[4] as i32,
+                args[5],
+            ),
+            11 => self.sys_munmap(args[0], args[1]),
+            12 => self.sys_brk(args[0]),
+            13 => self.sys_rt_sigaction(),
+            14 => self.sys_rt_sigprocmask(),
+            16 => self.sys_ioctl(args[0] as i32, args[1]),
+            60 => self.sys_exit(args[0] as i32),
             158 => self.sys_arch_prctl(args[0] as i32, args[1]),
             218 => self.sys_set_tid_address(),
             231 => self.sys_exit_group(args[0] as i32),
@@ -364,7 +376,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             273 => self.sys_set_robust_list(),
             302 => self.sys_prlimit64(args[0] as i32, args[1] as i32, args[2], args[3] as usize),
             334 => ENOSYS, // rseq — musl handles gracefully
-            _   => ENOSYS,
+            _ => ENOSYS,
         }
     }
 
@@ -553,16 +565,24 @@ impl<B: SyscallBackend> Linuxulator<B> {
     }
 
     /// Linux rt_sigaction(2): stub — no signal support.
-    fn sys_rt_sigaction(&self) -> i64 { 0 }
+    fn sys_rt_sigaction(&self) -> i64 {
+        0
+    }
 
     /// Linux rt_sigprocmask(2): stub — no signal support.
-    fn sys_rt_sigprocmask(&self) -> i64 { 0 }
+    fn sys_rt_sigprocmask(&self) -> i64 {
+        0
+    }
 
     /// Linux set_tid_address(2): return TID = 1 (single-threaded).
-    fn sys_set_tid_address(&self) -> i64 { 1 }
+    fn sys_set_tid_address(&self) -> i64 {
+        1
+    }
 
     /// Linux set_robust_list(2): stub — no futex cleanup needed.
-    fn sys_set_robust_list(&self) -> i64 { 0 }
+    fn sys_set_robust_list(&self) -> i64 {
+        0
+    }
 
     /// Linux prlimit64(2): query/set resource limits.
     ///
@@ -570,11 +590,13 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// return 0 (success, but no data written).
     fn sys_prlimit64(&self, pid: i32, resource: i32, _new_limit: u64, old_limit_ptr: usize) -> i64 {
         const RLIMIT_STACK: i32 = 3;
-        if pid != 0 { return ESRCH; }
+        if pid != 0 {
+            return ESRCH;
+        }
         if resource == RLIMIT_STACK && old_limit_ptr != 0 {
             let eight_mb = 8u64 * 1024 * 1024;
             unsafe {
-                *(old_limit_ptr as *mut u64) = eight_mb;       // rlim_cur
+                *(old_limit_ptr as *mut u64) = eight_mb; // rlim_cur
                 *((old_limit_ptr + 8) as *mut u64) = eight_mb; // rlim_max
             }
         }
@@ -598,7 +620,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
             }
             ARCH_GET_FS => {
                 if addr != 0 {
-                    unsafe { *(addr as *mut u64) = self.fs_base; }
+                    unsafe {
+                        *(addr as *mut u64) = self.fs_base;
+                    }
                 }
                 0
             }
@@ -992,7 +1016,7 @@ mod tests {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
         let mut rlimit = [0u8; 16]; // rlim_cur (8) + rlim_max (8)
-        // prlimit64(0, RLIMIT_STACK=3, NULL, &rlimit)
+                                    // prlimit64(0, RLIMIT_STACK=3, NULL, &rlimit)
         let result = lx.handle_syscall(302, [0, 3, 0, rlimit.as_mut_ptr() as u64, 0, 0]);
         assert_eq!(result, 0);
         let rlim_cur = u64::from_le_bytes(rlimit[0..8].try_into().unwrap());
