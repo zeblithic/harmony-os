@@ -344,24 +344,25 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// In the MVP flat address space, this is a direct pointer dereference.
     pub fn handle_syscall(&mut self, nr: u64, args: [u64; 6]) -> i64 {
         match nr {
-            0 => self.sys_read(args[0] as i32, args[1] as usize, args[2] as usize),
-            1 => self.sys_write(args[0] as i32, args[1] as usize, args[2] as usize),
-            3 => self.sys_close(args[0] as i32),
-            5 => self.sys_fstat(args[0] as i32, args[1] as usize),
-            9 => self.sys_mmap(
-                args[0],
-                args[1],
-                args[2] as i32,
-                args[3] as i32,
-                args[4] as i32,
-                args[5],
-            ),
-            11 => self.sys_munmap(args[0], args[1]),
-            12 => self.sys_brk(args[0]),
-            60 => self.sys_exit(args[0] as i32),
+            0   => self.sys_read(args[0] as i32, args[1] as usize, args[2] as usize),
+            1   => self.sys_write(args[0] as i32, args[1] as usize, args[2] as usize),
+            3   => self.sys_close(args[0] as i32),
+            5   => self.sys_fstat(args[0] as i32, args[1] as usize),
+            9   => self.sys_mmap(args[0], args[1], args[2] as i32, args[3] as i32, args[4] as i32, args[5]),
+            11  => self.sys_munmap(args[0], args[1]),
+            12  => self.sys_brk(args[0]),
+            13  => self.sys_rt_sigaction(),
+            14  => self.sys_rt_sigprocmask(),
+            16  => self.sys_ioctl(args[0] as i32, args[1]),
+            60  => self.sys_exit(args[0] as i32),
+            158 => ENOSYS, // arch_prctl — placeholder, implemented in Task 6
+            218 => self.sys_set_tid_address(),
             231 => self.sys_exit_group(args[0] as i32),
             257 => self.sys_openat(args[0] as i32, args[1] as usize, args[2] as i32),
-            _ => ENOSYS,
+            273 => self.sys_set_robust_list(),
+            302 => self.sys_prlimit64(args[0] as i32, args[1] as i32, args[2], args[3] as usize),
+            334 => ENOSYS, // rseq — musl handles gracefully
+            _   => ENOSYS,
         }
     }
 
@@ -535,6 +536,46 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux munmap(2): unmap memory (stub — always succeeds).
     fn sys_munmap(&mut self, _addr: u64, _length: u64) -> i64 {
+        0
+    }
+
+    /// Linux ioctl(2): device control.
+    ///
+    /// TIOCGWINSZ returns ENOTTY (no terminal). All other requests return ENOSYS.
+    fn sys_ioctl(&self, _fd: i32, request: u64) -> i64 {
+        const TIOCGWINSZ: u64 = 0x5413;
+        match request {
+            TIOCGWINSZ => ENOTTY,
+            _ => ENOSYS,
+        }
+    }
+
+    /// Linux rt_sigaction(2): stub — no signal support.
+    fn sys_rt_sigaction(&self) -> i64 { 0 }
+
+    /// Linux rt_sigprocmask(2): stub — no signal support.
+    fn sys_rt_sigprocmask(&self) -> i64 { 0 }
+
+    /// Linux set_tid_address(2): return TID = 1 (single-threaded).
+    fn sys_set_tid_address(&self) -> i64 { 1 }
+
+    /// Linux set_robust_list(2): stub — no futex cleanup needed.
+    fn sys_set_robust_list(&self) -> i64 { 0 }
+
+    /// Linux prlimit64(2): query/set resource limits.
+    ///
+    /// Only RLIMIT_STACK is supported (returns 8 MiB). Other resources
+    /// return 0 (success, but no data written).
+    fn sys_prlimit64(&self, pid: i32, resource: i32, _new_limit: u64, old_limit_ptr: usize) -> i64 {
+        const RLIMIT_STACK: i32 = 3;
+        if pid != 0 { return ESRCH; }
+        if resource == RLIMIT_STACK && old_limit_ptr != 0 {
+            let eight_mb = 8u64 * 1024 * 1024;
+            unsafe {
+                *(old_limit_ptr as *mut u64) = eight_mb;       // rlim_cur
+                *((old_limit_ptr + 8) as *mut u64) = eight_mb; // rlim_max
+            }
+        }
         0
     }
 }
@@ -860,6 +901,78 @@ mod tests {
         let mut statbuf = [0u8; 144];
         let result = lx.handle_syscall(5, [99, statbuf.as_mut_ptr() as u64, 0, 0, 0, 0]);
         assert_eq!(result, EBADF);
+    }
+
+    // ── stub syscall tests ──────────────────────────────────────────
+
+    #[test]
+    fn sys_ioctl_tiocgwinsz_returns_enotty() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+        let result = lx.handle_syscall(16, [1, 0x5413, 0, 0, 0, 0]); // ioctl(stdout, TIOCGWINSZ)
+        assert_eq!(result, ENOTTY);
+    }
+
+    #[test]
+    fn sys_ioctl_unknown_returns_enosys() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+        let result = lx.handle_syscall(16, [1, 0xFFFF, 0, 0, 0, 0]);
+        assert_eq!(result, ENOSYS);
+    }
+
+    #[test]
+    fn sys_set_tid_address_returns_tid() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.handle_syscall(218, [0, 0, 0, 0, 0, 0]);
+        assert_eq!(result, 1); // TID = 1
+    }
+
+    #[test]
+    fn sys_set_robust_list_returns_zero() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.handle_syscall(273, [0, 0, 0, 0, 0, 0]);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn sys_rt_sigaction_returns_zero() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.handle_syscall(13, [2, 0, 0, 8, 0, 0]); // sigaction(SIGINT, ...)
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn sys_rt_sigprocmask_returns_zero() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.handle_syscall(14, [0, 0, 0, 0, 0, 0]);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn sys_prlimit64_writes_stack_limit() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let mut rlimit = [0u8; 16]; // rlim_cur (8) + rlim_max (8)
+        // prlimit64(0, RLIMIT_STACK=3, NULL, &rlimit)
+        let result = lx.handle_syscall(302, [0, 3, 0, rlimit.as_mut_ptr() as u64, 0, 0]);
+        assert_eq!(result, 0);
+        let rlim_cur = u64::from_le_bytes(rlimit[0..8].try_into().unwrap());
+        assert_eq!(rlim_cur, 8 * 1024 * 1024); // 8 MiB
+    }
+
+    #[test]
+    fn sys_rseq_returns_enosys() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.handle_syscall(334, [0, 0, 0, 0, 0, 0]);
+        assert_eq!(result, ENOSYS);
     }
 }
 
