@@ -175,6 +175,11 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, ElfError> {
         let p_memsz = u64_le(ph, 40);
         let p_align = u64_le(ph, 48);
 
+        // Validate memsz >= filesz (ELF spec requirement)
+        if p_memsz < p_filesz {
+            return Err(ElfError::SegmentOutOfBounds);
+        }
+
         // Validate segment data fits in the ELF
         let seg_end = p_offset
             .checked_add(p_filesz)

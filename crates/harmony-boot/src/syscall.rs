@@ -95,6 +95,11 @@ unsafe extern "C" fn rust_syscall_handler(
         if result.exited {
             PROCESS_EXITED = true;
             EXIT_CODE = result.exit_code;
+            // Halt — do not return to the binary after exit_group.
+            // sysretq would jump to an undefined address.
+            loop {
+                core::arch::asm!("hlt");
+            }
         }
         result.retval
     } else {

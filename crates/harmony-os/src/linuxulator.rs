@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! Linuxulator — Linux syscall-to-9P translation layer for Ring 3.
 //!
 //! Translates Linux syscall numbers and arguments into 9P FileServer
