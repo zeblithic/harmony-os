@@ -452,12 +452,16 @@ impl<B: SyscallBackend> Linuxulator<B> {
             Some(f) => f,
             None => return EBADF,
         };
+        self.chardev_fids.retain(|&f| f != fid);
         let _ = self.backend.clunk(fid);
         0
     }
 
     /// Linux fstat(2): get file status.
     fn sys_fstat(&mut self, fd: i32, statbuf_ptr: usize) -> i64 {
+        if statbuf_ptr == 0 {
+            return EINVAL;
+        }
         let fid = match self.fd_table.get(&fd) {
             Some(&fid) => fid,
             None => return EBADF,
@@ -536,20 +540,30 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Only `MAP_ANONYMOUS` is supported. Allocates from the top of the
     /// arena downward (opposite direction from brk). Returns the mapped
     /// address or a negative errno.
+    ///
+    /// `MAP_FIXED` is rejected with `ENOMEM` — the arena allocator cannot
+    /// guarantee placement at an arbitrary address.
     fn sys_mmap(
         &mut self,
-        _addr: u64,
+        addr: u64,
         length: u64,
         _prot: i32,
         flags: i32,
         _fd: i32,
         _offset: u64,
     ) -> i64 {
-        let len = ((length as usize) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let map_anonymous = 0x20;
+        let map_fixed = 0x10;
+        if length == 0 {
+            return EINVAL;
+        }
         if flags & map_anonymous == 0 {
             return EINVAL; // file-backed mmap not supported
         }
+        if flags & map_fixed != 0 && addr != 0 {
+            return ENOMEM; // arena allocator cannot place at fixed address
+        }
+        let len = ((length as usize) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         if len > self.arena.mmap_top.saturating_sub(self.arena.brk_offset) {
             return ENOMEM;
         }
@@ -570,8 +584,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux ioctl(2): device control.
     ///
-    /// TIOCGWINSZ returns ENOTTY (no terminal). All other requests return ENOSYS.
-    fn sys_ioctl(&self, _fd: i32, request: u64) -> i64 {
+    /// Validates the fd first. TIOCGWINSZ returns ENOTTY (no terminal).
+    /// All other requests return ENOSYS.
+    fn sys_ioctl(&self, fd: i32, request: u64) -> i64 {
+        if !self.fd_table.contains_key(&fd) {
+            return EBADF;
+        }
         const TIOCGWINSZ: u64 = 0x5413;
         match request {
             TIOCGWINSZ => ENOTTY,
@@ -611,8 +629,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if resource == RLIMIT_STACK && old_limit_ptr != 0 {
             let eight_mb = 8u64 * 1024 * 1024;
             unsafe {
-                *(old_limit_ptr as *mut u64) = eight_mb; // rlim_cur
-                *((old_limit_ptr + 8) as *mut u64) = eight_mb; // rlim_max
+                core::ptr::write_unaligned(old_limit_ptr as *mut u64, eight_mb); // rlim_cur
+                core::ptr::write_unaligned((old_limit_ptr + 8) as *mut u64, eight_mb); // rlim_max
             }
         }
         0
@@ -636,7 +654,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             ARCH_GET_FS => {
                 if addr != 0 {
                     unsafe {
-                        *(addr as *mut u64) = self.fs_base;
+                        core::ptr::write_unaligned(addr as *mut u64, self.fs_base);
                     }
                 }
                 0
@@ -854,6 +872,23 @@ mod tests {
     }
 
     #[test]
+    fn arena_mmap_zero_length_returns_einval() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::with_arena(mock, 64 * 1024);
+        let result = lx.handle_syscall(9, [0, 0, 3, 0x22, u64::MAX, 0]);
+        assert_eq!(result, EINVAL);
+    }
+
+    #[test]
+    fn arena_mmap_fixed_returns_enomem() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::with_arena(mock, 64 * 1024);
+        // MAP_FIXED (0x10) | MAP_ANONYMOUS (0x20) = 0x30, with non-zero addr
+        let result = lx.handle_syscall(9, [0x1000, 4096, 3, 0x30, u64::MAX, 0]);
+        assert_eq!(result, ENOMEM);
+    }
+
+    #[test]
     fn arena_munmap_returns_success() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::with_arena(mock, 64 * 1024);
@@ -914,6 +949,18 @@ mod tests {
         assert_eq!(result, EBADF);
     }
 
+    #[test]
+    fn sys_close_cleans_chardev_fids() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+        // Closing stdout should remove its fid from chardev_fids
+        let stdout_fid = lx.fid_for_fd(1).unwrap();
+        assert!(lx.chardev_fids.contains(&stdout_fid));
+        lx.handle_syscall(3, [1, 0, 0, 0, 0, 0]);
+        assert!(!lx.chardev_fids.contains(&stdout_fid));
+    }
+
     // ── sys_openat tests ──────────────────────────────────────────────
 
     #[test]
@@ -969,6 +1016,15 @@ mod tests {
         assert_eq!(result, EBADF);
     }
 
+    #[test]
+    fn sys_fstat_null_ptr_returns_einval() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+        let result = lx.handle_syscall(5, [1, 0, 0, 0, 0, 0]);
+        assert_eq!(result, EINVAL);
+    }
+
     // ── stub syscall tests ──────────────────────────────────────────
 
     #[test]
@@ -987,6 +1043,14 @@ mod tests {
         lx.init_stdio().unwrap();
         let result = lx.handle_syscall(16, [1, 0xFFFF, 0, 0, 0, 0]);
         assert_eq!(result, ENOSYS);
+    }
+
+    #[test]
+    fn sys_ioctl_bad_fd_returns_ebadf() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.handle_syscall(16, [99, 0x5413, 0, 0, 0, 0]);
+        assert_eq!(result, EBADF);
     }
 
     #[test]
