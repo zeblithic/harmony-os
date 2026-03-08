@@ -118,6 +118,31 @@ impl SyscallBackend for MockBackend {
     }
 }
 
+// ── Memory arena ──────────────────────────────────────────────────
+
+const PAGE_SIZE: usize = 4096;
+
+struct MemoryArena {
+    pages: Vec<u8>,
+    base: usize,
+    brk_offset: usize,
+    mmap_regions: Vec<(usize, usize)>,
+    mmap_top: usize,
+}
+
+impl MemoryArena {
+    fn new(size: usize) -> Self {
+        let size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let pages = alloc::vec![0u8; size];
+        let base = pages.as_ptr() as usize;
+        Self { pages, base, brk_offset: 0, mmap_regions: Vec::new(), mmap_top: size }
+    }
+
+    fn size(&self) -> usize {
+        self.pages.len()
+    }
+}
+
 // ── Linuxulator ─────────────────────────────────────────────────────
 
 /// Linux syscall-to-9P translation engine.
@@ -132,16 +157,24 @@ pub struct Linuxulator<B: SyscallBackend> {
     next_fid: Fid,
     /// Set by sys_exit_group.
     exit_code: Option<i32>,
+    /// Memory arena for brk/mmap.
+    arena: MemoryArena,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
-    /// Create a new Linuxulator with an empty fd table.
+    /// Create a new Linuxulator with default 1 MiB arena.
     pub fn new(backend: B) -> Self {
+        Self::with_arena(backend, 1024 * 1024) // 1 MiB default
+    }
+
+    /// Create a new Linuxulator with a custom arena size.
+    pub fn with_arena(backend: B, arena_size: usize) -> Self {
         Self {
             backend,
             fd_table: BTreeMap::new(),
             next_fid: 100, // avoid collision with server root fids
             exit_code: None,
+            arena: MemoryArena::new(arena_size),
         }
     }
 
@@ -211,6 +244,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.fd_table.get(&fd).copied()
     }
 
+    /// Base address of the memory arena (for testing).
+    #[cfg(test)]
+    pub fn arena_base(&self) -> usize {
+        self.arena.base
+    }
+
     /// Dispatch a Linux syscall. Returns the syscall result (negative = errno).
     ///
     /// # Arguments
@@ -223,6 +262,16 @@ impl<B: SyscallBackend> Linuxulator<B> {
     pub fn handle_syscall(&mut self, nr: u64, args: [u64; 6]) -> i64 {
         match nr {
             1 => self.sys_write(args[0] as i32, args[1] as usize, args[2] as usize),
+            9 => self.sys_mmap(
+                args[0],
+                args[1],
+                args[2] as i32,
+                args[3] as i32,
+                args[4] as i32,
+                args[5],
+            ),
+            11 => self.sys_munmap(args[0], args[1]),
+            12 => self.sys_brk(args[0]),
             231 => self.sys_exit_group(args[0] as i32),
             _ => ENOSYS,
         }
@@ -255,6 +304,64 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Linux exit_group(2): terminate the process.
     fn sys_exit_group(&mut self, code: i32) -> i64 {
         self.exit_code = Some(code);
+        0
+    }
+
+    /// Linux brk(2): adjust the program break.
+    ///
+    /// `addr == 0` probes the current break. Otherwise sets it to the
+    /// requested address (page-aligned up). Returns the new break, or
+    /// the current break unchanged if the request is invalid.
+    fn sys_brk(&mut self, addr: u64) -> i64 {
+        let base = self.arena.base as u64;
+        if addr == 0 {
+            return (base + self.arena.brk_offset as u64) as i64;
+        }
+        if addr < base {
+            return (base + self.arena.brk_offset as u64) as i64;
+        }
+        let requested_offset = (addr - base) as usize;
+        if requested_offset > self.arena.mmap_top {
+            return (base + self.arena.brk_offset as u64) as i64;
+        }
+        self.arena.brk_offset = (requested_offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        (base + self.arena.brk_offset as u64) as i64
+    }
+
+    /// Linux mmap(2): map anonymous memory.
+    ///
+    /// Only `MAP_ANONYMOUS` is supported. Allocates from the top of the
+    /// arena downward (opposite direction from brk). Returns the mapped
+    /// address or a negative errno.
+    fn sys_mmap(
+        &mut self,
+        _addr: u64,
+        length: u64,
+        _prot: i32,
+        flags: i32,
+        _fd: i32,
+        _offset: u64,
+    ) -> i64 {
+        let len = ((length as usize) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let map_anonymous = 0x20;
+        if flags & map_anonymous == 0 {
+            return ENOSYS;
+        }
+        if len > self.arena.mmap_top.saturating_sub(self.arena.brk_offset) {
+            return ENOMEM;
+        }
+        self.arena.mmap_top -= len;
+        let ptr = self.arena.base + self.arena.mmap_top;
+        // Safety: ptr is within the arena allocation and len bytes are available.
+        unsafe {
+            core::ptr::write_bytes(ptr as *mut u8, 0, len);
+        }
+        self.arena.mmap_regions.push((self.arena.mmap_top, len));
+        ptr as i64
+    }
+
+    /// Linux munmap(2): unmap memory (stub — always succeeds).
+    fn sys_munmap(&mut self, _addr: u64, _length: u64) -> i64 {
         0
     }
 }
@@ -394,6 +501,85 @@ mod tests {
         let msg = b"err";
         let result = lx.handle_syscall(1, [2, msg.as_ptr() as u64, 3, 0, 0, 0]);
         assert_eq!(result, 3);
+    }
+
+    // ── Memory arena tests ────────────────────────────────────────────
+
+    #[test]
+    fn arena_brk_probe_returns_base() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::with_arena(mock, 64 * 1024);
+        let base = lx.handle_syscall(12, [0, 0, 0, 0, 0, 0]);
+        assert!(base > 0);
+        assert_eq!(base as usize, lx.arena_base());
+    }
+
+    #[test]
+    fn arena_brk_extend_returns_new_brk() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::with_arena(mock, 64 * 1024);
+        let base = lx.handle_syscall(12, [0, 0, 0, 0, 0, 0]) as u64;
+        let new_brk = lx.handle_syscall(12, [base + 8192, 0, 0, 0, 0, 0]);
+        assert_eq!(new_brk as u64, base + 8192);
+    }
+
+    #[test]
+    fn arena_brk_aligns_to_4k() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::with_arena(mock, 64 * 1024);
+        let base = lx.handle_syscall(12, [0, 0, 0, 0, 0, 0]) as u64;
+        let new_brk = lx.handle_syscall(12, [base + 100, 0, 0, 0, 0, 0]);
+        assert_eq!(new_brk as u64, base + 4096);
+    }
+
+    #[test]
+    fn arena_mmap_anonymous_returns_valid_address() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::with_arena(mock, 64 * 1024);
+        let base = lx.arena_base();
+        let arena_size = 64 * 1024;
+        let addr = lx.handle_syscall(9, [0, 4096, 3, 0x22, u64::MAX, 0]);
+        assert!(addr > 0);
+        let addr = addr as usize;
+        assert!(addr >= base);
+        assert!(addr < base + arena_size);
+        assert_eq!(addr % 4096, 0);
+    }
+
+    #[test]
+    fn arena_mmap_is_zero_filled() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::with_arena(mock, 64 * 1024);
+        let addr = lx.handle_syscall(9, [0, 4096, 3, 0x22, u64::MAX, 0]) as usize;
+        let slice = unsafe { core::slice::from_raw_parts(addr as *const u8, 4096) };
+        assert!(slice.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn arena_brk_cannot_exceed_mmap() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::with_arena(mock, 16 * 1024);
+        let base = lx.handle_syscall(12, [0, 0, 0, 0, 0, 0]) as u64;
+        let _addr = lx.handle_syscall(9, [0, 8192, 3, 0x22, u64::MAX, 0]);
+        let result = lx.handle_syscall(12, [base + 16384, 0, 0, 0, 0, 0]) as u64;
+        assert!(result < base + 16384);
+    }
+
+    #[test]
+    fn arena_mmap_exhaustion_returns_enomem() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::with_arena(mock, 16 * 1024);
+        let result = lx.handle_syscall(9, [0, 32768, 3, 0x22, u64::MAX, 0]);
+        assert_eq!(result, ENOMEM);
+    }
+
+    #[test]
+    fn arena_munmap_returns_success() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::with_arena(mock, 64 * 1024);
+        let addr = lx.handle_syscall(9, [0, 4096, 3, 0x22, u64::MAX, 0]) as u64;
+        let result = lx.handle_syscall(11, [addr, 4096, 0, 0, 0, 0]);
+        assert_eq!(result, 0);
     }
 }
 
