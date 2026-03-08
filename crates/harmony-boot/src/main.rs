@@ -431,6 +431,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             ) -> Result<(), harmony_microkernel::IpcError> {
                 self.server.clunk(fid)
             }
+            fn stat(
+                &mut self,
+                fid: harmony_microkernel::Fid,
+            ) -> Result<harmony_microkernel::FileStat, harmony_microkernel::IpcError> {
+                self.server.stat(fid)
+            }
         }
 
         // 1. Load ELF
@@ -541,6 +547,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         fn dispatch(nr: u64, args: [u64; 6]) -> syscall::SyscallResult {
             let lx = unsafe { LINUXULATOR.as_mut().unwrap() };
             let retval = lx.handle_syscall(nr, args);
+            // Write FS base MSR only after handle_syscall confirms success.
+            // If arch_prctl ever adds validation (e.g. range check), an
+            // unconditional MSR write would leave the CPU in a bad state
+            // even though the syscall nominally failed.
+            if nr == 158 /* SYS_arch_prctl */ && args[0] == 0x1002 /* ARCH_SET_FS */ && retval == 0 {
+                unsafe { syscall::write_fs_base(args[1]); }
+            }
             syscall::SyscallResult {
                 retval,
                 exited: lx.exited(),

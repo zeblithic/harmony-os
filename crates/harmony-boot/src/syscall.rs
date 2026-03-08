@@ -210,3 +210,24 @@ pub unsafe fn setup_msrs(kernel_cs: u16, user_cs_base: u16) {
     // FMASK — clear IF (bit 9) on syscall entry to prevent interrupts
     wrmsr(IA32_FMASK, 0x200);
 }
+
+// ── FS base register ──────────────────────────────────────────────
+
+const IA32_FS_BASE: u32 = 0xC000_0100;
+
+/// Write the FS segment base register (for TLS).
+///
+/// # Safety
+/// Must be called in Ring 0.
+pub unsafe fn write_fs_base(addr: u64) {
+    wrmsr(IA32_FS_BASE, addr);
+}
+
+/// Read the FS segment base register.
+///
+/// # Safety
+/// Must be called in Ring 0.
+#[allow(dead_code)] // Symmetric pair with write_fs_base; used when ARCH_GET_FS reads from MSR.
+pub unsafe fn read_fs_base() -> u64 {
+    rdmsr(IA32_FS_BASE)
+}
