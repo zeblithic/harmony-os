@@ -131,19 +131,21 @@ extern "C" fn syscall_entry() {
         //
         // Current:  RAX=nr, RDI=a1, RSI=a2, RDX=a3, R10=a4, R8=a5, R9=a6
         // Need:     RDI=nr, RSI=a1, RDX=a2, RCX=a3, R8=a4, R9=a5, [stack]=a6
-        "push r9",           // save a6 for stack arg
+        // Set up 7th arg (a6) on stack for rust_syscall_handler.
+        // After 8 callee-saved pushes (64 bytes), RSP mod 16 = 0.
+        // We need: [rsp] = a6, then call (which pushes return addr).
+        // But we also need 16-byte alignment before call.
+        // 64 + 8 (padding) + 8 (a6) = 80 bytes → aligned.
+        "sub rsp, 8",        // alignment padding
+        "push r9",           // a6 as 7th stack arg at [rsp]
+
+        // Shuffle registers: Linux ABI → SysV calling convention
         "mov r9, r8",        // r9 = a5
         "mov r8, r10",       // r8 = a4
         "mov rcx, rdx",      // rcx = a3
         "mov rdx, rsi",      // rdx = a2
         "mov rsi, rdi",      // rsi = a1
         "mov rdi, rax",      // rdi = nr
-
-        // Push a6 as 7th arg (stack)
-        // It's already on the stack from "push r9" above.
-        // For 16-byte alignment: 8 pushes + 1 push = 9*8 = 72 bytes.
-        // 72 is not 16-aligned, so push one more.
-        "sub rsp, 8",        // align stack to 16 bytes
 
         "call rust_syscall_handler",
 
