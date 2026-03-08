@@ -11,6 +11,8 @@ extern crate alloc;
 
 mod pci;
 mod pit;
+#[cfg(feature = "ring3")]
+mod syscall;
 mod virtio;
 
 use bootloader_api::config::Mapping;
@@ -357,6 +359,161 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let _ = writeln!(serial, "[IPC]  echo: \"{}\"", msg);
 
         serial.log("KERN", "Ring 2 IPC demo complete");
+    }
+
+    // ── Ring 3 Linuxulator ────────────────────────────────────────────
+    #[cfg(feature = "ring3")]
+    {
+        use harmony_microkernel::serial_server::SerialServer as KernelSerialServer;
+        use harmony_microkernel::FileServer;
+        use harmony_os::elf::parse_elf;
+        use harmony_os::linuxulator::{Linuxulator, SyscallBackend};
+
+        serial.log("KERN", "Ring 3 Linuxulator mode");
+
+        // ── DirectBackend: wraps SerialServer directly ──────────────
+        // The Kernel requires `std` (identity stores), so on bare metal
+        // we bypass it and call SerialServer methods directly. Still
+        // exercises the FileServer trait — just skips capability checks.
+        struct DirectBackend {
+            server: KernelSerialServer,
+        }
+
+        impl DirectBackend {
+            fn new() -> Self {
+                Self {
+                    server: KernelSerialServer::new(),
+                }
+            }
+        }
+
+        impl SyscallBackend for DirectBackend {
+            fn walk(
+                &mut self,
+                _path: &str,
+                new_fid: harmony_microkernel::Fid,
+            ) -> Result<harmony_microkernel::QPath, harmony_microkernel::IpcError> {
+                // All walks go to "log" — the only file in SerialServer
+                self.server.walk(0, new_fid, "log")
+            }
+            fn open(
+                &mut self,
+                fid: harmony_microkernel::Fid,
+                mode: harmony_microkernel::OpenMode,
+            ) -> Result<(), harmony_microkernel::IpcError> {
+                self.server.open(fid, mode)
+            }
+            fn read(
+                &mut self,
+                fid: harmony_microkernel::Fid,
+                offset: u64,
+                count: u32,
+            ) -> Result<alloc::vec::Vec<u8>, harmony_microkernel::IpcError> {
+                self.server.read(fid, offset, count)
+            }
+            fn write(
+                &mut self,
+                fid: harmony_microkernel::Fid,
+                _offset: u64,
+                data: &[u8],
+            ) -> Result<u32, harmony_microkernel::IpcError> {
+                // Write to SerialServer buffer AND echo to real serial port
+                let result = self.server.write(fid, 0, data);
+                // Also write to actual serial for QEMU visibility
+                for &byte in data {
+                    serial_write_byte(byte);
+                }
+                result
+            }
+            fn clunk(
+                &mut self,
+                fid: harmony_microkernel::Fid,
+            ) -> Result<(), harmony_microkernel::IpcError> {
+                self.server.clunk(fid)
+            }
+        }
+
+        // 1. Load ELF
+        let elf_bytes = include_bytes!("../test-bins/hello.elf");
+        let parsed = match parse_elf(elf_bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = writeln!(serial, "[LINUX] ELF parse error: {:?}", e);
+                loop {
+                    x86_64::instructions::hlt();
+                }
+            }
+        };
+        let _ = writeln!(
+            serial,
+            "[LINUX] loaded hello.elf ({} bytes, {} segments)",
+            elf_bytes.len(),
+            parsed.segments.len()
+        );
+
+        // 2. Copy segment to heap
+        let seg = &parsed.segments[0];
+        let mut mem = alloc::vec![0u8; seg.memsz as usize];
+        let filesz = seg.filesz as usize;
+        mem[..filesz]
+            .copy_from_slice(&elf_bytes[seg.offset as usize..seg.offset as usize + filesz]);
+        let entry_offset = (parsed.entry_point - seg.vaddr) as usize;
+        let real_entry = mem.as_ptr() as usize + entry_offset;
+        let _ = writeln!(serial, "[LINUX] entry=0x{:x} stack=<pending>", real_entry);
+
+        // 3. Allocate stack
+        let stack_size = 64 * 1024; // 64 KiB
+        let stack = alloc::vec![0u8; stack_size];
+        let stack_top = stack.as_ptr() as usize + stack_size;
+        let _ = writeln!(serial, "[LINUX] stack_top=0x{:x}", stack_top);
+
+        // 4. Create Linuxulator with global storage
+        // We store it in a static to make it accessible from the syscall handler.
+        static mut LINUXULATOR: Option<Linuxulator<DirectBackend>> = None;
+        unsafe {
+            LINUXULATOR = Some(Linuxulator::new(DirectBackend::new()));
+            LINUXULATOR
+                .as_mut()
+                .unwrap()
+                .init_stdio()
+                .expect("init_stdio failed");
+        }
+
+        // 5. Install dispatch function
+        fn dispatch(nr: u64, args: [u64; 6]) -> syscall::SyscallResult {
+            let lx = unsafe { LINUXULATOR.as_mut().unwrap() };
+            let retval = lx.handle_syscall(nr, args);
+            syscall::SyscallResult {
+                retval,
+                exited: lx.exited(),
+                exit_code: lx.exit_code().unwrap_or(0),
+            }
+        }
+        unsafe {
+            syscall::set_dispatch_fn(dispatch);
+        }
+
+        // 6. Set up MSRs
+        // Use CS = 0x08 (standard GDT kernel code segment from bootloader)
+        unsafe {
+            syscall::setup_msrs(0x08);
+        }
+
+        serial.log("LINUX", "jumping to ELF entry point");
+
+        // 7. Jump to the binary
+        // Set RSP to stack_top and jump to entry. When the binary calls
+        // `syscall`, the CPU will vector to syscall_entry via LSTAR.
+        // After exit_group, we check the flag and continue.
+        unsafe {
+            core::arch::asm!(
+                "mov rsp, {stack}",
+                "jmp {entry}",
+                stack = in(reg) stack_top,
+                entry = in(reg) real_entry,
+                options(noreturn),
+            );
+        }
     }
 
     // Exit early during automated QEMU testing (feature-gated).
