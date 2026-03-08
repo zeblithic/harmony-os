@@ -24,6 +24,10 @@ use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
 /// Must match `harmony_athenaeum::CHUNK_SIZE` (which is `pub(crate)`).
 const CHUNK_SIZE: usize = 4096;
 
+/// Maximum concurrent ingest sessions. Each session can buffer up to
+/// `MAX_BLOB_SIZE` (1 MB), so this caps ingest memory at 4 MB.
+const MAX_CONCURRENT_INGESTS: usize = 4;
+
 // ── QPath constants ─────────────────────────────────────────────────
 
 const ROOT: QPath = 0;
@@ -428,6 +432,9 @@ impl FileServer for ContentServer {
                 if !matches!(mode, OpenMode::ReadWrite) {
                     return Err(IpcError::PermissionDenied);
                 }
+                if self.ingest_buffers.len() >= MAX_CONCURRENT_INGESTS {
+                    return Err(IpcError::ResourceExhausted);
+                }
                 self.ingest_buffers
                     .insert(fid, IngestState::Writing(Vec::new()));
             }
@@ -485,11 +492,13 @@ impl FileServer for ContentServer {
                     .ok_or(IpcError::InvalidArgument)?;
                 match buf {
                     IngestState::Writing(ref mut v) => {
+                        let written =
+                            u32::try_from(data.len()).map_err(|_| IpcError::ResourceExhausted)?;
                         if v.len().saturating_add(data.len()) > MAX_BLOB_SIZE {
                             return Err(IpcError::ResourceExhausted);
                         }
                         v.extend_from_slice(data);
-                        u32::try_from(data.len()).map_err(|_| IpcError::ResourceExhausted)
+                        Ok(written)
                     }
                     IngestState::Done(_) => Err(IpcError::InvalidArgument), // Already finalized
                 }
@@ -979,6 +988,27 @@ mod tests {
         server.clunk(2).unwrap();
         assert_eq!(server.chunk_count(), 1); // No new chunks
         assert_eq!(server.blob_count(), 1); // No new blob
+    }
+
+    #[test]
+    fn ingest_concurrent_limit_enforced() {
+        let mut server = ContentServer::new();
+        // Open MAX_CONCURRENT_INGESTS ingest fids — all should succeed.
+        for i in 0..MAX_CONCURRENT_INGESTS {
+            let fid = (i + 1) as Fid;
+            server.walk(0, fid, "ingest").unwrap();
+            server.open(fid, OpenMode::ReadWrite).unwrap();
+        }
+        // One more should be rejected.
+        let extra_fid = (MAX_CONCURRENT_INGESTS + 1) as Fid;
+        server.walk(0, extra_fid, "ingest").unwrap();
+        assert_eq!(
+            server.open(extra_fid, OpenMode::ReadWrite),
+            Err(IpcError::ResourceExhausted)
+        );
+        // Clunking one frees a slot.
+        server.clunk(1).unwrap();
+        server.open(extra_fid, OpenMode::ReadWrite).unwrap();
     }
 
     #[test]
