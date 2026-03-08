@@ -68,8 +68,10 @@ struct FidState {
 enum IngestState {
     /// Accumulating bytes from successive writes.
     Writing(Vec<u8>),
-    /// Finalized — response already consumed.
-    Done,
+    /// Finalized — cached response available for re-reading.
+    /// The response is retained so that partial reads (small `count` or
+    /// nonzero `offset`) can be retried without losing data.
+    Done(Vec<u8>),
 }
 
 // ── ContentServer ───────────────────────────────────────────────────
@@ -166,19 +168,26 @@ impl ContentServer {
                 return Err(IpcError::ResourceExhausted);
             }
             IngestState::Writing(_) => {} // validation passed, proceed
-            IngestState::Done => return Ok(Vec::new()),
+            IngestState::Done(ref response) => return Ok(response.clone()),
         }
         // All peeks passed — safe to transition.
-        match core::mem::replace(buf, IngestState::Done) {
+        match core::mem::replace(buf, IngestState::Done(Vec::new())) {
             IngestState::Writing(data) => {
                 let cid = sha256_hash(&data);
 
                 // Dedup: skip if blob already exists
                 if self.blobs.contains_key(&cid) {
                     let ath = &self.blobs[&cid];
-                    return self.build_ingest_response(&cid, ath); // ? propagated by return
+                    let response = self.build_ingest_response(&cid, ath)?;
+                    *self.ingest_buffers.get_mut(&fid).unwrap() =
+                        IngestState::Done(response.clone());
+                    return Ok(response);
                 }
 
+                // from_blob can fail with CollisionError::AllAlgorithmsCollide
+                // (32-bit address space exhaustion). Size errors are already
+                // handled by the peek above, so ResourceExhausted is the
+                // appropriate mapping for the remaining failure mode.
                 let ath = match Athenaeum::from_blob(cid, &data) {
                     Ok(ath) => ath,
                     Err(_) => {
@@ -213,12 +222,21 @@ impl ContentServer {
                 }
 
                 self.blobs.insert(cid, ath);
+                // Cache response so partial/multiple reads work.
+                *self.ingest_buffers.get_mut(&fid).unwrap() = IngestState::Done(response.clone());
                 Ok(response)
             }
-            IngestState::Done => unreachable!(), // handled by peek above
+            IngestState::Done(_) => unreachable!(), // handled by peek above
         }
     }
 
+    /// Serialise the ingest response.
+    ///
+    /// ```text
+    /// [0..32]  — 256-bit CID (raw bytes)
+    /// [32..36] — chunk_count as u32 little-endian
+    /// [36..40] — blob_size   as u32 little-endian
+    /// ```
     fn build_ingest_response(&self, cid: &[u8; 32], ath: &Athenaeum) -> Result<Vec<u8>, IpcError> {
         let chunk_count =
             u32::try_from(ath.chunks.len()).map_err(|_| IpcError::ResourceExhausted)?;
@@ -440,7 +458,7 @@ impl FileServer for ContentServer {
                         v.extend_from_slice(data);
                         u32::try_from(data.len()).map_err(|_| IpcError::ResourceExhausted)
                     }
-                    _ => Err(IpcError::InvalidArgument), // Already finalized
+                    IngestState::Done(_) => Err(IpcError::InvalidArgument), // Already finalized
                 }
             }
         }
@@ -569,6 +587,16 @@ mod tests {
         let addr = ChunkAddr::from_data(b"test chunk data for qpath", Depth::Blob, 0);
         let q = ContentServer::chunk_qpath(&addr);
         assert!(q >= CHUNK_QPATH_BASE);
+    }
+
+    #[test]
+    fn qpath_ranges_are_disjoint() {
+        // Maximum chunk QPath assuming 21-bit hash_bits (max 0x1F_FFFF).
+        let max_chunk_qpath = CHUNK_QPATH_BASE + 0x1F_FFFF;
+        assert!(
+            max_chunk_qpath < BLOB_QPATH_BASE,
+            "chunk and blob QPath ranges overlap"
+        );
     }
 
     // ── walk() tests ────────────────────────────────────────────────
@@ -784,15 +812,16 @@ mod tests {
     }
 
     #[test]
-    fn ingest_second_read_returns_empty() {
+    fn ingest_second_read_returns_cached_response() {
         let mut server = ContentServer::new();
         server.walk(0, 1, "ingest").unwrap();
         server.open(1, OpenMode::ReadWrite).unwrap();
         server.write(1, 0, &[0xCDu8; 100]).unwrap();
         let first = server.read(1, 0, 256).unwrap();
         assert_eq!(first.len(), 40);
+        // Response is cached — subsequent reads return the same data.
         let second = server.read(1, 0, 256).unwrap();
-        assert!(second.is_empty());
+        assert_eq!(second, first);
     }
 
     #[test]
@@ -829,6 +858,26 @@ mod tests {
         assert_eq!(slice.len(), 8);
         let chunk_count = u32::from_le_bytes(slice[0..4].try_into().unwrap());
         let blob_size = u32::from_le_bytes(slice[4..8].try_into().unwrap());
+        assert_eq!(chunk_count, 1);
+        assert_eq!(blob_size, 4096);
+    }
+
+    #[test]
+    fn ingest_partial_reads_across_multiple_calls() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "ingest").unwrap();
+        server.open(1, OpenMode::ReadWrite).unwrap();
+        let blob_data = alloc::vec![0xDDu8; 4096];
+        server.write(1, 0, &blob_data).unwrap();
+        // First read: CID only (first 32 bytes)
+        let cid_bytes = server.read(1, 0, 32).unwrap();
+        assert_eq!(cid_bytes.len(), 32);
+        // Second read: metadata only (bytes 32..40) — response is cached
+        let meta = server.read(1, 32, 8).unwrap();
+        assert_eq!(meta.len(), 8);
+        // Verify metadata is consistent
+        let chunk_count = u32::from_le_bytes(meta[0..4].try_into().unwrap());
+        let blob_size = u32::from_le_bytes(meta[4..8].try_into().unwrap());
         assert_eq!(chunk_count, 1);
         assert_eq!(blob_size, 4096);
     }
