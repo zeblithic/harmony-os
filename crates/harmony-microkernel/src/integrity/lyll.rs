@@ -91,6 +91,21 @@ impl Lyll {
         self.sampled_frames.remove(&paddr);
     }
 
+    /// Promote a CID-backed entry to a Snapshot entry, preserving its current
+    /// hash. This is needed when `vm_protect_region` makes a read-only frame
+    /// writable — the entry must accept write-barrier hash updates.
+    /// No-op if the entry is already a Snapshot or doesn't exist.
+    pub fn promote_to_snapshot(&mut self, paddr: PhysAddr) {
+        if let Some(record) = self.hash_registry.get_mut(&paddr) {
+            if let HashEntry::CidBacked { cid } = record.entry {
+                record.entry = HashEntry::Snapshot {
+                    hash: cid,
+                    generation: 0,
+                };
+            }
+        }
+    }
+
     /// Update a snapshot entry's hash. CID-backed entries are immutable and silently ignored.
     pub fn update_snapshot(&mut self, paddr: PhysAddr, new_hash: [u8; 32]) {
         if let Some(record) = self.hash_registry.get_mut(&paddr) {
@@ -280,6 +295,37 @@ mod tests {
             1,
         );
         lyll.update_snapshot(PhysAddr(0x1000), [0xFF; 32]);
+        assert_eq!(lyll.expected_hash(PhysAddr(0x1000)), Some([0xAA; 32]));
+    }
+
+    #[test]
+    fn promote_cid_to_snapshot_preserves_hash() {
+        let mut lyll = Lyll::new(test_config());
+        lyll.register_frame(
+            PhysAddr(0x1000),
+            HashEntry::CidBacked { cid: [0xAA; 32] },
+            1,
+        );
+        lyll.promote_to_snapshot(PhysAddr(0x1000));
+        // Hash preserved.
+        assert_eq!(lyll.expected_hash(PhysAddr(0x1000)), Some([0xAA; 32]));
+        // Now update_snapshot works (it was a no-op before promotion).
+        lyll.update_snapshot(PhysAddr(0x1000), [0xBB; 32]);
+        assert_eq!(lyll.expected_hash(PhysAddr(0x1000)), Some([0xBB; 32]));
+    }
+
+    #[test]
+    fn promote_snapshot_is_noop() {
+        let mut lyll = Lyll::new(test_config());
+        lyll.register_frame(
+            PhysAddr(0x1000),
+            HashEntry::Snapshot {
+                hash: [0xAA; 32],
+                generation: 5,
+            },
+            1,
+        );
+        lyll.promote_to_snapshot(PhysAddr(0x1000));
         assert_eq!(lyll.expected_hash(PhysAddr(0x1000)), Some([0xAA; 32]));
     }
 

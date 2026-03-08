@@ -615,13 +615,43 @@ impl<P: PageTable> Kernel<P> {
     }
 
     /// Change the permission flags on an existing region.
+    ///
+    /// If the region gains WRITABLE, any CidBacked hash entries are promoted
+    /// to Snapshot so that write-barrier hash updates are not silently lost.
     pub fn vm_protect_region(
         &mut self,
         pid: u32,
         vaddr: VirtAddr,
         new_flags: PageFlags,
     ) -> Result<(), VmError> {
-        self.vm.protect_region(pid, vaddr, new_flags)
+        // Check if this is a read-only → writable transition before mutating.
+        let was_writable = self
+            .vm
+            .space(pid)
+            .and_then(|s| s.regions.get(&vaddr))
+            .map(|r| r.flags.contains(PageFlags::WRITABLE))
+            .unwrap_or(false);
+
+        self.vm.protect_region(pid, vaddr, new_flags)?;
+
+        // Promote CidBacked → Snapshot for frames that just became writable.
+        if !was_writable && new_flags.contains(PageFlags::WRITABLE) {
+            let frames: Vec<PhysAddr> = self
+                .vm
+                .space(pid)
+                .unwrap()
+                .regions
+                .get(&vaddr)
+                .unwrap()
+                .frames
+                .clone();
+            for paddr in frames {
+                self.lyll.promote_to_snapshot(paddr);
+            }
+            self.sync_guardian_state_hashes();
+        }
+
+        Ok(())
     }
 
     /// Find a free region of at least `len` bytes in the process's
@@ -2113,5 +2143,52 @@ mod tests {
         // Writable frames should use Snapshot entries, so update_snapshot works.
         kernel.lyll_mut().update_snapshot(paddr, [0xAA; 32]);
         assert_eq!(kernel.lyll().expected_hash(paddr), Some([0xAA; 32]));
+    }
+
+    #[test]
+    fn protect_region_promotes_cid_to_snapshot_on_write() {
+        let mut kernel = make_kernel();
+        let pid = spawn_test_process(&mut kernel);
+        kernel
+            .vm_create_space(
+                pid,
+                default_budget(),
+                MockPageTable::new(PhysAddr(0x20_0000)),
+            )
+            .unwrap();
+
+        // Map read-only, non-ephemeral → CidBacked entry.
+        let ro_flags = PageFlags::READABLE | PageFlags::USER;
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize,
+                ro_flags,
+                FrameClassification::empty(),
+            )
+            .unwrap();
+
+        let paddr = kernel
+            .vm()
+            .space(pid)
+            .unwrap()
+            .regions
+            .get(&VirtAddr(0x1000))
+            .unwrap()
+            .frames[0];
+
+        // CidBacked → update_snapshot is a no-op.
+        kernel.lyll_mut().update_snapshot(paddr, [0xAA; 32]);
+        assert_eq!(kernel.lyll().expected_hash(paddr), Some([0u8; 32]));
+
+        // Promote to writable.
+        kernel
+            .vm_protect_region(pid, VirtAddr(0x1000), rw_user_flags())
+            .unwrap();
+
+        // Now it's a Snapshot entry → update_snapshot works.
+        kernel.lyll_mut().update_snapshot(paddr, [0xBB; 32]);
+        assert_eq!(kernel.lyll().expected_hash(paddr), Some([0xBB; 32]));
     }
 }
