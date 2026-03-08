@@ -394,8 +394,8 @@ mod tests {
     use crate::platform::entropy::KernelEntropy;
     use crate::platform::persistence::MemoryState;
 
-    fn test_entropy() -> KernelEntropy<impl FnMut(&mut [u8])> {
-        let mut counter: u8 = 42;
+    fn test_entropy_with_seed(seed: u8) -> KernelEntropy<impl FnMut(&mut [u8])> {
+        let mut counter: u8 = seed;
         KernelEntropy::new(move |buf: &mut [u8]| {
             for byte in buf.iter_mut() {
                 *byte = counter;
@@ -404,11 +404,21 @@ mod tests {
         })
     }
 
-    fn make_runtime() -> UnikernelRuntime<KernelEntropy<impl FnMut(&mut [u8])>, MemoryState> {
-        let mut entropy = test_entropy();
+    fn make_runtime_with_seed(
+        seed: u8,
+    ) -> UnikernelRuntime<KernelEntropy<impl FnMut(&mut [u8])>, MemoryState> {
+        let mut entropy = test_entropy_with_seed(seed);
         let identity = PrivateIdentity::generate(&mut entropy);
         let persistence = MemoryState::new();
         UnikernelRuntime::new(identity, entropy, persistence)
+    }
+
+    fn test_entropy() -> KernelEntropy<impl FnMut(&mut [u8])> {
+        test_entropy_with_seed(42)
+    }
+
+    fn make_runtime() -> UnikernelRuntime<KernelEntropy<impl FnMut(&mut [u8])>, MemoryState> {
+        make_runtime_with_seed(42)
     }
 
     #[test]
