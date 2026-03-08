@@ -6,7 +6,6 @@
 
 extern crate alloc;
 
-#[allow(unused_imports)]
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -88,6 +87,88 @@ impl SyscallBackend for MockBackend {
     }
 }
 
+// ── Linuxulator ─────────────────────────────────────────────────────
+
+/// Linux syscall-to-9P translation engine.
+///
+/// Owns a POSIX-style fd table and dispatches Linux syscalls to a
+/// [`SyscallBackend`]. Created once per Linux process.
+pub struct Linuxulator<B: SyscallBackend> {
+    backend: B,
+    /// Maps Linux fd (0, 1, 2, ...) → 9P fid.
+    fd_table: BTreeMap<i32, Fid>,
+    /// Next fid to allocate for backend calls.
+    next_fid: Fid,
+    /// Set by sys_exit_group.
+    exit_code: Option<i32>,
+}
+
+impl<B: SyscallBackend> Linuxulator<B> {
+    /// Create a new Linuxulator with an empty fd table.
+    pub fn new(backend: B) -> Self {
+        Self {
+            backend,
+            fd_table: BTreeMap::new(),
+            next_fid: 100, // avoid collision with server root fids
+            exit_code: None,
+        }
+    }
+
+    /// Allocate the next fid for a backend call.
+    fn alloc_fid(&mut self) -> Fid {
+        let fid = self.next_fid;
+        self.next_fid += 1;
+        fid
+    }
+
+    /// Pre-populate fd 0 (stdin), 1 (stdout), 2 (stderr) by walking
+    /// to the serial server and opening the log file.
+    ///
+    /// Expects SerialServer mounted at `/dev/serial` in the process namespace.
+    pub fn init_stdio(&mut self) -> Result<(), IpcError> {
+        // stdin (fd 0) — read mode
+        let stdin_fid = self.alloc_fid();
+        self.backend.walk("/dev/serial/log", stdin_fid)?;
+        self.backend.open(stdin_fid, OpenMode::Read)?;
+        self.fd_table.insert(0, stdin_fid);
+
+        // stdout (fd 1) — write mode
+        let stdout_fid = self.alloc_fid();
+        self.backend.walk("/dev/serial/log", stdout_fid)?;
+        self.backend.open(stdout_fid, OpenMode::Write)?;
+        self.fd_table.insert(1, stdout_fid);
+
+        // stderr (fd 2) — write mode
+        let stderr_fid = self.alloc_fid();
+        self.backend.walk("/dev/serial/log", stderr_fid)?;
+        self.backend.open(stderr_fid, OpenMode::Write)?;
+        self.fd_table.insert(2, stderr_fid);
+
+        Ok(())
+    }
+
+    /// Check if a Linux fd is in the table.
+    pub fn has_fd(&self, fd: i32) -> bool {
+        self.fd_table.contains_key(&fd)
+    }
+
+    /// Whether the process has called exit_group.
+    pub fn exited(&self) -> bool {
+        self.exit_code.is_some()
+    }
+
+    /// The exit code, if the process has exited.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_code
+    }
+
+    /// Access the backend (for test assertions).
+    #[cfg(test)]
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +189,41 @@ mod tests {
         assert_eq!(qpath, 0);
         assert_eq!(mock.walks.len(), 1);
         assert_eq!(mock.walks[0], ("/dev/serial/log".into(), 10));
+    }
+
+    #[test]
+    fn linuxulator_init_creates_fd_table() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        // Should have fd 0, 1, 2
+        assert!(lx.has_fd(0));
+        assert!(lx.has_fd(1));
+        assert!(lx.has_fd(2));
+        assert!(!lx.has_fd(3));
+    }
+
+    #[test]
+    fn init_stdio_walks_and_opens_serial() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        // Should have walked to /dev/serial/log three times
+        // (stdin, stdout, stderr each get their own fid)
+        assert_eq!(lx.backend().walks.len(), 3);
+        assert_eq!(lx.backend().walks[0].0, "/dev/serial/log");
+
+        // Should have opened all three
+        assert_eq!(lx.backend().opens.len(), 3);
+    }
+
+    #[test]
+    fn linuxulator_starts_not_exited() {
+        let mock = MockBackend::new();
+        let lx = Linuxulator::new(mock);
+        assert!(!lx.exited());
+        assert_eq!(lx.exit_code(), None);
     }
 }
