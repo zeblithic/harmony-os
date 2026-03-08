@@ -12,7 +12,7 @@ use harmony_identity::{
 use harmony_platform::EntropySource;
 
 use crate::integrity::lyll::{HashEntry, Lyll, LyllConfig};
-use crate::integrity::nakaiah::Nakaiah;
+use crate::integrity::nakaiah::{CapChain, Nakaiah};
 use crate::namespace::Namespace;
 use crate::vm::cap_tracker::MemoryBudget;
 use crate::vm::manager::AddressSpaceManager;
@@ -563,22 +563,24 @@ impl<P: PageTable> Kernel<P> {
         let region = space.regions.get(&vaddr).unwrap();
         for &paddr in &region.frames {
             let content_hash = ContentHash::ZERO;
-            self.lyll.register_frame(
-                paddr,
-                if classification.contains(FrameClassification::EPHEMERAL) {
-                    HashEntry::Snapshot {
-                        hash: content_hash.0,
-                        generation: 0,
-                    }
-                } else {
-                    HashEntry::CidBacked {
-                        cid: content_hash.0,
-                    }
-                },
-                pid,
-            );
+            // Writable or ephemeral frames use Snapshot entries (hash updates via
+            // write barrier). Only truly immutable frames use CidBacked.
+            let hash_entry = if flags.contains(PageFlags::WRITABLE)
+                || classification.contains(FrameClassification::EPHEMERAL)
+            {
+                HashEntry::Snapshot {
+                    hash: content_hash.0,
+                    generation: 0,
+                }
+            } else {
+                HashEntry::CidBacked {
+                    cid: content_hash.0,
+                }
+            };
+            self.lyll.register_frame(paddr, hash_entry, pid);
             if classification.contains(FrameClassification::ENCRYPTED) {
                 self.nakaiah.register_frame(paddr, content_hash.0);
+                self.nakaiah.grant_access(pid, paddr, CapChain::Owner);
             }
         }
 
@@ -1789,7 +1791,6 @@ mod tests {
         assert_eq!(kernel.nakaiah().integrity_registry_len(), 1);
     }
 
-    use crate::integrity::nakaiah::CapChain;
     use crate::integrity::IntegrityVerdict;
     use crate::vm::{AccessOp, ViolationReason};
 
@@ -1867,11 +1868,7 @@ mod tests {
             .unwrap()
             .frames[0];
 
-        // Grant access.
-        kernel
-            .nakaiah_mut()
-            .grant_access(pid, paddr, CapChain::Owner);
-
+        // vm_map_region auto-grants CapChain::Owner to the owning process.
         // Tampered content -> kill.
         let verdict = kernel.nakaiah().verify_access(
             pid,
@@ -1895,10 +1892,11 @@ mod tests {
     #[test]
     fn unauthorized_access_kills_process() {
         let mut kernel = make_kernel();
-        let pid = spawn_test_process(&mut kernel);
+        let owner_pid = spawn_test_process(&mut kernel);
+        let intruder_pid = spawn_test_process(&mut kernel);
         kernel
             .vm_create_space(
-                pid,
+                owner_pid,
                 default_budget(),
                 MockPageTable::new(PhysAddr(0x20_0000)),
             )
@@ -1906,7 +1904,7 @@ mod tests {
 
         kernel
             .vm_map_region(
-                pid,
+                owner_pid,
                 VirtAddr(0x1000),
                 PAGE_SIZE as usize,
                 rw_user_flags(),
@@ -1916,16 +1914,16 @@ mod tests {
 
         let paddr = kernel
             .vm()
-            .space(pid)
+            .space(owner_pid)
             .unwrap()
             .regions
             .get(&VirtAddr(0x1000))
             .unwrap()
             .frames[0];
 
-        // No capability granted -- unauthorized.
+        // Intruder process has no capability -- unauthorized.
         let verdict = kernel.nakaiah().verify_access(
-            pid,
+            intruder_pid,
             paddr,
             AccessOp::Read,
             [0u8; 32], // Content matches (it's zeroed).
@@ -2040,5 +2038,80 @@ mod tests {
         kernel.vm_unmap_region(pid, VirtAddr(0x1000)).unwrap();
         assert_eq!(kernel.lyll().registry_len(), 0);
         assert_eq!(kernel.nakaiah().integrity_registry_len(), 0);
+    }
+
+    #[test]
+    fn encrypted_frame_auto_grants_owner_capability() {
+        let mut kernel = make_kernel();
+        let pid = spawn_test_process(&mut kernel);
+        kernel
+            .vm_create_space(
+                pid,
+                default_budget(),
+                MockPageTable::new(PhysAddr(0x20_0000)),
+            )
+            .unwrap();
+
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize,
+                rw_user_flags(),
+                FrameClassification::ENCRYPTED,
+            )
+            .unwrap();
+
+        let paddr = kernel
+            .vm()
+            .space(pid)
+            .unwrap()
+            .regions
+            .get(&VirtAddr(0x1000))
+            .unwrap()
+            .frames[0];
+
+        // Owner should be able to access without a manual grant_access call.
+        let verdict = kernel
+            .nakaiah()
+            .verify_access(pid, paddr, AccessOp::Read, [0u8; 32]);
+        assert_eq!(verdict, IntegrityVerdict::Allow);
+    }
+
+    #[test]
+    fn writable_frame_gets_snapshot_entry() {
+        let mut kernel = make_kernel();
+        let pid = spawn_test_process(&mut kernel);
+        kernel
+            .vm_create_space(
+                pid,
+                default_budget(),
+                MockPageTable::new(PhysAddr(0x20_0000)),
+            )
+            .unwrap();
+
+        // Map a writable, non-ephemeral public frame.
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize,
+                rw_user_flags(),
+                FrameClassification::empty(),
+            )
+            .unwrap();
+
+        let paddr = kernel
+            .vm()
+            .space(pid)
+            .unwrap()
+            .regions
+            .get(&VirtAddr(0x1000))
+            .unwrap()
+            .frames[0];
+
+        // Writable frames should use Snapshot entries, so update_snapshot works.
+        kernel.lyll_mut().update_snapshot(paddr, [0xAA; 32]);
+        assert_eq!(kernel.lyll().expected_hash(paddr), Some([0xAA; 32]));
     }
 }

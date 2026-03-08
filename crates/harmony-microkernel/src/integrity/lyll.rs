@@ -66,6 +66,10 @@ impl Lyll {
             config.sweep_interval_ticks > 0,
             "sweep_interval_ticks must be > 0"
         );
+        assert!(
+            config.sampling_rate_percent >= 1 && config.sampling_rate_percent <= 100,
+            "sampling_rate_percent must be 1..=100"
+        );
         Self {
             hash_registry: BTreeMap::new(),
             nakaiah_state_hash: ContentHash::ZERO,
@@ -443,6 +447,24 @@ mod tests {
         // Second verify on same address — no duplicate.
         lyll.verify_frame(PhysAddr(0x1000), [0xCC; 32], 1);
         assert_eq!(lyll.quarantine.len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "sampling_rate_percent must be 1..=100")]
+    fn zero_sampling_rate_panics() {
+        Lyll::new(LyllConfig {
+            sampling_rate_percent: 0,
+            sweep_interval_ticks: 10,
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "sampling_rate_percent must be 1..=100")]
+    fn sampling_rate_over_100_panics() {
+        Lyll::new(LyllConfig {
+            sampling_rate_percent: 101,
+            sweep_interval_ticks: 10,
+        });
     }
 
     #[test]
