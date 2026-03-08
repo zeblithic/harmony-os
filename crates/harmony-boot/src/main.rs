@@ -540,6 +540,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // 5. Install dispatch function
         fn dispatch(nr: u64, args: [u64; 6]) -> syscall::SyscallResult {
             let lx = unsafe { LINUXULATOR.as_mut().unwrap() };
+            // For arch_prctl(ARCH_SET_FS), write the actual MSR before
+            // handle_syscall returns — musl immediately uses FS-relative
+            // addressing after the syscall.
+            if nr == 158 && args[0] == 0x1002 {
+                unsafe { syscall::write_fs_base(args[1]); }
+            }
             let retval = lx.handle_syscall(nr, args);
             syscall::SyscallResult {
                 retval,

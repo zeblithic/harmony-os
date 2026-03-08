@@ -233,6 +233,8 @@ pub struct Linuxulator<B: SyscallBackend> {
     exit_code: Option<i32>,
     /// Memory arena for brk/mmap.
     arena: MemoryArena,
+    /// FS segment base register (TLS pointer for arch_prctl).
+    fs_base: u64,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -249,6 +251,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             next_fid: 100, // avoid collision with server root fids
             exit_code: None,
             arena: MemoryArena::new(arena_size),
+            fs_base: 0,
         }
     }
 
@@ -355,7 +358,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             14  => self.sys_rt_sigprocmask(),
             16  => self.sys_ioctl(args[0] as i32, args[1]),
             60  => self.sys_exit(args[0] as i32),
-            158 => ENOSYS, // arch_prctl — placeholder, implemented in Task 6
+            158 => self.sys_arch_prctl(args[0] as i32, args[1]),
             218 => self.sys_set_tid_address(),
             231 => self.sys_exit_group(args[0] as i32),
             257 => self.sys_openat(args[0] as i32, args[1] as usize, args[2] as i32),
@@ -577,6 +580,36 @@ impl<B: SyscallBackend> Linuxulator<B> {
             }
         }
         0
+    }
+
+    /// Linux arch_prctl(2): set/get architecture-specific thread state.
+    ///
+    /// ARCH_SET_FS records the FS base address (TLS pointer). On bare
+    /// metal, the boot crate writes the actual IA32_FS_BASE MSR before
+    /// this method is called. In unit tests, we just record the value.
+    ///
+    /// ARCH_GET_FS writes the stored FS base to the user pointer.
+    fn sys_arch_prctl(&mut self, code: i32, addr: u64) -> i64 {
+        const ARCH_SET_FS: i32 = 0x1002;
+        const ARCH_GET_FS: i32 = 0x1003;
+        match code {
+            ARCH_SET_FS => {
+                self.fs_base = addr;
+                0
+            }
+            ARCH_GET_FS => {
+                if addr != 0 {
+                    unsafe { *(addr as *mut u64) = self.fs_base; }
+                }
+                0
+            }
+            _ => EINVAL,
+        }
+    }
+
+    /// The current FS segment base (TLS pointer).
+    pub fn fs_base(&self) -> u64 {
+        self.fs_base
     }
 }
 
@@ -973,6 +1006,25 @@ mod tests {
         let mut lx = Linuxulator::new(mock);
         let result = lx.handle_syscall(334, [0, 0, 0, 0, 0, 0]);
         assert_eq!(result, ENOSYS);
+    }
+
+    // ── sys_arch_prctl tests ────────────────────────────────────────
+
+    #[test]
+    fn sys_arch_prctl_set_fs_returns_zero() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // ARCH_SET_FS = 0x1002
+        let result = lx.handle_syscall(158, [0x1002, 0x12345678, 0, 0, 0, 0]);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn sys_arch_prctl_unknown_code_returns_einval() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.handle_syscall(158, [0x9999, 0, 0, 0, 0, 0]);
+        assert_eq!(result, EINVAL);
     }
 }
 
