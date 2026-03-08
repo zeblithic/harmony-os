@@ -169,6 +169,54 @@ fn flags_to_open_mode(flags: i32) -> OpenMode {
     }
 }
 
+/// Write a Linux x86_64 `struct stat` (144 bytes) to process memory.
+///
+/// Field layout follows the x86_64 Linux kernel struct stat:
+///   offset  size  field
+///   0       8     st_dev
+///   8       8     st_ino
+///   16      8     st_nlink
+///   24      4     st_mode
+///   28      4     st_uid
+///   32      4     st_gid
+///   36      4     (pad)
+///   40      8     st_rdev
+///   48      8     st_size
+///   56      8     st_blksize
+///   64      8     st_blocks
+///   72-144        timestamps (zeroed for MVP)
+fn write_linux_stat(buf_ptr: usize, stat: &FileStat, is_chardev: bool) {
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, 144) };
+    buf.fill(0);
+
+    // st_ino (offset 8, 8 bytes)
+    buf[8..16].copy_from_slice(&stat.qpath.to_le_bytes());
+
+    // st_nlink (offset 16, 8 bytes)
+    buf[16..24].copy_from_slice(&1u64.to_le_bytes());
+
+    // st_mode (offset 24, 4 bytes)
+    let mode: u32 = if is_chardev {
+        0o020000 | 0o666 // S_IFCHR | rw-rw-rw-
+    } else {
+        match stat.file_type {
+            FileType::Regular => 0o100000 | 0o644,  // S_IFREG | rw-r--r--
+            FileType::Directory => 0o040000 | 0o755, // S_IFDIR | rwxr-xr-x
+        }
+    };
+    buf[24..28].copy_from_slice(&mode.to_le_bytes());
+
+    // st_size (offset 48, 8 bytes)
+    buf[48..56].copy_from_slice(&stat.size.to_le_bytes());
+
+    // st_blksize (offset 56, 8 bytes)
+    buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
+
+    // st_blocks (offset 64, 8 bytes)
+    let blocks = (stat.size + 511) / 512;
+    buf[64..72].copy_from_slice(&blocks.to_le_bytes());
+}
+
 // ── Linuxulator ─────────────────────────────────────────────────────
 
 /// Linux syscall-to-9P translation engine.
@@ -299,6 +347,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             0 => self.sys_read(args[0] as i32, args[1] as usize, args[2] as usize),
             1 => self.sys_write(args[0] as i32, args[1] as usize, args[2] as usize),
             3 => self.sys_close(args[0] as i32),
+            5 => self.sys_fstat(args[0] as i32, args[1] as usize),
             9 => self.sys_mmap(
                 args[0],
                 args[1],
@@ -375,6 +424,22 @@ impl<B: SyscallBackend> Linuxulator<B> {
         };
         let _ = self.backend.clunk(fid);
         0
+    }
+
+    /// Linux fstat(2): get file status.
+    fn sys_fstat(&mut self, fd: i32, statbuf_ptr: usize) -> i64 {
+        let fid = match self.fd_table.get(&fd) {
+            Some(&fid) => fid,
+            None => return EBADF,
+        };
+        let is_chardev = fd <= 2; // stdin/stdout/stderr are character devices
+        match self.backend.stat(fid) {
+            Ok(stat) => {
+                write_linux_stat(statbuf_ptr, &stat, is_chardev);
+                0
+            }
+            Err(e) => ipc_err_to_errno(e),
+        }
     }
 
     /// Linux openat(2): open a file relative to a directory fd.
@@ -768,6 +833,33 @@ mod tests {
         assert_eq!(result, 0);
         assert!(lx.exited());
         assert_eq!(lx.exit_code(), Some(7));
+    }
+
+    // ── sys_fstat tests ──────────────────────────────────────────────
+
+    #[test]
+    fn sys_fstat_writes_stat_struct() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        let mut statbuf = [0u8; 144];
+        let result = lx.handle_syscall(5, [1, statbuf.as_mut_ptr() as u64, 0, 0, 0, 0]);
+        assert_eq!(result, 0);
+
+        // st_mode at offset 24 should be S_IFCHR | 0o666 for stdio
+        let st_mode = u32::from_le_bytes([statbuf[24], statbuf[25], statbuf[26], statbuf[27]]);
+        let s_ifchr: u32 = 0o020000;
+        assert_eq!(st_mode & 0o170000, s_ifchr);
+    }
+
+    #[test]
+    fn sys_fstat_bad_fd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let mut statbuf = [0u8; 144];
+        let result = lx.handle_syscall(5, [99, statbuf.as_mut_ptr() as u64, 0, 0, 0, 0]);
+        assert_eq!(result, EBADF);
     }
 }
 
