@@ -676,8 +676,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Linux arch_prctl(2): set/get architecture-specific thread state.
     ///
     /// ARCH_SET_FS records the FS base address (TLS pointer). On bare
-    /// metal, the boot crate writes the actual IA32_FS_BASE MSR before
-    /// this method is called. In unit tests, we just record the value.
+    /// metal, the boot crate writes the actual IA32_FS_BASE MSR after
+    /// this method returns (only when retval == 0). In unit tests, we
+    /// just record the value.
     ///
     /// ARCH_GET_FS writes the stored FS base to the user pointer.
     fn sys_arch_prctl(&mut self, code: i32, addr: u64) -> i64 {
