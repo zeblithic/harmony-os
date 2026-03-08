@@ -14,11 +14,8 @@ use harmony_microkernel::{Fid, IpcError, OpenMode, QPath};
 
 // ── Linux errno constants ───────────────────────────────────────────
 
-#[allow(dead_code)]
 const EBADF: i64 = -9;
-#[allow(dead_code)]
 const EIO: i64 = -5;
-#[allow(dead_code)]
 const ENOSYS: i64 = -38;
 
 // ── SyscallBackend trait ────────────────────────────────────────────
@@ -167,6 +164,54 @@ impl<B: SyscallBackend> Linuxulator<B> {
     pub fn backend(&self) -> &B {
         &self.backend
     }
+
+    /// Look up the fid for a Linux fd (for testing).
+    #[cfg(test)]
+    pub fn fid_for_fd(&self, fd: i32) -> Option<Fid> {
+        self.fd_table.get(&fd).copied()
+    }
+
+    /// Dispatch a Linux syscall. Returns the syscall result (negative = errno).
+    ///
+    /// # Arguments
+    /// - `nr`: Linux syscall number (x86_64 ABI)
+    /// - `args`: syscall arguments [arg1, arg2, arg3, arg4, arg5, arg6]
+    ///
+    /// # Safety
+    /// For `sys_write`, `args[1]` is treated as a pointer to user memory.
+    /// In the MVP flat address space, this is a direct pointer dereference.
+    pub fn handle_syscall(&mut self, nr: u64, args: [u64; 6]) -> i64 {
+        match nr {
+            1 => self.sys_write(args[0] as i32, args[1] as usize, args[2] as usize),
+            231 => self.sys_exit_group(args[0] as i32),
+            _ => ENOSYS,
+        }
+    }
+
+    /// Linux write(2): write to a file descriptor.
+    fn sys_write(&mut self, fd: i32, buf_ptr: usize, count: usize) -> i64 {
+        let fid = match self.fd_table.get(&fd) {
+            Some(&fid) => fid,
+            None => return EBADF,
+        };
+
+        // In the MVP flat address space, we can directly read from the pointer.
+        // Safety: caller guarantees buf_ptr points to valid memory of at least
+        // `count` bytes. This is the same trust model as a real kernel reading
+        // from user space — except here there's no protection boundary.
+        let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
+
+        match self.backend.write(fid, 0, data) {
+            Ok(n) => n as i64,
+            Err(_) => EIO,
+        }
+    }
+
+    /// Linux exit_group(2): terminate the process.
+    fn sys_exit_group(&mut self, code: i32) -> i64 {
+        self.exit_code = Some(code);
+        0
+    }
 }
 
 #[cfg(test)]
@@ -225,5 +270,64 @@ mod tests {
         let lx = Linuxulator::new(mock);
         assert!(!lx.exited());
         assert_eq!(lx.exit_code(), None);
+    }
+
+    #[test]
+    fn sys_write_to_stdout() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        let msg = b"Hello\n";
+        let result = lx.handle_syscall(1, [1, msg.as_ptr() as u64, 6, 0, 0, 0]);
+        assert_eq!(result, 6); // 6 bytes written
+
+        // Backend should have received the write
+        let stdout_fid = lx.fid_for_fd(1).unwrap();
+        let stdout_writes: Vec<_> = lx.backend().writes.iter().filter(|(fid, _)| *fid == stdout_fid).collect();
+        assert_eq!(stdout_writes.len(), 1);
+        assert_eq!(stdout_writes[0].1, b"Hello\n");
+    }
+
+    #[test]
+    fn sys_write_bad_fd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        let msg = b"test";
+        let result = lx.handle_syscall(1, [99, msg.as_ptr() as u64, 4, 0, 0, 0]);
+        assert_eq!(result, EBADF);
+    }
+
+    #[test]
+    fn sys_exit_group_sets_flag() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let result = lx.handle_syscall(231, [42, 0, 0, 0, 0, 0]);
+        assert_eq!(result, 0);
+        assert!(lx.exited());
+        assert_eq!(lx.exit_code(), Some(42));
+    }
+
+    #[test]
+    fn unknown_syscall_returns_enosys() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let result = lx.handle_syscall(9999, [0, 0, 0, 0, 0, 0]);
+        assert_eq!(result, ENOSYS);
+    }
+
+    #[test]
+    fn sys_write_to_stderr() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        let msg = b"err";
+        let result = lx.handle_syscall(1, [2, msg.as_ptr() as u64, 3, 0, 0, 0]);
+        assert_eq!(result, 3);
     }
 }
