@@ -33,6 +33,16 @@ pub struct BuddyAllocator {
 }
 
 impl BuddyAllocator {
+    /// Create an empty allocator with zero frames. All allocations return `None`.
+    pub fn empty() -> Self {
+        Self {
+            free_lists: Default::default(),
+            bitmap: Vec::new(),
+            base: PhysAddr(0),
+            frame_count: 0,
+        }
+    }
+
     /// Create a new buddy allocator managing `frame_count` frames starting
     /// at `base`.
     ///
@@ -246,6 +256,16 @@ impl BuddyAllocator {
     /// Total number of frames managed by this allocator.
     pub fn total_frame_count(&self) -> usize {
         self.frame_count
+    }
+
+    /// Total bytes managed by this allocator.
+    pub fn total_bytes(&self) -> u64 {
+        self.frame_count as u64 * PAGE_SIZE
+    }
+
+    /// Base physical address of the managed region.
+    pub fn base_addr(&self) -> PhysAddr {
+        self.base
     }
 
     /// Reserve a range of frames, marking them as allocated.
