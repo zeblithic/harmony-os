@@ -672,13 +672,25 @@ mod tests {
         let mut rt_a = make_runtime_with_seed(42);
         let mut rt_b = make_runtime_with_seed(99);
 
+        // Verify distinct identities — same seed = same keypair = useless test.
+        assert_ne!(
+            rt_a.identity().public_identity().address_hash,
+            rt_b.identity().public_identity().address_hash,
+            "runtimes must have distinct identities"
+        );
+
         rt_a.register_interface("net0");
         rt_b.register_interface("net0");
         rt_a.register_announcing_destination("harmony", &["node"], 300_000, 0);
         rt_b.register_announcing_destination("harmony", &["node"], 300_000, 0);
 
+        let mut a_discovered_b = false;
+        let mut b_discovered_a = false;
         let mut a_got_heartbeat = false;
         let mut b_got_heartbeat = false;
+
+        let addr_a = rt_a.identity().public_identity().address_hash;
+        let addr_b = rt_b.identity().public_identity().address_hash;
 
         // Run for 10 simulated seconds (heartbeat_interval_ms = 5000).
         // Discovery happens on tick 0-1. Heartbeats fire at ~6s.
@@ -693,6 +705,11 @@ mod tests {
                 if let RuntimeAction::SendOnInterface { raw, .. } = action {
                     let results = rt_b.handle_packet("net0", raw.clone(), now);
                     for r in &results {
+                        if let RuntimeAction::PeerDiscovered { address_hash, .. } = r {
+                            if *address_hash == addr_a {
+                                b_discovered_a = true;
+                            }
+                        }
                         if matches!(r, RuntimeAction::HeartbeatReceived { .. }) {
                             b_got_heartbeat = true;
                         }
@@ -705,6 +722,11 @@ mod tests {
                 if let RuntimeAction::SendOnInterface { raw, .. } = action {
                     let results = rt_a.handle_packet("net0", raw.clone(), now);
                     for r in &results {
+                        if let RuntimeAction::PeerDiscovered { address_hash, .. } = r {
+                            if *address_hash == addr_b {
+                                a_discovered_b = true;
+                            }
+                        }
                         if matches!(r, RuntimeAction::HeartbeatReceived { .. }) {
                             a_got_heartbeat = true;
                         }
@@ -717,6 +739,9 @@ mod tests {
             }
         }
 
+        // Discovery is a prerequisite — assert it first for actionable failure messages.
+        assert!(b_discovered_a, "B should have discovered A via announce");
+        assert!(a_discovered_b, "A should have discovered B via announce");
         assert!(a_got_heartbeat, "A should have received a heartbeat from B");
         assert!(b_got_heartbeat, "B should have received a heartbeat from A");
     }

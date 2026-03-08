@@ -91,8 +91,8 @@ test-mesh: build
     cleanup() {
         [ -n "$PID_A" ] && kill "$PID_A" 2>/dev/null || true
         [ -n "$PID_B" ] && kill "$PID_B" 2>/dev/null || true
-        wait "$PID_A" 2>/dev/null || true
-        wait "$PID_B" 2>/dev/null || true
+        [ -n "$PID_A" ] && wait "$PID_A" 2>/dev/null || true
+        [ -n "$PID_B" ] && wait "$PID_B" 2>/dev/null || true
         rm -f "$LOG_A" "$LOG_B"
     }
     trap cleanup EXIT
