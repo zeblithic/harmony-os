@@ -1128,4 +1128,54 @@ mod integration_tests {
         assert!(lx.exited());
         assert_eq!(lx.exit_code(), Some(0));
     }
+
+    #[test]
+    fn linuxulator_full_fd_lifecycle() {
+        let mut entropy = test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let mut kernel = Kernel::new(kernel_id);
+
+        let serial_pid = kernel
+            .spawn_process("serial", Box::new(SerialServer::new()), &[])
+            .unwrap();
+
+        let linux_pid = kernel
+            .spawn_process(
+                "hello-linux",
+                Box::new(EchoServer::new()),
+                &[("/dev/serial", serial_pid, 0)],
+            )
+            .unwrap();
+
+        kernel
+            .grant_endpoint_cap(&mut entropy, linux_pid, serial_pid, 0)
+            .unwrap();
+
+        let backend = KernelBackend::new(&mut kernel, linux_pid);
+        let mut lx = Linuxulator::new(backend);
+        lx.init_stdio().unwrap();
+
+        // Write to stdout
+        let msg = b"Hello\n";
+        let result = lx.handle_syscall(1, [1, msg.as_ptr() as u64, 6, 0, 0, 0]);
+        assert_eq!(result, 6);
+
+        // fstat on stdout — should succeed
+        let mut statbuf = [0u8; 144];
+        let result = lx.handle_syscall(5, [1, statbuf.as_mut_ptr() as u64, 0, 0, 0, 0]);
+        assert_eq!(result, 0);
+
+        // Close stdout
+        let result = lx.handle_syscall(3, [1, 0, 0, 0, 0, 0]);
+        assert_eq!(result, 0);
+        assert!(!lx.has_fd(1));
+
+        // Write to closed fd should fail
+        let result = lx.handle_syscall(1, [1, msg.as_ptr() as u64, 6, 0, 0, 0]);
+        assert_eq!(result, -9); // EBADF
+
+        // Exit
+        lx.handle_syscall(231, [0, 0, 0, 0, 0, 0]);
+        assert!(lx.exited());
+    }
 }

@@ -431,6 +431,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             ) -> Result<(), harmony_microkernel::IpcError> {
                 self.server.clunk(fid)
             }
+            fn stat(
+                &mut self,
+                fid: harmony_microkernel::Fid,
+            ) -> Result<harmony_microkernel::FileStat, harmony_microkernel::IpcError> {
+                self.server.stat(fid)
+            }
         }
 
         // 1. Load ELF
