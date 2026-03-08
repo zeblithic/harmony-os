@@ -230,14 +230,21 @@ fn write_linux_stat(buf_ptr: usize, stat: &FileStat, is_chardev: bool) {
 
 // ── Linuxulator ─────────────────────────────────────────────────────
 
+/// Per-fd state: the 9P fid and the current file offset.
+#[derive(Clone, Copy)]
+struct FdEntry {
+    fid: Fid,
+    offset: u64,
+}
+
 /// Linux syscall-to-9P translation engine.
 ///
 /// Owns a POSIX-style fd table and dispatches Linux syscalls to a
 /// [`SyscallBackend`]. Created once per Linux process.
 pub struct Linuxulator<B: SyscallBackend> {
     backend: B,
-    /// Maps Linux fd (0, 1, 2, ...) → 9P fid.
-    fd_table: BTreeMap<i32, Fid>,
+    /// Maps Linux fd (0, 1, 2, ...) → 9P fid + file offset.
+    fd_table: BTreeMap<i32, FdEntry>,
     /// Next fid to allocate for backend calls.
     next_fid: Fid,
     /// Set by sys_exit_group.
@@ -295,19 +302,19 @@ impl<B: SyscallBackend> Linuxulator<B> {
         let stdin_fid = self.alloc_fid();
         self.backend.walk("/dev/serial/log", stdin_fid)?;
         self.backend.open(stdin_fid, OpenMode::Read)?;
-        self.fd_table.insert(0, stdin_fid);
+        self.fd_table.insert(0, FdEntry { fid: stdin_fid, offset: 0 });
 
         // stdout (fd 1) — write mode
         let stdout_fid = self.alloc_fid();
         self.backend.walk("/dev/serial/log", stdout_fid)?;
         self.backend.open(stdout_fid, OpenMode::Write)?;
-        self.fd_table.insert(1, stdout_fid);
+        self.fd_table.insert(1, FdEntry { fid: stdout_fid, offset: 0 });
 
         // stderr (fd 2) — write mode
         let stderr_fid = self.alloc_fid();
         self.backend.walk("/dev/serial/log", stderr_fid)?;
         self.backend.open(stderr_fid, OpenMode::Write)?;
-        self.fd_table.insert(2, stderr_fid);
+        self.fd_table.insert(2, FdEntry { fid: stderr_fid, offset: 0 });
 
         // Track stdio fids as character devices for fstat.
         self.chardev_fids
@@ -346,7 +353,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Look up the fid for a Linux fd (for testing).
     #[cfg(test)]
     pub fn fid_for_fd(&self, fd: i32) -> Option<Fid> {
-        self.fd_table.get(&fd).copied()
+        self.fd_table.get(&fd).map(|e| e.fid)
     }
 
     /// Base address of the memory arena (for testing).
@@ -402,10 +409,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return 0;
         }
 
-        let fid = match self.fd_table.get(&fd) {
-            Some(&fid) => fid,
+        let entry = match self.fd_table.get_mut(&fd) {
+            Some(e) => e,
             None => return EBADF,
         };
+        let fid = entry.fid;
+        let offset = entry.offset;
 
         // In the MVP flat address space, we can directly read from the pointer.
         // Safety: caller guarantees buf_ptr points to valid memory of at least
@@ -413,8 +422,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
         // from user space — except here there's no protection boundary.
         let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
 
-        match self.backend.write(fid, 0, data) {
-            Ok(n) => n as i64,
+        match self.backend.write(fid, offset, data) {
+            Ok(n) => {
+                self.fd_table.get_mut(&fd).unwrap().offset += n as u64;
+                n as i64
+            }
             Err(e) => ipc_err_to_errno(e),
         }
     }
@@ -425,12 +437,15 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return 0;
         }
 
-        let fid = match self.fd_table.get(&fd) {
-            Some(&fid) => fid,
+        let entry = match self.fd_table.get(&fd) {
+            Some(e) => *e,
             None => return EBADF,
         };
 
-        match self.backend.read(fid, 0, count as u32) {
+        // 9P count is u32; cap to avoid silent truncation on large reads.
+        let capped = count.min(u32::MAX as usize) as u32;
+
+        match self.backend.read(entry.fid, entry.offset, capped) {
             Ok(data) => {
                 let n = data.len().min(count);
                 if n > 0 {
@@ -439,6 +454,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                     unsafe {
                         core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr as *mut u8, n);
                     }
+                    self.fd_table.get_mut(&fd).unwrap().offset += n as u64;
                 }
                 n as i64
             }
@@ -448,12 +464,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux close(2): close a file descriptor.
     fn sys_close(&mut self, fd: i32) -> i64 {
-        let fid = match self.fd_table.remove(&fd) {
-            Some(f) => f,
+        let entry = match self.fd_table.remove(&fd) {
+            Some(e) => e,
             None => return EBADF,
         };
-        self.chardev_fids.retain(|&f| f != fid);
-        let _ = self.backend.clunk(fid);
+        self.chardev_fids.retain(|&f| f != entry.fid);
+        let _ = self.backend.clunk(entry.fid);
         0
     }
 
@@ -463,7 +479,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return EINVAL;
         }
         let fid = match self.fd_table.get(&fd) {
-            Some(&fid) => fid,
+            Some(e) => e.fid,
             None => return EBADF,
         };
         let is_chardev = self.chardev_fids.contains(&fid);
@@ -481,6 +497,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
         let path = unsafe { read_c_string(pathname_ptr) };
 
         let at_fdcwd: i32 = -100;
+        // TODO: relative-path resolution relative to dirfd is not yet implemented.
+        // All current callers use AT_FDCWD or absolute paths, so this is fine for
+        // the MVP. A future implementation should resolve path components starting
+        // from the fid mapped to dirfd.
         if dirfd != at_fdcwd && !self.fd_table.contains_key(&dirfd) {
             return EBADF;
         }
@@ -497,7 +517,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
 
         let fd = self.alloc_fd();
-        self.fd_table.insert(fd, fid);
+        self.fd_table.insert(fd, FdEntry { fid, offset: 0 });
         fd as i64
     }
 
@@ -619,21 +639,24 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux prlimit64(2): query/set resource limits.
     ///
-    /// Only RLIMIT_STACK is supported (returns 8 MiB). Other resources
-    /// return 0 (success, but no data written).
+    /// Only RLIMIT_STACK is supported (returns 8 MiB). Unknown resources
+    /// return EINVAL to prevent callers from reading uninitialized buffers.
     fn sys_prlimit64(&self, pid: i32, resource: i32, _new_limit: u64, old_limit_ptr: usize) -> i64 {
         const RLIMIT_STACK: i32 = 3;
         if pid != 0 {
             return ESRCH;
         }
-        if resource == RLIMIT_STACK && old_limit_ptr != 0 {
-            let eight_mb = 8u64 * 1024 * 1024;
-            unsafe {
-                core::ptr::write_unaligned(old_limit_ptr as *mut u64, eight_mb); // rlim_cur
-                core::ptr::write_unaligned((old_limit_ptr + 8) as *mut u64, eight_mb); // rlim_max
+        if resource == RLIMIT_STACK {
+            if old_limit_ptr != 0 {
+                let eight_mb = 8u64 * 1024 * 1024;
+                unsafe {
+                    core::ptr::write_unaligned(old_limit_ptr as *mut u64, eight_mb); // rlim_cur
+                    core::ptr::write_unaligned((old_limit_ptr + 8) as *mut u64, eight_mb); // rlim_max
+                }
             }
+            return 0;
         }
-        0
+        EINVAL // unknown resource
     }
 
     /// Linux arch_prctl(2): set/get architecture-specific thread state.
