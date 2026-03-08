@@ -451,14 +451,48 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             parsed.segments.len()
         );
 
-        // 2. Copy segment to heap
-        let seg = &parsed.segments[0];
-        let mut mem = alloc::vec![0u8; seg.memsz as usize];
-        let filesz = seg.filesz as usize;
-        mem[..filesz]
-            .copy_from_slice(&elf_bytes[seg.offset as usize..seg.offset as usize + filesz]);
-        let entry_offset = (parsed.entry_point - seg.vaddr) as usize;
-        let real_entry = mem.as_ptr() as usize + entry_offset;
+        // 2. Copy all PT_LOAD segments to heap
+        if parsed.segments.is_empty() {
+            let _ = writeln!(serial, "[LINUX] ELF has no PT_LOAD segments");
+            loop {
+                x86_64::instructions::hlt();
+            }
+        }
+
+        // Find the overall virtual address range across all segments
+        let vaddr_min = parsed
+            .segments
+            .iter()
+            .map(|s| s.vaddr)
+            .min()
+            .unwrap();
+        let vaddr_max = parsed
+            .segments
+            .iter()
+            .map(|s| s.vaddr.saturating_add(s.memsz))
+            .max()
+            .unwrap();
+        let total_size = (vaddr_max - vaddr_min) as usize;
+        let mut mem = alloc::vec![0u8; total_size];
+
+        // Load each segment at its correct offset within the allocation
+        for seg in &parsed.segments {
+            let seg_offset = (seg.vaddr - vaddr_min) as usize;
+            let filesz = seg.filesz as usize;
+            mem[seg_offset..seg_offset + filesz]
+                .copy_from_slice(&elf_bytes[seg.offset as usize..seg.offset as usize + filesz]);
+        }
+
+        // Compute entry point with checked arithmetic
+        let real_entry = match parsed.entry_point.checked_sub(vaddr_min) {
+            Some(offset) => mem.as_ptr() as usize + offset as usize,
+            None => {
+                let _ = writeln!(serial, "[LINUX] entry_point < vaddr_min");
+                loop {
+                    x86_64::instructions::hlt();
+                }
+            }
+        };
         let _ = writeln!(serial, "[LINUX] entry=0x{:x} stack=<pending>", real_entry);
 
         // 3. Allocate stack
@@ -494,9 +528,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
 
         // 6. Set up MSRs
-        // Use CS = 0x08 (standard GDT kernel code segment from bootloader)
+        // kernel_cs = 0x08 (standard GDT kernel code segment from bootloader)
+        // user_cs_base = 0x00 (unused in flat Ring 0 MVP — we use jmp instead of sysretq)
         unsafe {
-            syscall::setup_msrs(0x08);
+            syscall::setup_msrs(0x08, 0x00);
         }
 
         serial.log("LINUX", "jumping to ELF entry point");

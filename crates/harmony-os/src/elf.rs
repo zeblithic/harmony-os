@@ -144,6 +144,11 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, ElfError> {
     let e_phentsize = u16_le(data, 54) as usize;
     let e_phnum = u16_le(data, 56) as usize;
 
+    // Validate phdr table doesn't overlap the ELF header
+    if e_phnum > 0 && e_phoff < ELF64_HEADER_SIZE {
+        return Err(ElfError::InvalidPhdr);
+    }
+
     // Validate program header table fits
     if e_phentsize < ELF64_PHDR_SIZE {
         return Err(ElfError::InvalidPhdr);

@@ -167,7 +167,11 @@ extern "C" fn syscall_entry() {
         "pop r11",           // return RFLAGS
         "pop rcx",           // return RIP
 
-        "sysretq",
+        // In our flat Ring 0 MVP (no privilege separation), we use jmp
+        // instead of sysretq. sysretq forces RPL=3 on CS which requires
+        // valid Ring 3 GDT entries and user-accessible page mappings.
+        // Since everything runs in Ring 0, a simple jmp is correct.
+        "jmp rcx",
     );
 }
 
@@ -175,10 +179,15 @@ extern "C" fn syscall_entry() {
 
 /// Configure x86_64 MSRs for syscall interception.
 ///
+/// # Arguments
+/// - `kernel_cs`: Kernel code segment selector (SYSCALL loads this into CS)
+/// - `user_cs_base`: Base selector for SYSRET. SYSRET sets CS = base+16, SS = base+8.
+///   In our flat Ring 0 MVP, set this so base+16 resolves to a valid 64-bit code segment.
+///
 /// # Safety
 /// Must be called in Ring 0 with interrupts disabled.
-/// The GDT must have a valid kernel code segment.
-pub unsafe fn setup_msrs(kernel_cs: u16) {
+/// The GDT must have valid segments at both `kernel_cs` and `user_cs_base+16`.
+pub unsafe fn setup_msrs(kernel_cs: u16, user_cs_base: u16) {
     // Enable System Call Enable bit in EFER
     let efer = rdmsr(IA32_EFER);
     wrmsr(IA32_EFER, efer | EFER_SCE);
@@ -186,8 +195,10 @@ pub unsafe fn setup_msrs(kernel_cs: u16) {
     // LSTAR — syscall entry point
     wrmsr(IA32_LSTAR, syscall_entry as u64);
 
-    // STAR — kernel CS in bits 47:32
-    let star = (kernel_cs as u64) << 32;
+    // STAR — kernel CS in [47:32], user CS base in [63:48]
+    // SYSCALL: CS = STAR[47:32], SS = STAR[47:32] + 8
+    // SYSRET:  CS = STAR[63:48] + 16, SS = STAR[63:48] + 8
+    let star = ((user_cs_base as u64) << 48) | ((kernel_cs as u64) << 32);
     wrmsr(IA32_STAR, star);
 
     // FMASK — clear IF (bit 9) on syscall entry to prevent interrupts
