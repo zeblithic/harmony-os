@@ -18,6 +18,7 @@ pub mod echo;
 pub mod kernel;
 pub mod namespace;
 pub mod serial_server;
+pub mod vm;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
