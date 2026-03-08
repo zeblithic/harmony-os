@@ -10,16 +10,18 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+use harmony_microkernel::vm::{FrameClassification, PageFlags, VmError};
 use harmony_microkernel::{Fid, FileStat, FileType, IpcError, OpenMode, QPath};
 
 // ── Linux errno constants ───────────────────────────────────────────
 
+const EPERM: i64 = -1;
 const EBADF: i64 = -9;
-const ENOSYS: i64 = -38;
 const ENOMEM: i64 = -12;
 const EINVAL: i64 = -22;
 const ENOTTY: i64 = -25;
 const ESRCH: i64 = -3;
+const ENOSYS: i64 = -38;
 
 fn ipc_err_to_errno(e: IpcError) -> i64 {
     match e {
@@ -37,6 +39,21 @@ fn ipc_err_to_errno(e: IpcError) -> i64 {
     }
 }
 
+fn vm_err_to_errno(e: VmError) -> i64 {
+    match e {
+        VmError::OutOfMemory | VmError::BudgetExceeded { .. } => ENOMEM,
+        VmError::NotMapped(_) => EINVAL,
+        VmError::RegionConflict(_) => EINVAL,
+        VmError::NoSuchProcess(_) => ESRCH,
+        VmError::ClassificationDenied(_) => EPERM,
+        VmError::CapabilityInvalid => EPERM,
+        VmError::Unaligned(_) => EINVAL,
+        VmError::InvalidOrder(_) => EINVAL,
+        VmError::PageTableError => ENOMEM,
+        VmError::ProcessExists(_) => EINVAL,
+    }
+}
+
 // ── SyscallBackend trait ────────────────────────────────────────────
 
 /// Abstraction over 9P operations. The Linuxulator calls these to
@@ -49,11 +66,52 @@ pub trait SyscallBackend {
     fn write(&mut self, fid: Fid, offset: u64, data: &[u8]) -> Result<u32, IpcError>;
     fn clunk(&mut self, fid: Fid) -> Result<(), IpcError>;
     fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError>;
+
+    // ── VM operations (optional) ──────────────────────────────────
+
+    /// Whether this backend supports VM operations.
+    ///
+    /// When `false`, the Linuxulator falls back to the MemoryArena for
+    /// mmap/munmap/brk. When `true`, those syscalls delegate to the VM
+    /// methods below.
+    fn has_vm_support(&self) -> bool {
+        false
+    }
+
+    /// Map a region of virtual memory. Returns the base virtual address.
+    fn vm_mmap(
+        &mut self,
+        _vaddr: u64,
+        _len: usize,
+        _flags: PageFlags,
+        _classification: FrameClassification,
+    ) -> Result<u64, VmError> {
+        Err(VmError::PageTableError)
+    }
+
+    /// Unmap a previously mapped region.
+    fn vm_munmap(&mut self, _vaddr: u64, _len: usize) -> Result<(), VmError> {
+        Err(VmError::PageTableError)
+    }
+
+    /// Change protection flags on a mapped region.
+    fn vm_mprotect(&mut self, _vaddr: u64, _len: usize, _flags: PageFlags) -> Result<(), VmError> {
+        Err(VmError::PageTableError)
+    }
+
+    /// Find a free virtual address region of at least `len` bytes.
+    fn vm_find_free_region(&self, _len: usize) -> Result<u64, VmError> {
+        Err(VmError::PageTableError)
+    }
 }
 
 // ── MockBackend ─────────────────────────────────────────────────────
 
 /// Test double that records all 9P calls for assertion.
+///
+/// Does NOT support VM operations (`has_vm_support()` returns `false`),
+/// so the Linuxulator falls back to MemoryArena for mmap/munmap/brk.
+/// Use [`VmMockBackend`] for tests that exercise the VM path.
 #[cfg(test)]
 pub struct MockBackend {
     pub walks: Vec<(alloc::string::String, Fid)>,
@@ -74,6 +132,50 @@ impl MockBackend {
             reads: Vec::new(),
             clunks: Vec::new(),
             stats: Vec::new(),
+        }
+    }
+}
+
+/// VM-aware test double that records VM operations for assertion.
+///
+/// Returns `has_vm_support() == true` and records all VM calls. Uses a
+/// simple monotonic address counter to simulate `find_free_region` and
+/// `vm_mmap`.
+#[cfg(test)]
+pub struct VmMockBackend {
+    pub walks: Vec<(alloc::string::String, Fid)>,
+    pub opens: Vec<(Fid, OpenMode)>,
+    pub writes: Vec<(Fid, Vec<u8>)>,
+    pub reads: Vec<(Fid, u64, u32)>,
+    pub clunks: Vec<Fid>,
+    pub stats: Vec<Fid>,
+    /// Recorded vm_mmap calls: (vaddr, len, flags, classification).
+    pub vm_mmaps: Vec<(u64, usize, PageFlags, FrameClassification)>,
+    /// Recorded vm_munmap calls: (vaddr, len).
+    pub vm_munmaps: Vec<(u64, usize)>,
+    /// Recorded vm_mprotect calls: (vaddr, len, flags).
+    pub vm_mprotects: Vec<(u64, usize, PageFlags)>,
+    /// Next virtual address to hand out from find_free_region.
+    next_vaddr: u64,
+    /// Per-page budget remaining. When 0, vm_mmap returns BudgetExceeded.
+    budget_pages: usize,
+}
+
+#[cfg(test)]
+impl VmMockBackend {
+    pub fn new(budget_pages: usize) -> Self {
+        Self {
+            walks: Vec::new(),
+            opens: Vec::new(),
+            writes: Vec::new(),
+            reads: Vec::new(),
+            clunks: Vec::new(),
+            stats: Vec::new(),
+            vm_mmaps: Vec::new(),
+            vm_munmaps: Vec::new(),
+            vm_mprotects: Vec::new(),
+            next_vaddr: 0x1_0000, // start above null guard
+            budget_pages,
         }
     }
 }
@@ -114,6 +216,97 @@ impl SyscallBackend for MockBackend {
             size: 0,
             file_type: FileType::Regular,
         })
+    }
+}
+
+#[cfg(test)]
+impl SyscallBackend for VmMockBackend {
+    fn walk(&mut self, path: &str, new_fid: Fid) -> Result<QPath, IpcError> {
+        self.walks
+            .push((alloc::string::String::from(path), new_fid));
+        Ok(0)
+    }
+
+    fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
+        self.opens.push((fid, mode));
+        Ok(())
+    }
+
+    fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
+        self.reads.push((fid, offset, count));
+        Ok(Vec::new())
+    }
+
+    fn write(&mut self, fid: Fid, _offset: u64, data: &[u8]) -> Result<u32, IpcError> {
+        self.writes.push((fid, data.to_vec()));
+        Ok(data.len() as u32)
+    }
+
+    fn clunk(&mut self, fid: Fid) -> Result<(), IpcError> {
+        self.clunks.push(fid);
+        Ok(())
+    }
+
+    fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
+        self.stats.push(fid);
+        Ok(FileStat {
+            qpath: 0,
+            name: alloc::sync::Arc::from("mock"),
+            size: 0,
+            file_type: FileType::Regular,
+        })
+    }
+
+    fn has_vm_support(&self) -> bool {
+        true
+    }
+
+    fn vm_mmap(
+        &mut self,
+        vaddr: u64,
+        len: usize,
+        flags: PageFlags,
+        classification: FrameClassification,
+    ) -> Result<u64, VmError> {
+        let aligned_len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let pages = aligned_len / PAGE_SIZE;
+        if pages > self.budget_pages {
+            return Err(VmError::BudgetExceeded {
+                limit: (self.budget_pages * PAGE_SIZE) as u64,
+                used: 0,
+                requested: len as u64,
+            });
+        }
+        self.budget_pages -= pages;
+        self.vm_mmaps
+            .push((vaddr, aligned_len, flags, classification));
+        // Advance next_vaddr past this mapping.
+        let end = vaddr + aligned_len as u64;
+        if end > self.next_vaddr {
+            self.next_vaddr = end;
+        }
+        Ok(vaddr)
+    }
+
+    fn vm_munmap(&mut self, vaddr: u64, len: usize) -> Result<(), VmError> {
+        let pages = len.div_ceil(PAGE_SIZE);
+        self.budget_pages += pages;
+        self.vm_munmaps.push((vaddr, len));
+        Ok(())
+    }
+
+    fn vm_mprotect(&mut self, vaddr: u64, len: usize, flags: PageFlags) -> Result<(), VmError> {
+        self.vm_mprotects.push((vaddr, len, flags));
+        Ok(())
+    }
+
+    fn vm_find_free_region(&self, len: usize) -> Result<u64, VmError> {
+        let aligned_len = ((len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)) as u64;
+        let pages = aligned_len as usize / PAGE_SIZE;
+        if pages > self.budget_pages {
+            return Err(VmError::OutOfMemory);
+        }
+        Ok(self.next_vaddr)
     }
 }
 
@@ -240,6 +433,27 @@ fn write_linux_stat(buf_ptr: usize, stat: &FileStat, is_chardev: bool) {
     buf[64..72].copy_from_slice(&blocks.to_le_bytes());
 }
 
+// ── Linux PROT_* constants ───────────────────────────────────────────
+
+const PROT_READ: i32 = 0x1;
+const PROT_WRITE: i32 = 0x2;
+const PROT_EXEC: i32 = 0x4;
+
+/// Translate Linux PROT_* flags to `PageFlags`.
+fn prot_to_page_flags(prot: i32) -> PageFlags {
+    let mut flags = PageFlags::USER;
+    if prot & PROT_READ != 0 {
+        flags |= PageFlags::READABLE;
+    }
+    if prot & PROT_WRITE != 0 {
+        flags |= PageFlags::WRITABLE;
+    }
+    if prot & PROT_EXEC != 0 {
+        flags |= PageFlags::EXECUTABLE;
+    }
+    flags
+}
+
 // ── Linuxulator ─────────────────────────────────────────────────────
 
 /// Per-fd state: the 9P fid and the current file offset.
@@ -261,13 +475,17 @@ pub struct Linuxulator<B: SyscallBackend> {
     next_fid: Fid,
     /// Set by sys_exit_group.
     exit_code: Option<i32>,
-    /// Memory arena for brk/mmap.
+    /// Memory arena for brk/mmap (fallback when backend has no VM support).
     arena: MemoryArena,
     /// FS segment base register (TLS pointer for arch_prctl).
     fs_base: u64,
     /// Fids that represent character devices (stdio).
     /// Used by fstat to report S_IFCHR instead of S_IFREG.
     chardev_fids: Vec<Fid>,
+    /// VM-backed brk: base address of the heap (0 = not yet established).
+    vm_brk_base: u64,
+    /// VM-backed brk: current program break.
+    vm_brk_current: u64,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -286,6 +504,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
             arena: MemoryArena::new(arena_size),
             fs_base: 0,
             chardev_fids: Vec::new(),
+            vm_brk_base: 0,
+            vm_brk_current: 0,
         }
     }
 
@@ -415,6 +635,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 args[4] as i32,
                 args[5],
             ),
+            10 => self.sys_mprotect(args[0], args[1], args[2] as i32),
             11 => self.sys_munmap(args[0], args[1]),
             12 => self.sys_brk(args[0]),
             13 => self.sys_rt_sigaction(),
@@ -566,10 +787,21 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux brk(2): adjust the program break.
     ///
+    /// When the backend supports VM operations, brk allocates real frames
+    /// via the VM layer. Otherwise falls back to the MemoryArena.
+    ///
     /// `addr == 0` probes the current break. Otherwise sets it to the
     /// requested address (page-aligned up). Returns the new break, or
     /// the current break unchanged if the request is invalid.
     fn sys_brk(&mut self, addr: u64) -> i64 {
+        if self.backend.has_vm_support() {
+            return self.sys_brk_vm(addr);
+        }
+        self.sys_brk_arena(addr)
+    }
+
+    /// Arena-based brk (original implementation).
+    fn sys_brk_arena(&mut self, addr: u64) -> i64 {
         let base = self.arena.base as u64;
         if addr == 0 {
             return (base + self.arena.brk_offset as u64) as i64;
@@ -585,32 +817,92 @@ impl<B: SyscallBackend> Linuxulator<B> {
         (base + self.arena.brk_offset as u64) as i64
     }
 
+    /// VM-backed brk: allocates real frames through the backend.
+    ///
+    /// The heap starts at `vm_brk_base` and grows upward. On first call
+    /// (addr == 0), returns the current brk. On subsequent calls, maps
+    /// new pages for any growth and unmaps pages for shrinkage.
+    fn sys_brk_vm(&mut self, addr: u64) -> i64 {
+        // First call: establish the brk base if not yet set.
+        if self.vm_brk_base == 0 {
+            // Pick a base address for the heap.
+            match self.backend.vm_find_free_region(PAGE_SIZE) {
+                Ok(base) => {
+                    self.vm_brk_base = base;
+                    self.vm_brk_current = base;
+                }
+                Err(_) => return ENOMEM,
+            }
+        }
+
+        if addr == 0 {
+            return self.vm_brk_current as i64;
+        }
+
+        if addr < self.vm_brk_base {
+            return self.vm_brk_current as i64;
+        }
+
+        // Page-align the requested address upward.
+        let new_brk = (addr + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
+
+        if new_brk > self.vm_brk_current {
+            // Growing: map new pages.
+            let grow_len = (new_brk - self.vm_brk_current) as usize;
+            let flags = PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::USER;
+            match self.backend.vm_mmap(
+                self.vm_brk_current,
+                grow_len,
+                flags,
+                FrameClassification::empty(),
+            ) {
+                Ok(_) => {
+                    self.vm_brk_current = new_brk;
+                }
+                Err(_) => return self.vm_brk_current as i64, // Linux returns old brk on failure
+            }
+        } else if new_brk < self.vm_brk_current {
+            // Shrinking: unmap pages.
+            let shrink_len = (self.vm_brk_current - new_brk) as usize;
+            let _ = self.backend.vm_munmap(new_brk, shrink_len);
+            self.vm_brk_current = new_brk;
+        }
+
+        self.vm_brk_current as i64
+    }
+
     /// Linux mmap(2): map anonymous memory.
     ///
-    /// Only `MAP_ANONYMOUS` is supported. Allocates from the top of the
-    /// arena downward (opposite direction from brk). Returns the mapped
-    /// address or a negative errno.
+    /// When the backend supports VM operations, delegates to the VM layer.
+    /// Otherwise uses the MemoryArena allocator.
     ///
-    /// `MAP_FIXED` is rejected with `ENOMEM` — the arena allocator cannot
-    /// guarantee placement at an arbitrary address.
+    /// Only `MAP_ANONYMOUS` is supported. Returns the mapped address or a
+    /// negative errno.
     fn sys_mmap(
         &mut self,
         addr: u64,
         length: u64,
-        _prot: i32,
+        prot: i32,
         flags: i32,
         _fd: i32,
         _offset: u64,
     ) -> i64 {
-        let map_anonymous = 0x20;
-        let map_fixed = 0x10;
+        const MAP_ANONYMOUS: i32 = 0x20;
+        const MAP_FIXED: i32 = 0x10;
+
         if length == 0 {
             return EINVAL;
         }
-        if flags & map_anonymous == 0 {
+        if flags & MAP_ANONYMOUS == 0 {
             return EINVAL; // file-backed mmap not supported
         }
-        if flags & map_fixed != 0 {
+
+        if self.backend.has_vm_support() {
+            return self.sys_mmap_vm(addr, length, prot, flags);
+        }
+
+        // Arena fallback path.
+        if flags & MAP_FIXED != 0 {
             return ENOMEM; // arena allocator cannot place at fixed address
         }
         let _ = addr; // hint addr is intentionally unused (no MAP_FIXED support)
@@ -628,9 +920,75 @@ impl<B: SyscallBackend> Linuxulator<B> {
         ptr as i64
     }
 
-    /// Linux munmap(2): unmap memory (stub — always succeeds).
-    fn sys_munmap(&mut self, _addr: u64, _length: u64) -> i64 {
-        0
+    /// VM-backed mmap: allocates through the backend's VM layer.
+    fn sys_mmap_vm(&mut self, addr: u64, length: u64, prot: i32, flags: i32) -> i64 {
+        const MAP_FIXED: i32 = 0x10;
+
+        let len = ((length as usize) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let page_flags = prot_to_page_flags(prot);
+
+        let vaddr = if flags & MAP_FIXED != 0 {
+            // MAP_FIXED: use the exact address.
+            if addr & (PAGE_SIZE as u64 - 1) != 0 {
+                return EINVAL; // must be page-aligned
+            }
+            addr
+        } else {
+            // Non-fixed: find a free region.
+            match self.backend.vm_find_free_region(len) {
+                Ok(va) => va,
+                Err(e) => return vm_err_to_errno(e),
+            }
+        };
+
+        match self
+            .backend
+            .vm_mmap(vaddr, len, page_flags, FrameClassification::empty())
+        {
+            Ok(mapped_addr) => mapped_addr as i64,
+            Err(e) => vm_err_to_errno(e),
+        }
+    }
+
+    /// Linux munmap(2): unmap memory.
+    ///
+    /// When the backend supports VM, delegates to vm_munmap. Otherwise
+    /// returns success (arena stub).
+    fn sys_munmap(&mut self, addr: u64, length: u64) -> i64 {
+        if self.backend.has_vm_support() {
+            if length == 0 {
+                return EINVAL;
+            }
+            let len = ((length as usize) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            match self.backend.vm_munmap(addr, len) {
+                Ok(()) => 0,
+                Err(e) => vm_err_to_errno(e),
+            }
+        } else {
+            0 // arena stub: always succeeds
+        }
+    }
+
+    /// Linux mprotect(2): change protection on a memory region.
+    ///
+    /// Translates PROT_* flags to PageFlags and delegates to the backend.
+    /// Returns 0 on success or a negative errno.
+    fn sys_mprotect(&mut self, addr: u64, length: u64, prot: i32) -> i64 {
+        if !self.backend.has_vm_support() {
+            return 0; // no-op when running with arena
+        }
+        if length == 0 {
+            return EINVAL;
+        }
+        if addr & (PAGE_SIZE as u64 - 1) != 0 {
+            return EINVAL; // must be page-aligned
+        }
+        let len = ((length as usize) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let page_flags = prot_to_page_flags(prot);
+        match self.backend.vm_mprotect(addr, len, page_flags) {
+            Ok(()) => 0,
+            Err(e) => vm_err_to_errno(e),
+        }
     }
 
     /// Linux ioctl(2): device control.
@@ -1189,6 +1547,134 @@ mod tests {
         let result = lx.handle_syscall(158, [0x9999, 0, 0, 0, 0, 0]);
         assert_eq!(result, EINVAL);
     }
+
+    // ── VM-backed mmap/munmap/mprotect/brk tests ─────────────────────
+
+    #[test]
+    fn vm_mmap_allocates_via_backend() {
+        let mock = VmMockBackend::new(16); // 16 pages budget
+        let mut lx = Linuxulator::new(mock);
+
+        // mmap 4096 bytes: PROT_READ|PROT_WRITE (3), MAP_ANONYMOUS|MAP_PRIVATE (0x22)
+        let addr = lx.handle_syscall(9, [0, 4096, 3, 0x22, u64::MAX, 0]);
+        assert!(addr > 0, "vm mmap should return a positive address");
+        assert_eq!(addr as u64 % 4096, 0, "address must be page-aligned");
+
+        // Backend should have recorded the mmap.
+        assert_eq!(lx.backend().vm_mmaps.len(), 1);
+        let (vaddr, len, flags, _class) = &lx.backend().vm_mmaps[0];
+        assert_eq!(*len, 4096);
+        assert!(flags.contains(PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::USER));
+        assert_eq!(*vaddr, addr as u64);
+    }
+
+    #[test]
+    fn vm_munmap_calls_backend() {
+        let mock = VmMockBackend::new(16);
+        let mut lx = Linuxulator::new(mock);
+
+        let addr = lx.handle_syscall(9, [0, 4096, 3, 0x22, u64::MAX, 0]);
+        assert!(addr > 0);
+
+        let result = lx.handle_syscall(11, [addr as u64, 4096, 0, 0, 0, 0]);
+        assert_eq!(result, 0);
+        assert_eq!(lx.backend().vm_munmaps.len(), 1);
+        assert_eq!(lx.backend().vm_munmaps[0], (addr as u64, 4096));
+    }
+
+    #[test]
+    fn vm_mprotect_calls_backend() {
+        let mock = VmMockBackend::new(16);
+        let mut lx = Linuxulator::new(mock);
+
+        let addr = lx.handle_syscall(9, [0, 4096, 1, 0x22, u64::MAX, 0]); // PROT_READ
+        assert!(addr > 0);
+
+        // mprotect to PROT_READ|PROT_WRITE
+        let result = lx.handle_syscall(10, [addr as u64, 4096, 3, 0, 0, 0]);
+        assert_eq!(result, 0);
+        assert_eq!(lx.backend().vm_mprotects.len(), 1);
+        let (vaddr, len, flags) = &lx.backend().vm_mprotects[0];
+        assert_eq!(*vaddr, addr as u64);
+        assert_eq!(*len, 4096);
+        assert!(flags.contains(PageFlags::READABLE | PageFlags::WRITABLE));
+    }
+
+    #[test]
+    fn vm_mmap_budget_exhaustion_returns_enomem() {
+        let mock = VmMockBackend::new(2); // Only 2 pages budget
+        let mut lx = Linuxulator::new(mock);
+
+        // Request 16 pages — exceeds budget.
+        let result = lx.handle_syscall(9, [0, 4096 * 16, 3, 0x22, u64::MAX, 0]);
+        assert_eq!(result, ENOMEM);
+    }
+
+    #[test]
+    fn vm_brk_expands_heap_via_backend() {
+        let mock = VmMockBackend::new(16);
+        let mut lx = Linuxulator::new(mock);
+
+        // Probe initial brk.
+        let base = lx.handle_syscall(12, [0, 0, 0, 0, 0, 0]);
+        assert!(base > 0);
+
+        // Expand by 8192.
+        let new_brk = lx.handle_syscall(12, [base as u64 + 8192, 0, 0, 0, 0, 0]);
+        assert_eq!(new_brk as u64, base as u64 + 8192);
+
+        // Backend should have recorded a vm_mmap for the growth.
+        assert_eq!(lx.backend().vm_mmaps.len(), 1);
+        let (vaddr, len, _flags, _class) = &lx.backend().vm_mmaps[0];
+        assert_eq!(*vaddr, base as u64);
+        assert_eq!(*len, 8192);
+    }
+
+    #[test]
+    fn vm_mprotect_unaligned_addr_returns_einval() {
+        let mock = VmMockBackend::new(16);
+        let mut lx = Linuxulator::new(mock);
+
+        // Unaligned address
+        let result = lx.handle_syscall(10, [0x1001, 4096, 3, 0, 0, 0]);
+        assert_eq!(result, EINVAL);
+    }
+
+    #[test]
+    fn vm_mprotect_zero_length_returns_einval() {
+        let mock = VmMockBackend::new(16);
+        let mut lx = Linuxulator::new(mock);
+
+        let result = lx.handle_syscall(10, [0x1000, 0, 3, 0, 0, 0]);
+        assert_eq!(result, EINVAL);
+    }
+
+    #[test]
+    fn vm_mprotect_noop_without_vm_support() {
+        let mock = MockBackend::new(); // No VM support
+        let mut lx = Linuxulator::new(mock);
+
+        // Should return 0 (no-op) even without VM support.
+        let result = lx.handle_syscall(10, [0x1000, 4096, 3, 0, 0, 0]);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn prot_to_page_flags_mapping() {
+        use super::prot_to_page_flags;
+
+        let flags = prot_to_page_flags(0x1); // PROT_READ
+        assert!(flags.contains(PageFlags::READABLE));
+        assert!(flags.contains(PageFlags::USER));
+        assert!(!flags.contains(PageFlags::WRITABLE));
+        assert!(!flags.contains(PageFlags::EXECUTABLE));
+
+        let flags = prot_to_page_flags(0x3); // PROT_READ | PROT_WRITE
+        assert!(flags.contains(PageFlags::READABLE | PageFlags::WRITABLE));
+
+        let flags = prot_to_page_flags(0x7); // PROT_READ | PROT_WRITE | PROT_EXEC
+        assert!(flags.contains(PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::EXECUTABLE));
+    }
 }
 
 #[cfg(test)]
@@ -1198,21 +1684,32 @@ mod integration_tests {
     use harmony_microkernel::echo::EchoServer;
     use harmony_microkernel::kernel::Kernel;
     use harmony_microkernel::serial_server::SerialServer;
+    use harmony_microkernel::vm::buddy::BuddyAllocator;
+    use harmony_microkernel::vm::cap_tracker::MemoryBudget;
+    use harmony_microkernel::vm::manager::AddressSpaceManager;
+    use harmony_microkernel::vm::mock::MockPageTable;
+    use harmony_microkernel::vm::{PhysAddr, PAGE_SIZE as VM_PAGE_SIZE};
     use harmony_unikernel::KernelEntropy;
 
+    /// Create a test VM manager with 64 frames.
+    fn make_test_vm() -> AddressSpaceManager<MockPageTable> {
+        let buddy = BuddyAllocator::new(PhysAddr(0x10_0000), 64).unwrap();
+        AddressSpaceManager::new(buddy)
+    }
+
     /// SyscallBackend backed by a real Ring 2 Kernel.
-    struct KernelBackend<'a> {
-        kernel: &'a mut Kernel,
+    struct KernelBackend<'a, P: harmony_microkernel::vm::page_table::PageTable> {
+        kernel: &'a mut Kernel<P>,
         pid: u32,
     }
 
-    impl<'a> KernelBackend<'a> {
-        fn new(kernel: &'a mut Kernel, pid: u32) -> Self {
+    impl<'a, P: harmony_microkernel::vm::page_table::PageTable> KernelBackend<'a, P> {
+        fn new(kernel: &'a mut Kernel<P>, pid: u32) -> Self {
             Self { kernel, pid }
         }
     }
 
-    impl SyscallBackend for KernelBackend<'_> {
+    impl<P: harmony_microkernel::vm::page_table::PageTable> SyscallBackend for KernelBackend<'_, P> {
         fn walk(&mut self, path: &str, new_fid: Fid) -> Result<QPath, IpcError> {
             self.kernel.walk(self.pid, path, 0, new_fid, 0)
         }
@@ -1231,6 +1728,51 @@ mod integration_tests {
         fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
             self.kernel.stat(self.pid, fid)
         }
+
+        fn has_vm_support(&self) -> bool {
+            self.kernel.has_vm_space(self.pid)
+        }
+
+        fn vm_mmap(
+            &mut self,
+            vaddr: u64,
+            len: usize,
+            flags: PageFlags,
+            classification: FrameClassification,
+        ) -> Result<u64, VmError> {
+            use harmony_microkernel::vm::VirtAddr;
+            self.kernel
+                .vm_map_region(self.pid, VirtAddr(vaddr), len, flags, classification)?;
+            Ok(vaddr)
+        }
+
+        fn vm_munmap(&mut self, vaddr: u64, len: usize) -> Result<(), VmError> {
+            use harmony_microkernel::vm::VirtAddr;
+            // TODO(harmony-qv2): partial unmap support. Currently unmaps the
+            // entire region regardless of `len`. Real Linux allows unmapping
+            // sub-ranges, splitting regions. Needed for ELF loaders.
+            let _ = len;
+            self.kernel.vm_unmap_region(self.pid, VirtAddr(vaddr))
+        }
+
+        fn vm_mprotect(
+            &mut self,
+            vaddr: u64,
+            _len: usize,
+            flags: PageFlags,
+        ) -> Result<(), VmError> {
+            use harmony_microkernel::vm::VirtAddr;
+            // TODO(harmony-qv2): partial mprotect support. Currently changes
+            // flags for the entire region regardless of `_len`.
+            self.kernel
+                .vm_protect_region(self.pid, VirtAddr(vaddr), flags)
+        }
+
+        fn vm_find_free_region(&self, len: usize) -> Result<u64, VmError> {
+            self.kernel
+                .vm_find_free_region(self.pid, len)
+                .map(|va| va.as_u64())
+        }
     }
 
     fn test_entropy() -> KernelEntropy<impl FnMut(&mut [u8])> {
@@ -1247,11 +1789,11 @@ mod integration_tests {
     fn linuxulator_writes_hello_through_kernel_to_serial() {
         let mut entropy = test_entropy();
         let kernel_id = PrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id);
+        let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         // Spawn SerialServer
         let serial_pid = kernel
-            .spawn_process("serial", Box::new(SerialServer::new()), &[])
+            .spawn_process("serial", Box::new(SerialServer::new()), &[], None)
             .unwrap();
 
         // Spawn a "linux process" with SerialServer mounted at /dev/serial
@@ -1260,6 +1802,7 @@ mod integration_tests {
                 "hello-linux",
                 Box::new(EchoServer::new()), // placeholder server
                 &[("/dev/serial", serial_pid, 0)],
+                None,
             )
             .unwrap();
 
@@ -1296,10 +1839,10 @@ mod integration_tests {
     fn linuxulator_full_fd_lifecycle() {
         let mut entropy = test_entropy();
         let kernel_id = PrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id);
+        let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         let serial_pid = kernel
-            .spawn_process("serial", Box::new(SerialServer::new()), &[])
+            .spawn_process("serial", Box::new(SerialServer::new()), &[], None)
             .unwrap();
 
         let linux_pid = kernel
@@ -1307,6 +1850,7 @@ mod integration_tests {
                 "hello-linux",
                 Box::new(EchoServer::new()),
                 &[("/dev/serial", serial_pid, 0)],
+                None,
             )
             .unwrap();
 
@@ -1340,5 +1884,336 @@ mod integration_tests {
         // Exit
         lx.handle_syscall(231, [0, 0, 0, 0, 0, 0]);
         assert!(lx.exited());
+    }
+
+    // ── VM-backed syscall integration tests ──────────────────────────
+
+    /// Create a kernel with a large frame pool and a VM-enabled process.
+    #[allow(clippy::type_complexity)]
+    fn setup_vm_kernel() -> (
+        Kernel<MockPageTable>,
+        u32, // serial_pid
+        u32, // linux_pid (VM-enabled)
+        KernelEntropy<impl FnMut(&mut [u8])>,
+    ) {
+        let mut entropy = test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        // 256 frames = 1 MiB physical
+        let buddy = BuddyAllocator::new(PhysAddr(0x10_0000), 256).unwrap();
+        let vm = AddressSpaceManager::new(buddy);
+        let mut kernel = Kernel::new(kernel_id, vm);
+
+        let serial_pid = kernel
+            .spawn_process("serial", Box::new(SerialServer::new()), &[], None)
+            .unwrap();
+
+        // Create a VM-enabled linux process.
+        let budget = MemoryBudget::new(
+            VM_PAGE_SIZE as usize * 64, // 64 pages budget
+            FrameClassification::all(),
+        );
+        let page_table = MockPageTable::new(PhysAddr(0x20_0000));
+
+        let linux_pid = kernel
+            .spawn_process(
+                "vm-linux",
+                Box::new(EchoServer::new()),
+                &[("/dev/serial", serial_pid, 0)],
+                Some((budget, page_table)),
+            )
+            .unwrap();
+
+        kernel
+            .grant_endpoint_cap(&mut entropy, linux_pid, serial_pid, 0)
+            .unwrap();
+
+        (kernel, serial_pid, linux_pid, entropy)
+    }
+
+    #[test]
+    fn vm_mmap_allocates_region() {
+        let (mut kernel, _serial_pid, linux_pid, _entropy) = setup_vm_kernel();
+        let backend = KernelBackend::new(&mut kernel, linux_pid);
+        let mut lx = Linuxulator::new(backend);
+
+        // mmap 1 page: PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE
+        let addr = lx.handle_syscall(9, [0, 4096, 3, 0x22, u64::MAX, 0]);
+        assert!(addr > 0, "mmap should return a valid address, got {}", addr);
+        assert_eq!(addr as u64 % 4096, 0, "mmap address must be page-aligned");
+    }
+
+    #[test]
+    fn vm_munmap_frees_region() {
+        let (mut kernel, _serial_pid, linux_pid, _entropy) = setup_vm_kernel();
+        let backend = KernelBackend::new(&mut kernel, linux_pid);
+        let mut lx = Linuxulator::new(backend);
+
+        // mmap then munmap
+        let addr = lx.handle_syscall(9, [0, 4096, 3, 0x22, u64::MAX, 0]);
+        assert!(addr > 0);
+        let result = lx.handle_syscall(11, [addr as u64, 4096, 0, 0, 0, 0]);
+        assert_eq!(result, 0, "munmap should succeed");
+    }
+
+    #[test]
+    fn vm_mprotect_changes_flags() {
+        let (mut kernel, _serial_pid, linux_pid, _entropy) = setup_vm_kernel();
+        let backend = KernelBackend::new(&mut kernel, linux_pid);
+        let mut lx = Linuxulator::new(backend);
+
+        // mmap as read-only
+        let addr = lx.handle_syscall(9, [0, 4096, 1, 0x22, u64::MAX, 0]); // PROT_READ
+        assert!(addr > 0);
+
+        // mprotect to read-write
+        let result = lx.handle_syscall(10, [addr as u64, 4096, 3, 0, 0, 0]); // PROT_READ|PROT_WRITE
+        assert_eq!(result, 0, "mprotect should succeed");
+    }
+
+    #[test]
+    fn vm_mmap_budget_exhaustion() {
+        let mut entropy = test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        // 256 frames total
+        let buddy = BuddyAllocator::new(PhysAddr(0x10_0000), 256).unwrap();
+        let vm = AddressSpaceManager::new(buddy);
+        let mut kernel = Kernel::new(kernel_id, vm);
+
+        let serial_pid = kernel
+            .spawn_process("serial", Box::new(SerialServer::new()), &[], None)
+            .unwrap();
+
+        // Tiny budget: only 2 pages
+        let budget = MemoryBudget::new(VM_PAGE_SIZE as usize * 2, FrameClassification::all());
+        let page_table = MockPageTable::new(PhysAddr(0x20_0000));
+
+        let linux_pid = kernel
+            .spawn_process(
+                "budget-limited",
+                Box::new(EchoServer::new()),
+                &[("/dev/serial", serial_pid, 0)],
+                Some((budget, page_table)),
+            )
+            .unwrap();
+
+        kernel
+            .grant_endpoint_cap(&mut entropy, linux_pid, serial_pid, 0)
+            .unwrap();
+
+        let backend = KernelBackend::new(&mut kernel, linux_pid);
+        let mut lx = Linuxulator::new(backend);
+
+        // Request 16 pages — exceeds the 2-page budget
+        let result = lx.handle_syscall(9, [0, 4096 * 16, 3, 0x22, u64::MAX, 0]);
+        assert_eq!(result, ENOMEM, "should return ENOMEM when budget exceeded");
+    }
+
+    #[test]
+    fn vm_brk_expands_heap() {
+        let (mut kernel, _serial_pid, linux_pid, _entropy) = setup_vm_kernel();
+        let backend = KernelBackend::new(&mut kernel, linux_pid);
+        let mut lx = Linuxulator::new(backend);
+
+        // Probe initial brk (addr = 0).
+        let base = lx.handle_syscall(12, [0, 0, 0, 0, 0, 0]);
+        assert!(base > 0, "brk(0) should return a valid base address");
+
+        // Expand by 8192 bytes.
+        let new_brk = lx.handle_syscall(12, [base as u64 + 8192, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            new_brk as u64,
+            base as u64 + 8192,
+            "brk should expand to requested address"
+        );
+
+        // Probe again — should still show the expanded brk.
+        let probed = lx.handle_syscall(12, [0, 0, 0, 0, 0, 0]);
+        assert_eq!(probed, new_brk);
+    }
+
+    #[test]
+    fn test_elf_loading_with_real_vm() {
+        use crate::elf::{parse_elf, SegmentFlags};
+        use harmony_microkernel::vm::{FrameClassification, VirtAddr};
+
+        let mut entropy = test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        // Large frame pool for ELF loading.
+        let buddy = BuddyAllocator::new(PhysAddr(0x10_0000), 256).unwrap();
+        let vm = AddressSpaceManager::new(buddy);
+        let mut kernel = Kernel::new(kernel_id, vm);
+
+        // Build a minimal ELF with two PT_LOAD segments:
+        // - .text at 0x401000 (R-X): 16 bytes of code
+        // - .data at 0x402000 (RW-): 8 bytes of data + 24 bytes BSS (memsz > filesz)
+        let code = [
+            0x48, 0x31, 0xC0, 0xB0, 0x3C, 0x0F, 0x05,
+            0xCC, // xor rax,rax; mov al,60; syscall; int3
+            0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+        ]; // nop sled
+        let data_bytes = [0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x21, 0x0A, 0x00]; // "Hello!\n\0"
+
+        // Construct a 2-segment ELF: header (64) + 2 phdrs (112) + code (16) + data (8)
+        let phdr_count = 2;
+        let phdr_start: usize = 64;
+        let code_offset = phdr_start + phdr_count * 56;
+        let data_offset = code_offset + code.len();
+        let total_size = data_offset + data_bytes.len();
+
+        let mut elf = alloc::vec![0u8; total_size];
+
+        // ELF header
+        elf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // ELFDATA2LSB
+        elf[6] = 1; // EV_CURRENT
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes()); // EM_X86_64
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        elf[24..32].copy_from_slice(&0x401000u64.to_le_bytes()); // e_entry
+        elf[32..40].copy_from_slice(&(phdr_start as u64).to_le_bytes()); // e_phoff
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        elf[56..58].copy_from_slice(&(phdr_count as u16).to_le_bytes()); // e_phnum
+
+        // Program header 1: .text (R-X)
+        let ph1 = &mut elf[phdr_start..phdr_start + 56];
+        ph1[0..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        ph1[4..8].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
+        ph1[8..16].copy_from_slice(&(code_offset as u64).to_le_bytes()); // p_offset
+        ph1[16..24].copy_from_slice(&0x401000u64.to_le_bytes()); // p_vaddr
+        ph1[24..32].copy_from_slice(&0x401000u64.to_le_bytes()); // p_paddr
+        ph1[32..40].copy_from_slice(&(code.len() as u64).to_le_bytes()); // p_filesz
+        ph1[40..48].copy_from_slice(&(code.len() as u64).to_le_bytes()); // p_memsz
+        ph1[48..56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+
+        // Program header 2: .data (RW-) with BSS extension
+        let ph2_start = phdr_start + 56;
+        let ph2 = &mut elf[ph2_start..ph2_start + 56];
+        ph2[0..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        ph2[4..8].copy_from_slice(&6u32.to_le_bytes()); // PF_R | PF_W
+        ph2[8..16].copy_from_slice(&(data_offset as u64).to_le_bytes()); // p_offset
+        ph2[16..24].copy_from_slice(&0x402000u64.to_le_bytes()); // p_vaddr
+        ph2[24..32].copy_from_slice(&0x402000u64.to_le_bytes()); // p_paddr
+        ph2[32..40].copy_from_slice(&(data_bytes.len() as u64).to_le_bytes()); // p_filesz
+        ph2[40..48].copy_from_slice(&32u64.to_le_bytes()); // p_memsz (8 file + 24 BSS)
+        ph2[48..56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+
+        // Copy segment data.
+        elf[code_offset..code_offset + code.len()].copy_from_slice(&code);
+        elf[data_offset..data_offset + data_bytes.len()].copy_from_slice(&data_bytes);
+
+        // Parse the ELF.
+        let parsed = parse_elf(&elf).expect("ELF parsing should succeed");
+        assert_eq!(parsed.entry_point, 0x401000);
+        assert_eq!(parsed.segments.len(), 2);
+
+        // Spawn a VM-enabled process.
+        let budget = MemoryBudget::new(VM_PAGE_SIZE as usize * 32, FrameClassification::all());
+        let page_table = MockPageTable::new(PhysAddr(0x20_0000));
+        let pid = kernel
+            .spawn_process(
+                "elf-process",
+                Box::new(EchoServer::new()),
+                &[],
+                Some((budget, page_table)),
+            )
+            .unwrap();
+
+        // Convert ELF segment flags to PageFlags.
+        fn seg_flags_to_page_flags(sf: &SegmentFlags) -> PageFlags {
+            let mut pf = PageFlags::USER;
+            if sf.read {
+                pf |= PageFlags::READABLE;
+            }
+            if sf.write {
+                pf |= PageFlags::WRITABLE;
+            }
+            if sf.execute {
+                pf |= PageFlags::EXECUTABLE;
+            }
+            pf
+        }
+
+        // Map each PT_LOAD segment into the process address space.
+        for seg in &parsed.segments {
+            let page_aligned_vaddr = seg.vaddr & !(VM_PAGE_SIZE - 1);
+            let page_aligned_memsz = ((seg.memsz + (seg.vaddr - page_aligned_vaddr) + VM_PAGE_SIZE
+                - 1)
+                & !(VM_PAGE_SIZE - 1)) as usize;
+            let flags = seg_flags_to_page_flags(&seg.flags);
+
+            kernel
+                .vm_map_region(
+                    pid,
+                    VirtAddr(page_aligned_vaddr),
+                    page_aligned_memsz,
+                    flags,
+                    FrameClassification::empty(),
+                )
+                .expect("mapping ELF segment should succeed");
+        }
+
+        // Verify the mappings exist with correct permissions via public API.
+
+        // .text segment at 0x401000: should be R-X (USER | READABLE | EXECUTABLE)
+        let (_, text_flags) = kernel
+            .vm_translate(pid, VirtAddr(0x401000))
+            .expect(".text page should be mapped");
+        assert!(
+            text_flags.contains(PageFlags::READABLE),
+            ".text must be readable"
+        );
+        assert!(
+            text_flags.contains(PageFlags::EXECUTABLE),
+            ".text must be executable"
+        );
+        assert!(
+            !text_flags.contains(PageFlags::WRITABLE),
+            ".text must NOT be writable"
+        );
+
+        // .data segment at 0x402000: should be RW- (USER | READABLE | WRITABLE)
+        let (_, data_flags) = kernel
+            .vm_translate(pid, VirtAddr(0x402000))
+            .expect(".data page should be mapped");
+        assert!(
+            data_flags.contains(PageFlags::READABLE),
+            ".data must be readable"
+        );
+        assert!(
+            data_flags.contains(PageFlags::WRITABLE),
+            ".data must be writable"
+        );
+        assert!(
+            !data_flags.contains(PageFlags::EXECUTABLE),
+            ".data must NOT be executable"
+        );
+
+        // Verify .text and .data map to different physical frames.
+        let (text_phys, _) = kernel.vm_translate(pid, VirtAddr(0x401000)).unwrap();
+        let (data_phys, _) = kernel.vm_translate(pid, VirtAddr(0x402000)).unwrap();
+        assert_ne!(
+            text_phys, data_phys,
+            ".text and .data must map to different physical frames"
+        );
+
+        // Verify unmapped regions between/around segments return None.
+        assert!(
+            kernel.vm_translate(pid, VirtAddr(0x400000)).is_none(),
+            "Address before .text should not be mapped"
+        );
+        assert!(
+            kernel.vm_translate(pid, VirtAddr(0x403000)).is_none(),
+            "Address after .data should not be mapped"
+        );
+
+        // Verify the process's region count via the VM manager.
+        let space = kernel.vm_manager().space(pid).unwrap();
+        assert_eq!(
+            space.regions.len(),
+            2,
+            "Process should have exactly 2 regions (text + data)"
+        );
     }
 }

@@ -39,4 +39,5 @@ harmony-microkernel = { path = "crates/harmony-microkernel", default-features = 
 harmony-os = { path = "crates/harmony-os" }
 
 # Shared dependencies
+bitflags = "2"
 rand_core = { version = "0.6", default-features = false }

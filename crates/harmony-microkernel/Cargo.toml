@@ -25,6 +25,7 @@ kernel = [
 [dependencies]
 # Ring 1
 harmony-unikernel = { workspace = true }
+bitflags = { workspace = true }
 
 # Ring 0 — protocol crates, only needed for kernel IPC dispatch
 harmony-crypto = { workspace = true, optional = true }
