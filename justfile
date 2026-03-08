@@ -98,7 +98,7 @@ test-mesh: build
     trap cleanup EXIT
 
     qemu-system-x86_64 \
-        -drive format=raw,file=target/harmony-boot-bios.img \
+        -drive format=raw,file=target/harmony-boot-bios.img,snapshot=on \
         -serial file:"$LOG_A" \
         -display none \
         -cpu qemu64,+rdrand \
@@ -107,7 +107,7 @@ test-mesh: build
     PID_A=$!
 
     qemu-system-x86_64 \
-        -drive format=raw,file=target/harmony-boot-bios.img \
+        -drive format=raw,file=target/harmony-boot-bios.img,snapshot=on \
         -serial file:"$LOG_B" \
         -display none \
         -cpu qemu64,+rdrand \
