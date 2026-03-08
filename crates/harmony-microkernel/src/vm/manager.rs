@@ -274,7 +274,9 @@ impl<P: PageTable> AddressSpaceManager<P> {
         }
 
         // Remove from cap_tracker and free frames to the correct buddy.
-        let use_kernel = region.classification.contains(FrameClassification::ENCRYPTED)
+        let use_kernel = region
+            .classification
+            .contains(FrameClassification::ENCRYPTED)
             && self.buddy_kernel.total_frame_count() > 0;
         let buddy = if use_kernel {
             &mut self.buddy_kernel
@@ -341,7 +343,9 @@ impl<P: PageTable> AddressSpaceManager<P> {
                 let _ = space.page_table.unmap(page_vaddr);
             }
 
-            let use_kernel = region.classification.contains(FrameClassification::ENCRYPTED)
+            let use_kernel = region
+                .classification
+                .contains(FrameClassification::ENCRYPTED)
                 && self.buddy_kernel.total_frame_count() > 0;
             let buddy = if use_kernel {
                 &mut self.buddy_kernel

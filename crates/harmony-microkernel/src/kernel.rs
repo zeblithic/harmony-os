@@ -11,11 +11,13 @@ use harmony_identity::{
 };
 use harmony_platform::EntropySource;
 
+use crate::integrity::lyll::{HashEntry, Lyll, LyllConfig};
+use crate::integrity::nakaiah::Nakaiah;
 use crate::namespace::Namespace;
 use crate::vm::cap_tracker::MemoryBudget;
 use crate::vm::manager::AddressSpaceManager;
 use crate::vm::page_table::PageTable;
-use crate::vm::{FrameClassification, PageFlags, VirtAddr, VmError};
+use crate::vm::{ContentHash, FrameClassification, PageFlags, PhysAddr, VirtAddr, VmError};
 use crate::{Fid, FileServer, IpcError, OpenMode, QPath};
 
 /// Maximum UCAN delegation chain depth for capability verification.
@@ -58,6 +60,10 @@ pub struct Kernel<P: PageTable> {
     /// Virtual memory manager — owns per-process address spaces, the buddy
     /// allocator, and capability tracker.
     vm: AddressSpaceManager<P>,
+    /// Lyll — the probabilistic public-memory auditor.
+    lyll: Lyll,
+    /// Nakaiah — the deterministic private-memory bodyguard.
+    nakaiah: Nakaiah,
 }
 
 impl<P: PageTable> Kernel<P> {
@@ -75,6 +81,11 @@ impl<P: PageTable> Kernel<P> {
             fid_owners: BTreeMap::new(),
             next_server_fid: 1,
             vm,
+            lyll: Lyll::new(LyllConfig {
+                sampling_rate_percent: 5,
+                sweep_interval_ticks: 100,
+            }),
+            nakaiah: Nakaiah::new(0.01),
         }
     }
 
@@ -181,6 +192,22 @@ impl<P: PageTable> Kernel<P> {
         // client (key side) and where it is the target server (value side).
         self.fid_owners
             .retain(|&(p, _), &mut (tp, _)| p != pid && tp != pid);
+
+        // Collect integrity info before destroying VM space.
+        if let Some(space) = self.vm.space(pid) {
+            let frame_info: Vec<(PhysAddr, FrameClassification)> = space
+                .regions
+                .values()
+                .flat_map(|r| r.frames.iter().map(|&p| (p, r.classification)))
+                .collect();
+
+            for (paddr, class) in frame_info {
+                self.lyll.unregister_frame(paddr);
+                if class.contains(FrameClassification::ENCRYPTED) {
+                    self.nakaiah.unregister_frame(paddr);
+                }
+            }
+        }
 
         // Destroy VM space. Ignore NoSuchProcess — the process may
         // have been spawned without a VM config.
@@ -463,13 +490,52 @@ impl<P: PageTable> Kernel<P> {
         Ok(())
     }
 
+    // ── Integrity guardians ────────────────────────────────────────────
+
+    /// Read-only access to the Lyll auditor.
+    pub fn lyll(&self) -> &Lyll {
+        &self.lyll
+    }
+
+    /// Mutable access to the Lyll auditor.
+    pub fn lyll_mut(&mut self) -> &mut Lyll {
+        &mut self.lyll
+    }
+
+    /// Read-only access to the Nakaiah bodyguard.
+    pub fn nakaiah(&self) -> &Nakaiah {
+        &self.nakaiah
+    }
+
+    /// Mutable access to the Nakaiah bodyguard.
+    pub fn nakaiah_mut(&mut self) -> &mut Nakaiah {
+        &mut self.nakaiah
+    }
+
+    /// Read-only access to the VM manager.
+    pub fn vm(&self) -> &AddressSpaceManager<P> {
+        &self.vm
+    }
+
     // ── VM delegation ────────────────────────────────────────────────
+
+    /// Create a VM address space for a process.
+    pub fn vm_create_space(
+        &mut self,
+        pid: u32,
+        budget: MemoryBudget,
+        page_table: P,
+    ) -> Result<(), VmError> {
+        self.vm.create_space(pid, budget, page_table)
+    }
 
     /// Map a region of virtual memory for a process.
     ///
-    /// Delegates to the `AddressSpaceManager`. Returns the base virtual
-    /// address on success. The process must have a VM space (created via
-    /// `spawn_process` with `vm_config`).
+    /// Delegates to the `AddressSpaceManager`, then registers newly mapped
+    /// frames with the integrity guardians:
+    /// - All frames are registered with Lyll (public memory auditor).
+    /// - ENCRYPTED frames are additionally registered with Nakaiah (private
+    ///   memory bodyguard).
     pub fn vm_map_region(
         &mut self,
         pid: u32,
@@ -478,12 +544,58 @@ impl<P: PageTable> Kernel<P> {
         flags: PageFlags,
         classification: FrameClassification,
     ) -> Result<(), VmError> {
-        self.vm.map_region(pid, vaddr, len, flags, classification)
+        self.vm.map_region(pid, vaddr, len, flags, classification)?;
+
+        // Register frames with integrity guardians.
+        let space = self.vm.space(pid).unwrap();
+        let region = space.regions.get(&vaddr).unwrap();
+        for &paddr in &region.frames {
+            let content_hash = ContentHash::ZERO;
+            self.lyll.register_frame(
+                paddr,
+                if classification.contains(FrameClassification::EPHEMERAL) {
+                    HashEntry::Snapshot {
+                        hash: content_hash.0,
+                        generation: 0,
+                    }
+                } else {
+                    HashEntry::CidBacked {
+                        cid: content_hash.0,
+                    }
+                },
+                pid,
+            );
+            if classification.contains(FrameClassification::ENCRYPTED) {
+                self.nakaiah.register_frame(paddr, content_hash.0);
+            }
+        }
+
+        Ok(())
     }
 
     /// Unmap a region previously mapped at `vaddr` for process `pid`.
+    ///
+    /// Collects frame and classification info before unmapping, then
+    /// unregisters frames from the integrity guardians.
     pub fn vm_unmap_region(&mut self, pid: u32, vaddr: VirtAddr) -> Result<(), VmError> {
-        self.vm.unmap_region(pid, vaddr)
+        // Collect frames and classification before unmapping (unmap removes the region).
+        let (frames, classification) = {
+            let space = self.vm.space(pid).ok_or(VmError::NoSuchProcess(pid))?;
+            let region = space.regions.get(&vaddr).ok_or(VmError::NotMapped(vaddr))?;
+            (region.frames.clone(), region.classification)
+        };
+
+        self.vm.unmap_region(pid, vaddr)?;
+
+        // Unregister from guardians.
+        for &paddr in &frames {
+            self.lyll.unregister_frame(paddr);
+            if classification.contains(FrameClassification::ENCRYPTED) {
+                self.nakaiah.unregister_frame(paddr);
+            }
+        }
+
+        Ok(())
     }
 
     /// Change the permission flags on an existing region.
@@ -1579,5 +1691,116 @@ mod tests {
                 "No ephemeral frames should reference the destroyed process"
             );
         }
+    }
+
+    // ── Integrity guardian tests ────────────────────────────────────────
+
+    use crate::vm::PAGE_SIZE;
+
+    fn make_kernel() -> Kernel<MockPageTable> {
+        let mut entropy = make_test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        Kernel::new(kernel_id, make_test_vm())
+    }
+
+    fn default_budget() -> MemoryBudget {
+        MemoryBudget::new(64 * PAGE_SIZE as usize, FrameClassification::all())
+    }
+
+    fn rw_user_flags() -> PageFlags {
+        PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::USER
+    }
+
+    fn spawn_test_process(kernel: &mut Kernel<MockPageTable>) -> u32 {
+        kernel
+            .spawn_process("test", Box::new(EchoServer::new()), &[], None)
+            .unwrap()
+    }
+
+    #[test]
+    fn kernel_has_integrity_guardians() {
+        let kernel = make_kernel();
+        assert_eq!(kernel.lyll().registry_len(), 0);
+        assert_eq!(kernel.nakaiah().integrity_registry_len(), 0);
+    }
+
+    #[test]
+    fn map_region_registers_with_lyll() {
+        let mut kernel = make_kernel();
+        let pid = spawn_test_process(&mut kernel);
+        kernel
+            .vm_create_space(
+                pid,
+                default_budget(),
+                MockPageTable::new(PhysAddr(0x20_0000)),
+            )
+            .unwrap();
+
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize,
+                rw_user_flags(),
+                FrameClassification::empty(),
+            )
+            .unwrap();
+
+        assert_eq!(kernel.lyll().registry_len(), 1);
+    }
+
+    #[test]
+    fn map_encrypted_region_registers_with_both() {
+        let mut kernel = make_kernel();
+        let pid = spawn_test_process(&mut kernel);
+        kernel
+            .vm_create_space(
+                pid,
+                default_budget(),
+                MockPageTable::new(PhysAddr(0x20_0000)),
+            )
+            .unwrap();
+
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize,
+                rw_user_flags(),
+                FrameClassification::ENCRYPTED,
+            )
+            .unwrap();
+
+        assert_eq!(kernel.lyll().registry_len(), 1);
+        assert_eq!(kernel.nakaiah().integrity_registry_len(), 1);
+    }
+
+    #[test]
+    fn unmap_region_unregisters_from_guardians() {
+        let mut kernel = make_kernel();
+        let pid = spawn_test_process(&mut kernel);
+        kernel
+            .vm_create_space(
+                pid,
+                default_budget(),
+                MockPageTable::new(PhysAddr(0x20_0000)),
+            )
+            .unwrap();
+
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize,
+                rw_user_flags(),
+                FrameClassification::ENCRYPTED,
+            )
+            .unwrap();
+        assert_eq!(kernel.lyll().registry_len(), 1);
+        assert_eq!(kernel.nakaiah().integrity_registry_len(), 1);
+
+        kernel.vm_unmap_region(pid, VirtAddr(0x1000)).unwrap();
+        assert_eq!(kernel.lyll().registry_len(), 0);
+        assert_eq!(kernel.nakaiah().integrity_registry_len(), 0);
     }
 }

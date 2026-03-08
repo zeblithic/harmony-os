@@ -271,11 +271,7 @@ mod tests {
     #[test]
     fn unregister_frame_removes_entry() {
         let mut lyll = Lyll::new(test_config());
-        lyll.register_frame(
-            PhysAddr(0x1000),
-            HashEntry::CidBacked { cid: [0; 32] },
-            1,
-        );
+        lyll.register_frame(PhysAddr(0x1000), HashEntry::CidBacked { cid: [0; 32] }, 1);
         assert_eq!(lyll.registry_len(), 1);
         lyll.unregister_frame(PhysAddr(0x1000));
         assert_eq!(lyll.registry_len(), 0);
@@ -369,11 +365,7 @@ mod tests {
     #[test]
     fn unregister_also_removes_from_samples() {
         let mut lyll = Lyll::new(test_config());
-        lyll.register_frame(
-            PhysAddr(0x1000),
-            HashEntry::CidBacked { cid: [0; 32] },
-            1,
-        );
+        lyll.register_frame(PhysAddr(0x1000), HashEntry::CidBacked { cid: [0; 32] }, 1);
         lyll.add_sample(PhysAddr(0x1000));
         assert_eq!(lyll.sampled_count(), 1);
         lyll.unregister_frame(PhysAddr(0x1000));
@@ -391,16 +383,8 @@ mod tests {
     #[test]
     fn all_registered_frames_returns_all_addrs() {
         let mut lyll = Lyll::new(test_config());
-        lyll.register_frame(
-            PhysAddr(0x1000),
-            HashEntry::CidBacked { cid: [0; 32] },
-            1,
-        );
-        lyll.register_frame(
-            PhysAddr(0x2000),
-            HashEntry::CidBacked { cid: [1; 32] },
-            2,
-        );
+        lyll.register_frame(PhysAddr(0x1000), HashEntry::CidBacked { cid: [0; 32] }, 1);
+        lyll.register_frame(PhysAddr(0x2000), HashEntry::CidBacked { cid: [1; 32] }, 2);
         let all = lyll.all_registered_frames();
         assert_eq!(all.len(), 2);
         assert!(all.contains(&PhysAddr(0x1000)));

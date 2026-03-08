@@ -44,8 +44,13 @@ pub enum IntegrityVerdict {
         paddr: PhysAddr,
         reason: ViolationReason,
     },
-    Kill { pid: u32, reason: ViolationReason },
-    Panic { reason: ViolationReason },
+    Kill {
+        pid: u32,
+        reason: ViolationReason,
+    },
+    Panic {
+        reason: ViolationReason,
+    },
 }
 
 #[cfg(test)]
@@ -205,7 +210,11 @@ mod tests {
     #[test]
     fn quarantine_record_forensics() {
         let mut lyll = test_lyll();
-        lyll.register_frame(PhysAddr(0x1000), HashEntry::CidBacked { cid: [0xAA; 32] }, 42);
+        lyll.register_frame(
+            PhysAddr(0x1000),
+            HashEntry::CidBacked { cid: [0xAA; 32] },
+            42,
+        );
 
         let verdict = lyll.verify_frame(PhysAddr(0x1000), [0xBB; 32], 999);
         assert!(matches!(verdict, IntegrityVerdict::Quarantine { .. }));

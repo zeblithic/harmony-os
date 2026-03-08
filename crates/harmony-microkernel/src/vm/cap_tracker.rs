@@ -491,13 +491,19 @@ mod tests {
 
         tracker.record_mapping(paddr(0), 1, FrameClassification::ENCRYPTED);
         assert_eq!(
-            tracker.budget(1).unwrap().zone_used(MemoryZone::KernelDurable),
+            tracker
+                .budget(1)
+                .unwrap()
+                .zone_used(MemoryZone::KernelDurable),
             PAGE_SIZE as usize,
         );
 
         tracker.remove_mapping(paddr(0), 1);
         assert_eq!(
-            tracker.budget(1).unwrap().zone_used(MemoryZone::KernelDurable),
+            tracker
+                .budget(1)
+                .unwrap()
+                .zone_used(MemoryZone::KernelDurable),
             0,
         );
     }
