@@ -16,8 +16,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use harmony_athenaeum::ChunkAddr;
-use harmony_athenaeum::Athenaeum;
+use harmony_athenaeum::{Athenaeum, ChunkAddr, sha256_hash, MAX_BLOB_SIZE};
 
 use crate::{Fid, QPath, OpenMode, FileType, FileStat, IpcError, FileServer};
 
@@ -61,9 +60,7 @@ struct FidState {
 enum IngestState {
     /// Accumulating bytes from successive writes.
     Writing(Vec<u8>),
-    /// SHA-256 computed, blob + chunks stored, awaiting clunk.
-    Finalized(Vec<u8>),
-    /// Clunked — no longer active.
+    /// Finalized — response already consumed.
     Done,
 }
 
@@ -134,12 +131,110 @@ impl ContentServer {
             .find(|(addr, _)| addr.hash_bits() == hash_bits)
             .map(|(addr, _)| addr)
     }
+
+    /// Finalize an ingest: chunk the blob, store chunks + metadata, return 40-byte response.
+    fn finalize_ingest(&mut self, fid: Fid) -> Result<Vec<u8>, IpcError> {
+        let buf = self
+            .ingest_buffers
+            .get_mut(&fid)
+            .ok_or(IpcError::InvalidArgument)?;
+        match core::mem::replace(buf, IngestState::Done) {
+            IngestState::Writing(data) => {
+                if data.is_empty() {
+                    return Err(IpcError::InvalidArgument); // read before write
+                }
+                if data.len() > MAX_BLOB_SIZE {
+                    return Err(IpcError::ResourceExhausted);
+                }
+                let cid = sha256_hash(&data);
+
+                // Dedup: skip if blob already exists
+                if self.blobs.contains_key(&cid) {
+                    let ath = &self.blobs[&cid];
+                    return Ok(self.build_ingest_response(&cid, ath));
+                }
+
+                let ath = Athenaeum::from_blob(cid, &data)
+                    .map_err(|_| IpcError::ResourceExhausted)?;
+
+                // Store chunks — iterate blob data in 4096-byte pieces,
+                // pad each to addr.size_bytes()
+                for (i, addr) in ath.chunks.iter().enumerate() {
+                    // Only store if not already present (chunk-level dedup)
+                    if !self.chunks.iter().any(|(a, _)| *a == *addr) {
+                        let chunk_start = i * 4096;
+                        let chunk_end = (chunk_start + 4096).min(data.len());
+                        let raw = &data[chunk_start..chunk_end];
+                        let padded_size = addr.size_bytes();
+                        let mut padded = alloc::vec![0u8; padded_size];
+                        padded[..raw.len()].copy_from_slice(raw);
+                        self.chunks.push((*addr, padded));
+                    }
+                }
+
+                let response = self.build_ingest_response(&cid, &ath);
+                self.blobs.insert(cid, ath);
+                Ok(response)
+            }
+            IngestState::Done => {
+                // Already finalized — return empty
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    fn build_ingest_response(&self, cid: &[u8; 32], ath: &Athenaeum) -> Vec<u8> {
+        let mut response = Vec::with_capacity(40);
+        response.extend_from_slice(cid);
+        response.extend_from_slice(&(ath.chunks.len() as u32).to_le_bytes());
+        response.extend_from_slice(&(ath.blob_size as u32).to_le_bytes());
+        response
+    }
+
+    /// Read blob data by reassembling from stored chunks.
+    fn read_blob(&self, cid: &[u8; 32], offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
+        let ath = self.blobs.get(cid).ok_or(IpcError::NotFound)?;
+        let chunks = &self.chunks;
+        let data = ath
+            .reassemble(|addr| {
+                chunks
+                    .iter()
+                    .find(|(a, _)| *a == addr)
+                    .map(|(_, d)| d.clone())
+            })
+            .map_err(|_| IpcError::NotFound)?;
+        Ok(slice_data(&data, offset, count))
+    }
+
+    /// Read raw chunk data.
+    fn read_chunk_data(
+        &self,
+        addr: &ChunkAddr,
+        offset: u64,
+        count: u32,
+    ) -> Result<Vec<u8>, IpcError> {
+        let (_, data) = self
+            .chunks
+            .iter()
+            .find(|(a, _)| *a == *addr)
+            .ok_or(IpcError::NotFound)?;
+        Ok(slice_data(data, offset, count))
+    }
 }
 
 impl Default for ContentServer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ── Slice helper ────────────────────────────────────────────────
+
+/// Extract a sub-slice from `data` bounded by `offset` and `count`, clamped to data length.
+fn slice_data(data: &[u8], offset: u64, count: u32) -> Vec<u8> {
+    let off = (offset as usize).min(data.len());
+    let end = (off.saturating_add(count as usize)).min(data.len());
+    data[off..end].to_vec()
 }
 
 // ── Hex helpers ─────────────────────────────────────────────────────
@@ -256,8 +351,23 @@ impl FileServer for ContentServer {
         Ok(())
     }
 
-    fn read(&mut self, _fid: Fid, _offset: u64, _count: u32) -> Result<Vec<u8>, IpcError> {
-        Err(IpcError::NotSupported)
+    fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
+        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
+        if !state.is_open {
+            return Err(IpcError::NotOpen);
+        }
+        match &state.node {
+            NodeKind::Root | NodeKind::BlobsDir | NodeKind::ChunksDir => Err(IpcError::IsDirectory),
+            NodeKind::Ingest => self.finalize_ingest(fid),
+            NodeKind::Blob(cid) => {
+                let cid = *cid;
+                self.read_blob(&cid, offset, count)
+            }
+            NodeKind::Chunk(addr) => {
+                let addr = *addr;
+                self.read_chunk_data(&addr, offset, count)
+            }
+        }
     }
 
     fn write(&mut self, fid: Fid, _offset: u64, data: &[u8]) -> Result<u32, IpcError> {
@@ -575,5 +685,125 @@ mod tests {
         let mut server = ContentServer::new();
         server.walk(0, 1, "ingest").unwrap();
         assert_eq!(server.write(1, 0, b"data"), Err(IpcError::NotOpen));
+    }
+
+    // ── read() tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn ingest_and_read_back_metadata() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "ingest").unwrap();
+        server.open(1, OpenMode::ReadWrite).unwrap();
+        let blob_data = alloc::vec![0xABu8; 4096];
+        server.write(1, 0, &blob_data).unwrap();
+
+        let response = server.read(1, 0, 256).unwrap();
+        assert_eq!(response.len(), 40);
+
+        let cid: [u8; 32] = response[..32].try_into().unwrap();
+        let chunk_count = u32::from_le_bytes(response[32..36].try_into().unwrap());
+        let blob_size = u32::from_le_bytes(response[36..40].try_into().unwrap());
+
+        assert_eq!(cid, harmony_athenaeum::sha256_hash(&blob_data));
+        assert_eq!(chunk_count, 1);
+        assert_eq!(blob_size, 4096);
+        assert_eq!(server.blob_count(), 1);
+        assert_eq!(server.chunk_count(), 1);
+    }
+
+    #[test]
+    fn ingest_second_read_returns_empty() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "ingest").unwrap();
+        server.open(1, OpenMode::ReadWrite).unwrap();
+        server.write(1, 0, &[0xCDu8; 100]).unwrap();
+        let first = server.read(1, 0, 256).unwrap();
+        assert_eq!(first.len(), 40);
+        let second = server.read(1, 0, 256).unwrap();
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn ingest_read_before_write_rejected() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "ingest").unwrap();
+        server.open(1, OpenMode::ReadWrite).unwrap();
+        assert_eq!(server.read(1, 0, 256), Err(IpcError::InvalidArgument));
+    }
+
+    #[test]
+    fn read_blob_by_cid() {
+        let mut server = ContentServer::new();
+        let blob_data = alloc::vec![0x42u8; 8000];
+        server.walk(0, 1, "ingest").unwrap();
+        server.open(1, OpenMode::ReadWrite).unwrap();
+        server.write(1, 0, &blob_data).unwrap();
+        let response = server.read(1, 0, 256).unwrap();
+        let cid_hex = format_cid_hex(&response[..32].try_into().unwrap());
+        server.clunk(1).unwrap();
+
+        server.walk(0, 2, "blobs").unwrap();
+        server.walk(2, 3, &cid_hex).unwrap();
+        server.open(3, OpenMode::Read).unwrap();
+        let read_back = server.read(3, 0, 16384).unwrap();
+        assert_eq!(read_back, blob_data);
+    }
+
+    #[test]
+    fn read_blob_with_offset() {
+        let mut server = ContentServer::new();
+        let blob_data = alloc::vec![0xEFu8; 4096];
+        server.walk(0, 1, "ingest").unwrap();
+        server.open(1, OpenMode::ReadWrite).unwrap();
+        server.write(1, 0, &blob_data).unwrap();
+        let response = server.read(1, 0, 256).unwrap();
+        let cid_hex = format_cid_hex(&response[..32].try_into().unwrap());
+        server.clunk(1).unwrap();
+
+        server.walk(0, 2, "blobs").unwrap();
+        server.walk(2, 3, &cid_hex).unwrap();
+        server.open(3, OpenMode::Read).unwrap();
+        let slice = server.read(3, 100, 50).unwrap();
+        assert_eq!(slice.len(), 50);
+        assert_eq!(slice, alloc::vec![0xEFu8; 50]);
+    }
+
+    #[test]
+    fn read_directory_returns_is_directory() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "blobs").unwrap();
+        server.open(1, OpenMode::Read).unwrap();
+        assert_eq!(server.read(1, 0, 256), Err(IpcError::IsDirectory));
+    }
+
+    #[test]
+    fn ingest_dedup_same_blob() {
+        let mut server = ContentServer::new();
+        let blob_data = alloc::vec![0xAAu8; 4096];
+
+        server.walk(0, 1, "ingest").unwrap();
+        server.open(1, OpenMode::ReadWrite).unwrap();
+        server.write(1, 0, &blob_data).unwrap();
+        server.read(1, 0, 256).unwrap();
+        server.clunk(1).unwrap();
+        assert_eq!(server.chunk_count(), 1);
+
+        server.walk(0, 2, "ingest").unwrap();
+        server.open(2, OpenMode::ReadWrite).unwrap();
+        server.write(2, 0, &blob_data).unwrap();
+        server.read(2, 0, 256).unwrap();
+        server.clunk(2).unwrap();
+        assert_eq!(server.chunk_count(), 1); // No new chunks
+        assert_eq!(server.blob_count(), 1); // No new blob
+    }
+
+    #[test]
+    fn ingest_oversized_blob_rejected() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "ingest").unwrap();
+        server.open(1, OpenMode::ReadWrite).unwrap();
+        let big = alloc::vec![0u8; harmony_athenaeum::MAX_BLOB_SIZE + 1];
+        server.write(1, 0, &big).unwrap();
+        assert_eq!(server.read(1, 0, 256), Err(IpcError::ResourceExhausted));
     }
 }
