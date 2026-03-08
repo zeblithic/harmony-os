@@ -9,6 +9,7 @@
 extern crate alloc;
 
 pub mod elf;
+pub mod linuxulator;
 
 #[cfg(test)]
 mod tests {
