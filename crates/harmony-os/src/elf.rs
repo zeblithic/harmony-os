@@ -149,7 +149,11 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, ElfError> {
         return Err(ElfError::InvalidPhdr);
     }
     let ph_end = e_phoff
-        .checked_add(e_phnum.checked_mul(e_phentsize).ok_or(ElfError::InvalidPhdr)?)
+        .checked_add(
+            e_phnum
+                .checked_mul(e_phentsize)
+                .ok_or(ElfError::InvalidPhdr)?,
+        )
         .ok_or(ElfError::InvalidPhdr)?;
     if ph_end > data.len() {
         return Err(ElfError::TooShort);
@@ -213,7 +217,7 @@ mod tests {
         elf[4] = 2; // ELFCLASS64
         elf[5] = 1; // ELFDATA2LSB
         elf[6] = 1; // EV_CURRENT
-                     // e_type = ET_EXEC (2)
+                    // e_type = ET_EXEC (2)
         elf[16..18].copy_from_slice(&2u16.to_le_bytes());
         // e_machine = EM_X86_64 (0x3E)
         elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());

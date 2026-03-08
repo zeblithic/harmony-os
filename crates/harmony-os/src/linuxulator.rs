@@ -7,7 +7,6 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
-use alloc::string::String;
 use alloc::vec::Vec;
 
 use harmony_microkernel::{Fid, IpcError, OpenMode, QPath};
@@ -36,7 +35,7 @@ pub trait SyscallBackend {
 /// Test double that records all 9P calls for assertion.
 #[cfg(test)]
 pub struct MockBackend {
-    pub walks: Vec<(String, Fid)>,
+    pub walks: Vec<(alloc::string::String, Fid)>,
     pub opens: Vec<(Fid, OpenMode)>,
     pub writes: Vec<(Fid, Vec<u8>)>,
     pub reads: Vec<(Fid, u64, u32)>,
@@ -59,7 +58,8 @@ impl MockBackend {
 #[cfg(test)]
 impl SyscallBackend for MockBackend {
     fn walk(&mut self, path: &str, new_fid: Fid) -> Result<QPath, IpcError> {
-        self.walks.push((String::from(path), new_fid));
+        self.walks
+            .push((alloc::string::String::from(path), new_fid));
         Ok(0)
     }
 
@@ -290,7 +290,12 @@ mod tests {
 
         // Backend should have received the write
         let stdout_fid = lx.fid_for_fd(1).unwrap();
-        let stdout_writes: Vec<_> = lx.backend().writes.iter().filter(|(fid, _)| *fid == stdout_fid).collect();
+        let stdout_writes: Vec<_> = lx
+            .backend()
+            .writes
+            .iter()
+            .filter(|(fid, _)| *fid == stdout_fid)
+            .collect();
         assert_eq!(stdout_writes.len(), 1);
         assert_eq!(stdout_writes[0].1, b"Hello\n");
     }
@@ -341,10 +346,10 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    use harmony_identity::PrivateIdentity;
     use harmony_microkernel::echo::EchoServer;
     use harmony_microkernel::kernel::Kernel;
     use harmony_microkernel::serial_server::SerialServer;
-    use harmony_identity::PrivateIdentity;
     use harmony_unikernel::KernelEntropy;
 
     /// SyscallBackend backed by a real Ring 2 Kernel.
