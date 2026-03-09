@@ -13,12 +13,19 @@ mod pl011;
 mod rndr;
 mod timer;
 
+#[cfg(not(test))]
+use linked_list_allocator::LockedHeap;
+
 #[cfg(target_os = "uefi")]
 use core::fmt::Write;
 #[cfg(target_os = "uefi")]
 use uefi::mem::memory_map::MemoryMap;
 #[cfg(target_os = "uefi")]
 use uefi::prelude::*;
+
+#[cfg(not(test))]
+#[global_allocator]
+static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 #[cfg(target_os = "uefi")]
 use mmu::MemoryRegion;
@@ -156,10 +163,80 @@ fn main() -> Status {
     );
     let _ = writeln!(serial, "[RNDR] Hardware RNG available");
 
-    // We cannot return Status::SUCCESS after ExitBootServices -- the UEFI
-    // runtime no longer owns control flow. Loop forever (subsequent tasks
-    // will replace this with a proper event loop / idle halt).
+    // ── Initialise heap allocator ──
+    // Find the largest usable memory region that isn't the bump allocator region.
+    // Cap at 4 MiB to avoid over-committing early in boot.
+    use harmony_microkernel::vm::PAGE_SIZE;
+
+    let (heap_base, heap_size) = regions[..region_count]
+        .iter()
+        .filter(|r| r.is_usable && r.base != bump_base)
+        .map(|r| (r.base, r.pages * PAGE_SIZE))
+        .max_by_key(|(_, size)| *size)
+        .expect("no usable memory region for heap");
+
+    let heap_size = core::cmp::min(heap_size, 4 * 1024 * 1024);
+
+    unsafe {
+        ALLOCATOR
+            .lock()
+            .init(heap_base as *mut u8, heap_size as usize);
+    }
+    let _ = writeln!(
+        serial,
+        "[Heap] Initialized: {} bytes at {:#x}",
+        heap_size, heap_base
+    );
+
+    // ── Generate Ed25519/X25519 identity ──
+    use harmony_identity::PrivateIdentity;
+    use harmony_unikernel::{KernelEntropy, MemoryState, UnikernelRuntime};
+
+    let mut entropy = KernelEntropy::new(|buf: &mut [u8]| {
+        unsafe { rndr::fill(buf) };
+    });
+
+    let identity = PrivateIdentity::generate(&mut entropy);
+    let addr = identity.public_identity().address_hash;
+    let _ = writeln!(
+        serial,
+        "[Identity] Generated Ed25519 address: {:02x}{:02x}{:02x}{:02x}...",
+        addr[0], addr[1], addr[2], addr[3],
+    );
+
+    // ── Create runtime and enter idle loop ──
+    let persistence = MemoryState::new();
+    let mut runtime = UnikernelRuntime::new(identity, entropy, persistence);
+    let _ = writeln!(
+        serial,
+        "[Runtime] UnikernelRuntime created, entering idle loop"
+    );
+
     loop {
-        core::hint::spin_loop();
+        let now = timer::now_ms();
+        let actions = runtime.tick(now);
+        for action in actions {
+            let _ = writeln!(serial, "[Runtime] action: {:?}", action);
+        }
+        // WFE = Wait For Event — ARM equivalent of HLT, saves power
+        unsafe { core::arch::asm!("wfe") };
+    }
+}
+
+// ── Panic handler ──────────────────────────────────────────────────────
+// The uefi crate's panic_handler feature is disabled because after
+// ExitBootServices the UEFI console is gone. This custom handler
+// prints to PL011 serial so panics are visible in QEMU.
+
+#[cfg(target_os = "uefi")]
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    let mut serial = harmony_unikernel::SerialWriter::new(|byte: u8| {
+        unsafe { pl011::write_byte(byte) };
+    });
+    use core::fmt::Write;
+    let _ = writeln!(serial, "\n!!! PANIC: {}", info);
+    loop {
+        unsafe { core::arch::asm!("wfe") };
     }
 }

@@ -23,10 +23,11 @@ sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 # system libc headers, so the C NEON backend fails to build.
 blake3 = { version = "1", default-features = false, features = ["no_neon"] }
 
-# uefi crate is only needed on the UEFI target.  The `panic_handler` feature
-# conflicts with std's panic_handler when running host-target tests.
+# uefi crate is only needed on the UEFI target.  We provide our own
+# #[global_allocator] (LockedHeap) and #[panic_handler] (PL011 serial)
+# instead of the uefi crate's features, which don't work after ExitBootServices.
 [target.'cfg(target_os = "uefi")'.dependencies]
-uefi = { version = "0.36", features = ["global_allocator", "panic_handler"] }
+uefi = { version = "0.36" }
 
 [features]
 default = []
