@@ -102,7 +102,7 @@ pub unsafe fn init_and_enable(
     let mut pt = Aarch64PageTable::new(root_frame, identity_phys_to_virt);
 
     // 3. Map all usable RAM regions as Normal cacheable memory.
-    let ram_flags = PageFlags::READABLE | PageFlags::WRITABLE;
+    let ram_flags = PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::EXECUTABLE;
     let mut mapped_pages: u64 = 0;
 
     for region in regions {
