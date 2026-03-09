@@ -10,6 +10,7 @@ extern crate alloc;
 mod bump_alloc;
 mod mmu;
 mod pl011;
+mod rndr;
 mod timer;
 
 #[cfg(target_os = "uefi")]
@@ -147,6 +148,13 @@ fn main() -> Status {
         "[Timer] ARM generic timer: freq={} Hz",
         timer::freq()
     );
+
+    // ── Verify RNDR hardware RNG is available ──
+    assert!(
+        unsafe { rndr::is_available() },
+        "RNDR not available — use QEMU with -cpu max"
+    );
+    let _ = writeln!(serial, "[RNDR] Hardware RNG available");
 
     // We cannot return Status::SUCCESS after ExitBootServices -- the UEFI
     // runtime no longer owns control flow. Loop forever (subsequent tasks
