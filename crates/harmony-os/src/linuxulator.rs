@@ -54,6 +54,68 @@ fn vm_err_to_errno(e: VmError) -> i64 {
     }
 }
 
+// ── LinuxSyscall — CPU-agnostic syscall representation ──────────
+
+/// CPU-agnostic Linux syscall. Each architecture maps its native
+/// syscall numbers into this enum before the Linuxulator dispatches.
+#[derive(Debug)]
+pub enum LinuxSyscall {
+    Read { fd: i32, buf: u64, count: u64 },
+    Write { fd: i32, buf: u64, count: u64 },
+    Close { fd: i32 },
+    Fstat { fd: i32, buf: u64 },
+    Mmap { addr: u64, len: u64, prot: i32, flags: i32, fd: i32, offset: u64 },
+    Mprotect { addr: u64, len: u64, prot: i32 },
+    Munmap { addr: u64, len: u64 },
+    Brk { addr: u64 },
+    RtSigaction,
+    RtSigprocmask,
+    Ioctl { fd: i32, request: u64 },
+    Exit { code: i32 },
+    ArchPrctl { code: i32, addr: u64 },
+    SetTidAddress,
+    ExitGroup { code: i32 },
+    Openat { dirfd: i32, pathname: u64, flags: i32 },
+    SetRobustList,
+    Prlimit64 { pid: i32, resource: i32, new_limit: u64, old_limit_buf: u64 },
+    Rseq,
+    Unknown { nr: u64 },
+}
+
+impl LinuxSyscall {
+    /// Map x86_64 Linux syscall numbers to `LinuxSyscall`.
+    pub fn from_x86_64(nr: u64, args: [u64; 6]) -> Self {
+        match nr {
+            0 => LinuxSyscall::Read { fd: args[0] as i32, buf: args[1], count: args[2] },
+            1 => LinuxSyscall::Write { fd: args[0] as i32, buf: args[1], count: args[2] },
+            3 => LinuxSyscall::Close { fd: args[0] as i32 },
+            5 => LinuxSyscall::Fstat { fd: args[0] as i32, buf: args[1] },
+            9 => LinuxSyscall::Mmap {
+                addr: args[0], len: args[1], prot: args[2] as i32,
+                flags: args[3] as i32, fd: args[4] as i32, offset: args[5],
+            },
+            10 => LinuxSyscall::Mprotect { addr: args[0], len: args[1], prot: args[2] as i32 },
+            11 => LinuxSyscall::Munmap { addr: args[0], len: args[1] },
+            12 => LinuxSyscall::Brk { addr: args[0] },
+            13 => LinuxSyscall::RtSigaction,
+            14 => LinuxSyscall::RtSigprocmask,
+            16 => LinuxSyscall::Ioctl { fd: args[0] as i32, request: args[1] },
+            60 => LinuxSyscall::Exit { code: args[0] as i32 },
+            158 => LinuxSyscall::ArchPrctl { code: args[0] as i32, addr: args[1] },
+            218 => LinuxSyscall::SetTidAddress,
+            231 => LinuxSyscall::ExitGroup { code: args[0] as i32 },
+            257 => LinuxSyscall::Openat { dirfd: args[0] as i32, pathname: args[1], flags: args[2] as i32 },
+            273 => LinuxSyscall::SetRobustList,
+            302 => LinuxSyscall::Prlimit64 {
+                pid: args[0] as i32, resource: args[1] as i32,
+                new_limit: args[2], old_limit_buf: args[3],
+            },
+            334 => LinuxSyscall::Rseq,
+            _ => LinuxSyscall::Unknown { nr },
+        }
+    }
+}
+
 // ── SyscallBackend trait ────────────────────────────────────────────
 
 /// Abstraction over 9P operations. The Linuxulator calls these to
@@ -1674,6 +1736,50 @@ mod tests {
 
         let flags = prot_to_page_flags(0x7); // PROT_READ | PROT_WRITE | PROT_EXEC
         assert!(flags.contains(PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::EXECUTABLE));
+    }
+
+    #[test]
+    fn from_x86_64_write() {
+        let syscall = LinuxSyscall::from_x86_64(1, [1, 0x1000, 5, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Write { fd, buf, count } => {
+                assert_eq!(fd, 1);
+                assert_eq!(buf, 0x1000);
+                assert_eq!(count, 5);
+            }
+            other => panic!("expected Write, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_x86_64_read() {
+        let syscall = LinuxSyscall::from_x86_64(0, [3, 0x2000, 128, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Read { fd, buf, count } => {
+                assert_eq!(fd, 3);
+                assert_eq!(buf, 0x2000);
+                assert_eq!(count, 128);
+            }
+            other => panic!("expected Read, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_x86_64_exit_group() {
+        let syscall = LinuxSyscall::from_x86_64(231, [42, 0, 0, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::ExitGroup { code } => assert_eq!(code, 42),
+            other => panic!("expected ExitGroup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_x86_64_unknown() {
+        let syscall = LinuxSyscall::from_x86_64(9999, [0; 6]);
+        match syscall {
+            LinuxSyscall::Unknown { nr } => assert_eq!(nr, 9999),
+            other => panic!("expected Unknown, got {:?}", other),
+        }
     }
 }
 
