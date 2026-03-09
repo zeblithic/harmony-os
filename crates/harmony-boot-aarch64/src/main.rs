@@ -10,6 +10,7 @@ extern crate alloc;
 mod bump_alloc;
 mod mmu;
 mod pl011;
+mod timer;
 
 #[cfg(target_os = "uefi")]
 use core::fmt::Write;
@@ -138,6 +139,14 @@ fn main() -> Status {
 
     // ── Build identity map and enable MMU ──
     unsafe { mmu::init_and_enable(&regions[..region_count], &mut bump, &mut serial) };
+
+    // ── Initialise ARM Generic Timer ──
+    unsafe { timer::init() };
+    let _ = writeln!(
+        serial,
+        "[Timer] ARM generic timer: freq={} Hz",
+        timer::freq()
+    );
 
     // We cannot return Status::SUCCESS after ExitBootServices -- the UEFI
     // runtime no longer owns control flow. Loop forever (subsequent tasks
