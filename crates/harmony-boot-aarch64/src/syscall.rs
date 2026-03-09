@@ -51,11 +51,15 @@ pub unsafe fn set_dispatch_fn(f: fn(LinuxSyscall) -> SyscallDispatchResult) {
 }
 
 /// Check if the process has exited.
+/// Used when loading and running ELF binaries (future bead).
+#[allow(dead_code)]
 pub fn process_exited() -> bool {
     unsafe { PROCESS_EXITED }
 }
 
 /// Get the exit code.
+/// Used when loading and running ELF binaries (future bead).
+#[allow(dead_code)]
 pub fn exit_code() -> i32 {
     unsafe { EXIT_CODE }
 }

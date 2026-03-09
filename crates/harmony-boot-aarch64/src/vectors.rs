@@ -31,12 +31,17 @@ pub unsafe fn init() {
 /// Each entry is exactly 128 bytes (0x80). The table is 2048 bytes
 /// total (16 entries) and must be 2048-byte aligned.
 ///
+/// The 0x200 entry (Current EL, SPx, Synchronous) branches to an
+/// out-of-line handler (`el1_sync_handler`) that saves the full
+/// TrapFrame and dispatches SVC/abort. All handler code lives
+/// outside the table to avoid overflowing the 128-byte slot.
+///
 /// Layout:
 ///   0x000  Current EL, SP_EL0, Synchronous   — unused (we use SPx)
 ///   0x080  Current EL, SP_EL0, IRQ           — unused
 ///   0x100  Current EL, SP_EL0, FIQ           — unused
 ///   0x180  Current EL, SP_EL0, SError        — unused
-///   0x200  Current EL, SPx, Synchronous      — SVC + abort dispatch
+///   0x200  Current EL, SPx, Synchronous      — branch to el1_sync_handler
 ///   0x280  Current EL, SPx, IRQ              — unexpected
 ///   0x300  Current EL, SPx, FIQ              — unexpected
 ///   0x380  Current EL, SPx, SError           — unexpected
@@ -64,10 +69,49 @@ core::arch::global_asm!(
     ".balign 0x80",
 
     // ── 0x200 — Current EL, SPx, Synchronous ── THE MAIN ENTRY ──
-    //
-    // Save all general-purpose registers + ELR + SPSR to the stack
-    // (TrapFrame layout: x[31], elr, spsr = 264 bytes).
-    // Then read ESR_EL1 to determine exception class and dispatch.
+    // Branch out-of-line: handler body exceeds the 128-byte entry slot.
+    "b el1_sync_handler",
+    ".balign 0x80",
+
+    // 0x280 — Current EL, SPx, IRQ (unexpected)
+    "b unexpected_exception",
+    ".balign 0x80",
+
+    // 0x300 — Current EL, SPx, FIQ (unexpected)
+    "b unexpected_exception",
+    ".balign 0x80",
+
+    // 0x380 — Current EL, SPx, SError (unexpected)
+    "b unexpected_exception",
+    ".balign 0x80",
+
+    // 0x400-0x780 — Lower EL entries (8 entries, all unused)
+    "b unexpected_exception",
+    ".balign 0x80",
+    "b unexpected_exception",
+    ".balign 0x80",
+    "b unexpected_exception",
+    ".balign 0x80",
+    "b unexpected_exception",
+    ".balign 0x80",
+    "b unexpected_exception",
+    ".balign 0x80",
+    "b unexpected_exception",
+    ".balign 0x80",
+    "b unexpected_exception",
+    ".balign 0x80",
+    "b unexpected_exception",
+    ".balign 0x80",
+
+    // ── Unexpected exception handler ────────────────────────────
+    "unexpected_exception:",
+    "b unexpected_exception",  // infinite loop
+
+    // ── Out-of-line synchronous exception handler ─────────────
+    // Lives outside the vector table so it doesn't overflow the
+    // 128-byte entry at 0x200.
+
+    "el1_sync_handler:",
 
     // Allocate TrapFrame on the stack (264 bytes, rounded up to 272 for 16-byte alignment)
     "sub sp, sp, #272",
@@ -153,41 +197,4 @@ core::arch::global_asm!(
     // x1 already contains ESR_EL1 from above
     "bl abort_handler",        // abort_handler(&TrapFrame, esr: u64) -> !
     "b unexpected_exception",  // should not return, but safety net
-
-    // Pad to end of 0x200 entry (128 bytes total from the start of entry)
-    ".balign 0x80",
-
-    // 0x280 — Current EL, SPx, IRQ (unexpected)
-    "b unexpected_exception",
-    ".balign 0x80",
-
-    // 0x300 — Current EL, SPx, FIQ (unexpected)
-    "b unexpected_exception",
-    ".balign 0x80",
-
-    // 0x380 — Current EL, SPx, SError (unexpected)
-    "b unexpected_exception",
-    ".balign 0x80",
-
-    // 0x400-0x780 — Lower EL entries (8 entries, all unused)
-    "b unexpected_exception",
-    ".balign 0x80",
-    "b unexpected_exception",
-    ".balign 0x80",
-    "b unexpected_exception",
-    ".balign 0x80",
-    "b unexpected_exception",
-    ".balign 0x80",
-    "b unexpected_exception",
-    ".balign 0x80",
-    "b unexpected_exception",
-    ".balign 0x80",
-    "b unexpected_exception",
-    ".balign 0x80",
-    "b unexpected_exception",
-    ".balign 0x80",
-
-    // ── Unexpected exception handler ────────────────────────────
-    "unexpected_exception:",
-    "b unexpected_exception",  // infinite loop
 );

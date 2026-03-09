@@ -254,11 +254,9 @@ fn main() -> Status {
         "[Runtime] UnikernelRuntime created, entering idle loop"
     );
 
-    // ── Install exception vector table ──
-    unsafe { vectors::init() };
-    let _ = writeln!(serial, "[Vectors] Exception vector table installed");
-
     // ── Initialise Linuxulator ──
+    // Must happen BEFORE vectors::init() so the SVC dispatch function is
+    // installed before any exception can fire.
     {
         use harmony_microkernel::serial_server::SerialServer;
         use harmony_microkernel::FileServer;
@@ -353,6 +351,12 @@ fn main() -> Status {
 
         let _ = writeln!(serial, "[Linux] Linuxulator ready, SVC dispatch installed");
     }
+
+    // ── Install exception vector table ──
+    // Placed AFTER set_dispatch_fn so the SVC handler has a valid
+    // dispatch target from the moment exceptions are enabled.
+    unsafe { vectors::init() };
+    let _ = writeln!(serial, "[Vectors] Exception vector table installed");
 
     loop {
         let now = timer::now_ms();
