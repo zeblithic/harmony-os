@@ -89,6 +89,10 @@ impl Lyll {
         owner_pid: u32,
         zone: MemoryZone,
     ) {
+        // XOR out old entry if re-registering the same paddr.
+        if let Some(old) = self.hash_registry.get(&paddr) {
+            Self::xor_record_into(&mut self.state_hash.0, paddr, old);
+        }
         let record = FrameRecord {
             entry,
             owner_pid,
@@ -144,16 +148,28 @@ impl Lyll {
 
     /// Update a snapshot entry's hash. CID-backed entries are immutable and silently ignored.
     pub fn update_snapshot(&mut self, paddr: PhysAddr, new_hash: [u8; 32]) {
-        if let Some(record) = self.hash_registry.get_mut(&paddr) {
-            if let HashEntry::Snapshot {
-                ref mut hash,
-                ref mut generation,
-            } = record.entry
-            {
-                *hash = new_hash;
-                *generation += 1;
+        if let Some(record) = self.hash_registry.get(&paddr) {
+            if let HashEntry::Snapshot { .. } = record.entry {
+                // XOR out the old contribution.
+                Self::xor_record_into(&mut self.state_hash.0, paddr, record);
+            } else {
+                return; // CID-backed — immutable, nothing to do.
             }
+        } else {
+            return;
         }
+        // Now mutate the entry and XOR in the new contribution.
+        let record = self.hash_registry.get_mut(&paddr).unwrap();
+        if let HashEntry::Snapshot {
+            ref mut hash,
+            ref mut generation,
+        } = record.entry
+        {
+            *hash = new_hash;
+            *generation += 1;
+        }
+        let record = self.hash_registry.get(&paddr).unwrap();
+        Self::xor_record_into(&mut self.state_hash.0, paddr, record);
     }
 
     pub fn expected_hash(&self, paddr: PhysAddr) -> Option<[u8; 32]> {
@@ -606,6 +622,34 @@ mod tests {
         // Unregister first frame — back to zero.
         lyll.unregister_frame(PhysAddr(0x1000));
         assert_eq!(lyll.state_hash(), ContentHash::ZERO);
+    }
+
+    #[test]
+    fn update_snapshot_preserves_state_hash_invariant() {
+        let mut lyll = Lyll::new(test_config());
+        lyll.register_frame(
+            PhysAddr(0x1000),
+            HashEntry::Snapshot {
+                hash: [0xAA; 32],
+                generation: 0,
+            },
+            1,
+            MemoryZone::PublicDurable,
+        );
+        let after_register = lyll.state_hash();
+
+        // Update the snapshot hash (simulates write barrier).
+        lyll.update_snapshot(PhysAddr(0x1000), [0xBB; 32]);
+        let after_update = lyll.state_hash();
+        assert_ne!(after_update, after_register, "hash should change after update");
+
+        // Unregister must return to zero — not corrupt from stale XOR.
+        lyll.unregister_frame(PhysAddr(0x1000));
+        assert_eq!(
+            lyll.state_hash(),
+            ContentHash::ZERO,
+            "state_hash must return to ZERO after unregister"
+        );
     }
 
     #[test]

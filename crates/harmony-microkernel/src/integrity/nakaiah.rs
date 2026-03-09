@@ -76,6 +76,10 @@ impl Nakaiah {
     }
 
     pub fn register_frame(&mut self, paddr: PhysAddr, content_hash: [u8; 32]) {
+        // XOR out old entry if re-registering the same paddr.
+        if let Some(old) = self.integrity_registry.get(&paddr) {
+            Self::xor_registry_entry(&mut self.state_hash.0, paddr, old);
+        }
         Self::xor_registry_entry(&mut self.state_hash.0, paddr, &content_hash);
         self.integrity_registry.insert(paddr, content_hash);
     }
@@ -99,8 +103,11 @@ impl Nakaiah {
     }
 
     pub fn update_hash(&mut self, paddr: PhysAddr, new_hash: [u8; 32]) {
-        if let Some(stored) = self.integrity_registry.get_mut(&paddr) {
-            *stored = new_hash;
+        if let Some(old_hash) = self.integrity_registry.get(&paddr) {
+            // XOR out old contribution, replace, XOR in new.
+            Self::xor_registry_entry(&mut self.state_hash.0, paddr, old_hash);
+            self.integrity_registry.insert(paddr, new_hash);
+            Self::xor_registry_entry(&mut self.state_hash.0, paddr, &new_hash);
         }
     }
 
@@ -113,7 +120,11 @@ impl Nakaiah {
     }
 
     pub fn grant_access(&mut self, pid: u32, paddr: PhysAddr, chain: CapChain) {
-        Self::xor_cap_entry(&mut self.state_hash.0, pid, paddr);
+        // Only XOR in when there is no existing entry. Re-granting the same
+        // (pid, paddr) replaces the CapChain without double-folding the key.
+        if !self.capability_chains.contains_key(&(pid, paddr)) {
+            Self::xor_cap_entry(&mut self.state_hash.0, pid, paddr);
+        }
         self.capability_chains.insert((pid, paddr), chain);
     }
 
@@ -496,6 +507,52 @@ mod tests {
         assert_eq!(n.state_hash(), after_register);
 
         // Unregister frame — back to zero.
+        n.unregister_frame(PhysAddr(0x1000));
+        assert_eq!(n.state_hash(), ContentHash::ZERO);
+    }
+
+    #[test]
+    fn update_hash_preserves_state_hash_invariant() {
+        let mut n = test_nakaiah();
+        n.register_frame(PhysAddr(0x1000), [0xAA; 32]);
+        let after_register = n.state_hash();
+
+        // Update the content hash (simulates write barrier).
+        n.update_hash(PhysAddr(0x1000), [0xBB; 32]);
+        let after_update = n.state_hash();
+        assert_ne!(after_update, after_register, "hash should change after update");
+
+        // Unregister must return to zero — not corrupt from stale XOR.
+        n.unregister_frame(PhysAddr(0x1000));
+        assert_eq!(
+            n.state_hash(),
+            ContentHash::ZERO,
+            "state_hash must return to ZERO after unregister"
+        );
+    }
+
+    #[test]
+    fn double_grant_access_does_not_corrupt_state_hash() {
+        let mut n = test_nakaiah();
+        n.register_frame(PhysAddr(0x1000), [0xAA; 32]);
+        let after_register = n.state_hash();
+
+        // First grant.
+        n.grant_access(1, PhysAddr(0x1000), CapChain::Owner);
+        let after_grant = n.state_hash();
+        assert_ne!(after_grant, after_register);
+
+        // Re-grant same (pid, paddr) — hash must not change.
+        n.grant_access(1, PhysAddr(0x1000), CapChain::ReadOnly { granted_by: 0 });
+        assert_eq!(
+            n.state_hash(),
+            after_grant,
+            "re-grant must not double-fold XOR"
+        );
+
+        // Revoke and unregister — must return to zero cleanly.
+        n.revoke_access(1, PhysAddr(0x1000));
+        assert_eq!(n.state_hash(), after_register);
         n.unregister_frame(PhysAddr(0x1000));
         assert_eq!(n.state_hash(), ContentHash::ZERO);
     }
