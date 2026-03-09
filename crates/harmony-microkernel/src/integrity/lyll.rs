@@ -644,7 +644,10 @@ mod tests {
         // Update the snapshot hash (simulates write barrier).
         lyll.update_snapshot(PhysAddr(0x1000), [0xBB; 32]);
         let after_update = lyll.state_hash();
-        assert_ne!(after_update, after_register, "hash should change after update");
+        assert_ne!(
+            after_update, after_register,
+            "hash should change after update"
+        );
 
         // Unregister must return to zero — not corrupt from stale XOR.
         lyll.unregister_frame(PhysAddr(0x1000));

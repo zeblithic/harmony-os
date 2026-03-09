@@ -521,7 +521,10 @@ mod tests {
         // Update the content hash (simulates write barrier).
         n.update_hash(PhysAddr(0x1000), [0xBB; 32]);
         let after_update = n.state_hash();
-        assert_ne!(after_update, after_register, "hash should change after update");
+        assert_ne!(
+            after_update, after_register,
+            "hash should change after update"
+        );
 
         // Unregister must return to zero — not corrupt from stale XOR.
         n.unregister_frame(PhysAddr(0x1000));

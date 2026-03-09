@@ -54,6 +54,225 @@ fn vm_err_to_errno(e: VmError) -> i64 {
     }
 }
 
+// ── LinuxSyscall — CPU-agnostic syscall representation ──────────
+
+/// CPU-agnostic Linux syscall. Each architecture maps its native
+/// syscall numbers into this enum before the Linuxulator dispatches.
+#[derive(Debug)]
+pub enum LinuxSyscall {
+    Read {
+        fd: i32,
+        buf: u64,
+        count: u64,
+    },
+    Write {
+        fd: i32,
+        buf: u64,
+        count: u64,
+    },
+    Close {
+        fd: i32,
+    },
+    Fstat {
+        fd: i32,
+        buf: u64,
+    },
+    Mmap {
+        addr: u64,
+        len: u64,
+        prot: i32,
+        flags: i32,
+        fd: i32,
+        offset: u64,
+    },
+    Mprotect {
+        addr: u64,
+        len: u64,
+        prot: i32,
+    },
+    Munmap {
+        addr: u64,
+        len: u64,
+    },
+    Brk {
+        addr: u64,
+    },
+    RtSigaction,
+    RtSigprocmask,
+    Ioctl {
+        fd: i32,
+        request: u64,
+    },
+    Exit {
+        code: i32,
+    },
+    ArchPrctl {
+        code: i32,
+        addr: u64,
+    },
+    SetTidAddress,
+    ExitGroup {
+        code: i32,
+    },
+    Openat {
+        dirfd: i32,
+        pathname: u64,
+        flags: i32,
+    },
+    SetRobustList,
+    Prlimit64 {
+        pid: i32,
+        resource: i32,
+        new_limit: u64,
+        old_limit_buf: u64,
+    },
+    Rseq,
+    Unknown {
+        nr: u64,
+    },
+}
+
+impl LinuxSyscall {
+    /// Map x86_64 Linux syscall numbers to `LinuxSyscall`.
+    pub fn from_x86_64(nr: u64, args: [u64; 6]) -> Self {
+        match nr {
+            0 => LinuxSyscall::Read {
+                fd: args[0] as i32,
+                buf: args[1],
+                count: args[2],
+            },
+            1 => LinuxSyscall::Write {
+                fd: args[0] as i32,
+                buf: args[1],
+                count: args[2],
+            },
+            3 => LinuxSyscall::Close { fd: args[0] as i32 },
+            5 => LinuxSyscall::Fstat {
+                fd: args[0] as i32,
+                buf: args[1],
+            },
+            9 => LinuxSyscall::Mmap {
+                addr: args[0],
+                len: args[1],
+                prot: args[2] as i32,
+                flags: args[3] as i32,
+                fd: args[4] as i32,
+                offset: args[5],
+            },
+            10 => LinuxSyscall::Mprotect {
+                addr: args[0],
+                len: args[1],
+                prot: args[2] as i32,
+            },
+            11 => LinuxSyscall::Munmap {
+                addr: args[0],
+                len: args[1],
+            },
+            12 => LinuxSyscall::Brk { addr: args[0] },
+            13 => LinuxSyscall::RtSigaction,
+            14 => LinuxSyscall::RtSigprocmask,
+            16 => LinuxSyscall::Ioctl {
+                fd: args[0] as i32,
+                request: args[1],
+            },
+            60 => LinuxSyscall::Exit {
+                code: args[0] as i32,
+            },
+            158 => LinuxSyscall::ArchPrctl {
+                code: args[0] as i32,
+                addr: args[1],
+            },
+            218 => LinuxSyscall::SetTidAddress,
+            231 => LinuxSyscall::ExitGroup {
+                code: args[0] as i32,
+            },
+            257 => LinuxSyscall::Openat {
+                dirfd: args[0] as i32,
+                pathname: args[1],
+                flags: args[2] as i32,
+            },
+            273 => LinuxSyscall::SetRobustList,
+            302 => LinuxSyscall::Prlimit64 {
+                pid: args[0] as i32,
+                resource: args[1] as i32,
+                new_limit: args[2],
+                old_limit_buf: args[3],
+            },
+            334 => LinuxSyscall::Rseq,
+            _ => LinuxSyscall::Unknown { nr },
+        }
+    }
+
+    /// Map aarch64 Linux syscall numbers to `LinuxSyscall`.
+    ///
+    /// Reference: Linux kernel `include/uapi/asm-generic/unistd.h`
+    /// (aarch64 uses the generic syscall table).
+    pub fn from_aarch64(nr: u64, args: [u64; 6]) -> Self {
+        match nr {
+            29 => LinuxSyscall::Ioctl {
+                fd: args[0] as i32,
+                request: args[1],
+            },
+            56 => LinuxSyscall::Openat {
+                dirfd: args[0] as i32,
+                pathname: args[1],
+                flags: args[2] as i32,
+            },
+            57 => LinuxSyscall::Close { fd: args[0] as i32 },
+            63 => LinuxSyscall::Read {
+                fd: args[0] as i32,
+                buf: args[1],
+                count: args[2],
+            },
+            64 => LinuxSyscall::Write {
+                fd: args[0] as i32,
+                buf: args[1],
+                count: args[2],
+            },
+            80 => LinuxSyscall::Fstat {
+                fd: args[0] as i32,
+                buf: args[1],
+            },
+            93 => LinuxSyscall::Exit {
+                code: args[0] as i32,
+            },
+            94 => LinuxSyscall::ExitGroup {
+                code: args[0] as i32,
+            },
+            96 => LinuxSyscall::SetTidAddress,
+            99 => LinuxSyscall::SetRobustList,
+            134 => LinuxSyscall::RtSigaction,
+            135 => LinuxSyscall::RtSigprocmask,
+            214 => LinuxSyscall::Brk { addr: args[0] },
+            215 => LinuxSyscall::Munmap {
+                addr: args[0],
+                len: args[1],
+            },
+            222 => LinuxSyscall::Mmap {
+                addr: args[0],
+                len: args[1],
+                prot: args[2] as i32,
+                flags: args[3] as i32,
+                fd: args[4] as i32,
+                offset: args[5],
+            },
+            226 => LinuxSyscall::Mprotect {
+                addr: args[0],
+                len: args[1],
+                prot: args[2] as i32,
+            },
+            261 => LinuxSyscall::Prlimit64 {
+                pid: args[0] as i32,
+                resource: args[1] as i32,
+                new_limit: args[2],
+                old_limit_buf: args[3],
+            },
+            293 => LinuxSyscall::Rseq,
+            _ => LinuxSyscall::Unknown { nr },
+        }
+    }
+}
+
 // ── SyscallBackend trait ────────────────────────────────────────────
 
 /// Abstraction over 9P operations. The Linuxulator calls these to
@@ -385,9 +604,10 @@ fn flags_to_open_mode(flags: i32) -> OpenMode {
     }
 }
 
-/// Write a Linux x86_64 `struct stat` (144 bytes) to process memory.
+/// Write a Linux `struct stat` to process memory using the correct
+/// layout for the current architecture.
 ///
-/// Field layout follows the x86_64 Linux kernel struct stat:
+/// x86_64 layout (144 bytes):
 ///   offset  size  field
 ///   0       8     st_dev
 ///   8       8     st_ino
@@ -401,17 +621,23 @@ fn flags_to_open_mode(flags: i32) -> OpenMode {
 ///   56      8     st_blksize
 ///   64      8     st_blocks
 ///   72-144        timestamps (zeroed for MVP)
+///
+/// aarch64 layout (128 bytes, asm-generic):
+///   offset  size  field
+///   0       8     st_dev
+///   8       8     st_ino
+///   16      4     st_mode
+///   20      4     st_nlink
+///   24      4     st_uid
+///   28      4     st_gid
+///   32      8     st_rdev
+///   40      8     __pad1
+///   48      8     st_size
+///   56      4     st_blksize
+///   60      4     __pad2
+///   64      8     st_blocks
+///   72-128        timestamps (zeroed for MVP)
 fn write_linux_stat(buf_ptr: usize, stat: &FileStat, is_chardev: bool) {
-    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, 144) };
-    buf.fill(0);
-
-    // st_ino (offset 8, 8 bytes)
-    buf[8..16].copy_from_slice(&stat.qpath.to_le_bytes());
-
-    // st_nlink (offset 16, 8 bytes)
-    buf[16..24].copy_from_slice(&1u64.to_le_bytes());
-
-    // st_mode (offset 24, 4 bytes)
     let mode: u32 = if is_chardev {
         0o020000 | 0o666 // S_IFCHR | rw-rw-rw-
     } else {
@@ -420,17 +646,33 @@ fn write_linux_stat(buf_ptr: usize, stat: &FileStat, is_chardev: bool) {
             FileType::Directory => 0o040000 | 0o755, // S_IFDIR | rwxr-xr-x
         }
     };
-    buf[24..28].copy_from_slice(&mode.to_le_bytes());
 
-    // st_size (offset 48, 8 bytes)
-    buf[48..56].copy_from_slice(&stat.size.to_le_bytes());
+    #[cfg(target_arch = "x86_64")]
+    {
+        let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, 144) };
+        buf.fill(0);
+        buf[8..16].copy_from_slice(&stat.qpath.to_le_bytes()); // st_ino
+        buf[16..24].copy_from_slice(&1u64.to_le_bytes()); // st_nlink
+        buf[24..28].copy_from_slice(&mode.to_le_bytes()); // st_mode
+        buf[48..56].copy_from_slice(&stat.size.to_le_bytes()); // st_size
+        buf[56..64].copy_from_slice(&4096u64.to_le_bytes()); // st_blksize
+        let blocks = stat.size.div_ceil(512);
+        buf[64..72].copy_from_slice(&blocks.to_le_bytes()); // st_blocks
+    }
 
-    // st_blksize (offset 56, 8 bytes)
-    buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
-
-    // st_blocks (offset 64, 8 bytes)
-    let blocks = stat.size.div_ceil(512);
-    buf[64..72].copy_from_slice(&blocks.to_le_bytes());
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // aarch64 and other targets use the asm-generic stat layout (128 bytes)
+        let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, 128) };
+        buf.fill(0);
+        buf[8..16].copy_from_slice(&stat.qpath.to_le_bytes()); // st_ino
+        buf[16..20].copy_from_slice(&mode.to_le_bytes()); // st_mode (u32)
+        buf[20..24].copy_from_slice(&1u32.to_le_bytes()); // st_nlink (u32)
+        buf[48..56].copy_from_slice(&stat.size.to_le_bytes()); // st_size
+        buf[56..60].copy_from_slice(&4096u32.to_le_bytes()); // st_blksize (u32)
+        let blocks = stat.size.div_ceil(512);
+        buf[64..72].copy_from_slice(&blocks.to_le_bytes()); // st_blocks
+    }
 }
 
 // ── Linux PROT_* constants ───────────────────────────────────────────
@@ -612,44 +854,70 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.arena.base
     }
 
-    /// Dispatch a Linux syscall. Returns the syscall result (negative = errno).
+    /// Handle a syscall identified by x86_64 syscall number.
     ///
-    /// # Arguments
-    /// - `nr`: Linux syscall number (x86_64 ABI)
-    /// - `args`: syscall arguments [arg1, arg2, arg3, arg4, arg5, arg6]
+    /// This is the original entry point. It maps the raw number to a
+    /// `LinuxSyscall` and delegates to `dispatch_syscall`.
+    pub fn handle_syscall(&mut self, nr: u64, args: [u64; 6]) -> i64 {
+        let syscall = LinuxSyscall::from_x86_64(nr, args);
+        self.dispatch_syscall(syscall)
+    }
+
+    /// Dispatch a CPU-agnostic `LinuxSyscall` to the appropriate handler.
+    ///
+    /// This is the architecture-independent entry point. Both `handle_syscall`
+    /// (x86_64) and the aarch64 SVC handler call this method.
     ///
     /// # Safety
-    /// For `sys_write`, `args[1]` is treated as a pointer to user memory.
-    /// In the MVP flat address space, this is a direct pointer dereference.
-    pub fn handle_syscall(&mut self, nr: u64, args: [u64; 6]) -> i64 {
-        match nr {
-            0 => self.sys_read(args[0] as i32, args[1] as usize, args[2] as usize),
-            1 => self.sys_write(args[0] as i32, args[1] as usize, args[2] as usize),
-            3 => self.sys_close(args[0] as i32),
-            5 => self.sys_fstat(args[0] as i32, args[1] as usize),
-            9 => self.sys_mmap(
-                args[0],
-                args[1],
-                args[2] as i32,
-                args[3] as i32,
-                args[4] as i32,
-                args[5],
-            ),
-            10 => self.sys_mprotect(args[0], args[1], args[2] as i32),
-            11 => self.sys_munmap(args[0], args[1]),
-            12 => self.sys_brk(args[0]),
-            13 => self.sys_rt_sigaction(),
-            14 => self.sys_rt_sigprocmask(),
-            16 => self.sys_ioctl(args[0] as i32, args[1]),
-            60 => self.sys_exit(args[0] as i32),
-            158 => self.sys_arch_prctl(args[0] as i32, args[1]),
-            218 => self.sys_set_tid_address(),
-            231 => self.sys_exit_group(args[0] as i32),
-            257 => self.sys_openat(args[0] as i32, args[1] as usize, args[2] as i32),
-            273 => self.sys_set_robust_list(),
-            302 => self.sys_prlimit64(args[0] as i32, args[1] as i32, args[2], args[3] as usize),
-            334 => ENOSYS, // rseq — musl handles gracefully
-            _ => ENOSYS,
+    /// For syscalls that take pointer arguments (Write, Read, Openat, Fstat,
+    /// Prlimit64), the pointer values in the enum are treated as raw pointers
+    /// to process memory. In the MVP flat address space, this is a direct
+    /// dereference.
+    pub fn dispatch_syscall(&mut self, syscall: LinuxSyscall) -> i64 {
+        match syscall {
+            LinuxSyscall::Read { fd, buf, count } => {
+                self.sys_read(fd, buf as usize, count as usize)
+            }
+            LinuxSyscall::Write { fd, buf, count } => {
+                self.sys_write(fd, buf as usize, count as usize)
+            }
+            LinuxSyscall::Close { fd } => self.sys_close(fd),
+            LinuxSyscall::Fstat { fd, buf } => self.sys_fstat(fd, buf as usize),
+            LinuxSyscall::Mmap {
+                addr,
+                len,
+                prot,
+                flags,
+                fd,
+                offset,
+            } => self.sys_mmap(addr, len, prot, flags, fd, offset),
+            LinuxSyscall::Mprotect { addr, len, prot } => self.sys_mprotect(addr, len, prot),
+            LinuxSyscall::Munmap { addr, len } => self.sys_munmap(addr, len),
+            LinuxSyscall::Brk { addr } => self.sys_brk(addr),
+            LinuxSyscall::RtSigaction => self.sys_rt_sigaction(),
+            LinuxSyscall::RtSigprocmask => self.sys_rt_sigprocmask(),
+            LinuxSyscall::Ioctl { fd, request } => self.sys_ioctl(fd, request),
+            LinuxSyscall::Exit { code } => self.sys_exit(code),
+            #[cfg(target_arch = "x86_64")]
+            LinuxSyscall::ArchPrctl { code, addr } => self.sys_arch_prctl(code, addr),
+            #[cfg(not(target_arch = "x86_64"))]
+            LinuxSyscall::ArchPrctl { .. } => ENOSYS,
+            LinuxSyscall::SetTidAddress => self.sys_set_tid_address(),
+            LinuxSyscall::ExitGroup { code } => self.sys_exit_group(code),
+            LinuxSyscall::Openat {
+                dirfd,
+                pathname,
+                flags,
+            } => self.sys_openat(dirfd, pathname as usize, flags),
+            LinuxSyscall::SetRobustList => self.sys_set_robust_list(),
+            LinuxSyscall::Prlimit64 {
+                pid,
+                resource,
+                new_limit,
+                old_limit_buf,
+            } => self.sys_prlimit64(pid, resource, new_limit, old_limit_buf as usize),
+            LinuxSyscall::Rseq => ENOSYS,
+            LinuxSyscall::Unknown { .. } => ENOSYS,
         }
     }
 
@@ -1421,12 +1689,25 @@ mod tests {
         let mut lx = Linuxulator::new(mock);
         lx.init_stdio().unwrap();
 
-        let mut statbuf = [0u8; 144];
+        // x86_64: 144 bytes, st_mode at offset 24
+        // aarch64 (asm-generic): 128 bytes, st_mode at offset 16
+        #[cfg(target_arch = "x86_64")]
+        const STAT_SIZE: usize = 144;
+        #[cfg(not(target_arch = "x86_64"))]
+        const STAT_SIZE: usize = 128;
+        #[cfg(target_arch = "x86_64")]
+        const ST_MODE_OFFSET: usize = 24;
+        #[cfg(not(target_arch = "x86_64"))]
+        const ST_MODE_OFFSET: usize = 16;
+
+        let mut statbuf = [0u8; STAT_SIZE];
         let result = lx.handle_syscall(5, [1, statbuf.as_mut_ptr() as u64, 0, 0, 0, 0]);
         assert_eq!(result, 0);
 
-        // st_mode at offset 24 should be S_IFCHR | 0o666 for stdio
-        let st_mode = u32::from_le_bytes([statbuf[24], statbuf[25], statbuf[26], statbuf[27]]);
+        // st_mode should be S_IFCHR | 0o666 for stdio
+        let o = ST_MODE_OFFSET;
+        let st_mode =
+            u32::from_le_bytes([statbuf[o], statbuf[o + 1], statbuf[o + 2], statbuf[o + 3]]);
         let s_ifchr: u32 = 0o020000;
         assert_eq!(st_mode & 0o170000, s_ifchr);
     }
@@ -1435,7 +1716,10 @@ mod tests {
     fn sys_fstat_bad_fd() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
+        #[cfg(target_arch = "x86_64")]
         let mut statbuf = [0u8; 144];
+        #[cfg(not(target_arch = "x86_64"))]
+        let mut statbuf = [0u8; 128];
         let result = lx.handle_syscall(5, [99, statbuf.as_mut_ptr() as u64, 0, 0, 0, 0]);
         assert_eq!(result, EBADF);
     }
@@ -1532,6 +1816,7 @@ mod tests {
     // ── sys_arch_prctl tests ────────────────────────────────────────
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn sys_arch_prctl_set_fs_returns_zero() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
@@ -1541,6 +1826,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn sys_arch_prctl_unknown_code_returns_einval() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
@@ -1674,6 +1960,137 @@ mod tests {
 
         let flags = prot_to_page_flags(0x7); // PROT_READ | PROT_WRITE | PROT_EXEC
         assert!(flags.contains(PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::EXECUTABLE));
+    }
+
+    #[test]
+    fn from_x86_64_write() {
+        let syscall = LinuxSyscall::from_x86_64(1, [1, 0x1000, 5, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Write { fd, buf, count } => {
+                assert_eq!(fd, 1);
+                assert_eq!(buf, 0x1000);
+                assert_eq!(count, 5);
+            }
+            other => panic!("expected Write, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_x86_64_read() {
+        let syscall = LinuxSyscall::from_x86_64(0, [3, 0x2000, 128, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Read { fd, buf, count } => {
+                assert_eq!(fd, 3);
+                assert_eq!(buf, 0x2000);
+                assert_eq!(count, 128);
+            }
+            other => panic!("expected Read, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_x86_64_exit_group() {
+        let syscall = LinuxSyscall::from_x86_64(231, [42, 0, 0, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::ExitGroup { code } => assert_eq!(code, 42),
+            other => panic!("expected ExitGroup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_x86_64_unknown() {
+        let syscall = LinuxSyscall::from_x86_64(9999, [0; 6]);
+        match syscall {
+            LinuxSyscall::Unknown { nr } => assert_eq!(nr, 9999),
+            other => panic!("expected Unknown, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_aarch64_write() {
+        let syscall = LinuxSyscall::from_aarch64(64, [1, 0x1000, 5, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Write { fd, buf, count } => {
+                assert_eq!(fd, 1);
+                assert_eq!(buf, 0x1000);
+                assert_eq!(count, 5);
+            }
+            other => panic!("expected Write, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_aarch64_read() {
+        let syscall = LinuxSyscall::from_aarch64(63, [3, 0x2000, 128, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Read { fd, buf, count } => {
+                assert_eq!(fd, 3);
+                assert_eq!(buf, 0x2000);
+                assert_eq!(count, 128);
+            }
+            other => panic!("expected Read, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_aarch64_exit_group() {
+        let syscall = LinuxSyscall::from_aarch64(94, [42, 0, 0, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::ExitGroup { code } => assert_eq!(code, 42),
+            other => panic!("expected ExitGroup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_aarch64_mmap() {
+        let syscall = LinuxSyscall::from_aarch64(222, [0x1000, 4096, 3, 0x22, (-1i64) as u64, 0]);
+        match syscall {
+            LinuxSyscall::Mmap {
+                addr,
+                len,
+                prot,
+                flags,
+                fd,
+                offset,
+            } => {
+                assert_eq!(addr, 0x1000);
+                assert_eq!(len, 4096);
+                assert_eq!(prot, 3);
+                assert_eq!(flags, 0x22);
+                assert_eq!(fd, -1);
+                assert_eq!(offset, 0);
+            }
+            other => panic!("expected Mmap, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_aarch64_unknown() {
+        let syscall = LinuxSyscall::from_aarch64(9999, [0; 6]);
+        match syscall {
+            LinuxSyscall::Unknown { nr } => assert_eq!(nr, 9999),
+            other => panic!("expected Unknown, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_aarch64_arch_prctl_maps_to_unknown() {
+        // arch_prctl is x86_64-specific; aarch64 has no equivalent
+        let syscall = LinuxSyscall::from_aarch64(158, [0; 6]);
+        assert!(matches!(syscall, LinuxSyscall::Unknown { nr: 158 }));
+    }
+
+    #[test]
+    fn dispatch_write_via_enum() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        let msg = b"test";
+        let result = lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: 1,
+            buf: msg.as_ptr() as u64,
+            count: msg.len() as u64,
+        });
+        assert_eq!(result, msg.len() as i64);
     }
 }
 
@@ -2067,8 +2484,15 @@ mod integration_tests {
         elf[4] = 2; // ELFCLASS64
         elf[5] = 1; // ELFDATA2LSB
         elf[6] = 1; // EV_CURRENT
-        elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
-        elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes()); // EM_X86_64
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+
+        // e_machine — native machine type
+        #[cfg(target_arch = "x86_64")]
+        elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
+        #[cfg(target_arch = "aarch64")]
+        elf[18..20].copy_from_slice(&0xB7u16.to_le_bytes());
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
         elf[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
         elf[24..32].copy_from_slice(&0x401000u64.to_le_bytes()); // e_entry
         elf[32..40].copy_from_slice(&(phdr_start as u64).to_le_bytes()); // e_phoff
