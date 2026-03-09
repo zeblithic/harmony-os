@@ -21,7 +21,11 @@ impl BumpAllocator {
         let end = (base + size) & !(PAGE_SIZE - 1);
         Self {
             next: aligned_base,
-            end: if end > aligned_base { end } else { aligned_base },
+            end: if end > aligned_base {
+                end
+            } else {
+                aligned_base
+            },
         }
     }
 
