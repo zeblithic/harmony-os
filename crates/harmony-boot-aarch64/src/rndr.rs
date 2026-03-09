@@ -24,17 +24,23 @@ pub unsafe fn is_available() -> bool {
 
 /// Read a single 64-bit random value from the RNDR register.
 ///
-/// Retries on failure (NZCV.Z set means retry needed).
+/// Retries on failure (NZCV.Z set means retry needed), up to
+/// [`MAX_RETRIES`] attempts. Panics if all retries are exhausted.
 ///
 /// # Safety
-/// RNDR must be available (check with `is_available()` first).
+/// RNDR must be supported by the CPU (verify with [`is_available`] first).
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn read_u64() -> u64 {
-    loop {
+    const MAX_RETRIES: u32 = 1024;
+
+    for _ in 0..MAX_RETRIES {
         let val: u64;
         let success: u64;
+        // RNDR register — numeric encoding (s3_3_c2_c4_0) used because
+        // aarch64-unknown-uefi may not enable the `rand` target feature
+        // needed for the named `rndr` form.
         core::arch::asm!(
-            "mrs {val}, s3_3_c2_c4_0",  // RNDR
+            "mrs {val}, s3_3_c2_c4_0",
             "cset {success}, ne",         // NE = success
             val = out(reg) val,
             success = out(reg) success,
@@ -45,12 +51,13 @@ pub unsafe fn read_u64() -> u64 {
         // Yield before retry
         core::arch::asm!("yield");
     }
+    panic!("RNDR failed after {} retries", MAX_RETRIES);
 }
 
 /// Fill a byte buffer with hardware random data from RNDR.
 ///
 /// # Safety
-/// RNDR must be available.
+/// RNDR must be supported by the CPU (verify with [`is_available`] first).
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn fill(buf: &mut [u8]) {
     fill_from_u64(buf, || read_u64());
