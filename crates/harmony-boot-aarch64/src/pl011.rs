@@ -89,7 +89,9 @@ pub unsafe fn init() {
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn write_byte(byte: u8) {
     // Spin while TX FIFO is full
-    while read_reg(UARTFR) & UARTFR_TXFF != 0 {}
+    while read_reg(UARTFR) & UARTFR_TXFF != 0 {
+        core::hint::spin_loop();
+    }
     write_reg(UARTDR, byte as u32);
 }
 
