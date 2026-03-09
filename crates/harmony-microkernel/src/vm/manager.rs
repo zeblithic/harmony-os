@@ -49,19 +49,40 @@ pub struct ProcessSpace<P: PageTable> {
 ///
 /// Coordinates the buddy allocator, capability tracker, and per-process
 /// page tables. All VM policy is enforced here.
+///
+/// Physical memory is partitioned into two pools:
+/// - **public** (default) — used for normal, unclassified data frames and
+///   intermediate page table frames.
+/// - **kernel** — reserved for `ENCRYPTED` data frames.
 pub struct AddressSpaceManager<P: PageTable> {
     spaces: BTreeMap<u32, ProcessSpace<P>>,
-    buddy: BuddyAllocator,
+    buddy_public: BuddyAllocator,
+    buddy_kernel: BuddyAllocator,
     cap_tracker: CapTracker,
 }
 
 impl<P: PageTable> AddressSpaceManager<P> {
-    /// Create a new manager with the given buddy allocator, empty process
-    /// table, and a fresh capability tracker.
+    /// Create a new manager with a single buddy allocator (backward compat).
+    ///
+    /// All frames go into the public pool; the kernel pool is empty.
     pub fn new(buddy: BuddyAllocator) -> Self {
         Self {
             spaces: BTreeMap::new(),
-            buddy,
+            buddy_public: buddy,
+            buddy_kernel: BuddyAllocator::empty(),
+            cap_tracker: CapTracker::new(),
+        }
+    }
+
+    /// Create a new manager with separate public and kernel buddy allocators.
+    ///
+    /// Public frames serve unclassified allocations and intermediate page
+    /// table frames. Kernel frames serve `ENCRYPTED` allocations.
+    pub fn new_dual(buddy_public: BuddyAllocator, buddy_kernel: BuddyAllocator) -> Self {
+        Self {
+            spaces: BTreeMap::new(),
+            buddy_public,
+            buddy_kernel,
             cap_tracker: CapTracker::new(),
         }
     }
@@ -133,33 +154,51 @@ impl<P: PageTable> AddressSpaceManager<P> {
             }
         }
 
-        // Allocate frames from buddy (roll back on OOM).
+        // Allocate data frames from the correct buddy (BEFORE the split borrow).
+        // Route to the kernel buddy only when it actually has capacity (i.e.,
+        // was configured via `new_dual()`). When using the backward-compat
+        // `new()` constructor the kernel buddy is empty, so all allocations
+        // go through the public buddy regardless of classification.
+        let use_kernel_buddy = classification.contains(FrameClassification::ENCRYPTED)
+            && self.buddy_kernel.total_frame_count() > 0;
         let mut frames = Vec::with_capacity(page_count);
-        for _ in 0..page_count {
-            match self.buddy.alloc_frame() {
-                Some(paddr) => frames.push(paddr),
-                None => {
-                    // Roll back: free all frames allocated so far.
-                    for frame in &frames {
-                        let _ = self.buddy.free_frame(*frame);
+        {
+            let data_buddy = if use_kernel_buddy {
+                &mut self.buddy_kernel
+            } else {
+                &mut self.buddy_public
+            };
+            for _ in 0..page_count {
+                match data_buddy.alloc_frame() {
+                    Some(paddr) => frames.push(paddr),
+                    None => {
+                        // Roll back: free all frames allocated so far.
+                        for frame in &frames {
+                            let _ = data_buddy.free_frame(*frame);
+                        }
+                        return Err(VmError::OutOfMemory);
                     }
-                    return Err(VmError::OutOfMemory);
                 }
             }
         }
 
-        // Map each page via page_table. Split borrow: `spaces` and `buddy`
-        // are disjoint fields, so we can mutably borrow both simultaneously.
-        // The buddy allocator provides frames for intermediate page table
-        // levels (PDP/PD/PT on x86_64, L1/L2/L3 on aarch64).
+        // Map each page via page_table. Split borrow: `spaces` and
+        // `buddy_public` are disjoint fields. Intermediate page table frames
+        // (PDP/PD/PT on x86_64, L1/L2/L3 on aarch64) always come from the
+        // public buddy — they're structural, not data.
+        let mut map_error: Option<VmError> = None;
         {
-            let Self { spaces, buddy, .. } = self;
+            let Self {
+                spaces,
+                buddy_public,
+                ..
+            } = self;
             let space = spaces.get_mut(&pid).unwrap();
             let mut intermediate_frames: Vec<PhysAddr> = Vec::new();
             for (i, &paddr) in frames.iter().enumerate() {
                 let page_vaddr = VirtAddr(vaddr.as_u64() + (i as u64) * PAGE_SIZE);
                 let result = space.page_table.map(page_vaddr, paddr, flags, &mut || {
-                    let frame = buddy.alloc_frame()?;
+                    let frame = buddy_public.alloc_frame()?;
                     intermediate_frames.push(frame);
                     Some(frame)
                 });
@@ -169,17 +208,27 @@ impl<P: PageTable> AddressSpaceManager<P> {
                         let rollback_vaddr = VirtAddr(vaddr.as_u64() + (j as u64) * PAGE_SIZE);
                         let _ = space.page_table.unmap(rollback_vaddr);
                     }
-                    // Free all allocated data frames.
-                    for frame in &frames {
-                        let _ = buddy.free_frame(*frame);
-                    }
-                    // Free intermediate page table frames allocated so far.
+                    // Free intermediate page table frames.
                     for frame in &intermediate_frames {
-                        let _ = buddy.free_frame(*frame);
+                        let _ = buddy_public.free_frame(*frame);
                     }
-                    return Err(e);
+                    map_error = Some(e);
+                    break;
                 }
             }
+        }
+
+        // If page table mapping failed, free data frames (split borrow released).
+        if let Some(e) = map_error {
+            let data_buddy = if use_kernel_buddy {
+                &mut self.buddy_kernel
+            } else {
+                &mut self.buddy_public
+            };
+            for frame in &frames {
+                let _ = data_buddy.free_frame(*frame);
+            }
+            return Err(e);
         }
 
         // Record each mapping in cap_tracker.
@@ -224,13 +273,22 @@ impl<P: PageTable> AddressSpaceManager<P> {
             let _ = space.page_table.unmap(page_vaddr);
         }
 
-        // Remove from cap_tracker and free frames.
+        // Remove from cap_tracker and free frames to the correct buddy.
+        let use_kernel = region
+            .classification
+            .contains(FrameClassification::ENCRYPTED)
+            && self.buddy_kernel.total_frame_count() > 0;
+        let buddy = if use_kernel {
+            &mut self.buddy_kernel
+        } else {
+            &mut self.buddy_public
+        };
         for &paddr in &region.frames {
             let _classification = self.cap_tracker.remove_mapping(paddr, pid);
             // NOTE: If classification contains ENCRYPTED, the frame contents
             // should be zeroized before freeing. Hardware page table impls
             // will handle this; the mock does not model frame contents.
-            let _ = self.buddy.free_frame(paddr);
+            let _ = buddy.free_frame(paddr);
         }
 
         Ok(())
@@ -285,9 +343,18 @@ impl<P: PageTable> AddressSpaceManager<P> {
                 let _ = space.page_table.unmap(page_vaddr);
             }
 
+            let use_kernel = region
+                .classification
+                .contains(FrameClassification::ENCRYPTED)
+                && self.buddy_kernel.total_frame_count() > 0;
+            let buddy = if use_kernel {
+                &mut self.buddy_kernel
+            } else {
+                &mut self.buddy_public
+            };
             for &paddr in &region.frames {
                 let _ = self.cap_tracker.remove_mapping(paddr, pid);
-                let _ = self.buddy.free_frame(paddr);
+                let _ = buddy.free_frame(paddr);
             }
         }
 
@@ -343,9 +410,19 @@ impl<P: PageTable> AddressSpaceManager<P> {
         Ok(())
     }
 
-    /// Mutable access to the buddy allocator.
+    /// Mutable access to the public buddy allocator (backward compat).
     pub fn buddy(&mut self) -> &mut BuddyAllocator {
-        &mut self.buddy
+        &mut self.buddy_public
+    }
+
+    /// Read-only access to the public buddy allocator.
+    pub fn buddy_public(&self) -> &BuddyAllocator {
+        &self.buddy_public
+    }
+
+    /// Read-only access to the kernel buddy allocator.
+    pub fn buddy_kernel(&self) -> &BuddyAllocator {
+        &self.buddy_kernel
     }
 
     /// Read-only access to the capability tracker.
@@ -710,5 +787,152 @@ mod tests {
         );
 
         assert_eq!(mgr.switch_to(99).unwrap_err(), VmError::NoSuchProcess(99));
+    }
+
+    // ── Dual buddy tests ─────────────────────────────────────────────
+
+    #[test]
+    fn dual_partition_allocation() {
+        let buddy_public = BuddyAllocator::new(PhysAddr(0x10_0000), 12).unwrap();
+        let buddy_kernel = BuddyAllocator::new(PhysAddr(0x20_0000), 4).unwrap();
+        let mut mgr = AddressSpaceManager::new_dual(buddy_public, buddy_kernel);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+
+        // Public allocation: 2 pages from public buddy.
+        mgr.map_region(
+            1,
+            VirtAddr(0x1000),
+            PAGE_SIZE as usize * 2,
+            rw_user_flags(),
+            FrameClassification::empty(),
+        )
+        .unwrap();
+        assert_eq!(mgr.buddy_public().free_frame_count(), 10);
+        assert_eq!(mgr.buddy_kernel().free_frame_count(), 4);
+
+        // Encrypted allocation: 1 page from kernel buddy.
+        mgr.map_region(
+            1,
+            VirtAddr(0x5000),
+            PAGE_SIZE as usize,
+            rw_user_flags(),
+            FrameClassification::ENCRYPTED,
+        )
+        .unwrap();
+        assert_eq!(mgr.buddy_public().free_frame_count(), 10);
+        assert_eq!(mgr.buddy_kernel().free_frame_count(), 3);
+    }
+
+    #[test]
+    fn kernel_oom_does_not_affect_public() {
+        let buddy_public = BuddyAllocator::new(PhysAddr(0x10_0000), 8).unwrap();
+        let buddy_kernel = BuddyAllocator::new(PhysAddr(0x20_0000), 1).unwrap();
+        let mut mgr = AddressSpaceManager::new_dual(buddy_public, buddy_kernel);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+
+        // Use up the single kernel frame.
+        mgr.map_region(
+            1,
+            VirtAddr(0x1000),
+            PAGE_SIZE as usize,
+            rw_user_flags(),
+            FrameClassification::ENCRYPTED,
+        )
+        .unwrap();
+
+        // Second encrypted allocation should fail — kernel buddy is empty.
+        let err = mgr
+            .map_region(
+                1,
+                VirtAddr(0x5000),
+                PAGE_SIZE as usize,
+                rw_user_flags(),
+                FrameClassification::ENCRYPTED,
+            )
+            .unwrap_err();
+        assert_eq!(err, VmError::OutOfMemory);
+
+        // Public allocation should still succeed.
+        mgr.map_region(
+            1,
+            VirtAddr(0xA000),
+            PAGE_SIZE as usize,
+            rw_user_flags(),
+            FrameClassification::empty(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dual_unmap_returns_to_correct_buddy() {
+        let buddy_public = BuddyAllocator::new(PhysAddr(0x10_0000), 8).unwrap();
+        let buddy_kernel = BuddyAllocator::new(PhysAddr(0x20_0000), 4).unwrap();
+        let mut mgr = AddressSpaceManager::new_dual(buddy_public, buddy_kernel);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+
+        // Map public region.
+        mgr.map_region(
+            1,
+            VirtAddr(0x1000),
+            PAGE_SIZE as usize * 2,
+            rw_user_flags(),
+            FrameClassification::empty(),
+        )
+        .unwrap();
+
+        // Map encrypted region.
+        mgr.map_region(
+            1,
+            VirtAddr(0x5000),
+            PAGE_SIZE as usize,
+            rw_user_flags(),
+            FrameClassification::ENCRYPTED,
+        )
+        .unwrap();
+
+        assert_eq!(mgr.buddy_public().free_frame_count(), 6);
+        assert_eq!(mgr.buddy_kernel().free_frame_count(), 3);
+
+        // Unmap encrypted region — should return frame to kernel buddy.
+        mgr.unmap_region(1, VirtAddr(0x5000)).unwrap();
+        assert_eq!(mgr.buddy_public().free_frame_count(), 6);
+        assert_eq!(mgr.buddy_kernel().free_frame_count(), 4);
+
+        // Unmap public region — should return frames to public buddy.
+        mgr.unmap_region(1, VirtAddr(0x1000)).unwrap();
+        assert_eq!(mgr.buddy_public().free_frame_count(), 8);
+        assert_eq!(mgr.buddy_kernel().free_frame_count(), 4);
+    }
+
+    #[test]
+    fn dual_destroy_returns_to_correct_buddies() {
+        let buddy_public = BuddyAllocator::new(PhysAddr(0x10_0000), 8).unwrap();
+        let buddy_kernel = BuddyAllocator::new(PhysAddr(0x20_0000), 4).unwrap();
+        let mut mgr = AddressSpaceManager::new_dual(buddy_public, buddy_kernel);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+
+        mgr.map_region(
+            1,
+            VirtAddr(0x1000),
+            PAGE_SIZE as usize * 2,
+            rw_user_flags(),
+            FrameClassification::empty(),
+        )
+        .unwrap();
+        mgr.map_region(
+            1,
+            VirtAddr(0x5000),
+            PAGE_SIZE as usize * 2,
+            rw_user_flags(),
+            FrameClassification::ENCRYPTED,
+        )
+        .unwrap();
+
+        assert_eq!(mgr.buddy_public().free_frame_count(), 6);
+        assert_eq!(mgr.buddy_kernel().free_frame_count(), 2);
+
+        mgr.destroy_space(1).unwrap();
+        assert_eq!(mgr.buddy_public().free_frame_count(), 8);
+        assert_eq!(mgr.buddy_kernel().free_frame_count(), 4);
     }
 }

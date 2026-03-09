@@ -111,6 +111,69 @@ bitflags! {
     }
 }
 
+// ── Integrity shared types ──────────────────────────────────────────
+
+/// Which memory zone a frame belongs to, derived from FrameClassification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(usize)]
+pub enum MemoryZone {
+    PublicDurable = 0,
+    PublicEphemeral = 1,
+    KernelDurable = 2,
+    KernelEphemeral = 3,
+}
+
+impl From<FrameClassification> for MemoryZone {
+    fn from(class: FrameClassification) -> Self {
+        match (
+            class.contains(FrameClassification::ENCRYPTED),
+            class.contains(FrameClassification::EPHEMERAL),
+        ) {
+            (false, false) => MemoryZone::PublicDurable,
+            (false, true) => MemoryZone::PublicEphemeral,
+            (true, false) => MemoryZone::KernelDurable,
+            (true, true) => MemoryZone::KernelEphemeral,
+        }
+    }
+}
+
+/// A 32-byte content hash (BLAKE3) used for frame integrity verification.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ContentHash(pub [u8; 32]);
+
+impl ContentHash {
+    pub const ZERO: Self = Self([0u8; 32]);
+}
+
+impl Default for ContentHash {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
+impl fmt::Debug for ContentHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ContentHash({:02x}{:02x}..)", self.0[0], self.0[1])
+    }
+}
+
+/// What kind of access is being performed on a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AccessOp {
+    Read = 0,
+    Write = 1,
+    Execute = 2,
+}
+
+/// Reason for an integrity violation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViolationReason {
+    ContentTampered,
+    UnauthorizedAccess,
+    GuardianStateCorrupted,
+}
+
 // ── Error enum ───────────────────────────────────────────────────────
 
 /// Errors returned by VM operations.
@@ -228,5 +291,45 @@ mod tests {
             "expected PhysAddr in debug output"
         );
         assert_ne!(v_dbg, p_dbg);
+    }
+
+    #[test]
+    fn memory_zone_from_classification() {
+        assert_eq!(
+            MemoryZone::from(FrameClassification::empty()),
+            MemoryZone::PublicDurable,
+        );
+        assert_eq!(
+            MemoryZone::from(FrameClassification::EPHEMERAL),
+            MemoryZone::PublicEphemeral,
+        );
+        assert_eq!(
+            MemoryZone::from(FrameClassification::ENCRYPTED),
+            MemoryZone::KernelDurable,
+        );
+        assert_eq!(
+            MemoryZone::from(FrameClassification::ENCRYPTED | FrameClassification::EPHEMERAL),
+            MemoryZone::KernelEphemeral,
+        );
+    }
+
+    #[test]
+    fn content_hash_default_is_zeroed() {
+        let h = ContentHash::default();
+        assert_eq!(h.0, [0u8; 32]);
+    }
+
+    #[test]
+    fn access_op_variants_exist() {
+        let _r = AccessOp::Read;
+        let _w = AccessOp::Write;
+        let _x = AccessOp::Execute;
+    }
+
+    #[test]
+    fn violation_reason_variants_exist() {
+        let _ct = ViolationReason::ContentTampered;
+        let _ua = ViolationReason::UnauthorizedAccess;
+        let _gs = ViolationReason::GuardianStateCorrupted;
     }
 }

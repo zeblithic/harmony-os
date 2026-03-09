@@ -9,7 +9,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use super::{FrameClassification, PhysAddr, VmError, PAGE_SHIFT, PAGE_SIZE};
+use super::{FrameClassification, MemoryZone, PhysAddr, VmError, PAGE_SHIFT, PAGE_SIZE};
 
 // ── Per-frame metadata ──────────────────────────────────────────────
 
@@ -22,8 +22,12 @@ pub struct FrameMeta {
     pub owner_pid: u32,
     /// Security classification bits (ENCRYPTED, EPHEMERAL, etc.).
     pub classification: FrameClassification,
-    /// PIDs that currently have this frame mapped.
-    pub mapped_by: Vec<u32>,
+    /// PIDs that currently have this frame mapped, paired with the
+    /// [`MemoryZone`] each PID used at mapping time.  Storing the zone
+    /// per-PID ensures that budget decrements on unmap target the same
+    /// zone that was incremented, even when multiple PIDs share a frame
+    /// with different classifications.
+    pub mapped_by: Vec<(u32, MemoryZone)>,
 }
 
 // ── Per-process budget ──────────────────────────────────────────────
@@ -39,6 +43,8 @@ pub struct MemoryBudget {
     pub used: usize,
     /// Which frame classifications this process is allowed to map.
     pub allowed_classes: FrameClassification,
+    /// Per-zone usage tracking, indexed by MemoryZone as usize.
+    zone_usage: [usize; 4],
 }
 
 impl MemoryBudget {
@@ -48,6 +54,7 @@ impl MemoryBudget {
             limit,
             used: 0,
             allowed_classes,
+            zone_usage: [0; 4],
         }
     }
 
@@ -56,6 +63,21 @@ impl MemoryBudget {
         self.used
             .checked_add(additional)
             .is_some_and(|total| total <= self.limit)
+    }
+
+    /// Returns the number of bytes this process has mapped in the given zone.
+    pub fn zone_used(&self, zone: MemoryZone) -> usize {
+        self.zone_usage[zone as usize]
+    }
+
+    /// Add `bytes` to the usage counter for `zone`.
+    pub(crate) fn add_zone_usage(&mut self, zone: MemoryZone, bytes: usize) {
+        self.zone_usage[zone as usize] += bytes;
+    }
+
+    /// Subtract `bytes` from the usage counter for `zone` (saturating).
+    pub(crate) fn sub_zone_usage(&mut self, zone: MemoryZone, bytes: usize) {
+        self.zone_usage[zone as usize] = self.zone_usage[zone as usize].saturating_sub(bytes);
     }
 }
 
@@ -132,9 +154,15 @@ impl CapTracker {
         pid: u32,
         classification: FrameClassification,
     ) {
+        // Compute zone from the caller-provided classification (not the
+        // accumulated frame classification) so each PID's budget tracks the
+        // zone it actually requested.
+        let zone = MemoryZone::from(classification);
+
         // Update budget usage.
         if let Some(budget) = self.budgets.get_mut(&pid) {
             budget.used += PAGE_SIZE as usize;
+            budget.add_zone_usage(zone, PAGE_SIZE as usize);
         }
 
         // Only track frames with non-empty classification in the B-tree.
@@ -148,8 +176,8 @@ impl CapTracker {
                     classification,
                     mapped_by: Vec::new(),
                 });
-            if !meta.mapped_by.contains(&pid) {
-                meta.mapped_by.push(pid);
+            if !meta.mapped_by.iter().any(|&(p, _)| p == pid) {
+                meta.mapped_by.push((pid, zone));
             }
             // Merge classification bits (a frame mapped ENCRYPTED by one
             // process and EPHEMERAL by another is both).
@@ -163,12 +191,26 @@ impl CapTracker {
     /// frame's classification (empty if not tracked). Removes the B-tree entry
     /// once no PIDs reference the frame.
     pub fn remove_mapping(&mut self, paddr: PhysAddr, pid: u32) -> FrameClassification {
+        let frame_num = paddr.as_u64() >> PAGE_SHIFT;
+
+        // Look up the zone this PID recorded at mapping time, falling back
+        // to PublicDurable for untracked (public) frames.
+        let zone = self
+            .frame_meta
+            .get(&frame_num)
+            .and_then(|meta| {
+                meta.mapped_by
+                    .iter()
+                    .find(|&&(p, _)| p == pid)
+                    .map(|&(_, z)| z)
+            })
+            .unwrap_or(MemoryZone::PublicDurable);
+
         // Update budget usage.
         if let Some(budget) = self.budgets.get_mut(&pid) {
             budget.used = budget.used.saturating_sub(PAGE_SIZE as usize);
+            budget.sub_zone_usage(zone, PAGE_SIZE as usize);
         }
-
-        let frame_num = paddr.as_u64() >> PAGE_SHIFT;
 
         let Some(meta) = self.frame_meta.get_mut(&frame_num) else {
             return FrameClassification::empty();
@@ -177,7 +219,7 @@ impl CapTracker {
         let classification = meta.classification;
 
         // Remove this PID from mapped_by.
-        meta.mapped_by.retain(|&p| p != pid);
+        meta.mapped_by.retain(|&(p, _)| p != pid);
 
         // If no PIDs remain, remove the B-tree entry entirely.
         if meta.mapped_by.is_empty() {
@@ -209,7 +251,10 @@ impl CapTracker {
         self.frame_meta
             .iter()
             .filter(|(_, meta)| meta.classification.contains(class))
-            .map(|(&frame_num, meta)| (PhysAddr(frame_num << PAGE_SHIFT), meta.mapped_by.clone()))
+            .map(|(&frame_num, meta)| {
+                let pids = meta.mapped_by.iter().map(|&(p, _)| p).collect();
+                (PhysAddr(frame_num << PAGE_SHIFT), pids)
+            })
             .collect()
     }
 
@@ -421,5 +466,125 @@ mod tests {
         // Query EPHEMERAL — should return frames 1 and 2.
         let ephemeral = tracker.frames_with_classification(FrameClassification::EPHEMERAL);
         assert_eq!(ephemeral.len(), 2, "expected 2 EPHEMERAL frames");
+    }
+
+    #[test]
+    fn zone_budget_tracking() {
+        let mut tracker = CapTracker::new();
+        tracker.set_budget(
+            1,
+            MemoryBudget::new(10 * PAGE_SIZE as usize, FrameClassification::all()),
+        );
+
+        // Map some frames in different zones.
+        tracker.record_mapping(paddr(0), 1, FrameClassification::empty()); // public durable
+        tracker.record_mapping(paddr(1), 1, FrameClassification::EPHEMERAL); // public ephemeral
+        tracker.record_mapping(paddr(2), 1, FrameClassification::ENCRYPTED); // kernel durable
+
+        let budget = tracker.budget(1).unwrap();
+        assert_eq!(budget.used, 3 * PAGE_SIZE as usize);
+        assert_eq!(
+            budget.zone_used(MemoryZone::PublicDurable),
+            PAGE_SIZE as usize,
+        );
+        assert_eq!(
+            budget.zone_used(MemoryZone::PublicEphemeral),
+            PAGE_SIZE as usize,
+        );
+        assert_eq!(
+            budget.zone_used(MemoryZone::KernelDurable),
+            PAGE_SIZE as usize,
+        );
+        assert_eq!(budget.zone_used(MemoryZone::KernelEphemeral), 0);
+    }
+
+    #[test]
+    fn zone_usage_correct_with_shared_cross_classification_frame() {
+        let mut tracker = CapTracker::new();
+        tracker.set_budget(
+            1,
+            MemoryBudget::new(10 * PAGE_SIZE as usize, FrameClassification::all()),
+        );
+        tracker.set_budget(
+            2,
+            MemoryBudget::new(10 * PAGE_SIZE as usize, FrameClassification::all()),
+        );
+
+        // P1 maps frame 0 as ENCRYPTED → zone = KernelDurable.
+        tracker.record_mapping(paddr(0), 1, FrameClassification::ENCRYPTED);
+        // P2 maps the same frame as EPHEMERAL → zone = PublicEphemeral.
+        tracker.record_mapping(paddr(0), 2, FrameClassification::EPHEMERAL);
+
+        // meta.classification is now ENCRYPTED|EPHEMERAL, but each PID
+        // should still decrement the zone it originally incremented.
+        assert_eq!(
+            tracker
+                .budget(1)
+                .unwrap()
+                .zone_used(MemoryZone::KernelDurable),
+            PAGE_SIZE as usize,
+        );
+        assert_eq!(
+            tracker
+                .budget(2)
+                .unwrap()
+                .zone_used(MemoryZone::PublicEphemeral),
+            PAGE_SIZE as usize,
+        );
+
+        // Unmap P1 — should decrement KernelDurable, NOT KernelEphemeral.
+        tracker.remove_mapping(paddr(0), 1);
+        assert_eq!(
+            tracker
+                .budget(1)
+                .unwrap()
+                .zone_used(MemoryZone::KernelDurable),
+            0,
+        );
+        assert_eq!(
+            tracker
+                .budget(1)
+                .unwrap()
+                .zone_used(MemoryZone::KernelEphemeral),
+            0,
+            "KernelEphemeral should not have been touched",
+        );
+
+        // Unmap P2 — should decrement PublicEphemeral.
+        tracker.remove_mapping(paddr(0), 2);
+        assert_eq!(
+            tracker
+                .budget(2)
+                .unwrap()
+                .zone_used(MemoryZone::PublicEphemeral),
+            0,
+        );
+    }
+
+    #[test]
+    fn zone_usage_decreases_on_unmap() {
+        let mut tracker = CapTracker::new();
+        tracker.set_budget(
+            1,
+            MemoryBudget::new(10 * PAGE_SIZE as usize, FrameClassification::all()),
+        );
+
+        tracker.record_mapping(paddr(0), 1, FrameClassification::ENCRYPTED);
+        assert_eq!(
+            tracker
+                .budget(1)
+                .unwrap()
+                .zone_used(MemoryZone::KernelDurable),
+            PAGE_SIZE as usize,
+        );
+
+        tracker.remove_mapping(paddr(0), 1);
+        assert_eq!(
+            tracker
+                .budget(1)
+                .unwrap()
+                .zone_used(MemoryZone::KernelDurable),
+            0,
+        );
     }
 }

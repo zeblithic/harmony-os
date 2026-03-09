@@ -11,11 +11,15 @@ use harmony_identity::{
 };
 use harmony_platform::EntropySource;
 
+use crate::integrity::lyll::{HashEntry, Lyll, LyllConfig};
+use crate::integrity::nakaiah::{CapChain, Nakaiah};
 use crate::namespace::Namespace;
 use crate::vm::cap_tracker::MemoryBudget;
 use crate::vm::manager::AddressSpaceManager;
 use crate::vm::page_table::PageTable;
-use crate::vm::{FrameClassification, PageFlags, VirtAddr, VmError};
+use crate::vm::{
+    ContentHash, FrameClassification, MemoryZone, PageFlags, PhysAddr, VirtAddr, VmError,
+};
 use crate::{Fid, FileServer, IpcError, OpenMode, QPath};
 
 /// Maximum UCAN delegation chain depth for capability verification.
@@ -58,6 +62,10 @@ pub struct Kernel<P: PageTable> {
     /// Virtual memory manager — owns per-process address spaces, the buddy
     /// allocator, and capability tracker.
     vm: AddressSpaceManager<P>,
+    /// Lyll — the probabilistic public-memory auditor.
+    lyll: Lyll,
+    /// Nakaiah — the deterministic private-memory bodyguard.
+    nakaiah: Nakaiah,
 }
 
 impl<P: PageTable> Kernel<P> {
@@ -65,7 +73,7 @@ impl<P: PageTable> Kernel<P> {
     pub fn new(identity: PrivateIdentity, vm: AddressSpaceManager<P>) -> Self {
         let mut identity_store = MemoryIdentityStore::new();
         identity_store.insert(identity.public_identity().clone());
-        Kernel {
+        let mut kernel = Kernel {
             processes: BTreeMap::new(),
             next_pid: 0,
             identity,
@@ -75,7 +83,22 @@ impl<P: PageTable> Kernel<P> {
             fid_owners: BTreeMap::new(),
             next_server_fid: 1,
             vm,
-        }
+            lyll: Lyll::new(LyllConfig {
+                sampling_rate_percent: 5,
+                sweep_interval_ticks: 100,
+            }),
+            nakaiah: Nakaiah::new(100), // 100 bps = 1%
+        };
+        kernel.sync_guardian_state_hashes();
+        kernel
+    }
+
+    /// Exchange state hashes between Lyll and Nakaiah so each guardian
+    /// holds an up-to-date snapshot of the other's state for mutual
+    /// verification.
+    fn sync_guardian_state_hashes(&mut self) {
+        self.lyll.set_nakaiah_state_hash(self.nakaiah.state_hash());
+        self.nakaiah.set_lyll_state_hash(self.lyll.state_hash());
     }
 
     /// Allocate a unique server-side fid. Returns an error if the
@@ -182,9 +205,27 @@ impl<P: PageTable> Kernel<P> {
         self.fid_owners
             .retain(|&(p, _), &mut (tp, _)| p != pid && tp != pid);
 
+        // Collect integrity info before destroying VM space.
+        if let Some(space) = self.vm.space(pid) {
+            let frame_info: Vec<(PhysAddr, FrameClassification)> = space
+                .regions
+                .values()
+                .flat_map(|r| r.frames.iter().map(|&p| (p, r.classification)))
+                .collect();
+
+            for (paddr, class) in frame_info {
+                self.lyll.unregister_frame(paddr);
+                if class.contains(FrameClassification::ENCRYPTED) {
+                    self.nakaiah.unregister_frame(paddr);
+                }
+            }
+        }
+
         // Destroy VM space. Ignore NoSuchProcess — the process may
         // have been spawned without a VM config.
         let _ = self.vm.destroy_space(pid);
+
+        self.sync_guardian_state_hashes();
 
         Ok(())
     }
@@ -463,13 +504,69 @@ impl<P: PageTable> Kernel<P> {
         Ok(())
     }
 
+    // ── Integrity guardians ────────────────────────────────────────────
+
+    /// Read-only access to the Lyll auditor.
+    pub fn lyll(&self) -> &Lyll {
+        &self.lyll
+    }
+
+    /// Mutable access to the Lyll auditor.
+    ///
+    /// # Sync caveat
+    ///
+    /// All mutations that change `state_hash` — including
+    /// [`Lyll::update_snapshot`], register, and unregister — require a
+    /// [`sync_guardian_state_hashes`](Self::sync_guardian_state_hashes) call
+    /// afterward so the cross-guardian hashes stay consistent. Prefer the
+    /// orchestrated `vm_map_region` / `vm_unmap_region` / `destroy_process`
+    /// methods which handle sync automatically.
+    pub fn lyll_mut(&mut self) -> &mut Lyll {
+        &mut self.lyll
+    }
+
+    /// Read-only access to the Nakaiah bodyguard.
+    pub fn nakaiah(&self) -> &Nakaiah {
+        &self.nakaiah
+    }
+
+    /// Mutable access to the Nakaiah bodyguard.
+    ///
+    /// # Sync caveat
+    ///
+    /// Structural mutations (register/unregister, grant/revoke) should go
+    /// through the orchestrated Kernel methods which call
+    /// [`sync_guardian_state_hashes`](Self::sync_guardian_state_hashes)
+    /// automatically. Direct mutation without sync may break the
+    /// dual-guardian consistency invariant.
+    pub fn nakaiah_mut(&mut self) -> &mut Nakaiah {
+        &mut self.nakaiah
+    }
+
+    /// Read-only access to the VM manager.
+    pub fn vm(&self) -> &AddressSpaceManager<P> {
+        &self.vm
+    }
+
     // ── VM delegation ────────────────────────────────────────────────
+
+    /// Create a VM address space for a process.
+    pub fn vm_create_space(
+        &mut self,
+        pid: u32,
+        budget: MemoryBudget,
+        page_table: P,
+    ) -> Result<(), VmError> {
+        self.vm.create_space(pid, budget, page_table)
+    }
 
     /// Map a region of virtual memory for a process.
     ///
-    /// Delegates to the `AddressSpaceManager`. Returns the base virtual
-    /// address on success. The process must have a VM space (created via
-    /// `spawn_process` with `vm_config`).
+    /// Delegates to the `AddressSpaceManager`, then registers newly mapped
+    /// frames with the integrity guardians:
+    /// - All frames are registered with Lyll (public memory auditor).
+    /// - ENCRYPTED frames are additionally registered with Nakaiah (private
+    ///   memory bodyguard).
     pub fn vm_map_region(
         &mut self,
         pid: u32,
@@ -478,22 +575,103 @@ impl<P: PageTable> Kernel<P> {
         flags: PageFlags,
         classification: FrameClassification,
     ) -> Result<(), VmError> {
-        self.vm.map_region(pid, vaddr, len, flags, classification)
+        self.vm.map_region(pid, vaddr, len, flags, classification)?;
+
+        // Register frames with integrity guardians.
+        let space = self.vm.space(pid).unwrap();
+        let region = space.regions.get(&vaddr).unwrap();
+        for &paddr in &region.frames {
+            let content_hash = ContentHash::ZERO;
+            // Writable or ephemeral frames use Snapshot entries (hash updates via
+            // write barrier). Only truly immutable frames use CidBacked.
+            let hash_entry = if flags.contains(PageFlags::WRITABLE)
+                || classification.contains(FrameClassification::EPHEMERAL)
+            {
+                HashEntry::Snapshot {
+                    hash: content_hash.0,
+                    generation: 0,
+                }
+            } else {
+                HashEntry::CidBacked {
+                    cid: content_hash.0,
+                }
+            };
+            self.lyll
+                .register_frame(paddr, hash_entry, pid, MemoryZone::from(classification));
+            if classification.contains(FrameClassification::ENCRYPTED) {
+                self.nakaiah.register_frame(paddr, content_hash.0);
+                self.nakaiah.grant_access(pid, paddr, CapChain::Owner);
+            }
+        }
+
+        self.sync_guardian_state_hashes();
+        Ok(())
     }
 
     /// Unmap a region previously mapped at `vaddr` for process `pid`.
+    ///
+    /// Collects frame and classification info before unmapping, then
+    /// unregisters frames from the integrity guardians.
     pub fn vm_unmap_region(&mut self, pid: u32, vaddr: VirtAddr) -> Result<(), VmError> {
-        self.vm.unmap_region(pid, vaddr)
+        // Collect frames and classification before unmapping (unmap removes the region).
+        let (frames, classification) = {
+            let space = self.vm.space(pid).ok_or(VmError::NoSuchProcess(pid))?;
+            let region = space.regions.get(&vaddr).ok_or(VmError::NotMapped(vaddr))?;
+            (region.frames.clone(), region.classification)
+        };
+
+        self.vm.unmap_region(pid, vaddr)?;
+
+        // Unregister from guardians.
+        for &paddr in &frames {
+            self.lyll.unregister_frame(paddr);
+            if classification.contains(FrameClassification::ENCRYPTED) {
+                self.nakaiah.unregister_frame(paddr);
+            }
+        }
+
+        self.sync_guardian_state_hashes();
+        Ok(())
     }
 
     /// Change the permission flags on an existing region.
+    ///
+    /// If the region gains WRITABLE, any CidBacked hash entries are promoted
+    /// to Snapshot so that write-barrier hash updates are not silently lost.
     pub fn vm_protect_region(
         &mut self,
         pid: u32,
         vaddr: VirtAddr,
         new_flags: PageFlags,
     ) -> Result<(), VmError> {
-        self.vm.protect_region(pid, vaddr, new_flags)
+        // Check if this is a read-only → writable transition before mutating.
+        let was_writable = self
+            .vm
+            .space(pid)
+            .and_then(|s| s.regions.get(&vaddr))
+            .map(|r| r.flags.contains(PageFlags::WRITABLE))
+            .unwrap_or(false);
+
+        self.vm.protect_region(pid, vaddr, new_flags)?;
+
+        // Promote CidBacked → Snapshot for frames that just became writable.
+        if !was_writable && new_flags.contains(PageFlags::WRITABLE) {
+            let frames: Vec<PhysAddr> = self
+                .vm
+                .space(pid)
+                .unwrap()
+                .regions
+                .get(&vaddr)
+                .unwrap()
+                .frames
+                .clone();
+            for paddr in frames {
+                self.lyll.promote_to_snapshot(paddr);
+            }
+            self.sync_guardian_state_hashes();
+        }
+
+        Ok(())
     }
 
     /// Find a free region of at least `len` bytes in the process's
@@ -1579,5 +1757,458 @@ mod tests {
                 "No ephemeral frames should reference the destroyed process"
             );
         }
+    }
+
+    // ── Integrity guardian tests ────────────────────────────────────────
+
+    use crate::vm::PAGE_SIZE;
+
+    fn make_kernel() -> Kernel<MockPageTable> {
+        let mut entropy = make_test_entropy();
+        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        Kernel::new(kernel_id, make_test_vm())
+    }
+
+    fn default_budget() -> MemoryBudget {
+        MemoryBudget::new(64 * PAGE_SIZE as usize, FrameClassification::all())
+    }
+
+    fn rw_user_flags() -> PageFlags {
+        PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::USER
+    }
+
+    fn spawn_test_process(kernel: &mut Kernel<MockPageTable>) -> u32 {
+        kernel
+            .spawn_process("test", Box::new(EchoServer::new()), &[], None)
+            .unwrap()
+    }
+
+    #[test]
+    fn kernel_has_integrity_guardians() {
+        let kernel = make_kernel();
+        assert_eq!(kernel.lyll().registry_len(), 0);
+        assert_eq!(kernel.nakaiah().integrity_registry_len(), 0);
+    }
+
+    #[test]
+    fn map_region_registers_with_lyll() {
+        let mut kernel = make_kernel();
+        let pid = spawn_test_process(&mut kernel);
+        kernel
+            .vm_create_space(
+                pid,
+                default_budget(),
+                MockPageTable::new(PhysAddr(0x20_0000)),
+            )
+            .unwrap();
+
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize,
+                rw_user_flags(),
+                FrameClassification::empty(),
+            )
+            .unwrap();
+
+        assert_eq!(kernel.lyll().registry_len(), 1);
+    }
+
+    #[test]
+    fn map_encrypted_region_registers_with_both() {
+        let mut kernel = make_kernel();
+        let pid = spawn_test_process(&mut kernel);
+        kernel
+            .vm_create_space(
+                pid,
+                default_budget(),
+                MockPageTable::new(PhysAddr(0x20_0000)),
+            )
+            .unwrap();
+
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize,
+                rw_user_flags(),
+                FrameClassification::ENCRYPTED,
+            )
+            .unwrap();
+
+        assert_eq!(kernel.lyll().registry_len(), 1);
+        assert_eq!(kernel.nakaiah().integrity_registry_len(), 1);
+    }
+
+    use crate::integrity::IntegrityVerdict;
+    use crate::vm::{AccessOp, ViolationReason};
+
+    #[test]
+    fn public_corruption_detected_and_quarantined() {
+        let mut kernel = make_kernel();
+        let pid = spawn_test_process(&mut kernel);
+        kernel
+            .vm_create_space(
+                pid,
+                default_budget(),
+                MockPageTable::new(PhysAddr(0x20_0000)),
+            )
+            .unwrap();
+
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize,
+                rw_user_flags(),
+                FrameClassification::empty(),
+            )
+            .unwrap();
+
+        // Get the physical address of the mapped frame.
+        let paddr = kernel
+            .vm()
+            .space(pid)
+            .unwrap()
+            .regions
+            .get(&VirtAddr(0x1000))
+            .unwrap()
+            .frames[0];
+
+        // Simulate Lyll spot-checking and finding tampered content.
+        let tampered_hash = [0xFF; 32];
+        let verdict = kernel.lyll_mut().verify_frame(paddr, tampered_hash, 100);
+        assert!(
+            matches!(verdict, IntegrityVerdict::Quarantine { .. }),
+            "expected Quarantine, got {:?}",
+            verdict
+        );
+        assert!(kernel.lyll().quarantine.is_quarantined(paddr));
+    }
+
+    #[test]
+    fn private_corruption_kills_process() {
+        let mut kernel = make_kernel();
+        let pid = spawn_test_process(&mut kernel);
+        kernel
+            .vm_create_space(
+                pid,
+                default_budget(),
+                MockPageTable::new(PhysAddr(0x20_0000)),
+            )
+            .unwrap();
+
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize,
+                rw_user_flags(),
+                FrameClassification::ENCRYPTED,
+            )
+            .unwrap();
+
+        let paddr = kernel
+            .vm()
+            .space(pid)
+            .unwrap()
+            .regions
+            .get(&VirtAddr(0x1000))
+            .unwrap()
+            .frames[0];
+
+        // vm_map_region auto-grants CapChain::Owner to the owning process.
+        // Tampered content -> kill.
+        let verdict = kernel.nakaiah().verify_access(
+            pid,
+            paddr,
+            AccessOp::Read,
+            [0xFF; 32], // Wrong hash -- content was zeroed at map time.
+        );
+        assert!(
+            matches!(
+                verdict,
+                IntegrityVerdict::Kill {
+                    reason: ViolationReason::ContentTampered,
+                    ..
+                }
+            ),
+            "expected Kill/ContentTampered, got {:?}",
+            verdict
+        );
+    }
+
+    #[test]
+    fn unauthorized_access_kills_process() {
+        let mut kernel = make_kernel();
+        let owner_pid = spawn_test_process(&mut kernel);
+        let intruder_pid = spawn_test_process(&mut kernel);
+        kernel
+            .vm_create_space(
+                owner_pid,
+                default_budget(),
+                MockPageTable::new(PhysAddr(0x20_0000)),
+            )
+            .unwrap();
+
+        kernel
+            .vm_map_region(
+                owner_pid,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize,
+                rw_user_flags(),
+                FrameClassification::ENCRYPTED,
+            )
+            .unwrap();
+
+        let paddr = kernel
+            .vm()
+            .space(owner_pid)
+            .unwrap()
+            .regions
+            .get(&VirtAddr(0x1000))
+            .unwrap()
+            .frames[0];
+
+        // Intruder process has no capability -- unauthorized.
+        let verdict = kernel.nakaiah().verify_access(
+            intruder_pid,
+            paddr,
+            AccessOp::Read,
+            [0u8; 32], // Content matches (it's zeroed).
+        );
+        assert!(
+            matches!(
+                verdict,
+                IntegrityVerdict::Kill {
+                    reason: ViolationReason::UnauthorizedAccess,
+                    ..
+                }
+            ),
+            "expected Kill/UnauthorizedAccess, got {:?}",
+            verdict
+        );
+    }
+
+    #[test]
+    fn destroy_process_cleans_up_integrity() {
+        let mut kernel = make_kernel();
+        let pid = spawn_test_process(&mut kernel);
+        kernel
+            .vm_create_space(
+                pid,
+                default_budget(),
+                MockPageTable::new(PhysAddr(0x20_0000)),
+            )
+            .unwrap();
+
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize * 3,
+                rw_user_flags(),
+                FrameClassification::ENCRYPTED,
+            )
+            .unwrap();
+
+        assert_eq!(kernel.lyll().registry_len(), 3);
+        assert_eq!(kernel.nakaiah().integrity_registry_len(), 3);
+
+        kernel.destroy_process(pid).unwrap();
+
+        // Both guardians should have cleaned up.
+        assert_eq!(kernel.lyll().registry_len(), 0);
+        assert_eq!(kernel.nakaiah().integrity_registry_len(), 0);
+    }
+
+    #[test]
+    fn kernel_syncs_guardian_state_hashes_on_construction() {
+        let kernel = make_kernel();
+        // After construction, Lyll should hold Nakaiah's state hash and vice versa.
+        assert_eq!(
+            kernel.lyll().nakaiah_state_hash(),
+            kernel.nakaiah().state_hash()
+        );
+        assert_eq!(
+            kernel.nakaiah().lyll_state_hash(),
+            kernel.lyll().state_hash()
+        );
+    }
+
+    #[test]
+    fn guardian_compromise_panics() {
+        let mut kernel = make_kernel();
+
+        // Kernel::new already exchanges initial state hashes.
+        // Simulate Nakaiah compromise — change its state hash to something unexpected.
+        kernel.nakaiah_mut().set_state_hash(ContentHash([0xFF; 32]));
+
+        // Lyll detects it.
+        let verdict = kernel
+            .lyll()
+            .co_verify_nakaiah(kernel.nakaiah().state_hash());
+        assert!(
+            matches!(
+                verdict,
+                IntegrityVerdict::Panic {
+                    reason: ViolationReason::GuardianStateCorrupted
+                }
+            ),
+            "expected Panic/GuardianStateCorrupted, got {:?}",
+            verdict
+        );
+    }
+
+    #[test]
+    fn unmap_region_unregisters_from_guardians() {
+        let mut kernel = make_kernel();
+        let pid = spawn_test_process(&mut kernel);
+        kernel
+            .vm_create_space(
+                pid,
+                default_budget(),
+                MockPageTable::new(PhysAddr(0x20_0000)),
+            )
+            .unwrap();
+
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize,
+                rw_user_flags(),
+                FrameClassification::ENCRYPTED,
+            )
+            .unwrap();
+        assert_eq!(kernel.lyll().registry_len(), 1);
+        assert_eq!(kernel.nakaiah().integrity_registry_len(), 1);
+
+        kernel.vm_unmap_region(pid, VirtAddr(0x1000)).unwrap();
+        assert_eq!(kernel.lyll().registry_len(), 0);
+        assert_eq!(kernel.nakaiah().integrity_registry_len(), 0);
+    }
+
+    #[test]
+    fn encrypted_frame_auto_grants_owner_capability() {
+        let mut kernel = make_kernel();
+        let pid = spawn_test_process(&mut kernel);
+        kernel
+            .vm_create_space(
+                pid,
+                default_budget(),
+                MockPageTable::new(PhysAddr(0x20_0000)),
+            )
+            .unwrap();
+
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize,
+                rw_user_flags(),
+                FrameClassification::ENCRYPTED,
+            )
+            .unwrap();
+
+        let paddr = kernel
+            .vm()
+            .space(pid)
+            .unwrap()
+            .regions
+            .get(&VirtAddr(0x1000))
+            .unwrap()
+            .frames[0];
+
+        // Owner should be able to access without a manual grant_access call.
+        let verdict = kernel
+            .nakaiah()
+            .verify_access(pid, paddr, AccessOp::Read, [0u8; 32]);
+        assert_eq!(verdict, IntegrityVerdict::Allow);
+    }
+
+    #[test]
+    fn writable_frame_gets_snapshot_entry() {
+        let mut kernel = make_kernel();
+        let pid = spawn_test_process(&mut kernel);
+        kernel
+            .vm_create_space(
+                pid,
+                default_budget(),
+                MockPageTable::new(PhysAddr(0x20_0000)),
+            )
+            .unwrap();
+
+        // Map a writable, non-ephemeral public frame.
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize,
+                rw_user_flags(),
+                FrameClassification::empty(),
+            )
+            .unwrap();
+
+        let paddr = kernel
+            .vm()
+            .space(pid)
+            .unwrap()
+            .regions
+            .get(&VirtAddr(0x1000))
+            .unwrap()
+            .frames[0];
+
+        // Writable frames should use Snapshot entries, so update_snapshot works.
+        kernel.lyll_mut().update_snapshot(paddr, [0xAA; 32]);
+        assert_eq!(kernel.lyll().expected_hash(paddr), Some([0xAA; 32]));
+    }
+
+    #[test]
+    fn protect_region_promotes_cid_to_snapshot_on_write() {
+        let mut kernel = make_kernel();
+        let pid = spawn_test_process(&mut kernel);
+        kernel
+            .vm_create_space(
+                pid,
+                default_budget(),
+                MockPageTable::new(PhysAddr(0x20_0000)),
+            )
+            .unwrap();
+
+        // Map read-only, non-ephemeral → CidBacked entry.
+        let ro_flags = PageFlags::READABLE | PageFlags::USER;
+        kernel
+            .vm_map_region(
+                pid,
+                VirtAddr(0x1000),
+                PAGE_SIZE as usize,
+                ro_flags,
+                FrameClassification::empty(),
+            )
+            .unwrap();
+
+        let paddr = kernel
+            .vm()
+            .space(pid)
+            .unwrap()
+            .regions
+            .get(&VirtAddr(0x1000))
+            .unwrap()
+            .frames[0];
+
+        // CidBacked → update_snapshot is a no-op.
+        kernel.lyll_mut().update_snapshot(paddr, [0xAA; 32]);
+        assert_eq!(kernel.lyll().expected_hash(paddr), Some([0u8; 32]));
+
+        // Promote to writable.
+        kernel
+            .vm_protect_region(pid, VirtAddr(0x1000), rw_user_flags())
+            .unwrap();
+
+        // Now it's a Snapshot entry → update_snapshot works.
+        kernel.lyll_mut().update_snapshot(paddr, [0xBB; 32]);
+        assert_eq!(kernel.lyll().expected_hash(paddr), Some([0xBB; 32]));
     }
 }
