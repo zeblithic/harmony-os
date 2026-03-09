@@ -60,55 +60,143 @@ fn vm_err_to_errno(e: VmError) -> i64 {
 /// syscall numbers into this enum before the Linuxulator dispatches.
 #[derive(Debug)]
 pub enum LinuxSyscall {
-    Read { fd: i32, buf: u64, count: u64 },
-    Write { fd: i32, buf: u64, count: u64 },
-    Close { fd: i32 },
-    Fstat { fd: i32, buf: u64 },
-    Mmap { addr: u64, len: u64, prot: i32, flags: i32, fd: i32, offset: u64 },
-    Mprotect { addr: u64, len: u64, prot: i32 },
-    Munmap { addr: u64, len: u64 },
-    Brk { addr: u64 },
+    Read {
+        fd: i32,
+        buf: u64,
+        count: u64,
+    },
+    Write {
+        fd: i32,
+        buf: u64,
+        count: u64,
+    },
+    Close {
+        fd: i32,
+    },
+    Fstat {
+        fd: i32,
+        buf: u64,
+    },
+    Mmap {
+        addr: u64,
+        len: u64,
+        prot: i32,
+        flags: i32,
+        fd: i32,
+        offset: u64,
+    },
+    Mprotect {
+        addr: u64,
+        len: u64,
+        prot: i32,
+    },
+    Munmap {
+        addr: u64,
+        len: u64,
+    },
+    Brk {
+        addr: u64,
+    },
     RtSigaction,
     RtSigprocmask,
-    Ioctl { fd: i32, request: u64 },
-    Exit { code: i32 },
-    ArchPrctl { code: i32, addr: u64 },
+    Ioctl {
+        fd: i32,
+        request: u64,
+    },
+    Exit {
+        code: i32,
+    },
+    ArchPrctl {
+        code: i32,
+        addr: u64,
+    },
     SetTidAddress,
-    ExitGroup { code: i32 },
-    Openat { dirfd: i32, pathname: u64, flags: i32 },
+    ExitGroup {
+        code: i32,
+    },
+    Openat {
+        dirfd: i32,
+        pathname: u64,
+        flags: i32,
+    },
     SetRobustList,
-    Prlimit64 { pid: i32, resource: i32, new_limit: u64, old_limit_buf: u64 },
+    Prlimit64 {
+        pid: i32,
+        resource: i32,
+        new_limit: u64,
+        old_limit_buf: u64,
+    },
     Rseq,
-    Unknown { nr: u64 },
+    Unknown {
+        nr: u64,
+    },
 }
 
 impl LinuxSyscall {
     /// Map x86_64 Linux syscall numbers to `LinuxSyscall`.
     pub fn from_x86_64(nr: u64, args: [u64; 6]) -> Self {
         match nr {
-            0 => LinuxSyscall::Read { fd: args[0] as i32, buf: args[1], count: args[2] },
-            1 => LinuxSyscall::Write { fd: args[0] as i32, buf: args[1], count: args[2] },
-            3 => LinuxSyscall::Close { fd: args[0] as i32 },
-            5 => LinuxSyscall::Fstat { fd: args[0] as i32, buf: args[1] },
-            9 => LinuxSyscall::Mmap {
-                addr: args[0], len: args[1], prot: args[2] as i32,
-                flags: args[3] as i32, fd: args[4] as i32, offset: args[5],
+            0 => LinuxSyscall::Read {
+                fd: args[0] as i32,
+                buf: args[1],
+                count: args[2],
             },
-            10 => LinuxSyscall::Mprotect { addr: args[0], len: args[1], prot: args[2] as i32 },
-            11 => LinuxSyscall::Munmap { addr: args[0], len: args[1] },
+            1 => LinuxSyscall::Write {
+                fd: args[0] as i32,
+                buf: args[1],
+                count: args[2],
+            },
+            3 => LinuxSyscall::Close { fd: args[0] as i32 },
+            5 => LinuxSyscall::Fstat {
+                fd: args[0] as i32,
+                buf: args[1],
+            },
+            9 => LinuxSyscall::Mmap {
+                addr: args[0],
+                len: args[1],
+                prot: args[2] as i32,
+                flags: args[3] as i32,
+                fd: args[4] as i32,
+                offset: args[5],
+            },
+            10 => LinuxSyscall::Mprotect {
+                addr: args[0],
+                len: args[1],
+                prot: args[2] as i32,
+            },
+            11 => LinuxSyscall::Munmap {
+                addr: args[0],
+                len: args[1],
+            },
             12 => LinuxSyscall::Brk { addr: args[0] },
             13 => LinuxSyscall::RtSigaction,
             14 => LinuxSyscall::RtSigprocmask,
-            16 => LinuxSyscall::Ioctl { fd: args[0] as i32, request: args[1] },
-            60 => LinuxSyscall::Exit { code: args[0] as i32 },
-            158 => LinuxSyscall::ArchPrctl { code: args[0] as i32, addr: args[1] },
+            16 => LinuxSyscall::Ioctl {
+                fd: args[0] as i32,
+                request: args[1],
+            },
+            60 => LinuxSyscall::Exit {
+                code: args[0] as i32,
+            },
+            158 => LinuxSyscall::ArchPrctl {
+                code: args[0] as i32,
+                addr: args[1],
+            },
             218 => LinuxSyscall::SetTidAddress,
-            231 => LinuxSyscall::ExitGroup { code: args[0] as i32 },
-            257 => LinuxSyscall::Openat { dirfd: args[0] as i32, pathname: args[1], flags: args[2] as i32 },
+            231 => LinuxSyscall::ExitGroup {
+                code: args[0] as i32,
+            },
+            257 => LinuxSyscall::Openat {
+                dirfd: args[0] as i32,
+                pathname: args[1],
+                flags: args[2] as i32,
+            },
             273 => LinuxSyscall::SetRobustList,
             302 => LinuxSyscall::Prlimit64 {
-                pid: args[0] as i32, resource: args[1] as i32,
-                new_limit: args[2], old_limit_buf: args[3],
+                pid: args[0] as i32,
+                resource: args[1] as i32,
+                new_limit: args[2],
+                old_limit_buf: args[3],
             },
             334 => LinuxSyscall::Rseq,
             _ => LinuxSyscall::Unknown { nr },
@@ -121,28 +209,63 @@ impl LinuxSyscall {
     /// (aarch64 uses the generic syscall table).
     pub fn from_aarch64(nr: u64, args: [u64; 6]) -> Self {
         match nr {
-            29 => LinuxSyscall::Ioctl { fd: args[0] as i32, request: args[1] },
-            56 => LinuxSyscall::Openat { dirfd: args[0] as i32, pathname: args[1], flags: args[2] as i32 },
+            29 => LinuxSyscall::Ioctl {
+                fd: args[0] as i32,
+                request: args[1],
+            },
+            56 => LinuxSyscall::Openat {
+                dirfd: args[0] as i32,
+                pathname: args[1],
+                flags: args[2] as i32,
+            },
             57 => LinuxSyscall::Close { fd: args[0] as i32 },
-            63 => LinuxSyscall::Read { fd: args[0] as i32, buf: args[1], count: args[2] },
-            64 => LinuxSyscall::Write { fd: args[0] as i32, buf: args[1], count: args[2] },
-            80 => LinuxSyscall::Fstat { fd: args[0] as i32, buf: args[1] },
-            93 => LinuxSyscall::Exit { code: args[0] as i32 },
-            94 => LinuxSyscall::ExitGroup { code: args[0] as i32 },
+            63 => LinuxSyscall::Read {
+                fd: args[0] as i32,
+                buf: args[1],
+                count: args[2],
+            },
+            64 => LinuxSyscall::Write {
+                fd: args[0] as i32,
+                buf: args[1],
+                count: args[2],
+            },
+            80 => LinuxSyscall::Fstat {
+                fd: args[0] as i32,
+                buf: args[1],
+            },
+            93 => LinuxSyscall::Exit {
+                code: args[0] as i32,
+            },
+            94 => LinuxSyscall::ExitGroup {
+                code: args[0] as i32,
+            },
             96 => LinuxSyscall::SetTidAddress,
             99 => LinuxSyscall::SetRobustList,
             134 => LinuxSyscall::RtSigaction,
             135 => LinuxSyscall::RtSigprocmask,
             214 => LinuxSyscall::Brk { addr: args[0] },
-            215 => LinuxSyscall::Munmap { addr: args[0], len: args[1] },
-            222 => LinuxSyscall::Mmap {
-                addr: args[0], len: args[1], prot: args[2] as i32,
-                flags: args[3] as i32, fd: args[4] as i32, offset: args[5],
+            215 => LinuxSyscall::Munmap {
+                addr: args[0],
+                len: args[1],
             },
-            226 => LinuxSyscall::Mprotect { addr: args[0], len: args[1], prot: args[2] as i32 },
+            222 => LinuxSyscall::Mmap {
+                addr: args[0],
+                len: args[1],
+                prot: args[2] as i32,
+                flags: args[3] as i32,
+                fd: args[4] as i32,
+                offset: args[5],
+            },
+            226 => LinuxSyscall::Mprotect {
+                addr: args[0],
+                len: args[1],
+                prot: args[2] as i32,
+            },
             261 => LinuxSyscall::Prlimit64 {
-                pid: args[0] as i32, resource: args[1] as i32,
-                new_limit: args[2], old_limit_buf: args[3],
+                pid: args[0] as i32,
+                resource: args[1] as i32,
+                new_limit: args[2],
+                old_limit_buf: args[3],
             },
             293 => LinuxSyscall::Rseq,
             _ => LinuxSyscall::Unknown { nr },
@@ -737,12 +860,15 @@ impl<B: SyscallBackend> Linuxulator<B> {
             }
             LinuxSyscall::Close { fd } => self.sys_close(fd),
             LinuxSyscall::Fstat { fd, buf } => self.sys_fstat(fd, buf as usize),
-            LinuxSyscall::Mmap { addr, len, prot, flags, fd, offset } => {
-                self.sys_mmap(addr, len, prot, flags, fd, offset)
-            }
-            LinuxSyscall::Mprotect { addr, len, prot } => {
-                self.sys_mprotect(addr, len, prot)
-            }
+            LinuxSyscall::Mmap {
+                addr,
+                len,
+                prot,
+                flags,
+                fd,
+                offset,
+            } => self.sys_mmap(addr, len, prot, flags, fd, offset),
+            LinuxSyscall::Mprotect { addr, len, prot } => self.sys_mprotect(addr, len, prot),
             LinuxSyscall::Munmap { addr, len } => self.sys_munmap(addr, len),
             LinuxSyscall::Brk { addr } => self.sys_brk(addr),
             LinuxSyscall::RtSigaction => self.sys_rt_sigaction(),
@@ -752,13 +878,18 @@ impl<B: SyscallBackend> Linuxulator<B> {
             LinuxSyscall::ArchPrctl { code, addr } => self.sys_arch_prctl(code, addr),
             LinuxSyscall::SetTidAddress => self.sys_set_tid_address(),
             LinuxSyscall::ExitGroup { code } => self.sys_exit_group(code),
-            LinuxSyscall::Openat { dirfd, pathname, flags } => {
-                self.sys_openat(dirfd, pathname as usize, flags)
-            }
+            LinuxSyscall::Openat {
+                dirfd,
+                pathname,
+                flags,
+            } => self.sys_openat(dirfd, pathname as usize, flags),
             LinuxSyscall::SetRobustList => self.sys_set_robust_list(),
-            LinuxSyscall::Prlimit64 { pid, resource, new_limit, old_limit_buf } => {
-                self.sys_prlimit64(pid, resource, new_limit, old_limit_buf as usize)
-            }
+            LinuxSyscall::Prlimit64 {
+                pid,
+                resource,
+                new_limit,
+                old_limit_buf,
+            } => self.sys_prlimit64(pid, resource, new_limit, old_limit_buf as usize),
             LinuxSyscall::Rseq => ENOSYS,
             LinuxSyscall::Unknown { .. } => ENOSYS,
         }
@@ -1870,7 +2001,14 @@ mod tests {
     fn from_aarch64_mmap() {
         let syscall = LinuxSyscall::from_aarch64(222, [0x1000, 4096, 3, 0x22, (-1i64) as u64, 0]);
         match syscall {
-            LinuxSyscall::Mmap { addr, len, prot, flags, fd, offset } => {
+            LinuxSyscall::Mmap {
+                addr,
+                len,
+                prot,
+                flags,
+                fd,
+                offset,
+            } => {
                 assert_eq!(addr, 0x1000);
                 assert_eq!(len, 4096);
                 assert_eq!(prot, 3);
