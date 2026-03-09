@@ -29,18 +29,22 @@ const UARTFR_TXFF: u32 = 1 << 5; // TX FIFO full
 
 /// Compute integer and fractional baud-rate divisors for the PL011.
 ///
-/// Formula: BRD = clock_hz / (16 * baud).  IBRD = integer part.
-/// FBRD = round(fractional_part * 64).
+/// Formula (PL011 TRM):
+///   BRD  = clock_hz / (16 * baud)
+///   IBRD = integer part of BRD
+///   FBRD = integer(fractional_part * 64 + 0.5)   (i.e. rounded)
 ///
-/// We avoid floating-point by working in fixed-point:
-///   div_x64 = (clock_hz * 4) / baud
-///   ibrd    = div_x64 / 64
-///   fbrd    = div_x64 % 64
+/// We avoid floating-point by working in 128ths then rounding to 64ths:
+///   div_x128 = (clock_hz * 8) / baud
+///   div_x64  = (div_x128 + 1) / 2         (round to nearest 64th)
+///   ibrd     = div_x64 / 64
+///   fbrd     = div_x64 % 64
 pub fn baud_divisors(clock_hz: u32, baud: u32) -> (u16, u8) {
     if baud == 0 {
         return (0, 0);
     }
-    let div_x64 = (clock_hz as u64 * 4) / baud as u64;
+    let div_x128 = (clock_hz as u64 * 8) / baud as u64;
+    let div_x64 = (div_x128 + 1) / 2; // round to nearest 64th
     let ibrd = (div_x64 / 64) as u16;
     let fbrd = (div_x64 % 64) as u8;
     (ibrd, fbrd)
@@ -122,5 +126,13 @@ mod tests {
     #[test]
     fn baud_zero_baud_does_not_panic() {
         assert_eq!(baud_divisors(24_000_000, 0), (0, 0));
+    }
+
+    #[test]
+    fn baud_115200_at_48mhz_rounds_fbrd() {
+        // 48 MHz / (16 * 115200) = 26.04166...
+        // FBRD = round(0.04166 * 64) = round(2.666) = 3
+        // Truncation would give 2 — rounding gives 3 per PL011 TRM.
+        assert_eq!(baud_divisors(48_000_000, 115200), (26, 3));
     }
 }
