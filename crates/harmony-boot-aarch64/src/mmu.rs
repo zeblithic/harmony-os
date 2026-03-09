@@ -64,13 +64,18 @@ const MAIR_VALUE: u64 = 0x00FF;
 /// Note: IPS (bits [34:32]) is set at runtime in [`configure_system_regs`] by
 /// reading ID_AA64MMFR0_EL1.PARange to match the platform's physical address
 /// width. This base value leaves IPS=0 as a placeholder.
+///
+/// EPD1 (bit 23) disables TTBR1_EL1 table walks. Since we only use the lower
+/// VA range (TTBR0), any speculative access to an upper-half VA should fault
+/// immediately rather than walking from TTBR1's uninitialized reset value.
 const TCR_VALUE: u64 = {
     let t0sz: u64 = 16; // 48-bit VA
     let irgn0: u64 = 0b01 << 8; // Inner WB RA WA
     let orgn0: u64 = 0b01 << 10; // Outer WB RA WA
     let sh0: u64 = 0b11 << 12; // Inner Shareable
     let tg0: u64 = 0b00 << 14; // 4 KiB granule
-    t0sz | irgn0 | orgn0 | sh0 | tg0
+    let epd1: u64 = 1 << 23; // Disable TTBR1 walks
+    t0sz | irgn0 | orgn0 | sh0 | tg0 | epd1
 };
 
 /// SCTLR_EL1 bit: MMU enable.
@@ -225,8 +230,11 @@ unsafe fn configure_system_regs(root_paddr: u64) {
     // and place it into TCR_EL1.IPS (bits [34:32]).
     let mmfr0: u64;
     core::arch::asm!("mrs {}, id_aa64mmfr0_el1", out(reg) mmfr0);
-    let pa_range = mmfr0 & 0xF; // PARange field: bits [3:0]
-    let tcr = TCR_VALUE | (pa_range << 32); // IPS = PARange
+    // PARange is 4 bits [3:0] but IPS is only 3 bits [34:32]. Mask to 3 bits
+    // to avoid writing into TCR_EL1.AS (bit 35) if a future CPU reports a
+    // PARange value with bit 3 set.
+    let pa_range = mmfr0 & 0x7; // IPS field is 3 bits wide
+    let tcr = TCR_VALUE | (pa_range << 32); // IPS = PARange[2:0]
 
     core::arch::asm!(
         // Synchronize before touching translation registers
@@ -288,6 +296,8 @@ mod tests {
         assert_eq!((TCR_VALUE >> 12) & 0b11, 0b11);
         // TG0 = 0b00 (4 KiB granule)
         assert_eq!((TCR_VALUE >> 14) & 0b11, 0b00);
+        // EPD1 = 1 (disable TTBR1 walks)
+        assert_eq!((TCR_VALUE >> 23) & 0b1, 0b1);
     }
 
     #[test]
