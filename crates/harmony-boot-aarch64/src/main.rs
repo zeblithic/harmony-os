@@ -19,8 +19,6 @@ use linked_list_allocator::LockedHeap;
 #[cfg(target_os = "uefi")]
 use core::fmt::Write;
 #[cfg(target_os = "uefi")]
-use uefi::mem::memory_map::MemoryMap;
-#[cfg(target_os = "uefi")]
 use uefi::prelude::*;
 
 #[cfg(not(test))]
@@ -87,6 +85,7 @@ fn main() -> Status {
         base: 0,
         pages: 0,
         is_usable: false,
+        is_conventional: false,
     }; 128];
     let mut region_count = 0;
 
@@ -104,6 +103,7 @@ fn main() -> Status {
             base: desc.phys_start,
             pages: desc.page_count,
             is_usable: usable,
+            is_conventional: desc.ty == uefi::mem::memory_map::MemoryType::CONVENTIONAL,
         };
         region_count += 1;
     }
@@ -172,14 +172,16 @@ fn main() -> Status {
     let _ = writeln!(serial, "[RNDR] Hardware RNG available");
 
     // ── Initialise heap allocator ──
-    // Find the largest usable sub-region after carving out the bump allocator.
+    // Find the largest CONVENTIONAL sub-region after carving out the bump allocator.
+    // Only CONVENTIONAL memory is safe for heap: LOADER_CODE/DATA contain our
+    // running binary and BOOT_SERVICES_DATA may hold the active UEFI stack.
     // On QEMU virt, most RAM is one large CONVENTIONAL descriptor that contains
     // the bump allocator, so we must carve rather than exclude the whole region.
     // Cap at 4 MiB to avoid over-committing early in boot.
     let bump_end = bump_base + BUMP_REGION_SIZE;
 
     let mut best_heap: Option<(u64, u64)> = None; // (base, size)
-    for r in regions[..region_count].iter().filter(|r| r.is_usable) {
+    for r in regions[..region_count].iter().filter(|r| r.is_conventional) {
         let r_end = r.base + r.pages * PAGE_SIZE;
 
         // Consider up to two sub-regions: before and after the bump range.

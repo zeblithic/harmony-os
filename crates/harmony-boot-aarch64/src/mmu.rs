@@ -31,7 +31,13 @@ pub struct MemoryRegion {
     /// Number of 4 KiB pages in this region.
     pub pages: u64,
     /// Whether this region is usable RAM (vs. reserved/MMIO/ACPI).
+    /// True for CONVENTIONAL, BOOT_SERVICES_*, and LOADER_*.
     pub is_usable: bool,
+    /// Whether this region is safe for heap allocation.
+    /// True only for CONVENTIONAL memory. LOADER_CODE/DATA contain the
+    /// running binary and BOOT_SERVICES_DATA may hold the active stack,
+    /// so those must not be used as heap.
+    pub is_conventional: bool,
 }
 
 // ── PL011 MMIO address ──────────────────────────────────────────────
@@ -313,10 +319,12 @@ mod tests {
             base: 0x4_0000,
             pages: 256,
             is_usable: true,
+            is_conventional: true,
         };
         assert_eq!(r.base, 0x4_0000);
         assert_eq!(r.pages, 256);
         assert!(r.is_usable);
+        assert!(r.is_conventional);
     }
 
     #[test]
