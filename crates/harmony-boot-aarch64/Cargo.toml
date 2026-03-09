@@ -1,0 +1,34 @@
+[package]
+name = "harmony-boot-aarch64"
+description = "Ring 1: aarch64 boot stub for Harmony unikernel (QEMU virt target)"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/zeblithic/harmony-os"
+
+# Excluded from workspace — bare-metal target requires independent feature resolution
+# to avoid std feature unification with host-target workspace members.
+
+[dependencies]
+linked_list_allocator = "0.10"
+
+harmony-unikernel = { path = "../harmony-unikernel", default-features = false }
+harmony-identity = { git = "https://github.com/zeblithic/harmony.git", branch = "main", default-features = false }
+harmony-platform = { git = "https://github.com/zeblithic/harmony.git", branch = "main", default-features = false }
+harmony-microkernel = { path = "../harmony-microkernel", default-features = false }
+
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+
+# Force pure Rust BLAKE3 — cross-compiling for aarch64-unknown-uefi has no
+# system libc headers, so the C NEON backend fails to build.
+blake3 = { version = "1", default-features = false, features = ["no_neon"] }
+
+# uefi crate is only needed on the UEFI target.  We provide our own
+# #[global_allocator] (LockedHeap) and #[panic_handler] (PL011 serial)
+# instead of the uefi crate's features, which don't work after ExitBootServices.
+[target.'cfg(target_os = "uefi")'.dependencies]
+uefi = { version = "0.36" }
+
+[features]
+default = []
