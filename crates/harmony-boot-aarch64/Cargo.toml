@@ -3,6 +3,7 @@ name = "harmony-boot-aarch64"
 description = "Ring 1: aarch64 boot stub for Harmony unikernel (QEMU virt target)"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.75"
 license = "GPL-2.0-or-later"
 repository = "https://github.com/zeblithic/harmony-os"
 

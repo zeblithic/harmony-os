@@ -230,15 +230,23 @@ fn main() -> Status {
 // ExitBootServices the UEFI console is gone. This custom handler
 // prints to PL011 serial so panics are visible in QEMU.
 
-#[cfg(target_os = "uefi")]
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    let mut serial = harmony_unikernel::SerialWriter::new(|byte: u8| {
-        unsafe { pl011::write_byte(byte) };
-    });
-    use core::fmt::Write;
-    let _ = writeln!(serial, "\n!!! PANIC: {}", info);
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut serial = harmony_unikernel::SerialWriter::new(|byte: u8| {
+            unsafe { pl011::write_byte(byte) };
+        });
+        use core::fmt::Write;
+        let _ = writeln!(serial, "\n!!! PANIC: {}", info);
+    }
     loop {
-        unsafe { core::arch::asm!("wfe") };
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!("wfe")
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        core::hint::spin_loop();
     }
 }

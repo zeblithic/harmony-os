@@ -37,6 +37,9 @@ const UARTFR_TXFF: u32 = 1 << 5; // TX FIFO full
 ///   ibrd    = div_x64 / 64
 ///   fbrd    = div_x64 % 64
 pub fn baud_divisors(clock_hz: u32, baud: u32) -> (u16, u8) {
+    if baud == 0 {
+        return (0, 0);
+    }
     let div_x64 = (clock_hz as u64 * 4) / baud as u64;
     let ibrd = (div_x64 / 64) as u16;
     let fbrd = (div_x64 % 64) as u8;
@@ -114,5 +117,10 @@ mod tests {
     #[test]
     fn baud_zero_clock_does_not_panic() {
         assert_eq!(baud_divisors(0, 115200), (0, 0));
+    }
+
+    #[test]
+    fn baud_zero_baud_does_not_panic() {
+        assert_eq!(baud_divisors(24_000_000, 0), (0, 0));
     }
 }

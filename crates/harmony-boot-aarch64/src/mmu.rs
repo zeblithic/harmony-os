@@ -183,15 +183,15 @@ unsafe fn zero_frame(frame: PhysAddr) {
 
 /// Configure MAIR_EL1, TCR_EL1, TTBR0_EL1, and enable the MMU via SCTLR_EL1.
 ///
-/// The sequence:
+/// The ARM-recommended cold-start sequence:
 /// 1. DSB + ISB to synchronize before touching translation registers.
-/// 2. Write MAIR_EL1 (memory attribute definitions).
-/// 3. Write TCR_EL1 (translation control: VA size, granule, cacheability).
-/// 4. Write TTBR0_EL1 (root page table physical address).
-/// 5. ISB to ensure register writes complete.
-/// 6. Read-modify-write SCTLR_EL1 to set M (MMU), C (D-cache), I (I-cache).
-/// 7. ISB after SCTLR write.
-/// 8. TLB invalidation (TLBI vmalle1is) + DSB + ISB.
+/// 2. TLBI vmalle1is + DSB ISH + ISB to invalidate stale TLB entries first.
+/// 3. Write MAIR_EL1 (memory attribute definitions).
+/// 4. Write TCR_EL1 (translation control: VA size, granule, cacheability).
+/// 5. Write TTBR0_EL1 (root page table physical address).
+/// 6. ISB to ensure register writes complete.
+/// 7. Read-modify-write SCTLR_EL1 to set M (MMU), C (D-cache), I (I-cache).
+/// 8. ISB after SCTLR write.
 ///
 /// # Safety
 ///
@@ -202,6 +202,10 @@ unsafe fn zero_frame(frame: PhysAddr) {
 unsafe fn configure_system_regs(root_paddr: u64) {
     core::arch::asm!(
         // Synchronize before touching translation registers
+        "dsb ish",
+        "isb",
+        // Invalidate all stale TLB entries BEFORE writing translation regs
+        "tlbi vmalle1is",
         "dsb ish",
         "isb",
         // Set memory attributes
@@ -217,10 +221,6 @@ unsafe fn configure_system_regs(root_paddr: u64) {
         "orr {tmp}, {tmp}, {sctlr_bits}",
         "msr sctlr_el1, {tmp}",
         // Synchronize after MMU enable
-        "isb",
-        // Invalidate all TLB entries (inner-shareable)
-        "tlbi vmalle1is",
-        "dsb ish",
         "isb",
         mair = in(reg) MAIR_VALUE,
         tcr = in(reg) TCR_VALUE,

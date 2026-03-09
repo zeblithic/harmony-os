@@ -21,9 +21,12 @@ pub fn counter_to_ms(count: u64, freq: u64) -> u64 {
 
 // ── Hardware access (aarch64 only) ────────────────────────────────────
 
+#[cfg(target_arch = "aarch64")]
+use core::sync::atomic::{AtomicU64, Ordering};
+
 /// Cached timer frequency read from `CNTFRQ_EL0` during [`init`].
 #[cfg(target_arch = "aarch64")]
-static mut TIMER_FREQ: u64 = 0;
+static TIMER_FREQ: AtomicU64 = AtomicU64::new(0);
 
 /// Read `CNTFRQ_EL0` and cache the result in [`TIMER_FREQ`].
 ///
@@ -35,13 +38,13 @@ static mut TIMER_FREQ: u64 = 0;
 pub unsafe fn init() {
     let f: u64;
     core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f);
-    TIMER_FREQ = f;
+    TIMER_FREQ.store(f, Ordering::Relaxed);
 }
 
 /// Return the cached timer frequency in Hz.
 #[cfg(target_arch = "aarch64")]
 pub fn freq() -> u64 {
-    unsafe { TIMER_FREQ }
+    TIMER_FREQ.load(Ordering::Relaxed)
 }
 
 /// Read the current value of the physical counter (`CNTPCT_EL0`).
