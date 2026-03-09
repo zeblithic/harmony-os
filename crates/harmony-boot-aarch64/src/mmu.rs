@@ -60,6 +60,10 @@ const MAIR_VALUE: u64 = 0x00FF;
 /// - SH0   = 0b11 (bits [13:12]) -> Inner Shareable
 /// - ORGN0 = 0b01 (bits [11:10]) -> Normal, Outer Write-Back RA WA Cacheable
 /// - IRGN0 = 0b01 (bits [9:8])   -> Normal, Inner Write-Back RA WA Cacheable
+///
+/// Note: IPS (bits [34:32]) is set at runtime in [`configure_system_regs`] by
+/// reading ID_AA64MMFR0_EL1.PARange to match the platform's physical address
+/// width. This base value leaves IPS=0 as a placeholder.
 const TCR_VALUE: u64 = {
     let t0sz: u64 = 16; // 48-bit VA
     let irgn0: u64 = 0b01 << 8; // Inner WB RA WA
@@ -102,6 +106,12 @@ pub unsafe fn init_and_enable(
     let mut pt = Aarch64PageTable::new(root_frame, identity_phys_to_virt);
 
     // 3. Map all usable RAM regions as Normal cacheable memory.
+    //
+    // TODO: W^X hardening — currently all RAM is mapped RWX because we cannot
+    // distinguish code from data pages without linker-provided section boundaries
+    // (UEFI loads us as PE/COFF, not ELF). After enabling the MMU, instruction
+    // fetches fault on non-executable pages, so we must mark code pages RX.
+    // Future work: use linker symbols to split into RX (code) and RW (data/heap).
     let ram_flags = PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::EXECUTABLE;
     let mut mapped_pages: u64 = 0;
 
@@ -136,7 +146,14 @@ pub unsafe fn init_and_enable(
     match mmio_result {
         Ok(()) => mapped_pages += 1,
         Err(VmError::RegionConflict(_)) => {
-            // Already mapped as part of a usable region -- acceptable.
+            // On QEMU virt, PL011 MMIO (0x0900_0000) is never inside a usable
+            // RAM region, so this branch should be unreachable. If it IS reached,
+            // the UART was mapped as Normal cacheable memory (AttrIndx=0) which
+            // causes undefined hardware behaviour for MMIO — warn loudly.
+            let _ = writeln!(
+                serial,
+                "[MMU] WARNING: PL011 MMIO conflict — UART mapped as Normal memory, may be unreliable"
+            );
         }
         Err(e) => {
             let _ = writeln!(serial, "[MMU] PL011 MMIO map error: {:?}", e);
@@ -187,11 +204,15 @@ unsafe fn zero_frame(frame: PhysAddr) {
 /// 1. DSB + ISB to synchronize before touching translation registers.
 /// 2. TLBI vmalle1is + DSB ISH + ISB to invalidate stale TLB entries first.
 /// 3. Write MAIR_EL1 (memory attribute definitions).
-/// 4. Write TCR_EL1 (translation control: VA size, granule, cacheability).
+/// 4. Write TCR_EL1 (translation control: VA size, granule, cacheability, IPS).
 /// 5. Write TTBR0_EL1 (root page table physical address).
 /// 6. ISB to ensure register writes complete.
 /// 7. Read-modify-write SCTLR_EL1 to set M (MMU), C (D-cache), I (I-cache).
 /// 8. ISB after SCTLR write.
+///
+/// TCR_EL1.IPS is read from ID_AA64MMFR0_EL1.PARange at runtime so the
+/// physical address space matches the platform (e.g. 36-bit on some cores,
+/// 48-bit on others).
 ///
 /// # Safety
 ///
@@ -200,6 +221,13 @@ unsafe fn zero_frame(frame: PhysAddr) {
 /// covering all code and stack memory currently in use.
 #[cfg(target_arch = "aarch64")]
 unsafe fn configure_system_regs(root_paddr: u64) {
+    // Read the platform's physical address range from ID_AA64MMFR0_EL1[3:0]
+    // and place it into TCR_EL1.IPS (bits [34:32]).
+    let mmfr0: u64;
+    core::arch::asm!("mrs {}, id_aa64mmfr0_el1", out(reg) mmfr0);
+    let pa_range = mmfr0 & 0xF; // PARange field: bits [3:0]
+    let tcr = TCR_VALUE | (pa_range << 32); // IPS = PARange
+
     core::arch::asm!(
         // Synchronize before touching translation registers
         "dsb ish",
@@ -210,7 +238,7 @@ unsafe fn configure_system_regs(root_paddr: u64) {
         "isb",
         // Set memory attributes
         "msr mair_el1, {mair}",
-        // Set translation control
+        // Set translation control (with runtime IPS from ID_AA64MMFR0_EL1)
         "msr tcr_el1, {tcr}",
         // Set translation table base
         "msr ttbr0_el1, {ttbr}",
@@ -223,7 +251,7 @@ unsafe fn configure_system_regs(root_paddr: u64) {
         // Synchronize after MMU enable
         "isb",
         mair = in(reg) MAIR_VALUE,
-        tcr = in(reg) TCR_VALUE,
+        tcr = in(reg) tcr,
         ttbr = in(reg) root_paddr,
         sctlr_bits = in(reg) SCTLR_M | SCTLR_C | SCTLR_I,
         tmp = out(reg) _,
@@ -247,6 +275,9 @@ mod tests {
 
     #[test]
     fn tcr_value_correct() {
+        // Note: IPS (bits [34:32]) is set at runtime from ID_AA64MMFR0_EL1,
+        // so TCR_VALUE has IPS=0 as a placeholder.
+        assert_eq!((TCR_VALUE >> 32) & 0b111, 0b000);
         // T0SZ = 16 (48-bit VA)
         assert_eq!(TCR_VALUE & 0x3F, 16);
         // IRGN0 = 0b01 (WB RA WA)

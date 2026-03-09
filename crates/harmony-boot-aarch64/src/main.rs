@@ -92,6 +92,11 @@ fn main() -> Status {
 
     for desc in memory_map.entries() {
         if region_count >= regions.len() {
+            let _ = writeln!(
+                serial,
+                "[BOOT] WARNING: memory map truncated at {} entries",
+                regions.len()
+            );
             break;
         }
         let usable = is_usable_memory(desc.ty);
@@ -114,12 +119,12 @@ fn main() -> Status {
     );
 
     // ── Reserve bump allocator region from the first usable region >= 1 MiB ──
-    let mut bump_base: u64 = 0;
+    let mut bump_base: Option<u64> = None;
     for region in &regions[..region_count] {
         if !region.is_usable {
             continue;
         }
-        let region_end = region.base + region.pages * 4096;
+        let region_end = region.base + region.pages * PAGE_SIZE;
         // Find a region that starts at or above BUMP_MIN_ADDR with enough space.
         let start = if region.base >= BUMP_MIN_ADDR {
             region.base
@@ -130,12 +135,12 @@ fn main() -> Status {
         };
         let available = region_end.saturating_sub(start);
         if available >= BUMP_REGION_SIZE {
-            bump_base = start;
+            bump_base = Some(start);
             break;
         }
     }
 
-    assert!(bump_base != 0, "no suitable region for bump allocator");
+    let bump_base = bump_base.expect("no suitable region for bump allocator");
 
     let _ = writeln!(
         serial,
@@ -163,22 +168,43 @@ fn main() -> Status {
     let _ = writeln!(serial, "[RNDR] Hardware RNG available");
 
     // ── Initialise heap allocator ──
-    // Find the largest usable memory region that doesn't overlap the bump
-    // allocator range.  Cap at 4 MiB to avoid over-committing early in boot.
+    // Find the largest usable sub-region after carving out the bump allocator.
+    // On QEMU virt, most RAM is one large CONVENTIONAL descriptor that contains
+    // the bump allocator, so we must carve rather than exclude the whole region.
+    // Cap at 4 MiB to avoid over-committing early in boot.
     let bump_end = bump_base + BUMP_REGION_SIZE;
 
-    let (heap_base, heap_size) = regions[..region_count]
-        .iter()
-        .filter(|r| {
-            r.is_usable && {
-                let r_end = r.base + r.pages * PAGE_SIZE;
-                // Exclude regions that overlap the bump allocator range
-                r_end <= bump_base || r.base >= bump_end
+    let mut best_heap: Option<(u64, u64)> = None; // (base, size)
+    for r in regions[..region_count].iter().filter(|r| r.is_usable) {
+        let r_end = r.base + r.pages * PAGE_SIZE;
+
+        // Consider up to two sub-regions: before and after the bump range.
+        let candidates: [(u64, u64); 2] = [
+            // Sub-region before bump allocator
+            if r.base < bump_base {
+                (r.base, core::cmp::min(r_end, bump_base) - r.base)
+            } else {
+                (0, 0)
+            },
+            // Sub-region after bump allocator
+            if r_end > bump_end {
+                let start = core::cmp::max(r.base, bump_end);
+                (start, r_end - start)
+            } else {
+                (0, 0)
+            },
+        ];
+
+        for (base, size) in candidates {
+            if size > 0 {
+                if best_heap.map_or(true, |(_, best_size)| size > best_size) {
+                    best_heap = Some((base, size));
+                }
             }
-        })
-        .map(|r| (r.base, r.pages * PAGE_SIZE))
-        .max_by_key(|(_, size)| *size)
-        .expect("no usable memory region for heap");
+        }
+    }
+
+    let (heap_base, heap_size) = best_heap.expect("no usable memory region for heap");
 
     let heap_size = core::cmp::min(heap_size, 4 * 1024 * 1024);
 
