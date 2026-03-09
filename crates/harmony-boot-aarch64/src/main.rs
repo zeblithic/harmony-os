@@ -30,6 +30,13 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 #[cfg(target_os = "uefi")]
 use mmu::MemoryRegion;
 
+#[cfg(target_os = "uefi")]
+use harmony_identity::PrivateIdentity;
+#[cfg(target_os = "uefi")]
+use harmony_microkernel::vm::PAGE_SIZE;
+#[cfg(target_os = "uefi")]
+use harmony_unikernel::{KernelEntropy, MemoryState, UnikernelRuntime};
+
 /// Minimum physical address for the bump allocator region.
 /// We skip the first 1 MiB to avoid legacy low-memory hazards.
 #[cfg(target_os = "uefi")]
@@ -128,15 +135,7 @@ fn main() -> Status {
         }
     }
 
-    if bump_base == 0 {
-        let _ = writeln!(
-            serial,
-            "[BOOT] FATAL: no suitable region for bump allocator"
-        );
-        loop {
-            core::hint::spin_loop();
-        }
-    }
+    assert!(bump_base != 0, "no suitable region for bump allocator");
 
     let _ = writeln!(
         serial,
@@ -164,13 +163,19 @@ fn main() -> Status {
     let _ = writeln!(serial, "[RNDR] Hardware RNG available");
 
     // ── Initialise heap allocator ──
-    // Find the largest usable memory region that isn't the bump allocator region.
-    // Cap at 4 MiB to avoid over-committing early in boot.
-    use harmony_microkernel::vm::PAGE_SIZE;
+    // Find the largest usable memory region that doesn't overlap the bump
+    // allocator range.  Cap at 4 MiB to avoid over-committing early in boot.
+    let bump_end = bump_base + BUMP_REGION_SIZE;
 
     let (heap_base, heap_size) = regions[..region_count]
         .iter()
-        .filter(|r| r.is_usable && r.base != bump_base)
+        .filter(|r| {
+            r.is_usable && {
+                let r_end = r.base + r.pages * PAGE_SIZE;
+                // Exclude regions that overlap the bump allocator range
+                r_end <= bump_base || r.base >= bump_end
+            }
+        })
         .map(|r| (r.base, r.pages * PAGE_SIZE))
         .max_by_key(|(_, size)| *size)
         .expect("no usable memory region for heap");
@@ -189,9 +194,6 @@ fn main() -> Status {
     );
 
     // ── Generate Ed25519/X25519 identity ──
-    use harmony_identity::PrivateIdentity;
-    use harmony_unikernel::{KernelEntropy, MemoryState, UnikernelRuntime};
-
     let mut entropy = KernelEntropy::new(|buf: &mut [u8]| {
         unsafe { rndr::fill(buf) };
     });
