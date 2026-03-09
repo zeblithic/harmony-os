@@ -97,11 +97,37 @@ impl Lyll {
                 zone,
             },
         );
+        self.recompute_state_hash();
     }
 
     pub fn unregister_frame(&mut self, paddr: PhysAddr) {
         self.hash_registry.remove(&paddr);
         self.sampled_frames.remove(&paddr);
+        self.recompute_state_hash();
+    }
+
+    /// Recompute `state_hash` from the registry contents.
+    ///
+    /// Uses a simple fold over the sorted registry (BTreeMap guarantees
+    /// deterministic iteration order). This is a placeholder — will be
+    /// replaced with BLAKE3 once the crypto integration is wired up.
+    fn recompute_state_hash(&mut self) {
+        let mut hash = [0u8; 32];
+        for (&paddr, record) in &self.hash_registry {
+            let addr_bytes = paddr.as_u64().to_le_bytes();
+            let pid_bytes = record.owner_pid.to_le_bytes();
+            let expected = record.entry.expected_hash();
+            for (i, &b) in addr_bytes.iter().enumerate() {
+                hash[i] ^= b;
+            }
+            for (i, &b) in pid_bytes.iter().enumerate() {
+                hash[8 + i] ^= b;
+            }
+            for (i, &b) in expected.iter().enumerate() {
+                hash[i] ^= b;
+            }
+        }
+        self.state_hash = ContentHash(hash);
     }
 
     /// Promote a CID-backed entry to a Snapshot entry, preserving its current
@@ -548,6 +574,41 @@ mod tests {
             sampling_rate_percent: 101,
             sweep_interval_ticks: 10,
         });
+    }
+
+    #[test]
+    fn state_hash_changes_on_register_and_unregister() {
+        let mut lyll = Lyll::new(test_config());
+        let initial = lyll.state_hash();
+        assert_eq!(initial, ContentHash::ZERO);
+
+        // Register a frame — state hash must change.
+        lyll.register_frame(
+            PhysAddr(0x1000),
+            HashEntry::CidBacked { cid: [0xAA; 32] },
+            1,
+            MemoryZone::PublicDurable,
+        );
+        let after_register = lyll.state_hash();
+        assert_ne!(after_register, ContentHash::ZERO);
+
+        // Register a second frame — hash changes again.
+        lyll.register_frame(
+            PhysAddr(0x2000),
+            HashEntry::CidBacked { cid: [0xBB; 32] },
+            2,
+            MemoryZone::PublicDurable,
+        );
+        let after_second = lyll.state_hash();
+        assert_ne!(after_second, after_register);
+
+        // Unregister second frame — hash returns to single-frame state.
+        lyll.unregister_frame(PhysAddr(0x2000));
+        assert_eq!(lyll.state_hash(), after_register);
+
+        // Unregister first frame — back to zero.
+        lyll.unregister_frame(PhysAddr(0x1000));
+        assert_eq!(lyll.state_hash(), ContentHash::ZERO);
     }
 
     #[test]

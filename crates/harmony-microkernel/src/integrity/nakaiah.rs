@@ -77,11 +77,13 @@ impl Nakaiah {
 
     pub fn register_frame(&mut self, paddr: PhysAddr, content_hash: [u8; 32]) {
         self.integrity_registry.insert(paddr, content_hash);
+        self.recompute_state_hash();
     }
 
     pub fn unregister_frame(&mut self, paddr: PhysAddr) {
         self.integrity_registry.remove(&paddr);
         self.capability_chains.retain(|&(_, p), _| p != paddr);
+        self.recompute_state_hash();
     }
 
     pub fn update_hash(&mut self, paddr: PhysAddr, new_hash: [u8; 32]) {
@@ -100,10 +102,43 @@ impl Nakaiah {
 
     pub fn grant_access(&mut self, pid: u32, paddr: PhysAddr, chain: CapChain) {
         self.capability_chains.insert((pid, paddr), chain);
+        self.recompute_state_hash();
     }
 
     pub fn revoke_access(&mut self, pid: u32, paddr: PhysAddr) {
         self.capability_chains.remove(&(pid, paddr));
+        self.recompute_state_hash();
+    }
+
+    /// Recompute `state_hash` from the registry and capability chain contents.
+    ///
+    /// Uses a simple fold over the sorted registries (BTreeMap guarantees
+    /// deterministic iteration order). This is a placeholder — will be
+    /// replaced with BLAKE3 once the crypto integration is wired up.
+    fn recompute_state_hash(&mut self) {
+        let mut hash = [0u8; 32];
+        // Fold in integrity registry entries.
+        for (&paddr, content_hash) in &self.integrity_registry {
+            let addr_bytes = paddr.as_u64().to_le_bytes();
+            for (i, &b) in addr_bytes.iter().enumerate() {
+                hash[i] ^= b;
+            }
+            for (i, &b) in content_hash.iter().enumerate() {
+                hash[i] ^= b;
+            }
+        }
+        // Fold in capability chain keys for structural completeness.
+        for &(pid, paddr) in self.capability_chains.keys() {
+            let pid_bytes = pid.to_le_bytes();
+            let addr_bytes = paddr.as_u64().to_le_bytes();
+            for (i, &b) in pid_bytes.iter().enumerate() {
+                hash[12 + i] ^= b;
+            }
+            for (i, &b) in addr_bytes.iter().enumerate() {
+                hash[16 + i] ^= b;
+            }
+        }
+        self.state_hash = ContentHash(hash);
     }
 
     pub fn has_access(&self, pid: u32, paddr: PhysAddr, op: AccessOp) -> bool {
@@ -433,6 +468,30 @@ mod tests {
         n.unregister_frame(PhysAddr(0x1000));
         assert!(!n.has_access(1, PhysAddr(0x1000), AccessOp::Read));
         assert!(!n.has_access(2, PhysAddr(0x1000), AccessOp::Read));
+    }
+
+    #[test]
+    fn state_hash_changes_on_structural_mutations() {
+        let mut n = test_nakaiah();
+        assert_eq!(n.state_hash(), ContentHash::ZERO);
+
+        // Register a frame — state hash must change.
+        n.register_frame(PhysAddr(0x1000), [0xAA; 32]);
+        let after_register = n.state_hash();
+        assert_ne!(after_register, ContentHash::ZERO);
+
+        // Grant access — hash changes again (capability chain added).
+        n.grant_access(1, PhysAddr(0x1000), CapChain::Owner);
+        let after_grant = n.state_hash();
+        assert_ne!(after_grant, after_register);
+
+        // Revoke access — hash changes back (capability chain removed).
+        n.revoke_access(1, PhysAddr(0x1000));
+        assert_eq!(n.state_hash(), after_register);
+
+        // Unregister frame — back to zero.
+        n.unregister_frame(PhysAddr(0x1000));
+        assert_eq!(n.state_hash(), ContentHash::ZERO);
     }
 
     #[test]
