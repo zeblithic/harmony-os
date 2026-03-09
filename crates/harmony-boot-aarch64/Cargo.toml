@@ -10,7 +10,6 @@ repository = "https://github.com/zeblithic/harmony-os"
 # to avoid std feature unification with host-target workspace members.
 
 [dependencies]
-uefi = { version = "0.36", features = ["global_allocator", "panic_handler"] }
 linked_list_allocator = "0.10"
 
 harmony-unikernel = { path = "../harmony-unikernel", default-features = false }
@@ -23,6 +22,11 @@ sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 # Force pure Rust BLAKE3 — cross-compiling for aarch64-unknown-uefi has no
 # system libc headers, so the C NEON backend fails to build.
 blake3 = { version = "1", default-features = false, features = ["no_neon"] }
+
+# uefi crate is only needed on the UEFI target.  The `panic_handler` feature
+# conflicts with std's panic_handler when running host-target tests.
+[target.'cfg(target_os = "uefi")'.dependencies]
+uefi = { version = "0.36", features = ["global_allocator", "panic_handler"] }
 
 [features]
 default = []
