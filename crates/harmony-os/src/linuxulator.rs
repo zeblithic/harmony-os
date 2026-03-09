@@ -708,44 +708,59 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.arena.base
     }
 
-    /// Dispatch a Linux syscall. Returns the syscall result (negative = errno).
+    /// Handle a syscall identified by x86_64 syscall number.
     ///
-    /// # Arguments
-    /// - `nr`: Linux syscall number (x86_64 ABI)
-    /// - `args`: syscall arguments [arg1, arg2, arg3, arg4, arg5, arg6]
+    /// This is the original entry point. It maps the raw number to a
+    /// `LinuxSyscall` and delegates to `dispatch_syscall`.
+    pub fn handle_syscall(&mut self, nr: u64, args: [u64; 6]) -> i64 {
+        let syscall = LinuxSyscall::from_x86_64(nr, args);
+        self.dispatch_syscall(syscall)
+    }
+
+    /// Dispatch a CPU-agnostic `LinuxSyscall` to the appropriate handler.
+    ///
+    /// This is the architecture-independent entry point. Both `handle_syscall`
+    /// (x86_64) and the aarch64 SVC handler call this method.
     ///
     /// # Safety
-    /// For `sys_write`, `args[1]` is treated as a pointer to user memory.
-    /// In the MVP flat address space, this is a direct pointer dereference.
-    pub fn handle_syscall(&mut self, nr: u64, args: [u64; 6]) -> i64 {
-        match nr {
-            0 => self.sys_read(args[0] as i32, args[1] as usize, args[2] as usize),
-            1 => self.sys_write(args[0] as i32, args[1] as usize, args[2] as usize),
-            3 => self.sys_close(args[0] as i32),
-            5 => self.sys_fstat(args[0] as i32, args[1] as usize),
-            9 => self.sys_mmap(
-                args[0],
-                args[1],
-                args[2] as i32,
-                args[3] as i32,
-                args[4] as i32,
-                args[5],
-            ),
-            10 => self.sys_mprotect(args[0], args[1], args[2] as i32),
-            11 => self.sys_munmap(args[0], args[1]),
-            12 => self.sys_brk(args[0]),
-            13 => self.sys_rt_sigaction(),
-            14 => self.sys_rt_sigprocmask(),
-            16 => self.sys_ioctl(args[0] as i32, args[1]),
-            60 => self.sys_exit(args[0] as i32),
-            158 => self.sys_arch_prctl(args[0] as i32, args[1]),
-            218 => self.sys_set_tid_address(),
-            231 => self.sys_exit_group(args[0] as i32),
-            257 => self.sys_openat(args[0] as i32, args[1] as usize, args[2] as i32),
-            273 => self.sys_set_robust_list(),
-            302 => self.sys_prlimit64(args[0] as i32, args[1] as i32, args[2], args[3] as usize),
-            334 => ENOSYS, // rseq — musl handles gracefully
-            _ => ENOSYS,
+    /// For syscalls that take pointer arguments (Write, Read, Openat, Fstat,
+    /// Prlimit64), the pointer values in the enum are treated as raw pointers
+    /// to process memory. In the MVP flat address space, this is a direct
+    /// dereference.
+    pub fn dispatch_syscall(&mut self, syscall: LinuxSyscall) -> i64 {
+        match syscall {
+            LinuxSyscall::Read { fd, buf, count } => {
+                self.sys_read(fd, buf as usize, count as usize)
+            }
+            LinuxSyscall::Write { fd, buf, count } => {
+                self.sys_write(fd, buf as usize, count as usize)
+            }
+            LinuxSyscall::Close { fd } => self.sys_close(fd),
+            LinuxSyscall::Fstat { fd, buf } => self.sys_fstat(fd, buf as usize),
+            LinuxSyscall::Mmap { addr, len, prot, flags, fd, offset } => {
+                self.sys_mmap(addr, len, prot, flags, fd, offset)
+            }
+            LinuxSyscall::Mprotect { addr, len, prot } => {
+                self.sys_mprotect(addr, len, prot)
+            }
+            LinuxSyscall::Munmap { addr, len } => self.sys_munmap(addr, len),
+            LinuxSyscall::Brk { addr } => self.sys_brk(addr),
+            LinuxSyscall::RtSigaction => self.sys_rt_sigaction(),
+            LinuxSyscall::RtSigprocmask => self.sys_rt_sigprocmask(),
+            LinuxSyscall::Ioctl { fd, request } => self.sys_ioctl(fd, request),
+            LinuxSyscall::Exit { code } => self.sys_exit(code),
+            LinuxSyscall::ArchPrctl { code, addr } => self.sys_arch_prctl(code, addr),
+            LinuxSyscall::SetTidAddress => self.sys_set_tid_address(),
+            LinuxSyscall::ExitGroup { code } => self.sys_exit_group(code),
+            LinuxSyscall::Openat { dirfd, pathname, flags } => {
+                self.sys_openat(dirfd, pathname as usize, flags)
+            }
+            LinuxSyscall::SetRobustList => self.sys_set_robust_list(),
+            LinuxSyscall::Prlimit64 { pid, resource, new_limit, old_limit_buf } => {
+                self.sys_prlimit64(pid, resource, new_limit, old_limit_buf as usize)
+            }
+            LinuxSyscall::Rseq => ENOSYS,
+            LinuxSyscall::Unknown { .. } => ENOSYS,
         }
     }
 
@@ -1881,6 +1896,19 @@ mod tests {
         // arch_prctl is x86_64-specific; aarch64 has no equivalent
         let syscall = LinuxSyscall::from_aarch64(158, [0; 6]);
         assert!(matches!(syscall, LinuxSyscall::Unknown { nr: 158 }));
+    }
+
+    #[test]
+    fn dispatch_write_via_enum() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        let msg = b"test";
+        let result = lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: 1,
+            buf: msg.as_ptr() as u64,
+            count: msg.len() as u64,
+        });
+        assert_eq!(result, msg.len() as i64);
     }
 }
 
