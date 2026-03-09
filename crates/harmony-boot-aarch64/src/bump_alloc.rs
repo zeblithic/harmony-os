@@ -3,12 +3,19 @@
 
 use harmony_microkernel::vm::{PhysAddr, PAGE_SIZE};
 
+/// A simple bump allocator that hands out 4 KiB frames sequentially.
+///
+/// Never frees — used only during early boot before heap is available.
 pub struct BumpAllocator {
-    next: u64, // next frame to hand out (always page-aligned)
-    end: u64,  // one past last usable byte
+    next: u64,
+    end: u64,
 }
 
 impl BumpAllocator {
+    /// Create a new bump allocator over the region `[base, base + size)`.
+    ///
+    /// `base` is rounded up to the next page boundary. `size` is truncated
+    /// to a page boundary from `base + size`.
     pub fn new(base: u64, size: u64) -> Self {
         let aligned_base = (base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let end = (base + size) & !(PAGE_SIZE - 1);
@@ -18,6 +25,9 @@ impl BumpAllocator {
         }
     }
 
+    /// Allocate a single 4 KiB frame, returning its physical address.
+    ///
+    /// Returns `None` if the allocator is exhausted.
     pub fn alloc_frame(&mut self) -> Option<PhysAddr> {
         if self.next >= self.end {
             return None;
@@ -27,6 +37,7 @@ impl BumpAllocator {
         Some(PhysAddr(frame))
     }
 
+    /// Number of frames remaining.
     pub fn remaining(&self) -> u64 {
         (self.end - self.next) / PAGE_SIZE
     }
