@@ -1,0 +1,15 @@
+# Bare-metal cross-compilation defaults for harmony-boot-aarch64.
+#
+# Several crypto crates auto-detect the host and compile SIMD/AES code paths.
+# When cross-compiling for aarch64-unknown-uefi the LLVM backend may crash
+# trying to generate unsupported instructions.  Force software fallbacks.
+
+[build]
+target = "aarch64-unknown-uefi"
+
+[target.aarch64-unknown-uefi]
+rustflags = [
+    "--cfg", "poly1305_force_soft",
+    "--cfg", "aes_force_soft",
+    "--cfg", "curve25519_dalek_backend=\"serial\"",
+]

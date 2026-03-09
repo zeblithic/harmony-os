@@ -9,7 +9,7 @@ members = [
 # (x86_64-unknown-none) and Cargo's workspace feature unification would force
 # std features on its no_std dependencies. Build it via `cargo xtask` or
 # `cargo check -p harmony-boot --target x86_64-unknown-none` from crates/harmony-boot/.
-exclude = ["crates/harmony-boot", "xtask"]
+exclude = ["crates/harmony-boot", "crates/harmony-boot-aarch64", "xtask"]
 
 [workspace.package]
 version = "0.1.0"
