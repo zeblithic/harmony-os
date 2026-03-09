@@ -515,11 +515,10 @@ impl<P: PageTable> Kernel<P> {
     ///
     /// # Sync caveat
     ///
-    /// Operations that only update existing frame hashes (e.g.
-    /// [`Lyll::update_snapshot`]) do not change the guardian's
-    /// [`state_hash`](Lyll::state_hash) and are safe without a
-    /// [`sync_guardian_state_hashes`](Self::sync_guardian_state_hashes) call.
-    /// Structural mutations (register/unregister) should go through the
+    /// All mutations that change `state_hash` — including
+    /// [`Lyll::update_snapshot`], register, and unregister — require a
+    /// [`sync_guardian_state_hashes`](Self::sync_guardian_state_hashes) call
+    /// afterward so the cross-guardian hashes stay consistent. Prefer the
     /// orchestrated `vm_map_region` / `vm_unmap_region` / `destroy_process`
     /// methods which handle sync automatically.
     pub fn lyll_mut(&mut self) -> &mut Lyll {

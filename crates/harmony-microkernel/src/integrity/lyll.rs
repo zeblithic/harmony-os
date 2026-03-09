@@ -120,6 +120,9 @@ impl Lyll {
         let addr_bytes = paddr.as_u64().to_le_bytes();
         let pid_bytes = record.owner_pid.to_le_bytes();
         let expected = record.entry.expected_hash();
+        // Ranges: addr [0..8], pid [8..12], expected [12..32 wrapping to 0..12].
+        // Wrapping keeps all three fields in non-overlapping lanes so that
+        // different (addr, hash) pairs cannot silently cancel each other.
         for (i, &b) in addr_bytes.iter().enumerate() {
             hash[i] ^= b;
         }
@@ -127,7 +130,7 @@ impl Lyll {
             hash[8 + i] ^= b;
         }
         for (i, &b) in expected.iter().enumerate() {
-            hash[i] ^= b;
+            hash[(12 + i) % 32] ^= b;
         }
     }
 

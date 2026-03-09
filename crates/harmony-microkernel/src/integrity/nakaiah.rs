@@ -138,11 +138,12 @@ impl Nakaiah {
     /// XOR a single registry entry's contribution into (or out of) `hash`.
     fn xor_registry_entry(hash: &mut [u8; 32], paddr: PhysAddr, content_hash: &[u8; 32]) {
         let addr_bytes = paddr.as_u64().to_le_bytes();
+        // addr at [0..8], content_hash at [8..32 wrapping to 0..8].
         for (i, &b) in addr_bytes.iter().enumerate() {
             hash[i] ^= b;
         }
         for (i, &b) in content_hash.iter().enumerate() {
-            hash[i] ^= b;
+            hash[(8 + i) % 32] ^= b;
         }
     }
 
