@@ -154,6 +154,10 @@ fn main() -> Status {
 
     // ── Initialise ARM Generic Timer ──
     unsafe { timer::init() };
+    assert!(
+        timer::freq() != 0,
+        "CNTFRQ_EL0 is zero — timer not configured by firmware"
+    );
     let _ = writeln!(
         serial,
         "[Timer] ARM generic timer: freq={} Hz",

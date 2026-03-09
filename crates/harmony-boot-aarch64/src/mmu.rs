@@ -186,8 +186,8 @@ fn identity_phys_to_virt(pa: PhysAddr) -> *mut u8 {
 
 /// Allocate a frame from the bump allocator and zero it before returning.
 ///
-/// `Aarch64PageTable::map()` requires intermediate table frames to be zeroed
-/// so that all 512 entries start as invalid descriptors.
+/// Note: `Aarch64PageTable::map()` zeroes intermediate table frames itself,
+/// so this pre-zeroing is defensive rather than strictly required.
 fn alloc_zeroed_frame(alloc: &mut BumpAllocator) -> Option<PhysAddr> {
     let frame = alloc.alloc_frame()?;
     unsafe { zero_frame(frame) };
