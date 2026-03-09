@@ -512,6 +512,16 @@ impl<P: PageTable> Kernel<P> {
     }
 
     /// Mutable access to the Lyll auditor.
+    ///
+    /// # Sync caveat
+    ///
+    /// Operations that only update existing frame hashes (e.g.
+    /// [`Lyll::update_snapshot`]) do not change the guardian's
+    /// [`state_hash`](Lyll::state_hash) and are safe without a
+    /// [`sync_guardian_state_hashes`](Self::sync_guardian_state_hashes) call.
+    /// Structural mutations (register/unregister) should go through the
+    /// orchestrated `vm_map_region` / `vm_unmap_region` / `destroy_process`
+    /// methods which handle sync automatically.
     pub fn lyll_mut(&mut self) -> &mut Lyll {
         &mut self.lyll
     }
@@ -522,6 +532,14 @@ impl<P: PageTable> Kernel<P> {
     }
 
     /// Mutable access to the Nakaiah bodyguard.
+    ///
+    /// # Sync caveat
+    ///
+    /// Structural mutations (register/unregister, grant/revoke) should go
+    /// through the orchestrated Kernel methods which call
+    /// [`sync_guardian_state_hashes`](Self::sync_guardian_state_hashes)
+    /// automatically. Direct mutation without sync may break the
+    /// dual-guardian consistency invariant.
     pub fn nakaiah_mut(&mut self) -> &mut Nakaiah {
         &mut self.nakaiah
     }
