@@ -118,10 +118,12 @@ fn main() -> Status {
             .count()
     );
 
-    // ── Reserve bump allocator region from the first usable region >= 1 MiB ──
+    // ── Reserve bump allocator region from the first CONVENTIONAL region >= 1 MiB ──
+    // Like heap, bump must come from CONVENTIONAL memory to avoid overwriting
+    // our running binary (LOADER_CODE/DATA) or the UEFI stack (BOOT_SERVICES_DATA).
     let mut bump_base: Option<u64> = None;
     for region in &regions[..region_count] {
-        if !region.is_usable {
+        if !region.is_conventional {
             continue;
         }
         let region_end = region.base + region.pages * PAGE_SIZE;
