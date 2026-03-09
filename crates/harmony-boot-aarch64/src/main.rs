@@ -13,6 +13,9 @@ mod pl011;
 mod rndr;
 mod timer;
 
+mod syscall;
+mod vectors;
+
 #[cfg(not(test))]
 use linked_list_allocator::LockedHeap;
 
