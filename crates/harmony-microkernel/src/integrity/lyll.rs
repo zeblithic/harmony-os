@@ -89,45 +89,42 @@ impl Lyll {
         owner_pid: u32,
         zone: MemoryZone,
     ) {
-        self.hash_registry.insert(
-            paddr,
-            FrameRecord {
-                entry,
-                owner_pid,
-                zone,
-            },
-        );
-        self.recompute_state_hash();
+        let record = FrameRecord {
+            entry,
+            owner_pid,
+            zone,
+        };
+        Self::xor_record_into(&mut self.state_hash.0, paddr, &record);
+        self.hash_registry.insert(paddr, record);
     }
 
     pub fn unregister_frame(&mut self, paddr: PhysAddr) {
-        self.hash_registry.remove(&paddr);
+        if let Some(record) = self.hash_registry.remove(&paddr) {
+            // XOR is its own inverse — folding out the removed entry.
+            Self::xor_record_into(&mut self.state_hash.0, paddr, &record);
+        }
         self.sampled_frames.remove(&paddr);
-        self.recompute_state_hash();
     }
 
-    /// Recompute `state_hash` from the registry contents.
+    /// XOR a single record's contribution into (or out of) `hash`.
     ///
-    /// Uses a simple fold over the sorted registry (BTreeMap guarantees
-    /// deterministic iteration order). This is a placeholder — will be
-    /// replaced with BLAKE3 once the crypto integration is wired up.
-    fn recompute_state_hash(&mut self) {
-        let mut hash = [0u8; 32];
-        for (&paddr, record) in &self.hash_registry {
-            let addr_bytes = paddr.as_u64().to_le_bytes();
-            let pid_bytes = record.owner_pid.to_le_bytes();
-            let expected = record.entry.expected_hash();
-            for (i, &b) in addr_bytes.iter().enumerate() {
-                hash[i] ^= b;
-            }
-            for (i, &b) in pid_bytes.iter().enumerate() {
-                hash[8 + i] ^= b;
-            }
-            for (i, &b) in expected.iter().enumerate() {
-                hash[i] ^= b;
-            }
+    /// Because XOR is commutative, associative, and self-inverse, calling
+    /// this once folds the record in; calling it again on the same data
+    /// folds it back out. This makes register/unregister O(1) instead of
+    /// scanning the entire registry.
+    fn xor_record_into(hash: &mut [u8; 32], paddr: PhysAddr, record: &FrameRecord) {
+        let addr_bytes = paddr.as_u64().to_le_bytes();
+        let pid_bytes = record.owner_pid.to_le_bytes();
+        let expected = record.entry.expected_hash();
+        for (i, &b) in addr_bytes.iter().enumerate() {
+            hash[i] ^= b;
         }
-        self.state_hash = ContentHash(hash);
+        for (i, &b) in pid_bytes.iter().enumerate() {
+            hash[8 + i] ^= b;
+        }
+        for (i, &b) in expected.iter().enumerate() {
+            hash[i] ^= b;
+        }
     }
 
     /// Promote a CID-backed entry to a Snapshot entry, preserving its current

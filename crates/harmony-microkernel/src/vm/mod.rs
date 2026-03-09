@@ -137,16 +137,6 @@ impl From<FrameClassification> for MemoryZone {
     }
 }
 
-impl MemoryZone {
-    pub fn is_kernel(self) -> bool {
-        matches!(self, Self::KernelDurable | Self::KernelEphemeral)
-    }
-
-    pub fn is_ephemeral(self) -> bool {
-        matches!(self, Self::PublicEphemeral | Self::KernelEphemeral)
-    }
-}
-
 /// A 32-byte content hash (BLAKE3) used for frame integrity verification.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ContentHash(pub [u8; 32]);
@@ -182,7 +172,6 @@ pub enum ViolationReason {
     ContentTampered,
     UnauthorizedAccess,
     GuardianStateCorrupted,
-    BehavioralMismatch,
 }
 
 // ── Error enum ───────────────────────────────────────────────────────
@@ -342,6 +331,5 @@ mod tests {
         let _ct = ViolationReason::ContentTampered;
         let _ua = ViolationReason::UnauthorizedAccess;
         let _gs = ViolationReason::GuardianStateCorrupted;
-        let _bm = ViolationReason::BehavioralMismatch;
     }
 }

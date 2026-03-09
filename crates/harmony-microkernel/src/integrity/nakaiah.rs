@@ -76,14 +76,26 @@ impl Nakaiah {
     }
 
     pub fn register_frame(&mut self, paddr: PhysAddr, content_hash: [u8; 32]) {
+        Self::xor_registry_entry(&mut self.state_hash.0, paddr, &content_hash);
         self.integrity_registry.insert(paddr, content_hash);
-        self.recompute_state_hash();
     }
 
     pub fn unregister_frame(&mut self, paddr: PhysAddr) {
-        self.integrity_registry.remove(&paddr);
-        self.capability_chains.retain(|&(_, p), _| p != paddr);
-        self.recompute_state_hash();
+        // XOR out the registry entry.
+        if let Some(content_hash) = self.integrity_registry.remove(&paddr) {
+            Self::xor_registry_entry(&mut self.state_hash.0, paddr, &content_hash);
+        }
+        // XOR out all capability chain entries for this frame, then remove.
+        let keys_to_remove: Vec<_> = self
+            .capability_chains
+            .keys()
+            .filter(|&&(_, p)| p == paddr)
+            .copied()
+            .collect();
+        for key in keys_to_remove {
+            Self::xor_cap_entry(&mut self.state_hash.0, key.0, key.1);
+            self.capability_chains.remove(&key);
+        }
     }
 
     pub fn update_hash(&mut self, paddr: PhysAddr, new_hash: [u8; 32]) {
@@ -101,44 +113,38 @@ impl Nakaiah {
     }
 
     pub fn grant_access(&mut self, pid: u32, paddr: PhysAddr, chain: CapChain) {
+        Self::xor_cap_entry(&mut self.state_hash.0, pid, paddr);
         self.capability_chains.insert((pid, paddr), chain);
-        self.recompute_state_hash();
     }
 
     pub fn revoke_access(&mut self, pid: u32, paddr: PhysAddr) {
-        self.capability_chains.remove(&(pid, paddr));
-        self.recompute_state_hash();
+        if self.capability_chains.remove(&(pid, paddr)).is_some() {
+            // XOR is its own inverse — folding out the removed entry.
+            Self::xor_cap_entry(&mut self.state_hash.0, pid, paddr);
+        }
     }
 
-    /// Recompute `state_hash` from the registry and capability chain contents.
-    ///
-    /// Uses a simple fold over the sorted registries (BTreeMap guarantees
-    /// deterministic iteration order). This is a placeholder — will be
-    /// replaced with BLAKE3 once the crypto integration is wired up.
-    fn recompute_state_hash(&mut self) {
-        let mut hash = [0u8; 32];
-        // Fold in integrity registry entries.
-        for (&paddr, content_hash) in &self.integrity_registry {
-            let addr_bytes = paddr.as_u64().to_le_bytes();
-            for (i, &b) in addr_bytes.iter().enumerate() {
-                hash[i] ^= b;
-            }
-            for (i, &b) in content_hash.iter().enumerate() {
-                hash[i] ^= b;
-            }
+    /// XOR a single registry entry's contribution into (or out of) `hash`.
+    fn xor_registry_entry(hash: &mut [u8; 32], paddr: PhysAddr, content_hash: &[u8; 32]) {
+        let addr_bytes = paddr.as_u64().to_le_bytes();
+        for (i, &b) in addr_bytes.iter().enumerate() {
+            hash[i] ^= b;
         }
-        // Fold in capability chain keys for structural completeness.
-        for &(pid, paddr) in self.capability_chains.keys() {
-            let pid_bytes = pid.to_le_bytes();
-            let addr_bytes = paddr.as_u64().to_le_bytes();
-            for (i, &b) in pid_bytes.iter().enumerate() {
-                hash[12 + i] ^= b;
-            }
-            for (i, &b) in addr_bytes.iter().enumerate() {
-                hash[16 + i] ^= b;
-            }
+        for (i, &b) in content_hash.iter().enumerate() {
+            hash[i] ^= b;
         }
-        self.state_hash = ContentHash(hash);
+    }
+
+    /// XOR a single capability chain key's contribution into (or out of) `hash`.
+    fn xor_cap_entry(hash: &mut [u8; 32], pid: u32, paddr: PhysAddr) {
+        let pid_bytes = pid.to_le_bytes();
+        let addr_bytes = paddr.as_u64().to_le_bytes();
+        for (i, &b) in pid_bytes.iter().enumerate() {
+            hash[12 + i] ^= b;
+        }
+        for (i, &b) in addr_bytes.iter().enumerate() {
+            hash[16 + i] ^= b;
+        }
     }
 
     pub fn has_access(&self, pid: u32, paddr: PhysAddr, op: AccessOp) -> bool {
