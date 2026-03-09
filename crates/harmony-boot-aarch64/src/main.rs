@@ -7,6 +7,7 @@
 #[cfg(not(test))]
 extern crate alloc;
 
+mod bump_alloc;
 mod pl011;
 
 #[cfg(target_os = "uefi")]
