@@ -45,7 +45,8 @@ pub unsafe fn init() {
 ///   0x280  Current EL, SPx, IRQ              — unexpected
 ///   0x300  Current EL, SPx, FIQ              — unexpected
 ///   0x380  Current EL, SPx, SError           — unexpected
-///   0x400-0x780  Lower EL entries             — all unused
+///   0x400  Lower EL, AArch64, Synchronous  — branch to el1_sync_handler
+///   0x480-0x780  Lower EL, remaining entries  — unexpected
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(
     // ── Vector table ────────────────────────────────────────────
@@ -85,9 +86,12 @@ core::arch::global_asm!(
     "b unexpected_exception",
     ".balign 0x80",
 
-    // 0x400-0x780 — Lower EL entries (8 entries, all unused)
-    "b unexpected_exception",
+    // 0x400-0x780 — Lower EL entries
+    // 0x400 — Lower EL, AArch64, Synchronous (SVC from EL0)
+    // Routes to el1_sync_handler for diagnostics / future EL0 support
+    "b el1_sync_handler",
     ".balign 0x80",
+    // 0x480 — Lower EL, AArch64, IRQ
     "b unexpected_exception",
     ".balign 0x80",
     "b unexpected_exception",

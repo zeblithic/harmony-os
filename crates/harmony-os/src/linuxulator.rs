@@ -604,9 +604,10 @@ fn flags_to_open_mode(flags: i32) -> OpenMode {
     }
 }
 
-/// Write a Linux x86_64 `struct stat` (144 bytes) to process memory.
+/// Write a Linux `struct stat` to process memory using the correct
+/// layout for the current architecture.
 ///
-/// Field layout follows the x86_64 Linux kernel struct stat:
+/// x86_64 layout (144 bytes):
 ///   offset  size  field
 ///   0       8     st_dev
 ///   8       8     st_ino
@@ -620,17 +621,23 @@ fn flags_to_open_mode(flags: i32) -> OpenMode {
 ///   56      8     st_blksize
 ///   64      8     st_blocks
 ///   72-144        timestamps (zeroed for MVP)
+///
+/// aarch64 layout (128 bytes, asm-generic):
+///   offset  size  field
+///   0       8     st_dev
+///   8       8     st_ino
+///   16      4     st_mode
+///   20      4     st_nlink
+///   24      4     st_uid
+///   28      4     st_gid
+///   32      8     st_rdev
+///   40      8     __pad1
+///   48      8     st_size
+///   56      4     st_blksize
+///   60      4     __pad2
+///   64      8     st_blocks
+///   72-128        timestamps (zeroed for MVP)
 fn write_linux_stat(buf_ptr: usize, stat: &FileStat, is_chardev: bool) {
-    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, 144) };
-    buf.fill(0);
-
-    // st_ino (offset 8, 8 bytes)
-    buf[8..16].copy_from_slice(&stat.qpath.to_le_bytes());
-
-    // st_nlink (offset 16, 8 bytes)
-    buf[16..24].copy_from_slice(&1u64.to_le_bytes());
-
-    // st_mode (offset 24, 4 bytes)
     let mode: u32 = if is_chardev {
         0o020000 | 0o666 // S_IFCHR | rw-rw-rw-
     } else {
@@ -639,17 +646,33 @@ fn write_linux_stat(buf_ptr: usize, stat: &FileStat, is_chardev: bool) {
             FileType::Directory => 0o040000 | 0o755, // S_IFDIR | rwxr-xr-x
         }
     };
-    buf[24..28].copy_from_slice(&mode.to_le_bytes());
 
-    // st_size (offset 48, 8 bytes)
-    buf[48..56].copy_from_slice(&stat.size.to_le_bytes());
+    #[cfg(target_arch = "x86_64")]
+    {
+        let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, 144) };
+        buf.fill(0);
+        buf[8..16].copy_from_slice(&stat.qpath.to_le_bytes()); // st_ino
+        buf[16..24].copy_from_slice(&1u64.to_le_bytes()); // st_nlink
+        buf[24..28].copy_from_slice(&mode.to_le_bytes()); // st_mode
+        buf[48..56].copy_from_slice(&stat.size.to_le_bytes()); // st_size
+        buf[56..64].copy_from_slice(&4096u64.to_le_bytes()); // st_blksize
+        let blocks = stat.size.div_ceil(512);
+        buf[64..72].copy_from_slice(&blocks.to_le_bytes()); // st_blocks
+    }
 
-    // st_blksize (offset 56, 8 bytes)
-    buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
-
-    // st_blocks (offset 64, 8 bytes)
-    let blocks = stat.size.div_ceil(512);
-    buf[64..72].copy_from_slice(&blocks.to_le_bytes());
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // aarch64 and other targets use the asm-generic stat layout (128 bytes)
+        let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, 128) };
+        buf.fill(0);
+        buf[8..16].copy_from_slice(&stat.qpath.to_le_bytes()); // st_ino
+        buf[16..20].copy_from_slice(&mode.to_le_bytes()); // st_mode (u32)
+        buf[20..24].copy_from_slice(&1u32.to_le_bytes()); // st_nlink (u32)
+        buf[48..56].copy_from_slice(&stat.size.to_le_bytes()); // st_size
+        buf[56..60].copy_from_slice(&4096u32.to_le_bytes()); // st_blksize (u32)
+        let blocks = stat.size.div_ceil(512);
+        buf[64..72].copy_from_slice(&blocks.to_le_bytes()); // st_blocks
+    }
 }
 
 // ── Linux PROT_* constants ───────────────────────────────────────────
@@ -875,7 +898,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
             LinuxSyscall::RtSigprocmask => self.sys_rt_sigprocmask(),
             LinuxSyscall::Ioctl { fd, request } => self.sys_ioctl(fd, request),
             LinuxSyscall::Exit { code } => self.sys_exit(code),
+            #[cfg(target_arch = "x86_64")]
             LinuxSyscall::ArchPrctl { code, addr } => self.sys_arch_prctl(code, addr),
+            #[cfg(not(target_arch = "x86_64"))]
+            LinuxSyscall::ArchPrctl { .. } => ENOSYS,
             LinuxSyscall::SetTidAddress => self.sys_set_tid_address(),
             LinuxSyscall::ExitGroup { code } => self.sys_exit_group(code),
             LinuxSyscall::Openat {
@@ -1663,12 +1689,25 @@ mod tests {
         let mut lx = Linuxulator::new(mock);
         lx.init_stdio().unwrap();
 
-        let mut statbuf = [0u8; 144];
+        // x86_64: 144 bytes, st_mode at offset 24
+        // aarch64 (asm-generic): 128 bytes, st_mode at offset 16
+        #[cfg(target_arch = "x86_64")]
+        const STAT_SIZE: usize = 144;
+        #[cfg(not(target_arch = "x86_64"))]
+        const STAT_SIZE: usize = 128;
+        #[cfg(target_arch = "x86_64")]
+        const ST_MODE_OFFSET: usize = 24;
+        #[cfg(not(target_arch = "x86_64"))]
+        const ST_MODE_OFFSET: usize = 16;
+
+        let mut statbuf = [0u8; STAT_SIZE];
         let result = lx.handle_syscall(5, [1, statbuf.as_mut_ptr() as u64, 0, 0, 0, 0]);
         assert_eq!(result, 0);
 
-        // st_mode at offset 24 should be S_IFCHR | 0o666 for stdio
-        let st_mode = u32::from_le_bytes([statbuf[24], statbuf[25], statbuf[26], statbuf[27]]);
+        // st_mode should be S_IFCHR | 0o666 for stdio
+        let o = ST_MODE_OFFSET;
+        let st_mode =
+            u32::from_le_bytes([statbuf[o], statbuf[o + 1], statbuf[o + 2], statbuf[o + 3]]);
         let s_ifchr: u32 = 0o020000;
         assert_eq!(st_mode & 0o170000, s_ifchr);
     }
@@ -1677,7 +1716,10 @@ mod tests {
     fn sys_fstat_bad_fd() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
+        #[cfg(target_arch = "x86_64")]
         let mut statbuf = [0u8; 144];
+        #[cfg(not(target_arch = "x86_64"))]
+        let mut statbuf = [0u8; 128];
         let result = lx.handle_syscall(5, [99, statbuf.as_mut_ptr() as u64, 0, 0, 0, 0]);
         assert_eq!(result, EBADF);
     }
@@ -2440,8 +2482,15 @@ mod integration_tests {
         elf[4] = 2; // ELFCLASS64
         elf[5] = 1; // ELFDATA2LSB
         elf[6] = 1; // EV_CURRENT
-        elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
-        elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes()); // EM_X86_64
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+
+        // e_machine — native machine type
+        #[cfg(target_arch = "x86_64")]
+        elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
+        #[cfg(target_arch = "aarch64")]
+        elf[18..20].copy_from_slice(&0xB7u16.to_le_bytes());
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
         elf[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
         elf[24..32].copy_from_slice(&0x401000u64.to_le_bytes()); // e_entry
         elf[32..40].copy_from_slice(&(phdr_start as u64).to_le_bytes()); // e_phoff
