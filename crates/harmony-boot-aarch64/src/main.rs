@@ -254,6 +254,106 @@ fn main() -> Status {
         "[Runtime] UnikernelRuntime created, entering idle loop"
     );
 
+    // ── Install exception vector table ──
+    unsafe { vectors::init() };
+    let _ = writeln!(serial, "[Vectors] Exception vector table installed");
+
+    // ── Initialise Linuxulator ──
+    {
+        use harmony_microkernel::serial_server::SerialServer;
+        use harmony_microkernel::FileServer;
+        use harmony_os::linuxulator::{Linuxulator, LinuxSyscall, SyscallBackend};
+
+        let _ = writeln!(serial, "[Linux] Initializing Linuxulator");
+
+        // DirectBackend: wraps SerialServer directly, same pattern as x86_64
+        struct DirectBackend {
+            server: SerialServer,
+        }
+
+        impl DirectBackend {
+            fn new() -> Self {
+                Self {
+                    server: SerialServer::new(),
+                }
+            }
+        }
+
+        impl SyscallBackend for DirectBackend {
+            fn walk(
+                &mut self,
+                _path: &str,
+                new_fid: harmony_microkernel::Fid,
+            ) -> Result<harmony_microkernel::QPath, harmony_microkernel::IpcError> {
+                self.server.walk(0, new_fid, "log")
+            }
+            fn open(
+                &mut self,
+                fid: harmony_microkernel::Fid,
+                mode: harmony_microkernel::OpenMode,
+            ) -> Result<(), harmony_microkernel::IpcError> {
+                self.server.open(fid, mode)
+            }
+            fn read(
+                &mut self,
+                fid: harmony_microkernel::Fid,
+                offset: u64,
+                count: u32,
+            ) -> Result<alloc::vec::Vec<u8>, harmony_microkernel::IpcError> {
+                self.server.read(fid, offset, count)
+            }
+            fn write(
+                &mut self,
+                fid: harmony_microkernel::Fid,
+                _offset: u64,
+                data: &[u8],
+            ) -> Result<u32, harmony_microkernel::IpcError> {
+                // Route stdout/stderr writes through PL011 serial
+                for &byte in data {
+                    unsafe { pl011::write_byte(byte) };
+                }
+                Ok(data.len() as u32)
+            }
+            fn clunk(
+                &mut self,
+                fid: harmony_microkernel::Fid,
+            ) -> Result<(), harmony_microkernel::IpcError> {
+                self.server.clunk(fid)
+            }
+            fn stat(
+                &mut self,
+                fid: harmony_microkernel::Fid,
+            ) -> Result<harmony_microkernel::FileStat, harmony_microkernel::IpcError> {
+                self.server.stat(fid)
+            }
+        }
+
+        // Store Linuxulator in static for the SVC handler to access
+        static mut LINUXULATOR: Option<Linuxulator<DirectBackend>> = None;
+        unsafe {
+            LINUXULATOR = Some(Linuxulator::new(DirectBackend::new()));
+            LINUXULATOR
+                .as_mut()
+                .unwrap()
+                .init_stdio()
+                .expect("init_stdio failed");
+        }
+
+        // Install dispatch function for the SVC handler
+        fn dispatch(syscall: LinuxSyscall) -> syscall::SyscallDispatchResult {
+            let lx = unsafe { LINUXULATOR.as_mut().unwrap() };
+            let retval = lx.dispatch_syscall(syscall);
+            syscall::SyscallDispatchResult {
+                retval,
+                exited: lx.exited(),
+                exit_code: lx.exit_code().unwrap_or(0),
+            }
+        }
+        unsafe { syscall::set_dispatch_fn(dispatch) };
+
+        let _ = writeln!(serial, "[Linux] Linuxulator ready, SVC dispatch installed");
+    }
+
     loop {
         let now = timer::now_ms();
         let actions = runtime.tick(now);
