@@ -90,6 +90,10 @@ fn main() -> Status {
     let mut region_count = 0;
 
     for desc in memory_map.entries() {
+        let usable = is_usable_memory(desc.ty);
+        if !usable {
+            continue; // Only store usable regions to avoid truncating them
+        }
         if region_count >= regions.len() {
             let _ = writeln!(
                 serial,
@@ -98,11 +102,10 @@ fn main() -> Status {
             );
             break;
         }
-        let usable = is_usable_memory(desc.ty);
         regions[region_count] = MemoryRegion {
             base: desc.phys_start,
             pages: desc.page_count,
-            is_usable: usable,
+            is_usable: true,
             is_conventional: desc.ty == uefi::mem::memory_map::MemoryType::CONVENTIONAL,
         };
         region_count += 1;
