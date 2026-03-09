@@ -17,6 +17,7 @@ harmony-unikernel = { path = "../harmony-unikernel", default-features = false }
 harmony-identity = { git = "https://github.com/zeblithic/harmony.git", branch = "main", default-features = false }
 harmony-platform = { git = "https://github.com/zeblithic/harmony.git", branch = "main", default-features = false }
 harmony-microkernel = { path = "../harmony-microkernel", default-features = false }
+harmony-os = { path = "../harmony-os", default-features = false }
 
 sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 
