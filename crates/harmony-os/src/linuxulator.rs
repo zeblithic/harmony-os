@@ -114,6 +114,40 @@ impl LinuxSyscall {
             _ => LinuxSyscall::Unknown { nr },
         }
     }
+
+    /// Map aarch64 Linux syscall numbers to `LinuxSyscall`.
+    ///
+    /// Reference: Linux kernel `include/uapi/asm-generic/unistd.h`
+    /// (aarch64 uses the generic syscall table).
+    pub fn from_aarch64(nr: u64, args: [u64; 6]) -> Self {
+        match nr {
+            29 => LinuxSyscall::Ioctl { fd: args[0] as i32, request: args[1] },
+            56 => LinuxSyscall::Openat { dirfd: args[0] as i32, pathname: args[1], flags: args[2] as i32 },
+            57 => LinuxSyscall::Close { fd: args[0] as i32 },
+            63 => LinuxSyscall::Read { fd: args[0] as i32, buf: args[1], count: args[2] },
+            64 => LinuxSyscall::Write { fd: args[0] as i32, buf: args[1], count: args[2] },
+            80 => LinuxSyscall::Fstat { fd: args[0] as i32, buf: args[1] },
+            93 => LinuxSyscall::Exit { code: args[0] as i32 },
+            94 => LinuxSyscall::ExitGroup { code: args[0] as i32 },
+            96 => LinuxSyscall::SetTidAddress,
+            99 => LinuxSyscall::SetRobustList,
+            134 => LinuxSyscall::RtSigaction,
+            135 => LinuxSyscall::RtSigprocmask,
+            214 => LinuxSyscall::Brk { addr: args[0] },
+            215 => LinuxSyscall::Munmap { addr: args[0], len: args[1] },
+            222 => LinuxSyscall::Mmap {
+                addr: args[0], len: args[1], prot: args[2] as i32,
+                flags: args[3] as i32, fd: args[4] as i32, offset: args[5],
+            },
+            226 => LinuxSyscall::Mprotect { addr: args[0], len: args[1], prot: args[2] as i32 },
+            261 => LinuxSyscall::Prlimit64 {
+                pid: args[0] as i32, resource: args[1] as i32,
+                new_limit: args[2], old_limit_buf: args[3],
+            },
+            293 => LinuxSyscall::Rseq,
+            _ => LinuxSyscall::Unknown { nr },
+        }
+    }
 }
 
 // ── SyscallBackend trait ────────────────────────────────────────────
@@ -1780,6 +1814,73 @@ mod tests {
             LinuxSyscall::Unknown { nr } => assert_eq!(nr, 9999),
             other => panic!("expected Unknown, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn from_aarch64_write() {
+        let syscall = LinuxSyscall::from_aarch64(64, [1, 0x1000, 5, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Write { fd, buf, count } => {
+                assert_eq!(fd, 1);
+                assert_eq!(buf, 0x1000);
+                assert_eq!(count, 5);
+            }
+            other => panic!("expected Write, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_aarch64_read() {
+        let syscall = LinuxSyscall::from_aarch64(63, [3, 0x2000, 128, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Read { fd, buf, count } => {
+                assert_eq!(fd, 3);
+                assert_eq!(buf, 0x2000);
+                assert_eq!(count, 128);
+            }
+            other => panic!("expected Read, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_aarch64_exit_group() {
+        let syscall = LinuxSyscall::from_aarch64(94, [42, 0, 0, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::ExitGroup { code } => assert_eq!(code, 42),
+            other => panic!("expected ExitGroup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_aarch64_mmap() {
+        let syscall = LinuxSyscall::from_aarch64(222, [0x1000, 4096, 3, 0x22, (-1i64) as u64, 0]);
+        match syscall {
+            LinuxSyscall::Mmap { addr, len, prot, flags, fd, offset } => {
+                assert_eq!(addr, 0x1000);
+                assert_eq!(len, 4096);
+                assert_eq!(prot, 3);
+                assert_eq!(flags, 0x22);
+                assert_eq!(fd, -1);
+                assert_eq!(offset, 0);
+            }
+            other => panic!("expected Mmap, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_aarch64_unknown() {
+        let syscall = LinuxSyscall::from_aarch64(9999, [0; 6]);
+        match syscall {
+            LinuxSyscall::Unknown { nr } => assert_eq!(nr, 9999),
+            other => panic!("expected Unknown, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_aarch64_arch_prctl_maps_to_unknown() {
+        // arch_prctl is x86_64-specific; aarch64 has no equivalent
+        let syscall = LinuxSyscall::from_aarch64(158, [0; 6]);
+        assert!(matches!(syscall, LinuxSyscall::Unknown { nr: 158 }));
     }
 }
 
