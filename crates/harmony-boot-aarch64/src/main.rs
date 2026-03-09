@@ -113,11 +113,11 @@ fn main() -> Status {
 
     let _ = writeln!(
         serial,
-        "[BOOT] Memory map: {} regions ({} usable)",
+        "[BOOT] Memory map: {} usable regions ({} conventional)",
         region_count,
         regions[..region_count]
             .iter()
-            .filter(|r| r.is_usable)
+            .filter(|r| r.is_conventional)
             .count()
     );
 
