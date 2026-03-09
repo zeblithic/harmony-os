@@ -238,13 +238,20 @@ mod tests {
         elf[4] = 2; // ELFCLASS64
         elf[5] = 1; // ELFDATA2LSB
         elf[6] = 1; // EV_CURRENT
-                    // e_type = ET_EXEC (2)
+
+        // e_type = ET_EXEC (2)
         elf[16..18].copy_from_slice(&2u16.to_le_bytes());
-        // e_machine = EM_X86_64 (0x3E)
+
+        // e_machine — use native machine type so tests pass on any host
+        #[cfg(target_arch = "x86_64")]
         elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
-        // e_version
+        #[cfg(target_arch = "aarch64")]
+        elf[18..20].copy_from_slice(&0xB7u16.to_le_bytes());
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
+
+        // e_version, e_entry, e_phoff
         elf[20..24].copy_from_slice(&1u32.to_le_bytes());
-        // e_entry = 0x401000
         elf[24..32].copy_from_slice(&0x401000u64.to_le_bytes());
         // e_phoff = 64 (right after header)
         elf[32..40].copy_from_slice(&64u64.to_le_bytes());
@@ -323,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn reject_non_x86_64() {
+    fn reject_unsupported_machine_type() {
         let mut elf = build_test_elf(&[0xCC]);
         elf[18..20].copy_from_slice(&0x03u16.to_le_bytes()); // EM_386
         assert_eq!(parse_elf(&elf), Err(ElfError::UnsupportedMachine));
@@ -354,40 +361,30 @@ mod tests {
         assert_eq!(parsed.segments[0].memsz, 256);
     }
 
-    /// Build a minimal valid ELF64 binary with EM_AARCH64.
-    fn build_test_elf_aarch64(code: &[u8]) -> Vec<u8> {
+    /// Build a minimal valid ELF64 binary with a specific machine type override.
+    fn build_test_elf_with_machine(code: &[u8], machine: u16) -> Vec<u8> {
         let mut elf = build_test_elf(code);
-        elf[18..20].copy_from_slice(&0xB7u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&machine.to_le_bytes());
         elf
     }
 
     #[test]
     fn accept_native_machine_type() {
         let code = [0xCC; 16];
-        #[cfg(target_arch = "x86_64")]
-        {
-            let elf = build_test_elf(&code);
-            assert!(parse_elf(&elf).is_ok());
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            let elf = build_test_elf_aarch64(&code);
-            assert!(parse_elf(&elf).is_ok());
-        }
+        let elf = build_test_elf(&code);
+        assert!(parse_elf(&elf).is_ok());
     }
 
     #[test]
     fn reject_foreign_machine_type() {
         let code = [0xCC; 16];
+        // Use the opposite architecture's machine type
         #[cfg(target_arch = "x86_64")]
-        {
-            let elf = build_test_elf_aarch64(&code);
-            assert_eq!(parse_elf(&elf), Err(ElfError::UnsupportedMachine));
-        }
+        let elf = build_test_elf_with_machine(&code, 0xB7); // EM_AARCH64
         #[cfg(target_arch = "aarch64")]
-        {
-            let elf = build_test_elf(&code);
-            assert_eq!(parse_elf(&elf), Err(ElfError::UnsupportedMachine));
-        }
+        let elf = build_test_elf_with_machine(&code, 0x3E); // EM_X86_64
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let elf = build_test_elf_with_machine(&code, 0x3E);
+        assert_eq!(parse_elf(&elf), Err(ElfError::UnsupportedMachine));
     }
 }

@@ -141,8 +141,8 @@ core::arch::global_asm!(
 
     // Read ESR_EL1 for exception class
     "mrs x1, esr_el1",
-    // EC = ESR[31:26]
-    "lsr x2, x1, #26",
+    // EC = ESR[31:26] — ubfx extracts and masks in one instruction
+    "ubfx x2, x1, #26, #6",
 
     // EC == 0x15 → SVC from AArch64
     "cmp x2, #0x15",
