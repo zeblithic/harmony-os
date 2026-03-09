@@ -1816,6 +1816,7 @@ mod tests {
     // ── sys_arch_prctl tests ────────────────────────────────────────
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn sys_arch_prctl_set_fs_returns_zero() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
@@ -1825,6 +1826,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn sys_arch_prctl_unknown_code_returns_einval() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
