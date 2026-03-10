@@ -23,5 +23,6 @@ std = [
     "harmony-platform/std",
     "harmony-reticulum/std",
 ]
+test-utils = []
 
 [dev-dependencies]

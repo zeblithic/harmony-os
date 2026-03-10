@@ -2,6 +2,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
+pub mod drivers;
 pub mod event_loop;
 pub mod platform;
 pub mod serial;

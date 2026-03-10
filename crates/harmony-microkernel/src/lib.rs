@@ -20,6 +20,7 @@ pub mod kernel;
 pub mod library_server;
 pub mod namespace;
 pub mod serial_server;
+pub mod uart_server;
 pub mod vm;
 
 #[cfg(feature = "kernel")]
@@ -74,7 +75,7 @@ pub enum IpcError {
 // ── File metadata ────────────────────────────────────────────────────
 
 /// Metadata about a file (like 9P's stat).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FileStat {
     pub qpath: QPath,
     pub name: Arc<str>,

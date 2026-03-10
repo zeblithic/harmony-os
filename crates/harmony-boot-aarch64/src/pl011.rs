@@ -25,30 +25,10 @@ const UARTCR: usize = 0x030; // Control register
 // ── Flag register bits ────────────────────────────────────────────────
 const UARTFR_TXFF: u32 = 1 << 5; // TX FIFO full
 
-// ── Baud-rate divisor calculation (pure math — runs on any host) ─────
+// ── Baud-rate divisor calculation ────────────────────────────────────
 
-/// Compute integer and fractional baud-rate divisors for the PL011.
-///
-/// Formula (PL011 TRM):
-///   BRD  = clock_hz / (16 * baud)
-///   IBRD = integer part of BRD
-///   FBRD = integer(fractional_part * 64 + 0.5)   (i.e. rounded)
-///
-/// We avoid floating-point by working in 128ths then rounding to 64ths:
-///   div_x128 = (clock_hz * 8) / baud
-///   div_x64  = (div_x128 + 1) / 2         (round to nearest 64th)
-///   ibrd     = div_x64 / 64
-///   fbrd     = div_x64 % 64
-pub fn baud_divisors(clock_hz: u32, baud: u32) -> (u16, u8) {
-    if baud == 0 {
-        return (0, 0);
-    }
-    let div_x128 = (clock_hz as u64 * 8) / baud as u64;
-    let div_x64 = (div_x128 + 1) / 2; // round to nearest 64th
-    let ibrd = (div_x64 / 64) as u16;
-    let fbrd = (div_x64 % 64) as u8;
-    (ibrd, fbrd)
-}
+// Re-export from the sans-I/O driver — single source of truth.
+pub use harmony_unikernel::drivers::pl011::baud_divisors;
 
 // ── Hardware access (aarch64 only) ────────────────────────────────────
 
