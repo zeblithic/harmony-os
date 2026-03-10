@@ -125,7 +125,9 @@ impl<const N: usize> Pl011Driver<N> {
     /// Poll the RX FIFO and drain available bytes into the ring buffer.
     ///
     /// Call this periodically (e.g. in the event loop or before reads).
-    /// If the ring buffer is full, incoming bytes are dropped.
+    /// If the ring buffer is full, incoming bytes are dropped (not the
+    /// oldest buffered data). This preserves data the consumer has not
+    /// yet read, matching Linux serial driver semantics.
     pub fn poll_rx(&mut self, bank: &impl RegisterBank) {
         while bank.read(UARTFR) & UARTFR_RXFE == 0 {
             let byte = (bank.read(UARTDR) & 0xFF) as u8;

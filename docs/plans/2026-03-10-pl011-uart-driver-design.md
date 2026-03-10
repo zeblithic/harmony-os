@@ -101,7 +101,7 @@ Wraps a `Pl011Driver` and a `RegisterBank` to serve UART I/O over 9P.
 - Init sequence produces correct register writes in correct order
 - TX blocks when TXFF is set, resumes when cleared
 - RX drains FIFO into ring buffer; read_buffered returns correct data
-- Ring buffer wraps correctly; overflow drops oldest bytes
+- Ring buffer wraps correctly; overflow drops incoming bytes
 - Baud divisor calculation matches known values (e.g. 48 MHz / 115200)
 
 ### Unit tests (UartServer)
