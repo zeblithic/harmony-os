@@ -173,6 +173,14 @@ impl InterpreterLoader {
                 }
                 backend.vm_write_bytes(vaddr, &elf_bytes[offset..end]);
             }
+
+            // Restore the caller's intended permissions (remove
+            // the temporary WRITABLE if segment is not writable).
+            if !seg.flags.write {
+                backend
+                    .vm_mprotect(page_start, map_len, pf)
+                    .map_err(|_| ElfLoadError::OverlappingSegments)?;
+            }
         }
         Ok(())
     }
