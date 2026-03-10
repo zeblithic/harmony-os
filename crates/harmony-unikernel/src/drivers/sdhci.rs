@@ -185,8 +185,9 @@ impl SdhciDriver {
         // Calculate divider (base clock assumed 200 MHz)
         // Divider = base_clock / (2 * target_freq)
         // For 400 kHz: 200_000 / (2 * 400) = 250
+        // Clamped to 255 — the SDCLK Frequency Select field is 8 bits (bits 15:8).
         let divider = if freq_khz > 0 {
-            200_000 / (2 * freq_khz)
+            (200_000 / (2 * freq_khz)).min(255)
         } else {
             250
         };
@@ -606,6 +607,30 @@ mod tests {
         assert_eq!(clock_writes[0], TIMEOUT_VALUE << 16);
         // Second write: divider + internal_en + timeout in bits [23:16]
         assert_eq!((clock_writes[1] >> 16) & 0xFF, TIMEOUT_VALUE);
+    }
+
+    #[test]
+    fn set_clock_low_freq_does_not_corrupt_timeout() {
+        let mut driver = SdhciDriver::new();
+        let mut bank = MockRegisterBank::new();
+        // Clock stable on first poll
+        bank.on_read(
+            SDHCI_CLOCK_CONTROL,
+            vec![CLOCK_INTERNAL_STABLE, CLOCK_INTERNAL_STABLE],
+        );
+        // 390 kHz → raw divider = 200_000 / (2*390) = 256, must clamp to 255
+        driver.set_clock(&mut bank, 390).unwrap();
+        let clock_writes: Vec<u32> = bank
+            .writes
+            .iter()
+            .filter(|(off, _)| *off == SDHCI_CLOCK_CONTROL)
+            .map(|(_, v)| *v)
+            .collect();
+        // The divider write (second) must preserve timeout in bits [23:16]
+        let divider_write = clock_writes[1];
+        assert_eq!((divider_write >> 16) & 0xFF, TIMEOUT_VALUE);
+        // Divider in bits [15:8] must be 255 (clamped), not 256
+        assert_eq!((divider_write >> 8) & 0xFF, 255);
     }
 
     #[test]
