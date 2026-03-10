@@ -127,6 +127,30 @@ pub enum LinuxSyscall {
         old_limit_buf: u64,
     },
     Rseq,
+    Writev {
+        fd: i32,
+        iov: u64,
+        iovcnt: i32,
+    },
+    Lseek {
+        fd: i32,
+        offset: i64,
+        whence: i32,
+    },
+    Getrandom {
+        buf: u64,
+        buflen: u64,
+        flags: u32,
+    },
+    Getcwd {
+        buf: u64,
+        size: u64,
+    },
+    Readlink {
+        pathname: u64,
+        buf: u64,
+        bufsiz: u64,
+    },
     Unknown {
         nr: u64,
     },
@@ -150,6 +174,11 @@ impl LinuxSyscall {
             5 => LinuxSyscall::Fstat {
                 fd: args[0] as i32,
                 buf: args[1],
+            },
+            8 => LinuxSyscall::Lseek {
+                fd: args[0] as i32,
+                offset: args[1] as i64,
+                whence: args[2] as i32,
             },
             9 => LinuxSyscall::Mmap {
                 addr: args[0],
@@ -175,8 +204,22 @@ impl LinuxSyscall {
                 fd: args[0] as i32,
                 request: args[1],
             },
+            20 => LinuxSyscall::Writev {
+                fd: args[0] as i32,
+                iov: args[1],
+                iovcnt: args[2] as i32,
+            },
             60 => LinuxSyscall::Exit {
                 code: args[0] as i32,
+            },
+            79 => LinuxSyscall::Getcwd {
+                buf: args[0],
+                size: args[1],
+            },
+            89 => LinuxSyscall::Readlink {
+                pathname: args[0],
+                buf: args[1],
+                bufsiz: args[2],
             },
             158 => LinuxSyscall::ArchPrctl {
                 code: args[0] as i32,
@@ -198,6 +241,11 @@ impl LinuxSyscall {
                 new_limit: args[2],
                 old_limit_buf: args[3],
             },
+            318 => LinuxSyscall::Getrandom {
+                buf: args[0],
+                buflen: args[1],
+                flags: args[2] as u32,
+            },
             334 => LinuxSyscall::Rseq,
             _ => LinuxSyscall::Unknown { nr },
         }
@@ -209,6 +257,10 @@ impl LinuxSyscall {
     /// (aarch64 uses the generic syscall table).
     pub fn from_aarch64(nr: u64, args: [u64; 6]) -> Self {
         match nr {
+            17 => LinuxSyscall::Getcwd {
+                buf: args[0],
+                size: args[1],
+            },
             29 => LinuxSyscall::Ioctl {
                 fd: args[0] as i32,
                 request: args[1],
@@ -219,6 +271,11 @@ impl LinuxSyscall {
                 flags: args[2] as i32,
             },
             57 => LinuxSyscall::Close { fd: args[0] as i32 },
+            62 => LinuxSyscall::Lseek {
+                fd: args[0] as i32,
+                offset: args[1] as i64,
+                whence: args[2] as i32,
+            },
             63 => LinuxSyscall::Read {
                 fd: args[0] as i32,
                 buf: args[1],
@@ -228,6 +285,16 @@ impl LinuxSyscall {
                 fd: args[0] as i32,
                 buf: args[1],
                 count: args[2],
+            },
+            66 => LinuxSyscall::Writev {
+                fd: args[0] as i32,
+                iov: args[1],
+                iovcnt: args[2] as i32,
+            },
+            78 => LinuxSyscall::Readlink {
+                pathname: args[0],
+                buf: args[1],
+                bufsiz: args[2],
             },
             80 => LinuxSyscall::Fstat {
                 fd: args[0] as i32,
@@ -266,6 +333,11 @@ impl LinuxSyscall {
                 resource: args[1] as i32,
                 new_limit: args[2],
                 old_limit_buf: args[3],
+            },
+            278 => LinuxSyscall::Getrandom {
+                buf: args[0],
+                buflen: args[1],
+                flags: args[2] as u32,
             },
             293 => LinuxSyscall::Rseq,
             _ => LinuxSyscall::Unknown { nr },
@@ -917,6 +989,19 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 old_limit_buf,
             } => self.sys_prlimit64(pid, resource, new_limit, old_limit_buf as usize),
             LinuxSyscall::Rseq => ENOSYS,
+            LinuxSyscall::Writev { fd, iov, iovcnt } => {
+                self.sys_writev(fd, iov as usize, iovcnt)
+            }
+            LinuxSyscall::Lseek { fd, offset, whence } => self.sys_lseek(fd, offset, whence),
+            LinuxSyscall::Getrandom { buf, buflen, flags } => {
+                self.sys_getrandom(buf as usize, buflen as usize, flags)
+            }
+            LinuxSyscall::Getcwd { buf, size } => self.sys_getcwd(buf as usize, size as usize),
+            LinuxSyscall::Readlink {
+                pathname,
+                buf,
+                bufsiz,
+            } => self.sys_readlink(pathname, buf, bufsiz),
             LinuxSyscall::Unknown { .. } => ENOSYS,
         }
     }
@@ -1344,6 +1429,120 @@ impl<B: SyscallBackend> Linuxulator<B> {
             }
             _ => EINVAL,
         }
+    }
+
+    /// Linux writev(2): write from multiple buffers (scatter-gather).
+    ///
+    /// Iterates `iovcnt` iovec structs at `iov_ptr`. Each iovec is 16 bytes:
+    /// `iov_base: u64` + `iov_len: u64`. Calls `sys_write` for each buffer
+    /// and returns the total bytes written.
+    fn sys_writev(&mut self, fd: i32, iov_ptr: usize, iovcnt: i32) -> i64 {
+        if iovcnt <= 0 {
+            return EINVAL;
+        }
+        if !self.fd_table.contains_key(&fd) {
+            return EBADF;
+        }
+
+        let mut total: i64 = 0;
+        for i in 0..iovcnt as usize {
+            let iov_addr = iov_ptr + i * 16;
+            // Each iovec is { iov_base: *void, iov_len: size_t } — 16 bytes on 64-bit.
+            let base = unsafe { core::ptr::read_unaligned(iov_addr as *const u64) } as usize;
+            let len =
+                unsafe { core::ptr::read_unaligned((iov_addr + 8) as *const u64) } as usize;
+
+            if len == 0 {
+                continue;
+            }
+            let result = self.sys_write(fd, base, len);
+            if result < 0 {
+                // If we haven't written anything yet, return the error.
+                // Otherwise return what we've written so far (POSIX partial write).
+                return if total == 0 { result } else { total };
+            }
+            total += result;
+        }
+        total
+    }
+
+    /// Linux lseek(2): reposition file offset.
+    ///
+    /// - SEEK_SET (0): set offset to `offset`
+    /// - SEEK_CUR (1): set offset to current + `offset`
+    /// - SEEK_END (2): set offset to file size + `offset`
+    fn sys_lseek(&mut self, fd: i32, offset: i64, whence: i32) -> i64 {
+        const SEEK_SET: i32 = 0;
+        const SEEK_CUR: i32 = 1;
+        const SEEK_END: i32 = 2;
+
+        let entry = match self.fd_table.get(&fd) {
+            Some(e) => *e,
+            None => return EBADF,
+        };
+
+        let new_offset = match whence {
+            SEEK_SET => offset,
+            SEEK_CUR => entry.offset as i64 + offset,
+            SEEK_END => {
+                let stat = match self.backend.stat(entry.fid) {
+                    Ok(s) => s,
+                    Err(e) => return ipc_err_to_errno(e),
+                };
+                stat.size as i64 + offset
+            }
+            _ => return EINVAL,
+        };
+
+        if new_offset < 0 {
+            return EINVAL;
+        }
+
+        self.fd_table.get_mut(&fd).unwrap().offset = new_offset as u64;
+        new_offset
+    }
+
+    /// Linux getrandom(2): fill buffer with pseudo-random bytes.
+    ///
+    /// Uses a deterministic LCG based on the buffer address for each byte.
+    /// This is sufficient for ld-musl stack canaries and ASLR seeds in the
+    /// Linuxulator environment (no real security boundary).
+    fn sys_getrandom(&self, buf_ptr: usize, buflen: usize, _flags: u32) -> i64 {
+        if buflen == 0 {
+            return 0;
+        }
+        let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buflen) };
+        for (i, byte) in buf.iter_mut().enumerate() {
+            *byte = ((buf_ptr as u64)
+                .wrapping_add(i as u64)
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407)
+                >> 33) as u8;
+        }
+        buflen as i64
+    }
+
+    /// Linux getcwd(2): get current working directory.
+    ///
+    /// Always returns "/" since the Linuxulator uses a flat namespace.
+    /// On success, returns the pointer to the buffer (Linux convention).
+    fn sys_getcwd(&self, buf_ptr: usize, size: usize) -> i64 {
+        if size < 2 {
+            return EINVAL; // need room for "/\0"
+        }
+        let cwd = b"/\0";
+        unsafe {
+            core::ptr::copy_nonoverlapping(cwd.as_ptr(), buf_ptr as *mut u8, 2);
+        }
+        buf_ptr as i64
+    }
+
+    /// Linux readlink(2): read the value of a symbolic link.
+    ///
+    /// Returns ENOSYS — ld-musl has fallbacks for /proc/self/exe and
+    /// similar paths.
+    fn sys_readlink(&self, _pathname: u64, _buf: u64, _bufsiz: u64) -> i64 {
+        ENOSYS
     }
 }
 
@@ -2091,6 +2290,337 @@ mod tests {
             count: msg.len() as u64,
         });
         assert_eq!(result, msg.len() as i64);
+    }
+
+    // ── sys_writev tests ────────────────────────────────────────────
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_writev_single_iovec() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        let msg = b"Hello writev\n";
+        // Build a single iovec: { iov_base: *msg, iov_len: 13 }
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(msg.as_ptr() as u64).to_le_bytes());
+        iov[8..16].copy_from_slice(&(msg.len() as u64).to_le_bytes());
+
+        // writev(stdout=1, iov, iovcnt=1)  — x86_64 nr=20
+        let result = lx.handle_syscall(20, [1, iov.as_ptr() as u64, 1, 0, 0, 0]);
+        assert_eq!(result, msg.len() as i64);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_writev_multiple_iovecs() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        let msg1 = b"Hello";
+        let msg2 = b" world\n";
+        // Build two iovecs (32 bytes total)
+        let mut iovs = [0u8; 32];
+        iovs[0..8].copy_from_slice(&(msg1.as_ptr() as u64).to_le_bytes());
+        iovs[8..16].copy_from_slice(&(msg1.len() as u64).to_le_bytes());
+        iovs[16..24].copy_from_slice(&(msg2.as_ptr() as u64).to_le_bytes());
+        iovs[24..32].copy_from_slice(&(msg2.len() as u64).to_le_bytes());
+
+        let result = lx.handle_syscall(20, [1, iovs.as_ptr() as u64, 2, 0, 0, 0]);
+        assert_eq!(result, (msg1.len() + msg2.len()) as i64);
+
+        // Verify both chunks were written to the backend
+        let stdout_fid = lx.fid_for_fd(1).unwrap();
+        let stdout_writes: Vec<_> = lx
+            .backend()
+            .writes
+            .iter()
+            .filter(|(fid, _)| *fid == stdout_fid)
+            .collect();
+        assert_eq!(stdout_writes.len(), 2);
+        assert_eq!(stdout_writes[0].1, b"Hello");
+        assert_eq!(stdout_writes[1].1, b" world\n");
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_writev_bad_fd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let msg = b"test";
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(msg.as_ptr() as u64).to_le_bytes());
+        iov[8..16].copy_from_slice(&(msg.len() as u64).to_le_bytes());
+
+        let result = lx.handle_syscall(20, [99, iov.as_ptr() as u64, 1, 0, 0, 0]);
+        assert_eq!(result, EBADF);
+    }
+
+    // ── sys_lseek tests ────────────────────────────────────────────
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_lseek_set() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        // Open a file via openat to get fd 3
+        let path = b"/dev/serial/log\0";
+        let at_fdcwd = (-100i32) as u64;
+        let fd = lx.handle_syscall(257, [at_fdcwd, path.as_ptr() as u64, 0, 0, 0, 0]);
+        assert!(fd >= 0);
+
+        // lseek(fd, 42, SEEK_SET=0)  — x86_64 nr=8
+        let result = lx.handle_syscall(8, [fd as u64, 42, 0, 0, 0, 0]);
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_lseek_cur() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        let path = b"/dev/serial/log\0";
+        let at_fdcwd = (-100i32) as u64;
+        let fd = lx.handle_syscall(257, [at_fdcwd, path.as_ptr() as u64, 0, 0, 0, 0]);
+        assert!(fd >= 0);
+
+        // First seek to position 10
+        lx.handle_syscall(8, [fd as u64, 10, 0, 0, 0, 0]);
+        // Then seek +5 from current (SEEK_CUR=1)
+        let result = lx.handle_syscall(8, [fd as u64, 5, 1, 0, 0, 0]);
+        assert_eq!(result, 15);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_lseek_bad_fd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let result = lx.handle_syscall(8, [99, 0, 0, 0, 0, 0]);
+        assert_eq!(result, EBADF);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_lseek_bad_whence() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        // whence=99 is invalid
+        let result = lx.handle_syscall(8, [0, 0, 99, 0, 0, 0]);
+        assert_eq!(result, EINVAL);
+    }
+
+    // ── sys_getrandom tests ────────────────────────────────────────
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_getrandom_fills_buffer() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let mut buf = [0u8; 32];
+        // getrandom(buf, 32, 0)  — x86_64 nr=318
+        let result = lx.handle_syscall(318, [buf.as_mut_ptr() as u64, 32, 0, 0, 0, 0]);
+        assert_eq!(result, 32);
+        // At least some bytes should be non-zero (deterministic LCG output)
+        assert!(buf.iter().any(|&b| b != 0), "getrandom should produce non-zero bytes");
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_getrandom_zero_len() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let result = lx.handle_syscall(318, [0, 0, 0, 0, 0, 0]);
+        assert_eq!(result, 0);
+    }
+
+    // ── sys_getcwd tests ───────────────────────────────────────────
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_getcwd_returns_root() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let mut buf = [0xFFu8; 64];
+        // getcwd(buf, 64)  — x86_64 nr=79
+        let result = lx.handle_syscall(79, [buf.as_mut_ptr() as u64, 64, 0, 0, 0, 0]);
+        assert_eq!(result, buf.as_ptr() as i64);
+        assert_eq!(buf[0], b'/');
+        assert_eq!(buf[1], 0); // null terminator
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_getcwd_too_small() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let mut buf = [0u8; 1];
+        let result = lx.handle_syscall(79, [buf.as_mut_ptr() as u64, 1, 0, 0, 0, 0]);
+        assert_eq!(result, EINVAL);
+    }
+
+    // ── sys_readlink tests ─────────────────────────────────────────
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_readlink_returns_enosys() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let path = b"/proc/self/exe\0";
+        let mut buf = [0u8; 128];
+        // readlink(path, buf, 128)  — x86_64 nr=89
+        let result = lx.handle_syscall(
+            89,
+            [path.as_ptr() as u64, buf.as_mut_ptr() as u64, 128, 0, 0, 0],
+        );
+        assert_eq!(result, ENOSYS);
+    }
+
+    // ── from_x86_64 mapping tests for new syscalls ─────────────────
+
+    #[test]
+    fn from_x86_64_writev() {
+        let syscall = LinuxSyscall::from_x86_64(20, [1, 0x2000, 3, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Writev { fd, iov, iovcnt } => {
+                assert_eq!(fd, 1);
+                assert_eq!(iov, 0x2000);
+                assert_eq!(iovcnt, 3);
+            }
+            other => panic!("expected Writev, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_x86_64_lseek() {
+        let syscall = LinuxSyscall::from_x86_64(8, [3, 100, 0, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Lseek { fd, offset, whence } => {
+                assert_eq!(fd, 3);
+                assert_eq!(offset, 100);
+                assert_eq!(whence, 0);
+            }
+            other => panic!("expected Lseek, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_x86_64_getcwd() {
+        let syscall = LinuxSyscall::from_x86_64(79, [0x3000, 256, 0, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Getcwd { buf, size } => {
+                assert_eq!(buf, 0x3000);
+                assert_eq!(size, 256);
+            }
+            other => panic!("expected Getcwd, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_x86_64_readlink() {
+        let syscall = LinuxSyscall::from_x86_64(89, [0x1000, 0x2000, 128, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Readlink { pathname, buf, bufsiz } => {
+                assert_eq!(pathname, 0x1000);
+                assert_eq!(buf, 0x2000);
+                assert_eq!(bufsiz, 128);
+            }
+            other => panic!("expected Readlink, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_x86_64_getrandom() {
+        let syscall = LinuxSyscall::from_x86_64(318, [0x4000, 32, 0, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Getrandom { buf, buflen, flags } => {
+                assert_eq!(buf, 0x4000);
+                assert_eq!(buflen, 32);
+                assert_eq!(flags, 0);
+            }
+            other => panic!("expected Getrandom, got {:?}", other),
+        }
+    }
+
+    // ── from_aarch64 mapping tests for new syscalls ─────────────────
+
+    #[test]
+    fn from_aarch64_writev() {
+        let syscall = LinuxSyscall::from_aarch64(66, [1, 0x2000, 3, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Writev { fd, iov, iovcnt } => {
+                assert_eq!(fd, 1);
+                assert_eq!(iov, 0x2000);
+                assert_eq!(iovcnt, 3);
+            }
+            other => panic!("expected Writev, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_aarch64_lseek() {
+        let syscall = LinuxSyscall::from_aarch64(62, [3, 100, 0, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Lseek { fd, offset, whence } => {
+                assert_eq!(fd, 3);
+                assert_eq!(offset, 100);
+                assert_eq!(whence, 0);
+            }
+            other => panic!("expected Lseek, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_aarch64_getcwd() {
+        let syscall = LinuxSyscall::from_aarch64(17, [0x3000, 256, 0, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Getcwd { buf, size } => {
+                assert_eq!(buf, 0x3000);
+                assert_eq!(size, 256);
+            }
+            other => panic!("expected Getcwd, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_aarch64_readlink() {
+        let syscall = LinuxSyscall::from_aarch64(78, [0x1000, 0x2000, 128, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Readlink { pathname, buf, bufsiz } => {
+                assert_eq!(pathname, 0x1000);
+                assert_eq!(buf, 0x2000);
+                assert_eq!(bufsiz, 128);
+            }
+            other => panic!("expected Readlink, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_aarch64_getrandom() {
+        let syscall = LinuxSyscall::from_aarch64(278, [0x4000, 32, 0, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Getrandom { buf, buflen, flags } => {
+                assert_eq!(buf, 0x4000);
+                assert_eq!(buflen, 32);
+                assert_eq!(flags, 0);
+            }
+            other => panic!("expected Getrandom, got {:?}", other),
+        }
     }
 }
 
