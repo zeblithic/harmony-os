@@ -8,8 +8,6 @@
 
 **Tech Stack:** Rust, `no_std` + `alloc`, harmony-unikernel (Ring 1), harmony-microkernel (Ring 2), MockRegisterBank for tests.
 
-**Worktree:** `/Users/zeblith/work/zeblithic/harmony-os/.claude/worktrees/jake-os-usb-ethernet/`
-
 **All commands run from the worktree directory.**
 
 ---

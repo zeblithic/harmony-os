@@ -91,9 +91,9 @@ const _DMA_DESC_ADDRESS_LO: usize = 0x04;
 const _DMA_DESC_ADDRESS_HI: usize = 0x08;
 const DMA_DESC_SIZE: usize = 12; // 3 words per descriptor (v5)
 
-// DMA status/control bits
-const DMA_EN: u32 = 1 << 0;
-const DMA_DISABLED: u32 = 1 << 0;
+// DMA control/status bits (same bit position, different registers)
+const DMA_CTRL_EN: u32 = 1 << 0; // DMA_CTRL: set to enable DMA
+const DMA_STATUS_DISABLED: u32 = 1 << 0; // DMA_STATUS: set when DMA is disabled
 const _DMA_DESC_RAM_INIT_BUSY: u32 = 1 << 1;
 
 const DMA_BUFLENGTH_SHIFT: u32 = 16;
@@ -153,7 +153,7 @@ const DMA_XOFF_THRESHOLD_SHIFT: u32 = 16;
 // ── Constants ─────────────────────────────────────────────────────
 const _TOTAL_DESC: usize = 256;
 const ENET_MAX_MTU_SIZE: u32 = 1536; // ETH payload + headers + padding
-const RX_BUF_LENGTH: u32 = 2048;
+const DMA_BUF_LENGTH: u32 = 2048;
 
 // ── PHY registers (standard MII) ─────────────────────────────────
 const MII_BMSR: u32 = 1; // Basic Mode Status Register
@@ -270,7 +270,7 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         for _ in 0..poll_count {
             let ts = bank.read(tdma_status);
             let rs = bank.read(rdma_status);
-            if ts & DMA_DISABLED != 0 && rs & DMA_DISABLED != 0 {
+            if ts & DMA_STATUS_DISABLED != 0 && rs & DMA_STATUS_DISABLED != 0 {
                 dma_disabled = true;
                 break;
             }
@@ -290,7 +290,7 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         bank.write(tx_ring_base + RING_MBUF_DONE_THRESH, 1);
         bank.write(
             tx_ring_base + RING_BUF_SIZE,
-            (TX_RING as u32) << DMA_RING_SIZE_SHIFT | RX_BUF_LENGTH,
+            (TX_RING as u32) << DMA_RING_SIZE_SHIFT | DMA_BUF_LENGTH,
         );
         bank.write(tx_ring_base + RING_START_ADDR, 0);
         bank.write(
@@ -306,7 +306,7 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         bank.write(rx_ring_base + RING_CONS_INDEX, 0);
         bank.write(
             rx_ring_base + RING_BUF_SIZE,
-            (RX_RING as u32) << DMA_RING_SIZE_SHIFT | RX_BUF_LENGTH,
+            (RX_RING as u32) << DMA_RING_SIZE_SHIFT | DMA_BUF_LENGTH,
         );
         bank.write(
             rx_ring_base + RING_XON_XOFF_THRESH,
@@ -321,8 +321,8 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         bank.write(rx_ring_base + RING_READ_PTR, 0);
 
         // 12. Enable DMA
-        bank.write(tdma_ctrl, DMA_EN);
-        bank.write(rdma_ctrl, DMA_EN);
+        bank.write(tdma_ctrl, DMA_CTRL_EN);
+        bank.write(rdma_ctrl, DMA_CTRL_EN);
 
         // 13. Enable TX + RX in UMAC
         bank.write(UMAC_CMD, CMD_TX_EN | CMD_RX_EN | CMD_SPEED_1000);
@@ -365,10 +365,12 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
 
         let desc_idx = (self.tx_prod_index as usize) % TX_RING;
 
-        // Write frame data words to descriptor address registers.
-        // In real hardware these would be DMA addresses; in our sans-I/O
-        // model we write the frame content through the RegisterBank so
-        // tests can verify what was "sent".
+        // Write the length/status descriptor word.
+        // In real hardware the frame bytes live in a DMA-mapped buffer
+        // whose physical address goes into DMA_DESC_ADDRESS_LO/HI. In this
+        // sans-I/O model those registers are not written and the frame bytes
+        // are not stored — DMA buffer management is left to the MMIO
+        // integration layer.
         let desc_base = TDMA_OFF + DMA_RINGS_SIZE + 0x10 + desc_idx * DMA_DESC_SIZE;
         let len_status =
             ((frame.len() as u32) << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP | DMA_TX_APPEND_CRC;
@@ -426,10 +428,11 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
             return None;
         }
 
-        // Read frame data — in real hardware this comes from DMA buffers.
-        // In our sans-I/O model, we construct a placeholder frame of the
-        // correct length. The real MmioRegisterBank implementation would
-        // copy from the DMA buffer address stored in the descriptor.
+        // TODO(mmio): In real hardware, frame data lives in DMA buffers at
+        // the physical address stored in DMA_DESC_ADDRESS_LO/HI. In this
+        // sans-I/O model we return a zero-filled placeholder of the correct
+        // length. The MmioRegisterBank integration layer will copy actual
+        // frame bytes from the DMA buffer.
         let data = alloc::vec![0u8; length];
 
         self.stats.rx_packets += 1;
@@ -484,8 +487,8 @@ mod tests {
     fn init_bank() -> MockRegisterBank {
         let mut bank = MockRegisterBank::new();
         // DMA status: disabled immediately
-        bank.on_read(TDMA_OFF + DMA_STATUS, vec![DMA_DISABLED]);
-        bank.on_read(RDMA_OFF + DMA_STATUS, vec![DMA_DISABLED]);
+        bank.on_read(TDMA_OFF + DMA_STATUS, vec![DMA_STATUS_DISABLED]);
+        bank.on_read(RDMA_OFF + DMA_STATUS, vec![DMA_STATUS_DISABLED]);
         bank
     }
 
@@ -576,7 +579,7 @@ mod tests {
             .filter(|(off, _)| *off == TDMA_OFF + DMA_CTRL)
             .map(|(_, v)| *v)
             .collect();
-        assert_eq!(*tdma_ctrl_writes.last().unwrap(), DMA_EN);
+        assert_eq!(*tdma_ctrl_writes.last().unwrap(), DMA_CTRL_EN);
     }
 
     #[test]
