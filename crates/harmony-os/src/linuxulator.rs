@@ -1626,7 +1626,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// and returns the total bytes written.
     fn sys_writev(&mut self, fd: i32, iov_ptr: usize, iovcnt: i32) -> i64 {
         const IOV_MAX: i32 = 1024;
-        if iovcnt <= 0 || iovcnt > IOV_MAX {
+        if iovcnt == 0 {
+            return 0; // Linux permits zero iovcnt.
+        }
+        if !(1..=IOV_MAX).contains(&iovcnt) {
             return EINVAL;
         }
         if !self.fd_table.contains_key(&fd) {
