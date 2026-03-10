@@ -16,6 +16,7 @@ pub trait RegisterBank {
     fn write(&mut self, offset: usize, value: u32);
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 pub mod mock {
     use super::RegisterBank;
     use alloc::collections::BTreeMap;

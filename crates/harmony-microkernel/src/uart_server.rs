@@ -106,8 +106,7 @@ impl<B: RegisterBank, const N: usize> FileServer for UartServer<B, N> {
         self.driver.poll_rx(&self.bank);
         let max = count as usize;
         let mut buf = alloc::vec![0u8; max.min(self.driver.rx_available())];
-        let n = self.driver.read_buffered(&mut buf);
-        buf.truncate(n);
+        self.driver.read_buffered(&mut buf);
         Ok(buf)
     }
 
@@ -290,5 +289,41 @@ mod tests {
         srv.walk(0, 1, "uart0").unwrap();
         srv.clunk(1).unwrap();
         assert_eq!(srv.stat(1), Err(IpcError::InvalidFid));
+    }
+
+    #[test]
+    fn clone_fid_duplicates_state() {
+        let mut srv = test_server();
+        srv.walk(0, 1, "uart0").unwrap();
+        let qpath = srv.clone_fid(1, 2).unwrap();
+        assert_eq!(qpath, QPATH_UART0);
+        // Cloned fid should be stat-able but not open
+        let st = srv.stat(2).unwrap();
+        assert_eq!(&*st.name, "uart0");
+        assert_eq!(srv.read(2, 0, 256), Err(IpcError::NotOpen));
+    }
+
+    #[test]
+    fn readwrite_mode_allows_both() {
+        let mut srv = test_server();
+        // FR sequence: 0 (TX not full for write), then RXFE (RX empty for read)
+        srv.bank.on_read(UARTFR, vec![0, UARTFR_RXFE]);
+
+        srv.walk(0, 1, "uart0").unwrap();
+        srv.open(1, OpenMode::ReadWrite).unwrap();
+        // Write should succeed
+        let n = srv.write(1, 0, b"A").unwrap();
+        assert_eq!(n, 1);
+        // Read should succeed (returns empty since no RX data)
+        let data = srv.read(1, 0, 256).unwrap();
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn walk_from_non_root_rejected() {
+        let mut srv = test_server();
+        srv.walk(0, 1, "uart0").unwrap();
+        // Fid 1 is uart0 (not a directory) — walk should fail
+        assert_eq!(srv.walk(1, 2, "uart0"), Err(IpcError::NotDirectory));
     }
 }

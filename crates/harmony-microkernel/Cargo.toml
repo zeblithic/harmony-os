@@ -34,3 +34,4 @@ harmony-platform = { workspace = true, optional = true }
 harmony-athenaeum = { workspace = true, optional = true }
 
 [dev-dependencies]
+harmony-unikernel = { workspace = true, features = ["test-utils"] }

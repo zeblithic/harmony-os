@@ -57,6 +57,7 @@ impl<const N: usize> Default for Pl011Driver<N> {
 impl<const N: usize> Pl011Driver<N> {
     /// Create a new driver with an empty RX ring buffer.
     pub fn new() -> Self {
+        const { assert!(N > 0, "ring buffer size must be at least 1") };
         Self {
             rx_buf: [0u8; N],
             rx_head: 0,
@@ -88,6 +89,10 @@ impl<const N: usize> Pl011Driver<N> {
     }
 
     /// Transmit bytes, spinning while the TX FIFO is full.
+    ///
+    /// **Warning:** This method spins indefinitely if the TX FIFO never
+    /// drains.  Callers in interrupt-driven contexts should use
+    /// [`tx_ready`](Self::tx_ready) and write byte-by-byte instead.
     pub fn write_bytes(&self, bank: &mut impl RegisterBank, data: &[u8]) {
         for &byte in data {
             while !self.tx_ready(bank) {
