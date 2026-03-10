@@ -344,7 +344,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let mut runtime = UnikernelRuntime::new(identity, entropy, persistence);
 
     if virtio_net.is_some() {
-        runtime.register_interface("virtio0");
+        runtime.register_interface("eth0");
     }
     runtime.register_interface("udp0");
 
