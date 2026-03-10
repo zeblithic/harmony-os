@@ -402,9 +402,14 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
             ((frame.len() as u32) << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP | DMA_TX_APPEND_CRC;
         bank.write(desc_base + DMA_DESC_LENGTH_STATUS, len_status);
 
-        // Advance producer index and notify hardware
-        self.tx_prod_index = (self.tx_prod_index + 1) & DMA_P_INDEX_MASK;
+        // Advance write pointer (word units) and producer index.
+        // Hardware needs both: WRITE_PTR locates the descriptor in RAM,
+        // PROD_INDEX signals that a new frame is queued.
         let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
+        let write_ptr = (desc_idx * DMA_DESC_NUM_WORDS) as u32;
+        bank.write(tx_ring_base + RING_WRITE_PTR, write_ptr);
+
+        self.tx_prod_index = (self.tx_prod_index + 1) & DMA_P_INDEX_MASK;
         bank.write(tx_ring_base + RING_PROD_INDEX, self.tx_prod_index);
 
         self.stats.tx_packets += 1;
@@ -444,13 +449,27 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         let length = ((len_status >> DMA_BUFLENGTH_SHIFT) & DMA_BUFLENGTH_MASK) as usize;
         let status = len_status & 0xFFFF;
 
-        // Advance consumer index (always, even on error — reclaim descriptor)
+        // Advance read pointer (word units) and consumer index.
+        // Both must be updated: READ_PTR tells hardware which descriptor
+        // has been consumed, CONS_INDEX signals the packet count.
+        let read_ptr = (desc_idx * DMA_DESC_NUM_WORDS) as u32;
+        bank.write(rx_ring_base + RING_READ_PTR, read_ptr);
+
         self.rx_cons_index = (self.rx_cons_index + 1) & DMA_C_INDEX_MASK;
         bank.write(rx_ring_base + RING_CONS_INDEX, self.rx_cons_index);
 
         // Reject zero-length descriptors — no valid Ethernet frame can have
         // zero payload, and Ok(vec![]) would be indistinguishable from "ring empty".
         if length == 0 {
+            self.stats.rx_errors += 1;
+            return None;
+        }
+
+        // Reject fragmented frames: with DMA_BUF_LENGTH (2048) > ENET_MAX_MTU_SIZE
+        // (1536), every valid frame fits in a single descriptor. Both SOP and EOP
+        // must be set; a descriptor missing either indicates a multi-descriptor
+        // fragment that this driver does not reassemble.
+        if status & (DMA_SOP | DMA_EOP) != (DMA_SOP | DMA_EOP) {
             self.stats.rx_errors += 1;
             return None;
         }
@@ -772,6 +791,38 @@ mod tests {
     }
 
     #[test]
+    fn send_updates_write_ptr() {
+        let mut bank = init_bank();
+        let mut driver: GenetDriver<4, 4> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+
+        let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
+        bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![0, 0]);
+        bank.writes.clear();
+
+        // First send: desc_idx=0, write_ptr = 0 * 3 = 0
+        driver.send(&mut bank, &[0u8; 64]).unwrap();
+        let wp0: Vec<u32> = bank
+            .writes
+            .iter()
+            .filter(|(off, _)| *off == tx_ring_base + RING_WRITE_PTR)
+            .map(|(_, v)| *v)
+            .collect();
+        assert_eq!(wp0, vec![0]);
+
+        bank.writes.clear();
+
+        // Second send: desc_idx=1, write_ptr = 1 * 3 = 3
+        driver.send(&mut bank, &[0u8; 64]).unwrap();
+        let wp1: Vec<u32> = bank
+            .writes
+            .iter()
+            .filter(|(off, _)| *off == tx_ring_base + RING_WRITE_PTR)
+            .map(|(_, v)| *v)
+            .collect();
+        assert_eq!(wp1, vec![3]);
+    }
+
+    #[test]
     fn send_rejects_oversized_frame() {
         let mut bank = init_bank();
         let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
@@ -862,6 +913,66 @@ mod tests {
         // Descriptor with length=0, no error flags
         let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
         let len_status = DMA_SOP | DMA_EOP; // length field = 0
+        bank.on_read(desc_base + DMA_DESC_LENGTH_STATUS, vec![len_status]);
+
+        let frame = driver.poll_rx(&mut bank);
+        assert!(frame.is_none());
+        assert_eq!(driver.stats.rx_errors, 1);
+        assert_eq!(driver.stats.rx_packets, 0);
+        assert_eq!(driver.rx_cons_index, 1); // descriptor still consumed
+    }
+
+    #[test]
+    fn poll_rx_updates_read_ptr() {
+        let mut bank = init_bank();
+        let mut driver: GenetDriver<4, 4> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+
+        let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
+        bank.on_read(rx_ring_base + RING_PROD_INDEX, vec![2, 2]);
+
+        let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
+        let len_status = (64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP;
+        bank.on_read(desc_base + DMA_DESC_LENGTH_STATUS, vec![len_status]);
+        bank.on_read(
+            desc_base + DMA_DESC_SIZE + DMA_DESC_LENGTH_STATUS,
+            vec![len_status],
+        );
+        bank.writes.clear();
+
+        // First poll: desc_idx=0, read_ptr = 0 * 3 = 0
+        driver.poll_rx(&mut bank);
+        let rp0: Vec<u32> = bank
+            .writes
+            .iter()
+            .filter(|(off, _)| *off == rx_ring_base + RING_READ_PTR)
+            .map(|(_, v)| *v)
+            .collect();
+        assert_eq!(rp0, vec![0]);
+
+        bank.writes.clear();
+
+        // Second poll: desc_idx=1, read_ptr = 1 * 3 = 3
+        driver.poll_rx(&mut bank);
+        let rp1: Vec<u32> = bank
+            .writes
+            .iter()
+            .filter(|(off, _)| *off == rx_ring_base + RING_READ_PTR)
+            .map(|(_, v)| *v)
+            .collect();
+        assert_eq!(rp1, vec![3]);
+    }
+
+    #[test]
+    fn poll_rx_rejects_fragmented_frame() {
+        let mut bank = init_bank();
+        let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+
+        let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
+        bank.on_read(rx_ring_base + RING_PROD_INDEX, vec![1]);
+
+        // Descriptor with SOP only (first fragment of a multi-descriptor frame)
+        let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
+        let len_status = (64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP; // missing EOP
         bank.on_read(desc_base + DMA_DESC_LENGTH_STATUS, vec![len_status]);
 
         let frame = driver.poll_rx(&mut bank);
