@@ -59,6 +59,7 @@ pub enum ElfLoadError {
 
 // ── Load result ─────────────────────────────────────────────────────
 
+#[derive(Debug)]
 pub struct LoadResult {
     /// Entry point to jump to (interpreter's entry for dynamic,
     /// exe's for static).
@@ -189,7 +190,9 @@ impl InterpreterLoader {
             // requires bytes from vaddr+filesz to vaddr+memsz to be
             // zero.  vm_mmap does not guarantee zeroed pages.
             if seg.memsz > seg.filesz {
-                let bss_start = vaddr + seg.filesz;
+                let bss_start = vaddr
+                    .checked_add(seg.filesz)
+                    .ok_or(ElfLoadError::OverlappingSegments)?;
                 let bss_len = (seg.memsz - seg.filesz) as usize;
                 let zeros = alloc::vec![0u8; bss_len];
                 backend.vm_write_bytes(bss_start, &zeros);
@@ -671,11 +674,17 @@ mod tests {
             Ok(())
         }
 
-        fn stat(&mut self, _fid: Fid) -> Result<FileStat, IpcError> {
+        fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
+            let size = self
+                .fid_to_path
+                .get(&fid)
+                .and_then(|path| self.interp_files.get(path))
+                .map(|bytes| bytes.len() as u64)
+                .unwrap_or(0);
             Ok(FileStat {
                 qpath: 0,
                 name: Arc::from("mock"),
-                size: 0,
+                size,
                 file_type: FileType::Regular,
             })
         }
@@ -1361,6 +1370,29 @@ mod tests {
             &stack[random_offset..random_offset + 16],
             &random_bytes,
             "AT_RANDOM must point to the 16 random bytes"
+        );
+    }
+
+    #[test]
+    fn oversized_interpreter_rejected() {
+        let interp_path = b"/lib/ld-musl-x86_64.so.1\0";
+        let exe_code = [0xCC; 16];
+        let exe_elf =
+            build_elf_with_interp(&exe_code, interp_path, ElfType::Exec, 0x401000, 0x401000);
+
+        // Register an interpreter whose byte length exceeds MAX_INTERP_SIZE.
+        // The mock stat now returns the real content size, so the guard will trigger.
+        let oversized = alloc::vec![0u8; MAX_INTERP_SIZE as usize + 1];
+
+        let mut loader = InterpreterLoader::default();
+        let mut backend = LoaderMockBackend::new();
+        backend.register_interp("/lib/ld-musl-x86_64.so.1", oversized);
+
+        let result = loader.load(&exe_elf, &mut backend);
+        assert!(
+            matches!(result, Err(ElfLoadError::InterpreterParseError(_))),
+            "oversized interpreter should be rejected, got {:?}",
+            result,
         );
     }
 

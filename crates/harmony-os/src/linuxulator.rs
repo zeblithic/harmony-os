@@ -862,6 +862,9 @@ pub struct Linuxulator<B: SyscallBackend> {
     vm_brk_base: u64,
     /// VM-backed brk: current program break.
     vm_brk_current: u64,
+    /// Call counter for getrandom — ensures repeated calls to the same
+    /// buffer address produce distinct output.
+    getrandom_counter: u64,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -882,6 +885,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             chardev_fids: Vec::new(),
             vm_brk_base: 0,
             vm_brk_current: 0,
+            getrandom_counter: 0,
         }
     }
 
@@ -1590,7 +1594,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 // Otherwise return what we've written so far (POSIX partial write).
                 return if total == 0 { result } else { total };
             }
-            total += result;
+            total = total.saturating_add(result);
         }
         total
     }
@@ -1639,17 +1643,22 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux getrandom(2): fill buffer with pseudo-random bytes.
     ///
-    /// Uses a deterministic LCG based on the buffer address for each byte.
-    /// This is sufficient for ld-musl stack canaries and ASLR seeds in the
-    /// Linuxulator environment (no real security boundary).
-    fn sys_getrandom(&self, buf_ptr: usize, buflen: usize, _flags: u32) -> i64 {
+    /// Uses a deterministic LCG seeded from the buffer address and a
+    /// monotonic call counter so that repeated calls to the same address
+    /// produce distinct output.  This is sufficient for ld-musl stack
+    /// canaries and ASLR seeds in the Linuxulator environment (no real
+    /// security boundary).
+    fn sys_getrandom(&mut self, buf_ptr: usize, buflen: usize, _flags: u32) -> i64 {
         if buflen == 0 {
             return 0;
         }
+        let counter = self.getrandom_counter;
+        self.getrandom_counter = counter.wrapping_add(1);
         let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buflen) };
         for (i, byte) in buf.iter_mut().enumerate() {
             *byte = ((buf_ptr as u64)
                 .wrapping_add(i as u64)
+                .wrapping_add(counter)
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407)
                 >> 33) as u8;
@@ -1660,7 +1669,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Linux getcwd(2): get current working directory.
     ///
     /// Always returns "/" since the Linuxulator uses a flat namespace.
-    /// On success, returns the pointer to the buffer (Linux convention).
+    /// The raw syscall returns the number of bytes written (including
+    /// the null terminator), not the buffer pointer.  Musl calls the
+    /// raw syscall and interprets the return value as a byte count.
     fn sys_getcwd(&self, buf_ptr: usize, size: usize) -> i64 {
         if size < 2 {
             return ERANGE; // buffer too small for "/\0"
@@ -1669,7 +1680,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         unsafe {
             core::ptr::copy_nonoverlapping(cwd.as_ptr(), buf_ptr as *mut u8, 2);
         }
-        buf_ptr as i64
+        2 // bytes written: '/' + '\0'
     }
 
     /// Linux readlink(2): read the value of a symbolic link.
@@ -2595,7 +2606,7 @@ mod tests {
         let mut buf = [0xFFu8; 64];
         // getcwd(buf, 64)  — x86_64 nr=79
         let result = lx.handle_syscall(79, [buf.as_mut_ptr() as u64, 64, 0, 0, 0, 0]);
-        assert_eq!(result, buf.as_ptr() as i64);
+        assert_eq!(result, 2); // raw syscall returns byte count, not pointer
         assert_eq!(buf[0], b'/');
         assert_eq!(buf[1], 0); // null terminator
     }
