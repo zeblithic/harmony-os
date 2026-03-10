@@ -1335,6 +1335,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
                     return mapped;
                 }
                 let len = ((length as usize) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                // 9P read count is u32 — cap to avoid truncation.
+                // Mappings > 4 GiB are not expected in practice (musl
+                // .so files are a few MiB at most).
                 let capped = len.min(u32::MAX as usize) as u32;
                 match self.backend.read(fid, offset, capped) {
                     Ok(data) => {
@@ -1344,11 +1347,20 @@ impl<B: SyscallBackend> Linuxulator<B> {
                                 .vm_write_bytes(mapped as u64, &data[..copy_len]);
                         }
                         // Zero any tail bytes beyond file data (vm_mmap
-                        // does not guarantee zeroed pages).
-                        if copy_len < len {
-                            let zeros = alloc::vec![0u8; len - copy_len];
-                            self.backend
-                                .vm_write_bytes(mapped as u64 + copy_len as u64, &zeros);
+                        // does not guarantee zeroed pages).  Write in
+                        // page-sized chunks to bound transient allocation.
+                        let tail = len - copy_len;
+                        if tail > 0 {
+                            let chunk = alloc::vec![0u8; PAGE_SIZE.min(tail)];
+                            let mut written = 0usize;
+                            while written < tail {
+                                let n = chunk.len().min(tail - written);
+                                self.backend.vm_write_bytes(
+                                    mapped as u64 + (copy_len + written) as u64,
+                                    &chunk[..n],
+                                );
+                                written += n;
+                            }
                         }
                     }
                     Err(e) => {
@@ -1672,7 +1684,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// The raw syscall returns the number of bytes written (including
     /// the null terminator), not the buffer pointer.  Musl calls the
     /// raw syscall and interprets the return value as a byte count.
-    fn sys_getcwd(&self, buf_ptr: usize, size: usize) -> i64 {
+    fn sys_getcwd(&mut self, buf_ptr: usize, size: usize) -> i64 {
         if size < 2 {
             return ERANGE; // buffer too small for "/\0"
         }

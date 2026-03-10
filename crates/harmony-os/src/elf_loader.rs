@@ -189,13 +189,20 @@ impl InterpreterLoader {
             // Zero the BSS region (memsz > filesz).  The ELF spec
             // requires bytes from vaddr+filesz to vaddr+memsz to be
             // zero.  vm_mmap does not guarantee zeroed pages.
+            // Write in page-sized chunks to bound transient allocation.
             if seg.memsz > seg.filesz {
                 let bss_start = vaddr
                     .checked_add(seg.filesz)
                     .ok_or(ElfLoadError::OverlappingSegments)?;
                 let bss_len = (seg.memsz - seg.filesz) as usize;
-                let zeros = alloc::vec![0u8; bss_len];
-                backend.vm_write_bytes(bss_start, &zeros);
+                let chunk_size = (PAGE_SIZE as usize).min(bss_len);
+                let chunk = alloc::vec![0u8; chunk_size];
+                let mut written = 0usize;
+                while written < bss_len {
+                    let n = chunk.len().min(bss_len - written);
+                    backend.vm_write_bytes(bss_start + written as u64, &chunk[..n]);
+                    written += n;
+                }
             }
 
             // W^X check: standard ELFs should not have segments that
@@ -240,31 +247,35 @@ impl ElfLoader for InterpreterLoader {
         // 4. Handle interpreter if PT_INTERP is present.
         let (final_entry, interp_base_out) = if let Some(ref interp_path) = parsed.interpreter {
             // Walk, open, read the interpreter file via the backend.
+            // All operations after walk must clunk INTERP_FID on error
+            // to avoid leaking the sentinel fid.
             backend.walk(interp_path, INTERP_FID).map_err(|e| match e {
                 IpcError::NotFound => ElfLoadError::InterpreterNotFound,
                 other => ElfLoadError::BackendError(other),
             })?;
-            backend
-                .open(INTERP_FID, OpenMode::Read)
-                .map_err(ElfLoadError::BackendError)?;
 
-            // Check file size before reading to detect truncation.
-            let interp_stat = backend
-                .stat(INTERP_FID)
-                .map_err(ElfLoadError::BackendError)?;
-            if interp_stat.size > MAX_INTERP_SIZE as u64 {
-                let _ = backend.clunk(INTERP_FID);
-                return Err(ElfLoadError::InterpreterParseError(
-                    crate::elf::ElfError::TooShort,
-                ));
-            }
+            let interp_bytes = (|| -> Result<Vec<u8>, ElfLoadError> {
+                backend
+                    .open(INTERP_FID, OpenMode::Read)
+                    .map_err(ElfLoadError::BackendError)?;
 
-            let interp_bytes = backend
-                .read(INTERP_FID, 0, MAX_INTERP_SIZE)
-                .map_err(ElfLoadError::BackendError)?;
-            backend
-                .clunk(INTERP_FID)
-                .map_err(ElfLoadError::BackendError)?;
+                let interp_stat = backend
+                    .stat(INTERP_FID)
+                    .map_err(ElfLoadError::BackendError)?;
+                if interp_stat.size > MAX_INTERP_SIZE as u64 {
+                    return Err(ElfLoadError::InterpreterParseError(
+                        crate::elf::ElfError::TooShort,
+                    ));
+                }
+
+                backend
+                    .read(INTERP_FID, 0, MAX_INTERP_SIZE)
+                    .map_err(ElfLoadError::BackendError)
+            })();
+
+            // Always clunk the interpreter fid, whether we succeeded or failed.
+            let _ = backend.clunk(INTERP_FID);
+            let interp_bytes = interp_bytes?;
 
             // Parse interpreter ELF — must be ET_DYN (position-independent).
             let interp_parsed =
@@ -278,7 +289,9 @@ impl ElfLoader for InterpreterLoader {
             // Load interpreter segments at interp_base.
             self.load_segments(&interp_parsed, &interp_bytes, self.interp_base, backend)?;
 
-            // Entry point is the interpreter's entry.
+            // For ET_DYN interpreters, e_entry is a relative offset from
+            // the image base.  The absolute entry in the process's
+            // address space is interp_base + e_entry.
             let entry = self.interp_base + interp_parsed.entry_point;
             (entry, self.interp_base)
         } else {
