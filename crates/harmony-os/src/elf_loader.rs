@@ -267,6 +267,137 @@ impl ElfLoader for InterpreterLoader {
     }
 }
 
+// ── Stack layout construction ───────────────────────────────────────
+
+/// Build the initial process stack for a Linux binary.
+///
+/// Writes strings, AT_RANDOM bytes, auxv, envp, argv, and argc into
+/// `stack` memory starting from the top (high addresses). Returns the
+/// initial SP value (the address where argc is stored).
+///
+/// The `stack_base` is the virtual address of `stack[0]` in the
+/// process's address space. The returned SP is relative to this base.
+pub fn build_initial_stack(
+    stack: &mut [u8],
+    stack_base: u64,
+    argv: &[&str],
+    envp: &[&str],
+    auxv_entries: &[(u64, u64)],
+    random_bytes: &[u8; 16],
+) -> u64 {
+    let stack_len = stack.len();
+    let mut pos = stack_len;
+
+    // Helper: write bytes at `pos`, moving pos down.
+    // Returns the virtual address of the written data.
+    let write_bytes = |stack: &mut [u8], pos: &mut usize, data: &[u8]| -> u64 {
+        *pos -= data.len();
+        stack[*pos..*pos + data.len()].copy_from_slice(data);
+        stack_base + *pos as u64
+    };
+
+    // 1. Write AT_RANDOM bytes at the top of the stack.
+    let random_addr = write_bytes(stack, &mut pos, random_bytes);
+
+    // 2. Write argv string data (each null-terminated), recording addresses.
+    let mut argv_addrs = Vec::with_capacity(argv.len());
+    for arg in argv {
+        let mut s = Vec::from(arg.as_bytes());
+        s.push(0); // null terminator
+        let addr = write_bytes(stack, &mut pos, &s);
+        argv_addrs.push(addr);
+    }
+
+    // 3. Write envp string data (each null-terminated), recording addresses.
+    let mut envp_addrs = Vec::with_capacity(envp.len());
+    for env in envp {
+        let mut s = Vec::from(env.as_bytes());
+        s.push(0);
+        let addr = write_bytes(stack, &mut pos, &s);
+        envp_addrs.push(addr);
+    }
+
+    // 4. Pad string area to 16-byte alignment.
+    pos &= !0xF;
+
+    // Helper: write a u64 at `pos`, moving pos down by 8.
+    let write_u64 = |stack: &mut [u8], pos: &mut usize, val: u64| {
+        *pos -= 8;
+        stack[*pos..*pos + 8].copy_from_slice(&val.to_le_bytes());
+    };
+
+    // 5. To guarantee 16-byte SP alignment, count the total u64 entries
+    //    we will write. If the count is odd, insert one padding u64 at
+    //    the top of the structured region (before AT_NULL) so that the
+    //    total byte span is a multiple of 16 and argc lands on a
+    //    16-byte boundary.
+    let non_null_auxv_count = auxv_entries
+        .iter()
+        .filter(|(k, _)| *k != auxv::AT_NULL)
+        .count();
+    let total_u64s = 2                       // AT_NULL (key + value)
+        + non_null_auxv_count * 2            // auxv entries (key + value each)
+        + 1                                  // envp NULL terminator
+        + envp_addrs.len()                   // envp pointers
+        + 1                                  // argv NULL terminator
+        + argv_addrs.len()                   // argv pointers
+        + 1; // argc
+
+    // Write the structured data (working downward from high to low).
+
+    // Insert alignment padding if needed (at the top, above AT_NULL).
+    if total_u64s % 2 != 0 {
+        write_u64(stack, &mut pos, 0);
+    }
+
+    // AT_NULL terminator (two u64 zeros).
+    write_u64(stack, &mut pos, 0);
+    write_u64(stack, &mut pos, auxv::AT_NULL);
+
+    // Auxiliary vector entries in reverse order.
+    // Filter out AT_NULL from the caller's entries (we wrote it above).
+    for &(key, value) in auxv_entries.iter().rev() {
+        if key == auxv::AT_NULL {
+            continue;
+        }
+        let actual_value = if key == auxv::AT_RANDOM {
+            random_addr
+        } else {
+            value
+        };
+        write_u64(stack, &mut pos, actual_value);
+        write_u64(stack, &mut pos, key);
+    }
+
+    // envp NULL terminator.
+    write_u64(stack, &mut pos, 0);
+
+    // envp pointers in reverse.
+    for addr in envp_addrs.iter().rev() {
+        write_u64(stack, &mut pos, *addr);
+    }
+
+    // argv NULL terminator.
+    write_u64(stack, &mut pos, 0);
+
+    // argv pointers in reverse.
+    for addr in argv_addrs.iter().rev() {
+        write_u64(stack, &mut pos, *addr);
+    }
+
+    // argc.
+    write_u64(stack, &mut pos, argv.len() as u64);
+
+    // 6. SP points at argc. Verify alignment.
+    debug_assert_eq!(
+        (stack_base + pos as u64) % 16,
+        0,
+        "SP must be 16-byte aligned"
+    );
+
+    stack_base + pos as u64
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -757,5 +888,221 @@ mod tests {
 
         // No interpreter => AT_BASE = 0.
         assert_eq!(auxv_get(&result.auxv, auxv::AT_BASE), Some(0));
+    }
+
+    // ── Stack layout tests ────────────────────────────────────────
+
+    /// Helper: read a little-endian u64 from stack at a given virtual
+    /// address, using stack_base to compute the offset.
+    fn read_u64_at(stack: &[u8], stack_base: u64, vaddr: u64) -> u64 {
+        let offset = (vaddr - stack_base) as usize;
+        u64::from_le_bytes(stack[offset..offset + 8].try_into().unwrap())
+    }
+
+    #[test]
+    fn build_stack_layout() {
+        let mut stack = vec![0u8; 4096];
+        let stack_base = 0x7FFF_0000u64;
+        let random = [0xAA; 16];
+        let test_auxv = vec![
+            (auxv::AT_PHDR, 0x400040),
+            (auxv::AT_ENTRY, 0x401000),
+            (auxv::AT_PAGESZ, 4096),
+            (auxv::AT_RANDOM, 0), // placeholder
+            (auxv::AT_NULL, 0),
+        ];
+
+        let sp = build_initial_stack(
+            &mut stack,
+            stack_base,
+            &["./hello"],
+            &[],
+            &test_auxv,
+            &random,
+        );
+
+        // SP must be 16-byte aligned.
+        assert_eq!(sp % 16, 0, "SP must be 16-byte aligned");
+
+        // argc should be 1.
+        let argc = read_u64_at(&stack, stack_base, sp);
+        assert_eq!(argc, 1, "argc should be 1");
+    }
+
+    #[test]
+    fn stack_argv_readable() {
+        let mut stack = vec![0u8; 4096];
+        let stack_base = 0x7FFF_0000u64;
+        let random = [0xBB; 16];
+        let test_auxv = vec![
+            (auxv::AT_PAGESZ, 4096),
+            (auxv::AT_RANDOM, 0),
+            (auxv::AT_NULL, 0),
+        ];
+
+        let sp = build_initial_stack(
+            &mut stack,
+            stack_base,
+            &["./hello"],
+            &[],
+            &test_auxv,
+            &random,
+        );
+
+        // argc at SP
+        let argc = read_u64_at(&stack, stack_base, sp);
+        assert_eq!(argc, 1);
+
+        // argv[0] pointer at SP + 8
+        let argv0_ptr = read_u64_at(&stack, stack_base, sp + 8);
+
+        // Follow the pointer to read the string.
+        let str_offset = (argv0_ptr - stack_base) as usize;
+        let end = stack[str_offset..].iter().position(|&b| b == 0).unwrap();
+        let s = core::str::from_utf8(&stack[str_offset..str_offset + end]).unwrap();
+        assert_eq!(s, "./hello");
+    }
+
+    #[test]
+    fn stack_auxv_present() {
+        let mut stack = vec![0u8; 4096];
+        let stack_base = 0x7FFF_0000u64;
+        let random = [0xCC; 16];
+        let test_auxv = vec![
+            (auxv::AT_PHDR, 0x400040),
+            (auxv::AT_ENTRY, 0x401000),
+            (auxv::AT_PAGESZ, 4096),
+            (auxv::AT_RANDOM, 0),
+            (auxv::AT_NULL, 0),
+        ];
+
+        let sp = build_initial_stack(
+            &mut stack,
+            stack_base,
+            &["./hello"],
+            &[],
+            &test_auxv,
+            &random,
+        );
+
+        // Walk past argc (1 u64), argv pointers (1 ptr + NULL),
+        // envp (NULL) to reach auxv.
+        let mut cursor = sp;
+
+        // argc
+        let argc = read_u64_at(&stack, stack_base, cursor);
+        assert_eq!(argc, 1);
+        cursor += 8;
+
+        // argv[0] pointer
+        cursor += 8;
+        // argv NULL terminator
+        let argv_null = read_u64_at(&stack, stack_base, cursor);
+        assert_eq!(argv_null, 0);
+        cursor += 8;
+
+        // envp NULL terminator
+        let envp_null = read_u64_at(&stack, stack_base, cursor);
+        assert_eq!(envp_null, 0);
+        cursor += 8;
+
+        // Now we are at auxv. Collect entries until AT_NULL.
+        let mut found_auxv = Vec::new();
+        loop {
+            let key = read_u64_at(&stack, stack_base, cursor);
+            let val = read_u64_at(&stack, stack_base, cursor + 8);
+            cursor += 16;
+            if key == auxv::AT_NULL {
+                break;
+            }
+            found_auxv.push((key, val));
+        }
+
+        // Verify we found AT_PHDR, AT_ENTRY, AT_PAGESZ.
+        let find = |k: u64| {
+            found_auxv
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| *v)
+        };
+        assert_eq!(find(auxv::AT_PHDR), Some(0x400040));
+        assert_eq!(find(auxv::AT_ENTRY), Some(0x401000));
+        assert_eq!(find(auxv::AT_PAGESZ), Some(4096));
+    }
+
+    #[test]
+    fn stack_at_random_points_to_bytes() {
+        let mut stack = vec![0u8; 4096];
+        let stack_base = 0x7FFF_0000u64;
+        let random: [u8; 16] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10,
+        ];
+        let test_auxv = vec![
+            (auxv::AT_PAGESZ, 4096),
+            (auxv::AT_RANDOM, 0),
+            (auxv::AT_NULL, 0),
+        ];
+
+        let sp = build_initial_stack(
+            &mut stack,
+            stack_base,
+            &["./hello"],
+            &[],
+            &test_auxv,
+            &random,
+        );
+
+        // Walk to auxv.
+        let mut cursor = sp;
+        cursor += 8; // argc
+        cursor += 8; // argv[0]
+        cursor += 8; // argv NULL
+        cursor += 8; // envp NULL
+
+        // Find AT_RANDOM.
+        let mut random_ptr = None;
+        loop {
+            let key = read_u64_at(&stack, stack_base, cursor);
+            let val = read_u64_at(&stack, stack_base, cursor + 8);
+            cursor += 16;
+            if key == auxv::AT_NULL {
+                break;
+            }
+            if key == auxv::AT_RANDOM {
+                random_ptr = Some(val);
+            }
+        }
+
+        let ptr = random_ptr.expect("AT_RANDOM entry must exist");
+
+        // Follow the pointer to the random bytes.
+        let offset = (ptr - stack_base) as usize;
+        assert_eq!(&stack[offset..offset + 16], &random);
+    }
+
+    #[test]
+    fn stack_sp_alignment() {
+        let random = [0xDD; 16];
+        let test_auxv = vec![
+            (auxv::AT_PAGESZ, 4096),
+            (auxv::AT_RANDOM, 0),
+            (auxv::AT_NULL, 0),
+        ];
+
+        // Test with various argv lengths.
+        for args in &[
+            vec!["a"],
+            vec!["ab", "cd"],
+            vec!["hello", "world", "foo"],
+            vec!["x"],
+            vec!["longer-argument-string"],
+            vec!["a", "bb", "ccc", "dddd", "eeeee"],
+        ] {
+            let mut stack = vec![0u8; 4096];
+            let stack_base = 0x7FFF_0000u64;
+            let sp = build_initial_stack(&mut stack, stack_base, args, &[], &test_auxv, &random);
+            assert_eq!(sp % 16, 0, "SP must be 16-byte aligned for argv {:?}", args);
+        }
     }
 }
