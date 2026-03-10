@@ -395,6 +395,24 @@ pub trait SyscallBackend {
     fn vm_find_free_region(&self, _len: usize) -> Result<u64, VmError> {
         Err(VmError::PageTableError)
     }
+
+    /// Write bytes into a mapped VM region.
+    ///
+    /// Default implementation uses an unsafe pointer write, which works
+    /// when the mapped address is directly accessible (arena, real VM
+    /// with identity-mapped memory). Mock backends override this to
+    /// record the write without dereferencing the simulated address.
+    ///
+    /// # Safety
+    /// The default implementation dereferences `addr` as a raw pointer.
+    /// Callers must ensure the region at `addr` is mapped and writable.
+    fn vm_write_bytes(&mut self, addr: u64, data: &[u8]) {
+        if !data.is_empty() {
+            unsafe {
+                core::ptr::copy_nonoverlapping(data.as_ptr(), addr as usize as *mut u8, data.len());
+            }
+        }
+    }
 }
 
 // ── MockBackend ─────────────────────────────────────────────────────
@@ -412,6 +430,9 @@ pub struct MockBackend {
     pub reads: Vec<(Fid, u64, u32)>,
     pub clunks: Vec<Fid>,
     pub stats: Vec<Fid>,
+    /// File content keyed by fid. Populated via `set_file_content` so that
+    /// `read()` returns real data instead of an empty Vec.
+    file_content: BTreeMap<Fid, Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -424,7 +445,14 @@ impl MockBackend {
             reads: Vec::new(),
             clunks: Vec::new(),
             stats: Vec::new(),
+            file_content: BTreeMap::new(),
         }
+    }
+
+    /// Register file content for a fid. Subsequent `read()` calls on this
+    /// fid will return data from the content buffer at the requested offset.
+    pub fn set_file_content(&mut self, fid: Fid, content: Vec<u8>) {
+        self.file_content.insert(fid, content);
     }
 }
 
@@ -447,10 +475,14 @@ pub struct VmMockBackend {
     pub vm_munmaps: Vec<(u64, usize)>,
     /// Recorded vm_mprotect calls: (vaddr, len, flags).
     pub vm_mprotects: Vec<(u64, usize, PageFlags)>,
+    /// Recorded vm_write_bytes calls: (addr, data).
+    pub vm_writes: Vec<(u64, Vec<u8>)>,
     /// Next virtual address to hand out from find_free_region.
     next_vaddr: u64,
     /// Per-page budget remaining. When 0, vm_mmap returns BudgetExceeded.
     budget_pages: usize,
+    /// File content keyed by fid.
+    file_content: BTreeMap<Fid, Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -466,9 +498,16 @@ impl VmMockBackend {
             vm_mmaps: Vec::new(),
             vm_munmaps: Vec::new(),
             vm_mprotects: Vec::new(),
+            vm_writes: Vec::new(),
             next_vaddr: 0x1_0000, // start above null guard
             budget_pages,
+            file_content: BTreeMap::new(),
         }
+    }
+
+    /// Register file content for a fid.
+    pub fn set_file_content(&mut self, fid: Fid, content: Vec<u8>) {
+        self.file_content.insert(fid, content);
     }
 }
 
@@ -487,7 +526,14 @@ impl SyscallBackend for MockBackend {
 
     fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
         self.reads.push((fid, offset, count));
-        Ok(Vec::new())
+        // Return file content if registered for this fid.
+        if let Some(content) = self.file_content.get(&fid) {
+            let start = (offset as usize).min(content.len());
+            let end = (start + count as usize).min(content.len());
+            Ok(content[start..end].to_vec())
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     fn write(&mut self, fid: Fid, _offset: u64, data: &[u8]) -> Result<u32, IpcError> {
@@ -526,7 +572,13 @@ impl SyscallBackend for VmMockBackend {
 
     fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
         self.reads.push((fid, offset, count));
-        Ok(Vec::new())
+        if let Some(content) = self.file_content.get(&fid) {
+            let start = (offset as usize).min(content.len());
+            let end = (start + count as usize).min(content.len());
+            Ok(content[start..end].to_vec())
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     fn write(&mut self, fid: Fid, _offset: u64, data: &[u8]) -> Result<u32, IpcError> {
@@ -599,6 +651,11 @@ impl SyscallBackend for VmMockBackend {
             return Err(VmError::OutOfMemory);
         }
         Ok(self.next_vaddr)
+    }
+
+    fn vm_write_bytes(&mut self, addr: u64, data: &[u8]) {
+        // Record but do NOT dereference — addresses are simulated.
+        self.vm_writes.push((addr, data.to_vec()));
     }
 }
 
@@ -1223,21 +1280,22 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.vm_brk_current as i64
     }
 
-    /// Linux mmap(2): map anonymous memory.
+    /// Linux mmap(2): map memory (anonymous or file-backed).
     ///
     /// When the backend supports VM operations, delegates to the VM layer.
     /// Otherwise uses the MemoryArena allocator.
     ///
-    /// Only `MAP_ANONYMOUS` is supported. Returns the mapped address or a
-    /// negative errno.
+    /// Supports both `MAP_ANONYMOUS` (zeroed pages) and file-backed mappings
+    /// (reads file content from the backend via the fd table). Returns the
+    /// mapped address or a negative errno.
     fn sys_mmap(
         &mut self,
         addr: u64,
         length: u64,
         prot: i32,
         flags: i32,
-        _fd: i32,
-        _offset: u64,
+        fd: i32,
+        offset: u64,
     ) -> i64 {
         const MAP_ANONYMOUS: i32 = 0x20;
         const MAP_FIXED: i32 = 0x10;
@@ -1245,12 +1303,46 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if length == 0 {
             return EINVAL;
         }
-        if flags & MAP_ANONYMOUS == 0 {
-            return EINVAL; // file-backed mmap not supported
-        }
+
+        let is_anonymous = flags & MAP_ANONYMOUS != 0;
+
+        // For file-backed mappings, validate the fd up front.
+        let file_fid = if !is_anonymous {
+            match self.fd_table.get(&fd) {
+                Some(entry) => Some(entry.fid),
+                None => return EBADF,
+            }
+        } else {
+            None
+        };
 
         if self.backend.has_vm_support() {
-            return self.sys_mmap_vm(addr, length, prot, flags);
+            let mapped = self.sys_mmap_vm(addr, length, prot, flags);
+            if mapped < 0 {
+                return mapped;
+            }
+            // For file-backed mappings in the VM path, read file content
+            // and write it into the mapped region via `vm_write_bytes`.
+            if let Some(fid) = file_fid {
+                let len = ((length as usize) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                let capped = len.min(u32::MAX as usize) as u32;
+                match self.backend.read(fid, offset, capped) {
+                    Ok(data) => {
+                        let copy_len = data.len().min(len);
+                        if copy_len > 0 {
+                            self.backend
+                                .vm_write_bytes(mapped as u64, &data[..copy_len]);
+                        }
+                    }
+                    Err(e) => {
+                        // Clean up the mapping on read failure.
+                        let len = ((length as usize) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                        let _ = self.backend.vm_munmap(mapped as u64, len);
+                        return ipc_err_to_errno(e);
+                    }
+                }
+            }
+            return mapped;
         }
 
         // Arena fallback path.
@@ -1269,6 +1361,22 @@ impl<B: SyscallBackend> Linuxulator<B> {
             core::ptr::write_bytes(ptr as *mut u8, 0, len);
         }
         self.arena.mmap_regions.push((self.arena.mmap_top, len));
+
+        // For file-backed arena mappings, read file content into the region.
+        if let Some(fid) = file_fid {
+            let capped = len.min(u32::MAX as usize) as u32;
+            if let Ok(data) = self.backend.read(fid, offset, capped) {
+                let copy_len = data.len().min(len);
+                if copy_len > 0 {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, copy_len);
+                    }
+                }
+            }
+            // If read fails, the mapping still exists but with zeroed pages.
+            // This matches Linux behavior where partial reads fill what they can.
+        }
+
         ptr as i64
     }
 
@@ -2630,6 +2738,151 @@ mod tests {
             }
             other => panic!("expected Getrandom, got {:?}", other),
         }
+    }
+
+    // ── File-backed mmap tests (arena path) ──────────────────────────
+
+    #[test]
+    fn file_backed_mmap_reads_content() {
+        let mut mock = MockBackend::new();
+        // Pre-register content for fid 100 (the first fid alloc_fid will return).
+        let file_data = vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE];
+        mock.set_file_content(100, file_data.clone());
+        let mut lx = Linuxulator::with_arena(mock, 64 * 1024);
+
+        // Open a file via openat to get an fd. This will use fid 100.
+        let path = b"/lib/test.so\0";
+        let at_fdcwd = (-100i32) as u64;
+        let fd = lx.handle_syscall(257, [at_fdcwd, path.as_ptr() as u64, 0, 0, 0, 0]);
+        assert!(fd >= 0, "openat should succeed, got {}", fd);
+
+        // mmap with that fd (NOT MAP_ANONYMOUS). flags = MAP_PRIVATE (0x02).
+        // PROT_READ | PROT_WRITE = 3
+        let addr = lx.handle_syscall(9, [0, 4096, 3, 0x02, fd as u64, 0]);
+        assert!(
+            addr > 0,
+            "file-backed mmap should return valid address, got {}",
+            addr
+        );
+
+        // Verify the mapped memory contains the file content.
+        let mapped = unsafe { core::slice::from_raw_parts(addr as usize as *const u8, 4096) };
+        assert_eq!(
+            &mapped[..8],
+            &file_data[..],
+            "file content should be copied into mapped region"
+        );
+        // Rest should be zero-filled.
+        assert!(
+            mapped[8..].iter().all(|&b| b == 0),
+            "remaining bytes should be zero"
+        );
+    }
+
+    #[test]
+    fn file_backed_mmap_with_offset() {
+        let mut mock = MockBackend::new();
+        // File content: 16 bytes total.
+        let file_data: Vec<u8> = (0..16).collect();
+        mock.set_file_content(100, file_data);
+        let mut lx = Linuxulator::with_arena(mock, 64 * 1024);
+
+        let path = b"/lib/test.so\0";
+        let at_fdcwd = (-100i32) as u64;
+        let fd = lx.handle_syscall(257, [at_fdcwd, path.as_ptr() as u64, 0, 0, 0, 0]);
+        assert!(fd >= 0);
+
+        // mmap at file offset 8.
+        let addr = lx.handle_syscall(9, [0, 4096, 3, 0x02, fd as u64, 8]);
+        assert!(
+            addr > 0,
+            "file-backed mmap with offset should succeed, got {}",
+            addr
+        );
+
+        // Should contain bytes 8..16 from the file (8 bytes), then zeros.
+        let mapped = unsafe { core::slice::from_raw_parts(addr as usize as *const u8, 4096) };
+        assert_eq!(
+            &mapped[..8],
+            &[8, 9, 10, 11, 12, 13, 14, 15],
+            "should read from offset 8"
+        );
+        assert!(
+            mapped[8..].iter().all(|&b| b == 0),
+            "remaining bytes should be zero"
+        );
+    }
+
+    #[test]
+    fn file_backed_mmap_bad_fd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::with_arena(mock, 64 * 1024);
+
+        // mmap with invalid fd (not MAP_ANONYMOUS). flags = MAP_PRIVATE (0x02).
+        let result = lx.handle_syscall(9, [0, 4096, 3, 0x02, 99, 0]);
+        assert_eq!(
+            result, EBADF,
+            "file-backed mmap with bad fd should return EBADF"
+        );
+    }
+
+    // ── File-backed mmap tests (VM path) ─────────────────────────────
+
+    #[test]
+    fn vm_file_backed_mmap_reads_content() {
+        let mut mock = VmMockBackend::new(16);
+        let file_data = vec![0x7F, b'E', b'L', b'F', 0x02, 0x01, 0x01, 0x00];
+        mock.set_file_content(100, file_data.clone());
+        let mut lx = Linuxulator::new(mock);
+
+        // Open a file.
+        let path = b"/lib/libc.so\0";
+        let at_fdcwd = (-100i32) as u64;
+        let fd = lx.handle_syscall(257, [at_fdcwd, path.as_ptr() as u64, 0, 0, 0, 0]);
+        assert!(fd >= 0);
+
+        // File-backed mmap via VM path.
+        let addr = lx.handle_syscall(9, [0, 4096, 3, 0x02, fd as u64, 0]);
+        assert!(
+            addr > 0,
+            "VM file-backed mmap should return valid address, got {}",
+            addr
+        );
+
+        // VM path should have recorded a vm_mmap call.
+        assert_eq!(lx.backend().vm_mmaps.len(), 1);
+
+        // Backend read should have been called for the file content.
+        let file_fid = lx.fid_for_fd(fd as i32).unwrap();
+        let mmap_reads: Vec<_> = lx
+            .backend()
+            .reads
+            .iter()
+            .filter(|(fid, _, _)| *fid == file_fid)
+            .collect();
+        assert!(
+            !mmap_reads.is_empty(),
+            "mmap should read file content via backend"
+        );
+
+        // File data should have been written to the mapped address via vm_write_bytes.
+        assert_eq!(lx.backend().vm_writes.len(), 1);
+        let (write_addr, write_data) = &lx.backend().vm_writes[0];
+        assert_eq!(*write_addr, addr as u64);
+        assert_eq!(write_data, &file_data);
+    }
+
+    #[test]
+    fn vm_file_backed_mmap_bad_fd() {
+        let mock = VmMockBackend::new(16);
+        let mut lx = Linuxulator::new(mock);
+
+        // mmap with invalid fd (not MAP_ANONYMOUS).
+        let result = lx.handle_syscall(9, [0, 4096, 3, 0x02, 99, 0]);
+        assert_eq!(
+            result, EBADF,
+            "VM file-backed mmap with bad fd should return EBADF"
+        );
     }
 }
 
