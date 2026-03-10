@@ -257,8 +257,8 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, ElfError> {
 
                 let interp_bytes = &data[p_offset..p_offset + p_filesz];
                 let path = interp_bytes.strip_suffix(&[0]).unwrap_or(interp_bytes);
-                let path_str = core::str::from_utf8(path)
-                    .map_err(|_| ElfError::InterpreterPathInvalid)?;
+                let path_str =
+                    core::str::from_utf8(path).map_err(|_| ElfError::InterpreterPathInvalid)?;
                 interpreter = Some(String::from(path_str));
             }
             _ => {}
