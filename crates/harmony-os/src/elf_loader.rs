@@ -131,6 +131,12 @@ fn segment_flags_to_page_flags(flags: &SegmentFlags) -> PageFlags {
 const MAX_INTERP_SIZE: u32 = 4 * 1024 * 1024;
 
 /// Fid used for the interpreter file walk/open/read cycle.
+///
+/// This is a sentinel value far from the sequential fid range that
+/// LibraryServer and Linuxulator allocate from (starting near 0).
+/// The walk/open/read/clunk cycle is atomic within `load()`, so the
+/// fid is never exposed to user code.  If a dynamic fid allocator is
+/// added later, this should be replaced with an allocated fid.
 const INTERP_FID: Fid = 0xFFFF_FFF0;
 
 impl InterpreterLoader {
@@ -173,6 +179,15 @@ impl InterpreterLoader {
                 }
                 backend.vm_write_bytes(vaddr, &elf_bytes[offset..end]);
             }
+
+            // W^X check: standard ELFs should not have segments that
+            // are both writable and executable.  If one appears, it is
+            // likely a malformed or intentionally exotic binary.
+            debug_assert!(
+                !(seg.flags.write && seg.flags.execute),
+                "W^X violation: segment at vaddr {:#x} is both W and X",
+                seg.vaddr,
+            );
 
             // Restore the caller's intended permissions (remove
             // the temporary WRITABLE if segment is not writable).
@@ -247,7 +262,10 @@ impl ElfLoader for InterpreterLoader {
         };
 
         let auxv = alloc::vec![
-            (auxv::AT_PHDR, exe_base + parsed.phdr_offset),
+            (
+                auxv::AT_PHDR,
+                exe_base + parsed.load_bias + parsed.phdr_offset
+            ),
             (auxv::AT_PHENT, parsed.phdr_entry_size as u64),
             (auxv::AT_PHNUM, parsed.phdr_count as u64),
             (auxv::AT_PAGESZ, PAGE_SIZE),
@@ -861,11 +879,11 @@ mod tests {
         let mut backend = LoaderMockBackend::new();
         let result = loader.load(&elf, &mut backend).unwrap();
 
-        // AT_PHDR should be exe_base + parsed.phdr_offset.
+        // AT_PHDR = exe_base + load_bias + phdr_offset.
         // For ET_EXEC, exe_base = 0.
         assert_eq!(
             auxv_get(&result.auxv, auxv::AT_PHDR),
-            Some(parsed.phdr_offset)
+            Some(parsed.load_bias + parsed.phdr_offset)
         );
         assert_eq!(
             auxv_get(&result.auxv, auxv::AT_PHENT),
@@ -1091,8 +1109,14 @@ mod tests {
         cursor += 8;
         // Skip argv pointers (argc pointers + NULL terminator).
         cursor += (argc + 1) * 8;
-        // Skip envp NULL terminator.
-        cursor += 8;
+        // Skip envp pointers until NULL terminator.
+        loop {
+            let val = read_u64_at(stack, stack_base, cursor);
+            cursor += 8;
+            if val == 0 {
+                break;
+            }
+        }
 
         // Collect auxv entries.
         let mut found = Vec::new();
@@ -1176,10 +1200,15 @@ mod tests {
         // Collect auxv from the stack.
         let stack_auxv = collect_stack_auxv(&stack, stack_base, sp, argc);
 
-        // AT_PHDR must be present (exe's phdr offset, exe_base==0 for ET_EXEC).
+        // AT_PHDR = exe_base + load_bias + phdr_offset.
+        // For ET_EXEC, exe_base == 0.
+        let parsed = parse_elf(&elf).unwrap();
+        let expected_phdr = parsed.load_bias + parsed.phdr_offset;
         let at_phdr = find_auxv(&stack_auxv, auxv::AT_PHDR).expect("AT_PHDR must be in stack auxv");
-        // For our test ELF, phdr_offset == 64.
-        assert_eq!(at_phdr, 64, "AT_PHDR should point to exe's phdr table");
+        assert_eq!(
+            at_phdr, expected_phdr,
+            "AT_PHDR should point to exe's phdr table in memory"
+        );
 
         // AT_ENTRY must equal exe's entry point.
         let at_entry =
@@ -1279,12 +1308,13 @@ mod tests {
             "AT_BASE should be the interpreter's base address"
         );
 
-        // AT_PHDR points to exe's phdr in memory.
+        // AT_PHDR = exe_base + load_bias + phdr_offset.
+        let parsed_exe = parse_elf(&exe_elf).unwrap();
+        let expected_phdr = parsed_exe.load_bias + parsed_exe.phdr_offset;
         let at_phdr = find_auxv(&stack_auxv, auxv::AT_PHDR).expect("AT_PHDR must be in stack auxv");
-        // For ET_EXEC, exe_base == 0, so AT_PHDR == phdr_offset == 64.
         assert_eq!(
-            at_phdr, 64,
-            "AT_PHDR should point to exe's program header table"
+            at_phdr, expected_phdr,
+            "AT_PHDR should point to exe's program header table in memory"
         );
 
         // AT_RANDOM points to the random bytes we provided.

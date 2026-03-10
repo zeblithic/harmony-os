@@ -135,6 +135,17 @@ impl FileServer for LibraryServer {
 
     fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
         let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
+
+        // Root fid (name == "") is the /lib directory itself.
+        if state.name.is_empty() {
+            return Ok(FileStat {
+                qpath: 0,
+                name: Arc::from("lib"),
+                size: 0,
+                file_type: FileType::Directory,
+            });
+        }
+
         let data = self.manifest.get(&state.name).ok_or(IpcError::NotFound)?;
         Ok(FileStat {
             qpath: state.qpath,
@@ -235,6 +246,16 @@ mod tests {
         assert_eq!(st.size, 8);
         assert_eq!(&*st.name, "libc.so");
         assert_eq!(st.file_type, FileType::Regular);
+    }
+
+    #[test]
+    fn stat_root_fid() {
+        let mut srv = test_server();
+        let st = srv.stat(0).unwrap();
+        assert_eq!(&*st.name, "lib");
+        assert_eq!(st.file_type, FileType::Directory);
+        assert_eq!(st.size, 0);
+        assert_eq!(st.qpath, 0);
     }
 
     #[test]

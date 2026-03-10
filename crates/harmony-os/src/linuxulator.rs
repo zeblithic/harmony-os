@@ -1606,7 +1606,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                     Ok(s) => s,
                     Err(e) => return ipc_err_to_errno(e),
                 };
-                stat.size as i64 + offset
+                (stat.size as i64).saturating_add(offset)
             }
             _ => return EINVAL,
         };

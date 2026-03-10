@@ -97,6 +97,13 @@ pub struct ParsedElf {
     pub phdr_entry_size: u16,
     /// Number of program header entries.
     pub phdr_count: u16,
+    /// Load bias: `first_load_vaddr - first_load_offset`.
+    ///
+    /// For ET_EXEC, this is typically the first PT_LOAD's vaddr (e.g.
+    /// 0x400000).  For ET_DYN, it is typically 0 (first PT_LOAD has
+    /// vaddr=0, offset=0).  Used to compute the in-memory address of
+    /// program headers: `base + load_bias + phdr_offset`.
+    pub load_bias: u64,
 }
 
 // ── Little-endian helpers ───────────────────────────────────────────
@@ -265,6 +272,15 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, ElfError> {
         }
     }
 
+    // Compute load_bias from the first PT_LOAD segment.
+    // This is `p_vaddr - p_offset` for the segment that contains the
+    // ELF header (typically offset=0).  Used to convert phdr_offset
+    // (a file offset) into an in-memory virtual address.
+    let load_bias = segments
+        .first()
+        .map(|s| s.vaddr.wrapping_sub(s.offset))
+        .unwrap_or(0);
+
     Ok(ParsedElf {
         entry_point,
         elf_type,
@@ -273,6 +289,7 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, ElfError> {
         phdr_offset: e_phoff as u64,
         phdr_entry_size: e_phentsize as u16,
         phdr_count: e_phnum as u16,
+        load_bias,
     })
 }
 
