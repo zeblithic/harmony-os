@@ -137,7 +137,7 @@ impl<B: RegisterBank, const N: usize> FileServer for UartServer<B, N> {
     fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
         let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
         let (name, file_type) = match state.qpath {
-            QPATH_ROOT => ("uart", FileType::Directory),
+            QPATH_ROOT => ("/", FileType::Directory),
             QPATH_UART0 => ("uart0", FileType::Regular),
             _ => return Err(IpcError::NotFound),
         };
@@ -261,7 +261,7 @@ mod tests {
     fn stat_root() {
         let mut srv = test_server();
         let st = srv.stat(0).unwrap();
-        assert_eq!(&*st.name, "uart");
+        assert_eq!(&*st.name, "/");
         assert_eq!(st.file_type, FileType::Directory);
     }
 

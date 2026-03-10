@@ -26,7 +26,9 @@ const UARTFR_RXFE: u32 = 1 << 4; // RX FIFO empty
 ///   IBRD = integer part of BRD
 ///   FBRD = integer(fractional_part * 64 + 0.5)
 ///
-/// Avoids floating-point by working in 128ths then rounding to 64ths.
+/// Avoids floating-point by working in 128ths then rounding to 64ths:
+///   div_x128 = (clock_hz * 8) / baud
+///   div_x64  = div_ceil(div_x128, 2)   (round to nearest 64th)
 pub fn baud_divisors(clock_hz: u32, baud: u32) -> (u16, u8) {
     if baud == 0 || clock_hz == 0 {
         return (0, 0);
@@ -62,7 +64,7 @@ impl<const N: usize> Default for Pl011Driver<N> {
 impl<const N: usize> Pl011Driver<N> {
     /// Create a new driver with an empty RX ring buffer.
     pub fn new() -> Self {
-        const { assert!(N > 0, "ring buffer size must be at least 1") };
+        assert!(N > 0, "ring buffer size must be at least 1");
         Self {
             rx_buf: [0u8; N],
             rx_head: 0,
