@@ -214,8 +214,9 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
                     .driver
                     .link_status(&mut self.bank, self.mdio_polls)
                     .map_err(|_e: GenetError| {
-                        // MdioTimeout: PHY bus unresponsive; no perfect IpcError variant —
-                        // ResourceExhausted is the closest available approximation.
+                        // MdioTimeout / MdioReadFail: PHY bus unresponsive or NACK;
+                        // no perfect IpcError variant — ResourceExhausted is the
+                        // closest available approximation.
                         IpcError::ResourceExhausted
                     })?;
                 let bytes: &[u8] = if up { b"up\n" } else { b"down\n" };

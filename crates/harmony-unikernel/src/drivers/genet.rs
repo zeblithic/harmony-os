@@ -65,7 +65,7 @@ const MIB_RESET_TX: u32 = 1 << 2;
 
 // MDIO bits
 const MDIO_START_BUSY: u32 = 1 << 29;
-const _MDIO_READ_FAIL: u32 = 1 << 28;
+const MDIO_READ_FAIL: u32 = 1 << 28;
 const MDIO_RD: u32 = 2 << 26;
 const _MDIO_WR: u32 = 1 << 26;
 const MDIO_PMD_SHIFT: u32 = 21;
@@ -180,6 +180,8 @@ pub enum GenetError {
     FrameTooSmall,
     /// MDIO operation timed out.
     MdioTimeout,
+    /// MDIO read completed but PHY did not acknowledge (NACK).
+    MdioReadFail,
 }
 
 /// Statistics counters for the GENET interface.
@@ -489,6 +491,11 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         }
         if !completed {
             return Err(GenetError::MdioTimeout);
+        }
+
+        // PHY NACK: MDIO transaction completed but no device responded.
+        if result & MDIO_READ_FAIL != 0 {
+            return Err(GenetError::MdioReadFail);
         }
 
         self.link_up = result & BMSR_LSTATUS != 0;
@@ -910,6 +917,18 @@ mod tests {
 
         let result = driver.link_status(&mut bank, 5);
         assert_eq!(result, Err(GenetError::MdioTimeout));
+    }
+
+    #[test]
+    fn link_status_returns_mdio_read_fail() {
+        let mut bank = init_bank();
+        let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+
+        // MDIO completes (START_BUSY clear) but PHY NACKed (READ_FAIL set)
+        bank.on_read(UMAC_MDIO_CMD, vec![MDIO_READ_FAIL]);
+
+        let result = driver.link_status(&mut bank, 5);
+        assert_eq!(result, Err(GenetError::MdioReadFail));
     }
 
     // ── Stats tests ───────────────────────────────────────────────
