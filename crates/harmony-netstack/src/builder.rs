@@ -4,6 +4,11 @@ use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
 use crate::config::HARMONY_UDP_PORT;
 use crate::stack::NetStack;
 
+/// Fluent builder for [`NetStack`] configuration.
+///
+/// Requires at minimum a static IPv4 address via [`static_ip`](Self::static_ip).
+/// All other fields have sensible defaults (locally-administered MAC,
+/// port 4242, broadcast disabled, no explicit peers).
 pub struct NetStackBuilder {
     mac: [u8; 6],
     ip: Option<Ipv4Cidr>,

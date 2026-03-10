@@ -9,6 +9,11 @@ use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use crate::device::FrameBuffer;
 use crate::peers::PeerTable;
 
+/// UDP/IP network interface for Harmony mesh traffic.
+///
+/// Wraps smoltcp to process raw Ethernet frames and expose Harmony
+/// packets received via UDP. Implements `NetworkInterface` so the
+/// unikernel runtime can register it as `"udp0"`.
 pub struct NetStack {
     device: FrameBuffer,
     iface: Interface,
@@ -63,10 +68,12 @@ impl NetStack {
         }
     }
 
+    /// Feed a raw Ethernet frame into the network stack for processing.
     pub fn ingest(&mut self, frame: Vec<u8>) {
         self.device.ingest(frame);
     }
 
+    /// Drive the smoltcp interface and drain received UDP payloads into the rx queue.
     pub fn poll(&mut self, now: Instant) {
         self.iface.poll(now, &mut self.device, &mut self.sockets);
 
@@ -81,10 +88,12 @@ impl NetStack {
         }
     }
 
+    /// Drain outbound Ethernet frames produced by smoltcp (ARP replies, UDP packets, etc.).
     pub fn drain_tx(&mut self) -> impl Iterator<Item = Vec<u8>> + '_ {
         self.device.drain_tx()
     }
 
+    /// Returns the interface name (`"udp0"`).
     pub fn name(&self) -> &str {
         "udp0"
     }
