@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Minimal ELF64 parser for statically-linked x86_64 executables.
+//! Minimal ELF64 parser for x86_64 and aarch64 executables.
 //!
-//! Only supports ET_EXEC binaries with PT_LOAD segments. No dynamic
-//! linking, no section headers, no interpreter. Returns metadata
-//! only — the caller allocates memory and copies segments.
+//! Supports both ET_EXEC (static) and ET_DYN (PIE / shared library)
+//! binaries with PT_LOAD segments. No section headers, no interpreter
+//! handling. Returns metadata only — the caller allocates memory and
+//! copies segments.
 
 use alloc::vec::Vec;
 
@@ -14,6 +15,7 @@ const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 const ET_EXEC: u16 = 2;
+const ET_DYN: u16 = 3;
 #[cfg(target_arch = "x86_64")]
 const EM_X86_64: u16 = 0x3E;
 #[cfg(target_arch = "aarch64")]
@@ -41,6 +43,14 @@ pub enum ElfError {
     UnsupportedMachine,
     InvalidPhdr,
     SegmentOutOfBounds,
+}
+
+// ── ELF type ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElfType {
+    Exec,
+    Dyn,
 }
 
 // ── Parsed types ────────────────────────────────────────────────────
@@ -73,6 +83,7 @@ pub struct ElfSegment {
 #[derive(Debug, PartialEq, Eq)]
 pub struct ParsedElf {
     pub entry_point: u64,
+    pub elf_type: ElfType,
     pub segments: Vec<ElfSegment>,
 }
 
@@ -108,8 +119,9 @@ fn u64_le(data: &[u8], offset: usize) -> u64 {
 
 /// Parse an ELF64 binary from raw bytes.
 ///
-/// Returns metadata about loadable segments and the entry point.
-/// Only supports statically-linked x86_64 ET_EXEC binaries.
+/// Returns metadata about loadable segments, the entry point, and
+/// whether the binary is ET_EXEC or ET_DYN. Rejects other ELF types
+/// (e.g. ET_REL, ET_CORE).
 pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, ElfError> {
     if data.len() < ELF64_HEADER_SIZE {
         return Err(ElfError::TooShort);
@@ -130,11 +142,13 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, ElfError> {
         return Err(ElfError::NotLittleEndian);
     }
 
-    // Must be ET_EXEC
+    // Must be ET_EXEC or ET_DYN
     let e_type = u16_le(data, 16);
-    if e_type != ET_EXEC {
-        return Err(ElfError::NotExecutable);
-    }
+    let elf_type = match e_type {
+        ET_EXEC => ElfType::Exec,
+        ET_DYN => ElfType::Dyn,
+        _ => return Err(ElfError::NotExecutable),
+    };
 
     // Must be the native machine type
     let e_machine = u16_le(data, 18);
@@ -220,6 +234,7 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, ElfError> {
 
     Ok(ParsedElf {
         entry_point,
+        elf_type,
         segments,
     })
 }
@@ -337,10 +352,47 @@ mod tests {
     }
 
     #[test]
-    fn reject_dynamic_elf() {
+    fn accept_et_dyn() {
+        let code = [0xCC; 16];
+        let mut elf = build_test_elf(&code);
+        // Change e_type from ET_EXEC (2) to ET_DYN (3)
+        elf[16..18].copy_from_slice(&3u16.to_le_bytes());
+        let parsed = parse_elf(&elf).unwrap();
+        assert_eq!(parsed.entry_point, 0x401000);
+        assert_eq!(parsed.segments.len(), 1);
+    }
+
+    #[test]
+    fn accept_et_exec() {
+        // Existing static binaries still work
+        let code = [0xCC; 16];
+        let elf = build_test_elf(&code);
+        let parsed = parse_elf(&elf).unwrap();
+        assert_eq!(parsed.entry_point, 0x401000);
+    }
+
+    #[test]
+    fn reject_et_rel() {
         let mut elf = build_test_elf(&[0xCC]);
-        elf[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        elf[16..18].copy_from_slice(&1u16.to_le_bytes()); // ET_REL (relocatable)
         assert_eq!(parse_elf(&elf), Err(ElfError::NotExecutable));
+    }
+
+    #[test]
+    fn et_dyn_reports_elf_type() {
+        let code = [0xCC; 16];
+        let mut elf = build_test_elf(&code);
+        elf[16..18].copy_from_slice(&3u16.to_le_bytes());
+        let parsed = parse_elf(&elf).unwrap();
+        assert_eq!(parsed.elf_type, ElfType::Dyn);
+    }
+
+    #[test]
+    fn et_exec_reports_elf_type() {
+        let code = [0xCC; 16];
+        let elf = build_test_elf(&code);
+        let parsed = parse_elf(&elf).unwrap();
+        assert_eq!(parsed.elf_type, ElfType::Exec);
     }
 
     #[test]
