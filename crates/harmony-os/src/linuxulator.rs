@@ -1322,6 +1322,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return EINVAL;
         }
 
+        // W^X enforcement: reject simultaneous write+execute.
+        if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+            return EINVAL;
+        }
+
         // NOTE: Linux requires page-aligned mmap offsets because it maps
         // file pages directly from the page cache.  Our emulator reads
         // bytes via 9P and copies them, so sub-page offsets work correctly.
@@ -1673,6 +1678,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
                     Ok(s) => s,
                     Err(e) => return ipc_err_to_errno(e),
                 };
+                // Guard against files larger than i64::MAX — the
+                // `as i64` cast would wrap to negative.
+                if stat.size > i64::MAX as u64 {
+                    return EOVERFLOW;
+                }
                 match (stat.size as i64).checked_add(offset) {
                     Some(v) => v,
                     None => return EOVERFLOW,
