@@ -92,10 +92,7 @@ impl Device for FrameBuffer {
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         // Use struct destructuring to split borrows on rx_queue and tx_queue,
         // allowing smoltcp to send inline replies (e.g. ARP) while receiving.
-        let FrameBuffer {
-            rx_queue,
-            tx_queue,
-        } = self;
+        let FrameBuffer { rx_queue, tx_queue } = self;
 
         let frame = rx_queue.pop_front()?;
         Some((FrameBufRxToken(frame), FrameBufTxToken(tx_queue)))
