@@ -361,7 +361,9 @@ impl SdhciDriver {
         match self.card {
             None => Err(SdError::NoCard),
             Some(c) if c.is_sdhc => Ok(lba),
-            Some(_) => Ok(lba * SD_BLOCK_SIZE as u32),
+            Some(_) => lba
+                .checked_mul(SD_BLOCK_SIZE as u32)
+                .ok_or(SdError::DataError),
         }
     }
 
@@ -1073,6 +1075,23 @@ mod tests {
 
         // SDSC: argument should be byte address = LBA * 512 = 512
         assert!(bank.writes.contains(&(SDHCI_ARGUMENT, 512)));
+    }
+
+    #[test]
+    fn sdsc_large_lba_overflow_returns_error() {
+        let mut driver = SdhciDriver::new();
+        driver.card = Some(CardInfo {
+            rca: 0x1234,
+            capacity_blocks: 0,
+            is_sdhc: false,
+        });
+        let mut bank = MockRegisterBank::new();
+        let mut buf = [0u8; 512];
+        // LBA 0x0100_0000 * 512 = 0x2_0000_0000, overflows u32
+        assert_eq!(
+            driver.read_single_block(&mut bank, 0x0100_0000, &mut buf),
+            Err(SdError::DataError)
+        );
     }
 
     #[test]
