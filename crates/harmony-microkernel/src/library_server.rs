@@ -133,6 +133,11 @@ impl FileServer for LibraryServer {
     }
 
     fn clunk(&mut self, fid: Fid) -> Result<(), IpcError> {
+        if fid == 0 {
+            // Root fid is permanent — ignore clunk rather than
+            // breaking the server for the rest of its lifetime.
+            return Ok(());
+        }
         self.fids.remove(&fid).ok_or(IpcError::InvalidFid)?;
         Ok(())
     }
@@ -352,5 +357,16 @@ mod tests {
             srv.walk(0, 1, "ld-musl-aarch64.so.1"),
             Err(IpcError::InvalidFid)
         );
+    }
+
+    #[test]
+    fn clunk_root_fid_is_no_op() {
+        let mut srv = test_server();
+        // Clunking the root fid should succeed silently...
+        srv.clunk(0).unwrap();
+        // ...and walks from root should still work afterward.
+        srv.walk(0, 1, "libc.so").unwrap();
+        let st = srv.stat(1).unwrap();
+        assert_eq!(&*st.name, "libc.so");
     }
 }

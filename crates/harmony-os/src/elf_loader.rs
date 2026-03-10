@@ -174,13 +174,14 @@ impl InterpreterLoader {
 
             let pf = segment_flags_to_page_flags(&seg.flags);
 
-            // Map the pages — always writable during load so we can
-            // write segment data, then mprotect to final perms after.
+            // Map the pages writable (without execute) so we can copy
+            // segment data.  mprotect restores the real permissions
+            // afterward, avoiding a transient W+X window.
             backend
                 .vm_mmap(
                     page_start,
                     map_len,
-                    pf | PageFlags::WRITABLE,
+                    PageFlags::READABLE | PageFlags::WRITABLE,
                     FrameClassification::empty(),
                 )
                 .map_err(|_| ElfLoadError::OverlappingSegments)?;
@@ -216,13 +217,12 @@ impl InterpreterLoader {
                 }
             }
 
-            // Restore the caller's intended permissions (remove
-            // the temporary WRITABLE if segment is not writable).
-            if !seg.flags.write {
-                backend
-                    .vm_mprotect(page_start, map_len, pf)
-                    .map_err(|_| ElfLoadError::OverlappingSegments)?;
-            }
+            // Restore the caller's intended permissions.  The initial
+            // mapping was R+W (no X), so we always mprotect to the
+            // real segment flags.
+            backend
+                .vm_mprotect(page_start, map_len, pf)
+                .map_err(|_| ElfLoadError::OverlappingSegments)?;
         }
         Ok(())
     }

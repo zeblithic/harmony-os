@@ -1341,10 +1341,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         if self.backend.has_vm_support() {
             if let Some(fid) = file_fid {
-                // File-backed: map writable first so we can copy data in,
-                // then mprotect to the caller's requested permissions.
+                // File-backed: map writable (without execute) so we can
+                // copy data in, then mprotect to the caller's requested
+                // permissions.  This avoids a transient W+X window.
                 const PROT_WRITE: i32 = 2;
-                let write_prot = prot | PROT_WRITE;
+                let write_prot = (prot | PROT_WRITE) & !PROT_EXEC;
                 let mapped = self.sys_mmap_vm(addr, length, write_prot, flags);
                 if mapped < 0 {
                     return mapped;
@@ -1701,14 +1702,19 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
         let counter = self.getrandom_counter;
         self.getrandom_counter = counter.wrapping_add(1);
+        // Seed from address + counter, then iterate the LCG so each
+        // byte depends on the previous state (not an independent seed
+        // differing by 1, which would produce near-linear output).
+        let mut state = (buf_ptr as u64)
+            .wrapping_add(counter)
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buflen) };
-        for (i, byte) in buf.iter_mut().enumerate() {
-            *byte = ((buf_ptr as u64)
-                .wrapping_add(i as u64)
-                .wrapping_add(counter)
+        for byte in buf.iter_mut() {
+            state = state
                 .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407)
-                >> 33) as u8;
+                .wrapping_add(1442695040888963407);
+            *byte = (state >> 33) as u8;
         }
         buflen as i64
     }
