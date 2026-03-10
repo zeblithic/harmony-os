@@ -406,7 +406,7 @@ impl VirtioNet {
 
 impl NetworkInterface for VirtioNet {
     fn name(&self) -> &str {
-        "virtio0"
+        "eth0"
     }
 
     fn mtu(&self) -> usize {
