@@ -150,7 +150,9 @@ impl InterpreterLoader {
         backend: &mut dyn SyscallBackend,
     ) -> Result<(), ElfLoadError> {
         for seg in &parsed.segments {
-            let vaddr = base + seg.vaddr;
+            let vaddr = base
+                .checked_add(seg.vaddr)
+                .ok_or(ElfLoadError::OverlappingSegments)?;
             let page_start = page_floor(vaddr);
             let page_end = page_ceil(vaddr + seg.memsz);
             let map_len = (page_end - page_start) as usize;
@@ -309,6 +311,10 @@ pub fn build_initial_stack(
     // Helper: write bytes at `pos`, moving pos down.
     // Returns the virtual address of the written data.
     let write_bytes = |stack: &mut [u8], pos: &mut usize, data: &[u8]| -> u64 {
+        assert!(
+            *pos >= data.len(),
+            "stack buffer overflow during initial stack construction"
+        );
         *pos -= data.len();
         stack[*pos..*pos + data.len()].copy_from_slice(data);
         stack_base + *pos as u64

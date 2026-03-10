@@ -292,10 +292,13 @@ impl LinuxSyscall {
                 iov: args[1],
                 iovcnt: args[2] as i32,
             },
+            // aarch64 nr 78 is readlinkat(dirfd, pathname, buf, bufsiz).
+            // We ignore dirfd (args[0]) and map to Readlink with the
+            // remaining three arguments.
             78 => LinuxSyscall::Readlink {
-                pathname: args[0],
-                buf: args[1],
-                bufsiz: args[2],
+                pathname: args[1],
+                buf: args[2],
+                bufsiz: args[3],
             },
             80 => LinuxSyscall::Fstat {
                 fd: args[0] as i32,
@@ -1555,7 +1558,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// `iov_base: u64` + `iov_len: u64`. Calls `sys_write` for each buffer
     /// and returns the total bytes written.
     fn sys_writev(&mut self, fd: i32, iov_ptr: usize, iovcnt: i32) -> i64 {
-        if iovcnt <= 0 {
+        const IOV_MAX: i32 = 1024;
+        if iovcnt <= 0 || iovcnt > IOV_MAX {
             return EINVAL;
         }
         if !self.fd_table.contains_key(&fd) {
@@ -2723,7 +2727,9 @@ mod tests {
 
     #[test]
     fn from_aarch64_readlink() {
-        let syscall = LinuxSyscall::from_aarch64(78, [0x1000, 0x2000, 128, 0, 0, 0]);
+        // aarch64 nr 78 = readlinkat(dirfd, pathname, buf, bufsiz).
+        // dirfd (args[0]) is ignored; Readlink maps args[1..3].
+        let syscall = LinuxSyscall::from_aarch64(78, [0xFF9C, 0x1000, 0x2000, 128, 0, 0]);
         match syscall {
             LinuxSyscall::Readlink {
                 pathname,
