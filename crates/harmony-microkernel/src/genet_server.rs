@@ -168,6 +168,11 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
             QPATH_DATA => {
                 // Streaming semantics: offset is ignored, each read returns
                 // the next pending frame (or empty if none available).
+                // Guard: poll_rx is destructive (advances consumer index),
+                // so a zero-count read must not consume a frame.
+                if max == 0 {
+                    return Ok(Vec::new());
+                }
                 match self.driver.poll_rx(&mut self.bank) {
                     Some(frame) => {
                         let mut data = frame.data;
@@ -613,6 +618,33 @@ mod tests {
         srv.walk(0, 1, "genet0").unwrap();
         srv.walk(1, 2, "data").unwrap();
         srv.open(2, OpenMode::Read).unwrap();
+        let data = srv.read(2, 0, 2048).unwrap();
+        assert_eq!(data.len(), 64);
+    }
+
+    #[test]
+    fn read_data_zero_count_does_not_consume_frame() {
+        let mut srv = test_server();
+
+        // Set up RX ring with one frame
+        let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
+        srv.bank
+            .on_read(rx_ring_base + RING_PROD_INDEX, alloc::vec![1, 1]);
+
+        let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
+        let len_status = (64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP;
+        srv.bank
+            .on_read(desc_base + DMA_DESC_LENGTH_STATUS, alloc::vec![len_status]);
+
+        srv.walk(0, 1, "genet0").unwrap();
+        srv.walk(1, 2, "data").unwrap();
+        srv.open(2, OpenMode::Read).unwrap();
+
+        // Zero-count read must not consume the frame
+        let data = srv.read(2, 0, 0).unwrap();
+        assert!(data.is_empty());
+
+        // The frame should still be available
         let data = srv.read(2, 0, 2048).unwrap();
         assert_eq!(data.len(), 64);
     }

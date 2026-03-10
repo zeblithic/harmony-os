@@ -7,7 +7,9 @@
 
 pub mod dwc_usb;
 pub mod genet;
+pub mod gpio;
 pub mod pl011;
 pub mod register_bank;
+pub mod sdhci;
 
 pub use register_bank::RegisterBank;

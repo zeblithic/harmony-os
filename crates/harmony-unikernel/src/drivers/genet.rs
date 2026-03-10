@@ -89,7 +89,8 @@ const TBUF_64B_EN: u32 = 1 << 0;
 const DMA_DESC_LENGTH_STATUS: usize = 0x00;
 const _DMA_DESC_ADDRESS_LO: usize = 0x04;
 const _DMA_DESC_ADDRESS_HI: usize = 0x08;
-const DMA_DESC_SIZE: usize = 12; // 3 words per descriptor (v5)
+const DMA_DESC_SIZE: usize = 12; // 3 words × 4 bytes per descriptor (v5)
+const DMA_DESC_NUM_WORDS: usize = 3; // words per descriptor (for end_ptr register)
 
 // DMA control/status bits (same bit position, different registers)
 const DMA_CTRL_EN: u32 = 1 << 0; // DMA_CTRL: set to enable DMA
@@ -301,7 +302,7 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         bank.write(tx_ring_base + RING_START_ADDR, 0);
         bank.write(
             tx_ring_base + RING_END_ADDR,
-            (TX_RING * DMA_DESC_SIZE - 1) as u32,
+            (TX_RING * DMA_DESC_NUM_WORDS - 1) as u32,
         );
         bank.write(tx_ring_base + RING_WRITE_PTR, 0);
         bank.write(tx_ring_base + RING_READ_PTR, 0);
@@ -331,7 +332,7 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         bank.write(rx_ring_base + RING_START_ADDR, 0);
         bank.write(
             rx_ring_base + RING_END_ADDR,
-            (RX_RING * DMA_DESC_SIZE - 1) as u32,
+            (RX_RING * DMA_DESC_NUM_WORDS - 1) as u32,
         );
         bank.write(rx_ring_base + RING_WRITE_PTR, 0);
         bank.write(rx_ring_base + RING_READ_PTR, 0);
@@ -627,6 +628,35 @@ mod tests {
             .map(|(_, v)| *v)
             .collect();
         assert_eq!(cons_writes, vec![0]);
+    }
+
+    #[test]
+    fn init_end_addr_uses_word_units() {
+        let mut bank = init_bank();
+        GenetDriver::<256, 256>::init(&mut bank, TEST_MAC, 10).unwrap();
+
+        let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
+        let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
+
+        // end_ptr = num_descriptors × 3 words_per_descriptor - 1
+        // For 256 descriptors: 256 × 3 - 1 = 767
+        let expected = (256 * DMA_DESC_NUM_WORDS - 1) as u32;
+
+        let tx_end: Vec<u32> = bank
+            .writes
+            .iter()
+            .filter(|(off, _)| *off == tx_ring_base + RING_END_ADDR)
+            .map(|(_, v)| *v)
+            .collect();
+        assert_eq!(tx_end, vec![expected]);
+
+        let rx_end: Vec<u32> = bank
+            .writes
+            .iter()
+            .filter(|(off, _)| *off == rx_ring_base + RING_END_ADDR)
+            .map(|(_, v)| *v)
+            .collect();
+        assert_eq!(rx_end, vec![expected]);
     }
 
     // ── TX tests ──────────────────────────────────────────────────
