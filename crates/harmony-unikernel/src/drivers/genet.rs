@@ -313,6 +313,7 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         bank.write(rx_ring_base + RING_PROD_INDEX, 0);
         bank.write(rx_ring_base + RING_CONS_INDEX, 0);
+        bank.write(rx_ring_base + RING_MBUF_DONE_THRESH, 1);
         bank.write(
             rx_ring_base + RING_BUF_SIZE,
             (RX_RING as u32) << DMA_RING_SIZE_SHIFT | DMA_BUF_LENGTH,
@@ -446,6 +447,13 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         // Advance consumer index (always, even on error — reclaim descriptor)
         self.rx_cons_index = (self.rx_cons_index + 1) & DMA_C_INDEX_MASK;
         bank.write(rx_ring_base + RING_CONS_INDEX, self.rx_cons_index);
+
+        // Reject zero-length descriptors — no valid Ethernet frame can have
+        // zero payload, and Ok(vec![]) would be indistinguishable from "ring empty".
+        if length == 0 {
+            self.stats.rx_errors += 1;
+            return None;
+        }
 
         // Check for errors
         if status & DMA_RX_ERROR_MASK != 0 {
@@ -638,6 +646,31 @@ mod tests {
     }
 
     #[test]
+    fn init_mbuf_done_thresh_set_for_both_rings() {
+        let mut bank = init_bank();
+        GenetDriver::<256, 256>::init(&mut bank, TEST_MAC, 10).unwrap();
+
+        let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
+        let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
+
+        let tx_thresh: Vec<u32> = bank
+            .writes
+            .iter()
+            .filter(|(off, _)| *off == tx_ring_base + RING_MBUF_DONE_THRESH)
+            .map(|(_, v)| *v)
+            .collect();
+        assert_eq!(tx_thresh, vec![1]);
+
+        let rx_thresh: Vec<u32> = bank
+            .writes
+            .iter()
+            .filter(|(off, _)| *off == rx_ring_base + RING_MBUF_DONE_THRESH)
+            .map(|(_, v)| *v)
+            .collect();
+        assert_eq!(rx_thresh, vec![1]);
+    }
+
+    #[test]
     fn init_end_addr_uses_word_units() {
         let mut bank = init_bank();
         GenetDriver::<256, 256>::init(&mut bank, TEST_MAC, 10).unwrap();
@@ -816,6 +849,26 @@ mod tests {
         assert_eq!(frame.data.len(), 64);
         assert_eq!(driver.stats.rx_packets, 1);
         assert_eq!(driver.rx_cons_index, 1);
+    }
+
+    #[test]
+    fn poll_rx_rejects_zero_length_descriptor() {
+        let mut bank = init_bank();
+        let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+
+        let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
+        bank.on_read(rx_ring_base + RING_PROD_INDEX, vec![1]);
+
+        // Descriptor with length=0, no error flags
+        let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
+        let len_status = DMA_SOP | DMA_EOP; // length field = 0
+        bank.on_read(desc_base + DMA_DESC_LENGTH_STATUS, vec![len_status]);
+
+        let frame = driver.poll_rx(&mut bank);
+        assert!(frame.is_none());
+        assert_eq!(driver.stats.rx_errors, 1);
+        assert_eq!(driver.stats.rx_packets, 0);
+        assert_eq!(driver.rx_cons_index, 1); // descriptor still consumed
     }
 
     #[test]
