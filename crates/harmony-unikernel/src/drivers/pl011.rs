@@ -17,7 +17,6 @@ const UARTCR: usize = 0x030;
 
 // ── Flag register bits ──────────────────────────────────────────
 const UARTFR_TXFF: u32 = 1 << 5; // TX FIFO full
-#[allow(dead_code)]
 const UARTFR_RXFE: u32 = 1 << 4; // RX FIFO empty
 
 /// Compute integer and fractional baud-rate divisors for the PL011.
@@ -42,7 +41,6 @@ pub fn baud_divisors(clock_hz: u32, baud: u32) -> (u16, u8) {
 /// Sans-I/O PL011 UART driver.
 ///
 /// Generic over `N`: the RX ring buffer capacity in bytes.
-#[allow(dead_code)]
 pub struct Pl011Driver<const N: usize> {
     rx_buf: [u8; N],
     rx_head: usize,
@@ -97,6 +95,38 @@ impl<const N: usize> Pl011Driver<N> {
             }
             bank.write(UARTDR, byte as u32);
         }
+    }
+
+    /// Poll the RX FIFO and drain available bytes into the ring buffer.
+    ///
+    /// Call this periodically (e.g. in the event loop or before reads).
+    /// If the ring buffer is full, incoming bytes are dropped.
+    pub fn poll_rx(&mut self, bank: &impl RegisterBank) {
+        while bank.read(UARTFR) & UARTFR_RXFE == 0 {
+            let byte = (bank.read(UARTDR) & 0xFF) as u8;
+            if self.rx_count < N {
+                self.rx_buf[self.rx_head] = byte;
+                self.rx_head = (self.rx_head + 1) % N;
+                self.rx_count += 1;
+            }
+            // If full, drop the byte.
+        }
+    }
+
+    /// Read buffered RX data into `buf`. Returns the number of bytes copied.
+    pub fn read_buffered(&mut self, buf: &mut [u8]) -> usize {
+        let n = buf.len().min(self.rx_count);
+        for slot in buf[..n].iter_mut() {
+            *slot = self.rx_buf[self.rx_tail];
+            self.rx_tail = (self.rx_tail + 1) % N;
+            self.rx_count -= 1;
+        }
+        n
+    }
+
+    /// Number of bytes available in the RX ring buffer.
+    pub fn rx_available(&self) -> usize {
+        self.rx_count
     }
 }
 
@@ -181,5 +211,76 @@ mod tests {
             .copied()
             .collect();
         assert_eq!(data_writes, vec![(UARTDR, b'A' as u32)]);
+    }
+
+    #[test]
+    fn poll_rx_drains_fifo_into_ring() {
+        let mut driver: Pl011Driver<256> = Pl011Driver::new();
+        let mut bank = MockRegisterBank::new();
+        // FR: not empty, not empty, empty (stop)
+        bank.on_read(UARTFR, vec![0, 0, UARTFR_RXFE]);
+        // DR: two bytes available
+        bank.on_read(UARTDR, vec![b'A' as u32, b'B' as u32]);
+
+        driver.poll_rx(&bank);
+        assert_eq!(driver.rx_available(), 2);
+
+        let mut buf = [0u8; 4];
+        let n = driver.read_buffered(&mut buf);
+        assert_eq!(n, 2);
+        assert_eq!(&buf[..2], b"AB");
+    }
+
+    #[test]
+    fn ring_buffer_wraps() {
+        let mut driver: Pl011Driver<4> = Pl011Driver::new();
+        let mut bank = MockRegisterBank::new();
+
+        // Fill ring with 3 bytes
+        bank.on_read(UARTFR, vec![0, 0, 0, UARTFR_RXFE]);
+        bank.on_read(UARTDR, vec![1, 2, 3]);
+        driver.poll_rx(&bank);
+
+        // Drain 2
+        let mut buf = [0u8; 2];
+        driver.read_buffered(&mut buf);
+        assert_eq!(buf, [1, 2]);
+        assert_eq!(driver.rx_available(), 1);
+
+        // Add 3 more (wraps around)
+        let mut bank2 = MockRegisterBank::new();
+        bank2.on_read(UARTFR, vec![0, 0, 0, UARTFR_RXFE]);
+        bank2.on_read(UARTDR, vec![4, 5, 6]);
+        driver.poll_rx(&bank2);
+        assert_eq!(driver.rx_available(), 4); // full
+
+        let mut out = [0u8; 4];
+        let n = driver.read_buffered(&mut out);
+        assert_eq!(n, 4);
+        assert_eq!(out, [3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn ring_buffer_overflow_drops_bytes() {
+        let mut driver: Pl011Driver<2> = Pl011Driver::new();
+        let mut bank = MockRegisterBank::new();
+        // 3 bytes available but ring is only 2
+        bank.on_read(UARTFR, vec![0, 0, 0, UARTFR_RXFE]);
+        bank.on_read(UARTDR, vec![b'X' as u32, b'Y' as u32, b'Z' as u32]);
+
+        driver.poll_rx(&bank);
+        assert_eq!(driver.rx_available(), 2);
+
+        let mut buf = [0u8; 2];
+        driver.read_buffered(&mut buf);
+        assert_eq!(&buf, b"XY"); // Z was dropped
+    }
+
+    #[test]
+    fn read_buffered_empty() {
+        let mut driver: Pl011Driver<256> = Pl011Driver::new();
+        let mut buf = [0u8; 4];
+        let n = driver.read_buffered(&mut buf);
+        assert_eq!(n, 0);
     }
 }
