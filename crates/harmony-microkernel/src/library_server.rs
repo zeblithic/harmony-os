@@ -46,15 +46,19 @@ impl LibraryServer {
     /// Create a new LibraryServer with the given manifest.
     ///
     /// The manifest maps library filenames to their raw ELF bytes.
-    /// Fid 0 is reserved as the root fid (representing the `/lib/`
-    /// directory itself) but is not pre-allocated -- walks originate
-    /// from the namespace layer which provides the root fid via
-    /// `clone_fid`.
+    /// A root fid (0) is pre-allocated to represent the `/lib/`
+    /// directory itself. Walks originate from this root fid.
     pub fn new(manifest: BTreeMap<Arc<str>, Vec<u8>>) -> Self {
-        Self {
-            manifest,
-            fids: BTreeMap::new(),
-        }
+        let mut fids = BTreeMap::new();
+        fids.insert(
+            0,
+            FidState {
+                name: Arc::from(""),
+                qpath: 0,
+                is_open: false,
+            },
+        );
+        Self { manifest, fids }
     }
 
     /// Compute a stable QPath from a library name.
@@ -75,7 +79,12 @@ impl LibraryServer {
 }
 
 impl FileServer for LibraryServer {
-    fn walk(&mut self, _fid: Fid, new_fid: Fid, name: &str) -> Result<QPath, IpcError> {
+    fn walk(&mut self, fid: Fid, new_fid: Fid, name: &str) -> Result<QPath, IpcError> {
+        // Validate source fid exists (root fid comes from clone_fid).
+        self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
+        if self.fids.contains_key(&new_fid) {
+            return Err(IpcError::InvalidFid);
+        }
         let key: Arc<str> = Arc::from(name);
         if !self.manifest.contains_key(&key) {
             return Err(IpcError::NotFound);
@@ -106,10 +115,7 @@ impl FileServer for LibraryServer {
         if !state.is_open {
             return Err(IpcError::NotOpen);
         }
-        let data = self
-            .manifest
-            .get(&state.name)
-            .ok_or(IpcError::NotFound)?;
+        let data = self.manifest.get(&state.name).ok_or(IpcError::NotFound)?;
         let off = offset as usize;
         if off >= data.len() {
             return Ok(Vec::new());
@@ -129,10 +135,7 @@ impl FileServer for LibraryServer {
 
     fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
         let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        let data = self
-            .manifest
-            .get(&state.name)
-            .ok_or(IpcError::NotFound)?;
+        let data = self.manifest.get(&state.name).ok_or(IpcError::NotFound)?;
         Ok(FileStat {
             qpath: state.qpath,
             name: Arc::clone(&state.name),
@@ -166,7 +169,10 @@ mod tests {
     /// Helper: create a LibraryServer with a single test library.
     fn test_server() -> LibraryServer {
         let mut manifest = BTreeMap::new();
-        manifest.insert(Arc::from("libc.so"), vec![0x7f, b'E', b'L', b'F', 1, 2, 3, 4]);
+        manifest.insert(
+            Arc::from("libc.so"),
+            vec![0x7f, b'E', b'L', b'F', 1, 2, 3, 4],
+        );
         manifest.insert(
             Arc::from("ld-musl-aarch64.so.1"),
             vec![0x7f, b'E', b'L', b'F', 5, 6, 7, 8, 9, 10],
@@ -303,5 +309,23 @@ mod tests {
         // Request more bytes than available from offset 6
         let data = srv.read(1, 6, 100).unwrap();
         assert_eq!(data, vec![3, 4]);
+    }
+
+    #[test]
+    fn walk_invalid_source_fid() {
+        let mut srv = test_server();
+        // Source fid 99 was never walked or cloned
+        assert_eq!(srv.walk(99, 1, "libc.so"), Err(IpcError::InvalidFid));
+    }
+
+    #[test]
+    fn walk_duplicate_new_fid() {
+        let mut srv = test_server();
+        srv.walk(0, 1, "libc.so").unwrap();
+        // new_fid 1 is already in use
+        assert_eq!(
+            srv.walk(0, 1, "ld-musl-aarch64.so.1"),
+            Err(IpcError::InvalidFid)
+        );
     }
 }
