@@ -392,6 +392,11 @@ pub fn build_initial_stack(
 
     // Helper: write a u64 at `pos`, moving pos down by 8.
     let write_u64 = |stack: &mut [u8], pos: &mut usize, val: u64| {
+        assert!(
+            *pos >= 8,
+            "stack buffer overflow writing u64 (pos={}, need 8 bytes)",
+            *pos
+        );
         *pos -= 8;
         stack[*pos..*pos + 8].copy_from_slice(&val.to_le_bytes());
     };

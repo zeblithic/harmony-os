@@ -47,6 +47,9 @@ pub enum ElfError {
     InvalidPhdr,
     SegmentOutOfBounds,
     InterpreterPathInvalid,
+    /// First PT_LOAD segment has `p_offset > p_vaddr`, producing a
+    /// nonsensical load bias.  Reject rather than silently wrapping.
+    InvalidLoadBias,
 }
 
 // ── ELF type ────────────────────────────────────────────────────────
@@ -276,10 +279,13 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, ElfError> {
     // This is `p_vaddr - p_offset` for the segment that contains the
     // ELF header (typically offset=0).  Used to convert phdr_offset
     // (a file offset) into an in-memory virtual address.
-    let load_bias = segments
-        .first()
-        .map(|s| s.vaddr.wrapping_sub(s.offset))
-        .unwrap_or(0);
+    let load_bias = match segments.first() {
+        Some(s) => s
+            .vaddr
+            .checked_sub(s.offset)
+            .ok_or(ElfError::InvalidLoadBias)?,
+        None => 0,
+    };
 
     Ok(ParsedElf {
         entry_point,

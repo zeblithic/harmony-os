@@ -23,6 +23,7 @@ const ENOTTY: i64 = -25;
 const ESRCH: i64 = -3;
 const ERANGE: i64 = -34;
 const ENOSYS: i64 = -38;
+const ESPIPE: i64 = -29;
 const EOVERFLOW: i64 = -75;
 
 fn ipc_err_to_errno(e: IpcError) -> i64 {
@@ -1403,16 +1404,22 @@ impl<B: SyscallBackend> Linuxulator<B> {
         // For file-backed arena mappings, read file content into the region.
         if let Some(fid) = file_fid {
             let capped = len.min(u32::MAX as usize) as u32;
-            if let Ok(data) = self.backend.read(fid, offset, capped) {
-                let copy_len = data.len().min(len);
-                if copy_len > 0 {
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, copy_len);
+            match self.backend.read(fid, offset, capped) {
+                Ok(data) => {
+                    let copy_len = data.len().min(len);
+                    if copy_len > 0 {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, copy_len);
+                        }
                     }
                 }
+                Err(e) => {
+                    // Reclaim the arena allocation and return the error.
+                    self.arena.mmap_top += len;
+                    self.arena.mmap_regions.pop();
+                    return ipc_err_to_errno(e);
+                }
             }
-            // If read fails, the mapping still exists but with zeroed pages.
-            // This matches Linux behavior where partial reads fill what they can.
         }
 
         ptr as i64
@@ -1620,6 +1627,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
         const SEEK_SET: i32 = 0;
         const SEEK_CUR: i32 = 1;
         const SEEK_END: i32 = 2;
+
+        // stdin/stdout/stderr are character devices — not seekable.
+        if (0..=2).contains(&fd) {
+            return ESPIPE;
+        }
 
         let entry = match self.fd_table.get(&fd) {
             Some(e) => *e,
@@ -2573,9 +2585,33 @@ mod tests {
         let mut lx = Linuxulator::new(mock);
         lx.init_stdio().unwrap();
 
+        // Open a file to get a seekable fd
+        let path = b"/dev/serial/log\0";
+        let at_fdcwd = (-100i32) as u64;
+        let fd = lx.handle_syscall(257, [at_fdcwd, path.as_ptr() as u64, 0, 0, 0, 0]);
+        assert!(fd >= 0);
+
         // whence=99 is invalid
-        let result = lx.handle_syscall(8, [0, 0, 99, 0, 0, 0]);
+        let result = lx.handle_syscall(8, [fd as u64, 0, 99, 0, 0, 0]);
         assert_eq!(result, EINVAL);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_lseek_stdio_returns_espipe() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        // stdin (0), stdout (1), stderr (2) are character devices — not seekable.
+        for fd in 0..=2u64 {
+            let result = lx.handle_syscall(8, [fd, 0, 0, 0, 0, 0]);
+            assert_eq!(
+                result, ESPIPE,
+                "lseek on stdio fd {} should return ESPIPE",
+                fd
+            );
+        }
     }
 
     // ── sys_getrandom tests ────────────────────────────────────────
