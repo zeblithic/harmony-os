@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -109,6 +110,9 @@ impl HarmonyNetworkInterface for NetStack {
     }
 
     fn send(&mut self, data: &[u8]) -> Result<(), PlatformError> {
+        if data.len() > self.mtu() {
+            return Err(PlatformError::SendFailed);
+        }
         // Collect destinations first to avoid borrow conflict:
         // `self.peers.destinations()` borrows `self.peers` immutably while
         // `self.sockets.get_mut()` borrows `self.sockets` mutably.

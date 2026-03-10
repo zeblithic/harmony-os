@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 use alloc::vec::Vec;
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 

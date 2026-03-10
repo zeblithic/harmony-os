@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! Frame buffer device implementing smoltcp's `Device` trait.
 //!
 //! [`FrameBuffer`] decouples smoltcp from hardware drivers. The caller pushes
