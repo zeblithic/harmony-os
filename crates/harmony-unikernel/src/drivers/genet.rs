@@ -75,9 +75,9 @@ const MDIO_REG_SHIFT: u32 = 16;
 const RBUF_CTRL: usize = RBUF_OFF;
 const RBUF_CHK_CTRL: usize = RBUF_OFF + 0x14;
 
-const RBUF_64B_EN: u32 = 1 << 0;
+const RBUF_64B_EN: u32 = 1 << 0; // RBUF_CTRL: enable 64-byte status block
 const RBUF_ALIGN_2B: u32 = 1 << 1;
-const RBUF_RXCHK_EN: u32 = 1 << 0;
+const RBUF_CHK_EN: u32 = 1 << 0; // RBUF_CHK_CTRL: enable RX checksum offload
 const RBUF_SKIP_FCS: u32 = 1 << 4;
 
 // ── TBUF registers ────────────────────────────────────────────────
@@ -146,13 +146,12 @@ const DMA_RING_SIZE_SHIFT: u32 = 16;
 const DMA_MAX_BURST_LENGTH: u32 = 0x10;
 
 // Flow control thresholds
-const DMA_FC_THRESH_HI: u32 = 256 >> 4; // TOTAL_DESC >> 4
 const DMA_FC_THRESH_LO: u32 = 5;
 const DMA_XOFF_THRESHOLD_SHIFT: u32 = 16;
 
 // ── Constants ─────────────────────────────────────────────────────
-const _TOTAL_DESC: usize = 256;
 const ENET_MAX_MTU_SIZE: u32 = 1536; // ETH payload + headers + padding
+const ENET_MIN_FRAME: usize = 14; // Minimum Ethernet header (dst + src + ethertype)
 const DMA_BUF_LENGTH: u32 = 2048;
 
 // ── PHY registers (standard MII) ─────────────────────────────────
@@ -171,6 +170,8 @@ pub enum GenetError {
     TxRingFull,
     /// Frame exceeds maximum transmit size.
     FrameTooLarge,
+    /// Frame is smaller than minimum Ethernet header (14 bytes).
+    FrameTooSmall,
     /// MDIO operation timed out.
     MdioTimeout,
 }
@@ -242,7 +243,7 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         // 4. RBUF: enable 64B status block + 2-byte alignment
         bank.write(RBUF_CTRL, RBUF_64B_EN | RBUF_ALIGN_2B);
         // Enable RX checksum + skip FCS
-        bank.write(RBUF_CHK_CTRL, RBUF_RXCHK_EN | RBUF_SKIP_FCS);
+        bank.write(RBUF_CHK_CTRL, RBUF_CHK_EN | RBUF_SKIP_FCS);
 
         // 5. TBUF: enable 64B status block
         bank.write(TBUF_CTRL, TBUF_64B_EN);
@@ -308,9 +309,11 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
             rx_ring_base + RING_BUF_SIZE,
             (RX_RING as u32) << DMA_RING_SIZE_SHIFT | DMA_BUF_LENGTH,
         );
+        // Flow control: XON threshold derived from actual ring size
+        let fc_thresh_hi = (RX_RING as u32) >> 4;
         bank.write(
             rx_ring_base + RING_XON_XOFF_THRESH,
-            DMA_FC_THRESH_LO << DMA_XOFF_THRESHOLD_SHIFT | DMA_FC_THRESH_HI,
+            DMA_FC_THRESH_LO << DMA_XOFF_THRESHOLD_SHIFT | fc_thresh_hi,
         );
         bank.write(rx_ring_base + RING_START_ADDR, 0);
         bank.write(
@@ -356,6 +359,9 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
     /// producer index. The frame must include the Ethernet header
     /// but not the FCS (hardware appends CRC).
     pub fn send(&mut self, bank: &mut impl RegisterBank, frame: &[u8]) -> Result<(), GenetError> {
+        if frame.len() < ENET_MIN_FRAME {
+            return Err(GenetError::FrameTooSmall);
+        }
         if frame.len() > ENET_MAX_MTU_SIZE as usize {
             return Err(GenetError::FrameTooLarge);
         }
@@ -887,5 +893,44 @@ mod tests {
         assert_eq!(stats.rx_packets, 1);
         assert_eq!(stats.rx_errors, 0);
         assert_eq!(stats.tx_errors, 0);
+    }
+
+    #[test]
+    fn send_rejects_undersized_frame() {
+        let mut bank = init_bank();
+        let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+
+        let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
+        bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![0]);
+
+        // Empty frame
+        assert_eq!(driver.send(&mut bank, &[]), Err(GenetError::FrameTooSmall));
+        // 13 bytes — one short of minimum Ethernet header
+        assert_eq!(
+            driver.send(&mut bank, &[0u8; 13]),
+            Err(GenetError::FrameTooSmall)
+        );
+        // Exactly 14 bytes — minimum valid
+        assert!(driver.send(&mut bank, &[0u8; 14]).is_ok());
+    }
+
+    #[test]
+    fn init_flow_control_threshold_matches_ring_size() {
+        // Use a small ring to verify threshold is derived from RX_RING, not hardcoded
+        let mut bank = init_bank();
+        GenetDriver::<64, 64>::init(&mut bank, TEST_MAC, 10).unwrap();
+
+        let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
+        let xon_xoff_writes: Vec<u32> = bank
+            .writes
+            .iter()
+            .filter(|(off, _)| *off == rx_ring_base + RING_XON_XOFF_THRESH)
+            .map(|(_, v)| *v)
+            .collect();
+
+        // fc_thresh_hi = 64 >> 4 = 4, fc_thresh_lo = 5
+        // Expected: (5 << 16) | 4 = 0x0005_0004
+        let expected = (DMA_FC_THRESH_LO << DMA_XOFF_THRESHOLD_SHIFT) | (64u32 >> 4);
+        assert_eq!(xon_xoff_writes, vec![expected]);
     }
 }
