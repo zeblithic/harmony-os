@@ -16,7 +16,6 @@ pub trait RegisterBank {
     fn write(&mut self, offset: usize, value: u32);
 }
 
-#[cfg(test)]
 pub mod mock {
     use super::RegisterBank;
     use alloc::collections::BTreeMap;
@@ -27,6 +26,12 @@ pub mod mock {
         reads: BTreeMap<usize, Vec<u32>>,
         read_cursor: BTreeMap<usize, Cell<usize>>,
         pub writes: Vec<(usize, u32)>,
+    }
+
+    impl Default for MockRegisterBank {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl MockRegisterBank {
