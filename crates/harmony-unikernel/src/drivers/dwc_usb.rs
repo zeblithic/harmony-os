@@ -9,8 +9,11 @@
 #![allow(dead_code)]
 
 // ── Capability registers ──────────────────────────────────────────
-const CAPLENGTH: usize = 0x00;
-const HCIVERSION: usize = 0x02;
+// CAPLENGTH (bits [7:0]) and HCIVERSION (bits [31:16]) share a single
+// 32-bit dword at offset 0x00.  Extract via:
+//   caplength  = (bank.read(CAPLENGTH_HCIVERSION) & 0xFF) as usize;
+//   hciversion = (bank.read(CAPLENGTH_HCIVERSION) >> 16) as u16;
+const CAPLENGTH_HCIVERSION: usize = 0x00;
 const HCSPARAMS1: usize = 0x04;
 const HCSPARAMS2: usize = 0x08;
 const HCSPARAMS3: usize = 0x0C;
@@ -19,7 +22,9 @@ const DBOFF: usize = 0x14;
 const RTSOFF: usize = 0x18;
 const HCCPARAMS2: usize = 0x1C;
 
-// ── Operational registers (at base + CAPLENGTH) ───────────────────
+// ── Operational registers ─────────────────────────────────────────
+// Base address = mmio_base + caplength (read from CAPLENGTH_HCIVERSION & 0xFF).
+// All offsets below are relative to that computed operational base.
 const USBCMD: usize = 0x00;
 const USBSTS: usize = 0x04;
 const PAGESIZE: usize = 0x08;

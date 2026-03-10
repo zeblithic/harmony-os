@@ -175,9 +175,14 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
                 }
                 match self.driver.poll_rx(&mut self.bank) {
                     Some(frame) => {
-                        let mut data = frame.data;
-                        data.truncate(max);
-                        Ok(data)
+                        if frame.data.len() > max {
+                            // Frame too large for caller's buffer.
+                            // The frame is already consumed from the DMA ring —
+                            // returning truncated data would give the caller a
+                            // structurally invalid Ethernet frame with no indication.
+                            return Err(IpcError::InvalidArgument);
+                        }
+                        Ok(frame.data)
                     }
                     None => Ok(Vec::new()),
                 }
@@ -620,6 +625,28 @@ mod tests {
         srv.open(2, OpenMode::Read).unwrap();
         let data = srv.read(2, 0, 2048).unwrap();
         assert_eq!(data.len(), 64);
+    }
+
+    #[test]
+    fn read_data_undersized_buffer_returns_error() {
+        let mut srv = test_server();
+
+        // Set up RX ring with one 64-byte frame
+        let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
+        srv.bank
+            .on_read(rx_ring_base + RING_PROD_INDEX, alloc::vec![1]);
+
+        let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
+        let len_status = (64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP;
+        srv.bank
+            .on_read(desc_base + DMA_DESC_LENGTH_STATUS, alloc::vec![len_status]);
+
+        srv.walk(0, 1, "genet0").unwrap();
+        srv.walk(1, 2, "data").unwrap();
+        srv.open(2, OpenMode::Read).unwrap();
+
+        // Read with buffer smaller than frame — must error, not truncate
+        assert_eq!(srv.read(2, 0, 32), Err(IpcError::InvalidArgument));
     }
 
     #[test]
