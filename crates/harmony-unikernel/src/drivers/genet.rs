@@ -237,6 +237,11 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         mac: [u8; 6],
         poll_count: u32,
     ) -> Result<Self, GenetError> {
+        assert!(
+            RX_RING > 0 && TX_RING > 0,
+            "ring sizes must be non-zero"
+        );
+
         // 1. Software reset
         bank.write(UMAC_CMD, CMD_SW_RESET);
         bank.write(UMAC_CMD, 0);
@@ -451,10 +456,14 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         let length = ((len_status >> DMA_BUFLENGTH_SHIFT) & DMA_BUFLENGTH_MASK) as usize;
         let status = len_status & 0xFFFF;
 
-        // Advance consumer index and read pointer.
-        // Linux writes c_index to both RDMA_CONS_INDEX and RDMA_READ_PTR.
+        // Advance read pointer (word units) and consumer index.
+        // READ_PTR points past the consumed descriptor, matching TX WRITE_PTR
+        // semantics. Both use word-unit addressing into descriptor RAM.
+        let next_desc = (desc_idx + 1) % RX_RING;
+        let read_ptr = (next_desc * DMA_DESC_NUM_WORDS) as u32;
+        bank.write(rx_ring_base + RING_READ_PTR, read_ptr);
+
         self.rx_cons_index = (self.rx_cons_index + 1) & DMA_C_INDEX_MASK;
-        bank.write(rx_ring_base + RING_READ_PTR, self.rx_cons_index);
         bank.write(rx_ring_base + RING_CONS_INDEX, self.rx_cons_index);
 
         // Reject zero-length descriptors — no valid Ethernet frame can have
@@ -938,7 +947,7 @@ mod tests {
         );
         bank.writes.clear();
 
-        // First poll: cons_index advances to 1, READ_PTR = cons_index = 1
+        // First poll: desc_idx=0, read_ptr = (0+1)%4 * 3 = 3 (word units, next slot)
         driver.poll_rx(&mut bank);
         let rp0: Vec<u32> = bank
             .writes
@@ -946,11 +955,11 @@ mod tests {
             .filter(|(off, _)| *off == rx_ring_base + RING_READ_PTR)
             .map(|(_, v)| *v)
             .collect();
-        assert_eq!(rp0, vec![1]);
+        assert_eq!(rp0, vec![3]);
 
         bank.writes.clear();
 
-        // Second poll: cons_index advances to 2, READ_PTR = cons_index = 2
+        // Second poll: desc_idx=1, read_ptr = (1+1)%4 * 3 = 6
         driver.poll_rx(&mut bank);
         let rp1: Vec<u32> = bank
             .writes
@@ -958,7 +967,7 @@ mod tests {
             .filter(|(off, _)| *off == rx_ring_base + RING_READ_PTR)
             .map(|(_, v)| *v)
             .collect();
-        assert_eq!(rp1, vec![2]);
+        assert_eq!(rp1, vec![6]);
     }
 
     #[test]
@@ -1068,6 +1077,13 @@ mod tests {
         bank.on_read(RDMA_OFF + DMA_STATUS, vec![0]);
         let result = GenetDriver::<256, 256>::init(&mut bank, TEST_MAC, 5);
         assert!(matches!(result, Err(GenetError::DmaTimeout)));
+    }
+
+    #[test]
+    #[should_panic(expected = "ring sizes must be non-zero")]
+    fn init_panics_on_zero_ring_size() {
+        let mut bank = init_bank();
+        let _ = GenetDriver::<0, 0>::init(&mut bank, TEST_MAC, 10);
     }
 
     #[test]
