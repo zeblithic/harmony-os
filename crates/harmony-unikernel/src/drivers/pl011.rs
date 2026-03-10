@@ -8,9 +8,7 @@
 use super::register_bank::RegisterBank;
 
 // ── Register offsets ──────────────────────────────────────────────
-#[allow(dead_code)]
 const UARTDR: usize = 0x000;
-#[allow(dead_code)]
 const UARTFR: usize = 0x018;
 const UARTIBRD: usize = 0x024;
 const UARTFBRD: usize = 0x028;
@@ -18,7 +16,6 @@ const UARTLCR_H: usize = 0x02C;
 const UARTCR: usize = 0x030;
 
 // ── Flag register bits ──────────────────────────────────────────
-#[allow(dead_code)]
 const UARTFR_TXFF: u32 = 1 << 5; // TX FIFO full
 #[allow(dead_code)]
 const UARTFR_RXFE: u32 = 1 << 4; // RX FIFO empty
@@ -86,6 +83,21 @@ impl<const N: usize> Pl011Driver<N> {
         // 4. Enable UART (bit 0) + TX (bit 8) + RX (bit 9) = 0x301
         bank.write(UARTCR, 0x301);
     }
+
+    /// Check whether the TX FIFO has space.
+    pub fn tx_ready(&self, bank: &impl RegisterBank) -> bool {
+        bank.read(UARTFR) & UARTFR_TXFF == 0
+    }
+
+    /// Transmit bytes, spinning while the TX FIFO is full.
+    pub fn write_bytes(&self, bank: &mut impl RegisterBank, data: &[u8]) {
+        for &byte in data {
+            while !self.tx_ready(bank) {
+                core::hint::spin_loop();
+            }
+            bank.write(UARTDR, byte as u32);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -130,5 +142,44 @@ mod tests {
     #[test]
     fn baud_48mhz_rounds_correctly() {
         assert_eq!(baud_divisors(48_000_000, 115_200), (26, 3));
+    }
+
+    #[test]
+    fn write_bytes_sends_to_data_register() {
+        let driver: Pl011Driver<256> = Pl011Driver::new();
+        let mut bank = MockRegisterBank::new();
+        // FR returns 0 (FIFO not full) for every read.
+        bank.on_read(UARTFR, vec![0]);
+
+        driver.write_bytes(&mut bank, b"Hi");
+        // Should read FR twice (once per byte) and write DR twice.
+        let data_writes: Vec<(usize, u32)> = bank
+            .writes
+            .iter()
+            .filter(|(off, _)| *off == UARTDR)
+            .copied()
+            .collect();
+        assert_eq!(
+            data_writes,
+            vec![(UARTDR, b'H' as u32), (UARTDR, b'i' as u32)]
+        );
+    }
+
+    #[test]
+    fn write_bytes_spins_on_txff() {
+        let driver: Pl011Driver<256> = Pl011Driver::new();
+        let mut bank = MockRegisterBank::new();
+        // First read: TXFF set, second read: clear, third read: clear.
+        bank.on_read(UARTFR, vec![UARTFR_TXFF, 0]);
+
+        driver.write_bytes(&mut bank, b"A");
+        // Should have read FR twice (spin + success) then written DR once.
+        let data_writes: Vec<(usize, u32)> = bank
+            .writes
+            .iter()
+            .filter(|(off, _)| *off == UARTDR)
+            .copied()
+            .collect();
+        assert_eq!(data_writes, vec![(UARTDR, b'A' as u32)]);
     }
 }
