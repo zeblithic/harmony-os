@@ -1081,6 +1081,223 @@ mod tests {
         assert_eq!(&stack[offset..offset + 16], &random);
     }
 
+    // ── End-to-end integration tests ──────────────────────────────
+
+    /// Helper: walk the stack from SP to collect auxv entries.
+    /// Returns (auxv_entries, cursor_after_auxv).
+    fn collect_stack_auxv(stack: &[u8], stack_base: u64, sp: u64, argc: u64) -> Vec<(u64, u64)> {
+        let mut cursor = sp;
+        // Skip argc.
+        cursor += 8;
+        // Skip argv pointers (argc pointers + NULL terminator).
+        cursor += (argc + 1) * 8;
+        // Skip envp NULL terminator.
+        cursor += 8;
+
+        // Collect auxv entries.
+        let mut found = Vec::new();
+        loop {
+            let key = read_u64_at(stack, stack_base, cursor);
+            let val = read_u64_at(stack, stack_base, cursor + 8);
+            cursor += 16;
+            if key == auxv::AT_NULL {
+                break;
+            }
+            found.push((key, val));
+        }
+        found
+    }
+
+    /// Helper: find a value in collected auxv entries.
+    fn find_auxv(entries: &[(u64, u64)], key: u64) -> Option<u64> {
+        entries.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+    }
+
+    #[test]
+    fn end_to_end_static_elf_load() {
+        // 1. Build a synthetic ET_EXEC ELF.
+        let code = [0xCC; 32];
+        let exe_entry = 0x401000u64;
+        let elf = build_static_elf(&code);
+
+        // 2. Create backend and loader.
+        let mut backend = LoaderMockBackend::new();
+        let mut loader = InterpreterLoader::default();
+
+        // 3. Load via InterpreterLoader.
+        let result = loader.load(&elf, &mut backend).unwrap();
+
+        // 4. Verify load result.
+        assert_eq!(
+            result.entry_point, exe_entry,
+            "static ELF entry_point must be the exe's entry"
+        );
+        assert_eq!(
+            result.interp_base, 0,
+            "static ELF must have interp_base == 0"
+        );
+
+        // 5. Build initial stack using the returned auxv.
+        let mut stack = vec![0u8; 8192];
+        let stack_base = 0x7FFE_0000u64;
+        let random_bytes: [u8; 16] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10,
+        ];
+
+        let sp = build_initial_stack(
+            &mut stack,
+            stack_base,
+            &["./my_program"],
+            &[],
+            &result.auxv,
+            &random_bytes,
+        );
+
+        // 6. Verify stack layout.
+
+        // SP must be 16-byte aligned.
+        assert_eq!(sp % 16, 0, "SP must be 16-byte aligned");
+
+        // argc == 1.
+        let argc = read_u64_at(&stack, stack_base, sp);
+        assert_eq!(argc, 1, "argc should be 1");
+
+        // argv[0] is readable and contains our program name.
+        let argv0_ptr = read_u64_at(&stack, stack_base, sp + 8);
+        let str_offset = (argv0_ptr - stack_base) as usize;
+        let end = stack[str_offset..]
+            .iter()
+            .position(|&b| b == 0)
+            .expect("argv[0] must be null-terminated");
+        let argv0_str = core::str::from_utf8(&stack[str_offset..str_offset + end]).unwrap();
+        assert_eq!(argv0_str, "./my_program");
+
+        // Collect auxv from the stack.
+        let stack_auxv = collect_stack_auxv(&stack, stack_base, sp, argc);
+
+        // AT_PHDR must be present (exe's phdr offset, exe_base==0 for ET_EXEC).
+        let at_phdr = find_auxv(&stack_auxv, auxv::AT_PHDR).expect("AT_PHDR must be in stack auxv");
+        // For our test ELF, phdr_offset == 64.
+        assert_eq!(at_phdr, 64, "AT_PHDR should point to exe's phdr table");
+
+        // AT_ENTRY must equal exe's entry point.
+        let at_entry =
+            find_auxv(&stack_auxv, auxv::AT_ENTRY).expect("AT_ENTRY must be in stack auxv");
+        assert_eq!(at_entry, exe_entry, "AT_ENTRY should be exe's entry point");
+
+        // AT_PAGESZ must be present and == 4096.
+        let at_pagesz =
+            find_auxv(&stack_auxv, auxv::AT_PAGESZ).expect("AT_PAGESZ must be in stack auxv");
+        assert_eq!(at_pagesz, 4096, "AT_PAGESZ should be 4096");
+
+        // AT_RANDOM must point to the random bytes we provided.
+        let at_random_ptr =
+            find_auxv(&stack_auxv, auxv::AT_RANDOM).expect("AT_RANDOM must be in stack auxv");
+        let random_offset = (at_random_ptr - stack_base) as usize;
+        assert_eq!(
+            &stack[random_offset..random_offset + 16],
+            &random_bytes,
+            "AT_RANDOM must point to the 16 random bytes"
+        );
+    }
+
+    #[test]
+    fn end_to_end_dynamic_elf_with_interp() {
+        // 1. Build a synthetic ET_EXEC ELF with PT_INTERP.
+        let interp_path = b"/lib/ld-musl-x86_64.so.1\0";
+        let exe_code = [0xCC; 32];
+        let exe_entry = 0x401000u64;
+        let exe_elf =
+            build_elf_with_interp(&exe_code, interp_path, ElfType::Exec, 0x401000, exe_entry);
+
+        // 2. Build a synthetic ET_DYN ELF for the interpreter.
+        let interp_code = [0x90; 16];
+        let interp_entry_offset = 0x1000u64;
+        let interp_elf = build_interp_elf(&interp_code, 0x1000, interp_entry_offset);
+
+        // 3. Set up backend with interpreter file.
+        let mut backend = LoaderMockBackend::new();
+        backend.register_interp("/lib/ld-musl-x86_64.so.1", interp_elf);
+
+        // 4. Load via InterpreterLoader.
+        let mut loader = InterpreterLoader::default();
+        let expected_interp_base = loader.interp_base;
+        let result = loader.load(&exe_elf, &mut backend).unwrap();
+
+        // 5. Verify load result — entry is interpreter's, not exe's.
+        assert_ne!(result.interp_base, 0, "interp_base must not be zero");
+        assert_eq!(
+            result.interp_base, expected_interp_base,
+            "interp_base should match loader's configured interp_base"
+        );
+        assert_eq!(
+            result.entry_point,
+            expected_interp_base + interp_entry_offset,
+            "entry_point must be interp_base + interpreter's entry"
+        );
+
+        // 6. Build initial stack using the returned auxv.
+        let mut stack = vec![0u8; 8192];
+        let stack_base = 0x7FFE_0000u64;
+        let random_bytes: [u8; 16] = [
+            0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD,
+            0xAE, 0xAF,
+        ];
+
+        let sp = build_initial_stack(
+            &mut stack,
+            stack_base,
+            &["./dynamic_program"],
+            &[],
+            &result.auxv,
+            &random_bytes,
+        );
+
+        // 7. Verify stack layout.
+        assert_eq!(sp % 16, 0, "SP must be 16-byte aligned");
+
+        let argc = read_u64_at(&stack, stack_base, sp);
+        assert_eq!(argc, 1, "argc should be 1");
+
+        // Collect auxv from the stack.
+        let stack_auxv = collect_stack_auxv(&stack, stack_base, sp, argc);
+
+        // AT_ENTRY == exe's entry point (this is what ld-musl reads
+        // to find the program's main).
+        let at_entry =
+            find_auxv(&stack_auxv, auxv::AT_ENTRY).expect("AT_ENTRY must be in stack auxv");
+        assert_eq!(
+            at_entry, exe_entry,
+            "AT_ENTRY should be the exe's entry point, not the interpreter's"
+        );
+
+        // AT_BASE == interp_base (interpreter's load address).
+        let at_base = find_auxv(&stack_auxv, auxv::AT_BASE).expect("AT_BASE must be in stack auxv");
+        assert_eq!(
+            at_base, expected_interp_base,
+            "AT_BASE should be the interpreter's base address"
+        );
+
+        // AT_PHDR points to exe's phdr in memory.
+        let at_phdr = find_auxv(&stack_auxv, auxv::AT_PHDR).expect("AT_PHDR must be in stack auxv");
+        // For ET_EXEC, exe_base == 0, so AT_PHDR == phdr_offset == 64.
+        assert_eq!(
+            at_phdr, 64,
+            "AT_PHDR should point to exe's program header table"
+        );
+
+        // AT_RANDOM points to the random bytes we provided.
+        let at_random_ptr =
+            find_auxv(&stack_auxv, auxv::AT_RANDOM).expect("AT_RANDOM must be in stack auxv");
+        let random_offset = (at_random_ptr - stack_base) as usize;
+        assert_eq!(
+            &stack[random_offset..random_offset + 16],
+            &random_bytes,
+            "AT_RANDOM must point to the 16 random bytes"
+        );
+    }
+
     #[test]
     fn stack_sp_alignment() {
         let random = [0xDD; 16];
