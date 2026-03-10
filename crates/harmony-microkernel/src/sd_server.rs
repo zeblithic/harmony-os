@@ -238,7 +238,7 @@ mod tests {
             vec![
                 0x1AA,      // CMD8
                 0x0120,     // CMD55
-                0x80100000, // ACMD41 (ready, CCS set)
+                0xC0100000, // ACMD41 (ready bit 31 + CCS bit 30 = SDHC)
                 0,          // CMD2 R2
                 0xAAAA0000, // CMD3 RCA
                 0,          // CMD7

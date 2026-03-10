@@ -8,7 +8,14 @@
 
 use super::register_bank::RegisterBank;
 
-// ── SDHCI register offsets ──────────────────────────────────────
+// ── SDHCI register offsets (all 32-bit aligned) ─────────────────
+//
+// RegisterBank performs 32-bit accesses only.  Sub-32-bit SDHCI
+// registers are accessed through the enclosing aligned word:
+//   0x04: [Block Size (16) | Block Count (16)]
+//   0x2C: [Clock Control (16) | Timeout Control (8) | Software Reset (8)]
+//   0x30: [Normal Interrupt Status (16) | Error Interrupt Status (16)]
+const SDHCI_BLOCK_SIZE: usize = 0x04; // also packs Block Count in upper 16
 const SDHCI_ARGUMENT: usize = 0x08;
 const SDHCI_RESPONSE_0: usize = 0x10;
 const SDHCI_RESPONSE_1: usize = 0x14;
@@ -16,10 +23,8 @@ const SDHCI_RESPONSE_2: usize = 0x18;
 const SDHCI_RESPONSE_3: usize = 0x1C;
 const SDHCI_BUFFER_DATA: usize = 0x20;
 const SDHCI_PRESENT_STATE: usize = 0x24;
-const SDHCI_CLOCK_CONTROL: usize = 0x2C;
-const SDHCI_SOFTWARE_RESET: usize = 0x2F;
-const SDHCI_INT_STATUS: usize = 0x30;
-const SDHCI_ERR_INT_STATUS: usize = 0x38;
+const SDHCI_CLOCK_CONTROL: usize = 0x2C; // also packs Timeout Control + Software Reset
+const SDHCI_INT_STATUS: usize = 0x30; // also packs Error Interrupt Status in upper 16
 
 // ── Present state bits ──────────────────────────────────────────
 const STATE_CMD_INHIBIT: u32 = 1 << 0;
@@ -30,7 +35,7 @@ const INT_BUFFER_WRITE_READY: u32 = 1 << 4;
 const INT_BUFFER_READ_READY: u32 = 1 << 5;
 const INT_ERROR: u32 = 1 << 15;
 
-// ── Error interrupt bits ────────────────────────────────────────
+// ── Error interrupt bits (within Error Interrupt Status, bits [31:16] of 0x30)
 const ERR_CMD_TIMEOUT: u32 = 1 << 0;
 const ERR_CMD_CRC: u32 = 1 << 1;
 const ERR_CMD_INDEX: u32 = 1 << 3;
@@ -42,8 +47,8 @@ const CLOCK_INTERNAL_STABLE: u32 = 1 << 1;
 const CLOCK_SD_EN: u32 = 1 << 2;
 const CLOCK_DIVIDER_SHIFT: u32 = 8;
 
-// ── Software reset bits ─────────────────────────────────────────
-const RESET_ALL: u32 = 1 << 0;
+// ── Software reset bits (at bits [31:24] of the 32-bit word at 0x2C)
+const RESET_ALL: u32 = 1 << 0; // bit position within the Software Reset byte
 
 // ── Command register encoding ───────────────────────────────────
 // These values encode bits within the 16-bit Command register (upper
@@ -63,10 +68,13 @@ const CMD_INDEX_CHECK: u32 = 1 << 4;
 //   bits 31:16 = Command
 // Writing the Command portion triggers the command on the SD bus.
 const SDHCI_TRANSFER_MODE: usize = 0x0C;
-const SDHCI_BLOCK_SIZE: usize = 0x04;
-const SDHCI_BLOCK_COUNT: usize = 0x06;
 const CMD_DATA_PRESENT: u32 = 1 << 5;
 const XFER_READ: u32 = 1 << 4;
+
+// ── Timeout control ────────────────────────────────────────────
+// Timeout Control is at byte 0x2E, i.e., bits [23:16] of the 0x2C word.
+// 0x0E = maximum timeout (~2^27 TMCLK cycles, ~1 s at 200 MHz).
+const TIMEOUT_VALUE: u32 = 0x0E;
 
 // ── SD command numbers ──────────────────────────────────────────
 const CMD0_GO_IDLE: u8 = 0;
@@ -120,6 +128,8 @@ pub struct CardInfo {
     pub rca: u16,
     /// Card capacity in blocks (512 bytes each).
     pub capacity_blocks: u32,
+    /// True for SDHC/SDXC (block-addressed), false for SDSC (byte-addressed).
+    pub is_sdhc: bool,
 }
 
 /// Sans-I/O SDHCI driver.
@@ -142,10 +152,13 @@ impl SdhciDriver {
 
     /// Software reset. Writes RESET_ALL and polls until the bit clears.
     /// Uses a bounded poll loop (max 1000 iterations) to avoid infinite spin.
+    ///
+    /// Software Reset is at byte 0x2F, i.e., bits [31:24] of the aligned
+    /// 32-bit word at 0x2C. A full reset clears all controller state.
     pub fn reset(&mut self, bank: &mut impl RegisterBank) -> Result<(), SdError> {
-        bank.write(SDHCI_SOFTWARE_RESET, RESET_ALL);
+        bank.write(SDHCI_CLOCK_CONTROL, RESET_ALL << 24);
         for _ in 0..1000 {
-            if bank.read(SDHCI_SOFTWARE_RESET) & RESET_ALL == 0 {
+            if bank.read(SDHCI_CLOCK_CONTROL) & (RESET_ALL << 24) == 0 {
                 return Ok(());
             }
             core::hint::spin_loop();
@@ -155,13 +168,17 @@ impl SdhciDriver {
 
     /// Configure SD clock. Sets divider, enables internal clock,
     /// waits for stability, then enables SD clock output.
+    ///
+    /// The 32-bit word at 0x2C packs Clock Control (bits 15:0),
+    /// Timeout Control (bits 23:16), and Software Reset (bits 31:24).
+    /// Every write preserves the timeout value to avoid zeroing it.
     pub fn set_clock(
         &mut self,
         bank: &mut impl RegisterBank,
         freq_khz: u32,
     ) -> Result<(), SdError> {
-        // Disable SD clock first
-        bank.write(SDHCI_CLOCK_CONTROL, 0);
+        // Disable SD clock (preserve timeout in bits [23:16])
+        bank.write(SDHCI_CLOCK_CONTROL, TIMEOUT_VALUE << 16);
 
         // Calculate divider (base clock assumed 200 MHz)
         // Divider = base_clock / (2 * target_freq)
@@ -172,12 +189,12 @@ impl SdhciDriver {
             250
         };
         let clock_val = (divider << CLOCK_DIVIDER_SHIFT) | CLOCK_INTERNAL_EN;
-        bank.write(SDHCI_CLOCK_CONTROL, clock_val);
+        bank.write(SDHCI_CLOCK_CONTROL, (TIMEOUT_VALUE << 16) | clock_val);
 
         // Wait for internal clock stable
         for _ in 0..1000 {
             if bank.read(SDHCI_CLOCK_CONTROL) & CLOCK_INTERNAL_STABLE != 0 {
-                // Enable SD clock
+                // Enable SD clock (read-modify-write preserves timeout + divider)
                 let current = bank.read(SDHCI_CLOCK_CONTROL);
                 bank.write(SDHCI_CLOCK_CONTROL, current | CLOCK_SD_EN);
                 return Ok(());
@@ -223,12 +240,15 @@ impl SdhciDriver {
             (cmd_reg << 16) | (transfer_mode as u32),
         );
 
-        // Poll for completion
+        // Poll for completion.
+        // The 32-bit read at 0x30 gives us Normal Interrupt Status (bits 15:0)
+        // and Error Interrupt Status (bits 31:16) in one access.
         for _ in 0..100_000 {
             let status = bank.read(SDHCI_INT_STATUS);
             if status & INT_ERROR != 0 {
-                let err = bank.read(SDHCI_ERR_INT_STATUS);
-                // Clear status
+                // Error details are in bits [31:16] (Error Interrupt Status)
+                let err = status >> 16;
+                // Clear both normal and error status (write-1-to-clear)
                 bank.write(SDHCI_INT_STATUS, status);
                 return Err(Self::decode_error(err));
             }
@@ -282,14 +302,15 @@ impl SdhciDriver {
         lba: u32,
         buf: &mut [u8; 512],
     ) -> Result<(), SdError> {
-        // Set up block size and count
-        bank.write(SDHCI_BLOCK_SIZE, SD_BLOCK_SIZE as u32);
-        bank.write(SDHCI_BLOCK_COUNT, 1);
-        // Issue CMD17 with LBA (transfer mode included in combined write)
+        // Block Size (lower 16) + Block Count (upper 16) in one aligned write
+        bank.write(SDHCI_BLOCK_SIZE, (1u32 << 16) | SD_BLOCK_SIZE as u32);
+        // SDSC cards use byte addressing; SDHC/SDXC use block addressing
+        let arg = self.lba_to_arg(lba);
+        // Issue CMD17 with address (transfer mode included in combined write)
         self.send_command(
             bank,
             CMD17_READ_SINGLE,
-            lba,
+            arg,
             CMD_RESP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK | CMD_DATA_PRESENT,
             XFER_READ as u16,
         )?;
@@ -307,19 +328,31 @@ impl SdhciDriver {
         lba: u32,
         buf: &[u8; 512],
     ) -> Result<(), SdError> {
-        // Set up block size and count
-        bank.write(SDHCI_BLOCK_SIZE, SD_BLOCK_SIZE as u32);
-        bank.write(SDHCI_BLOCK_COUNT, 1);
-        // Issue CMD24 with LBA (write direction = transfer_mode 0)
+        // Block Size (lower 16) + Block Count (upper 16) in one aligned write
+        bank.write(SDHCI_BLOCK_SIZE, (1u32 << 16) | SD_BLOCK_SIZE as u32);
+        // SDSC cards use byte addressing; SDHC/SDXC use block addressing
+        let arg = self.lba_to_arg(lba);
+        // Issue CMD24 with address (write direction = transfer_mode 0)
         self.send_command(
             bank,
             CMD24_WRITE_SINGLE,
-            lba,
+            arg,
             CMD_RESP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK | CMD_DATA_PRESENT,
             0,
         )?;
         // PIO data transfer
         self.write_block(bank, buf)
+    }
+
+    /// Convert an LBA to the command argument based on card type.
+    /// SDHC/SDXC cards use block addressing (LBA directly).
+    /// SDSC cards use byte addressing (LBA * 512).
+    fn lba_to_arg(&self, lba: u32) -> u32 {
+        if self.card.map_or(true, |c| c.is_sdhc) {
+            lba
+        } else {
+            lba * SD_BLOCK_SIZE as u32
+        }
     }
 
     /// Read a single 512-byte block via PIO.
@@ -464,20 +497,15 @@ impl SdhciDriver {
             0,
         )?;
 
-        // Determine capacity (simplified: use OCR to check SDHC)
-        // SDHC cards (CCS bit set in OCR) use block addressing
-        let capacity_blocks = if ocr & (1 << 30) != 0 {
-            // SDHC/SDXC: capacity would come from CSD, use placeholder
-            // Real implementation would send CMD9 to read CSD
-            0
-        } else {
-            // SDSC: capacity would come from CSD
-            0
-        };
+        // Determine card type and capacity from OCR
+        // CCS bit (30) distinguishes SDHC/SDXC (block-addressed) from SDSC (byte-addressed)
+        let is_sdhc = ocr & (1 << 30) != 0;
+        let capacity_blocks = 0; // Would come from CMD9 (CSD); placeholder for now
 
         let info = CardInfo {
             rca,
             capacity_blocks,
+            is_sdhc,
         };
         self.card = Some(info);
         Ok(info)
@@ -499,18 +527,21 @@ mod tests {
     fn reset_writes_reset_all_and_polls() {
         let mut driver = SdhciDriver::new();
         let mut bank = MockRegisterBank::new();
-        // First read: RESET_ALL still set, second read: cleared
-        bank.on_read(SDHCI_SOFTWARE_RESET, vec![RESET_ALL, 0]);
+        // Software Reset is at bits [31:24] of the 0x2C word.
+        // First read: RESET_ALL still set, second read: cleared.
+        bank.on_read(SDHCI_CLOCK_CONTROL, vec![RESET_ALL << 24, 0]);
         driver.reset(&mut bank).unwrap();
-        assert!(bank.writes.contains(&(SDHCI_SOFTWARE_RESET, RESET_ALL)));
+        assert!(bank
+            .writes
+            .contains(&(SDHCI_CLOCK_CONTROL, RESET_ALL << 24)));
     }
 
     #[test]
     fn reset_fails_if_never_clears() {
         let mut driver = SdhciDriver::new();
         let mut bank = MockRegisterBank::new();
-        // Always returns RESET_ALL (never clears) — sticky last value
-        bank.on_read(SDHCI_SOFTWARE_RESET, vec![RESET_ALL]);
+        // Always returns RESET_ALL set (never clears) — sticky last value
+        bank.on_read(SDHCI_CLOCK_CONTROL, vec![RESET_ALL << 24]);
         assert_eq!(driver.reset(&mut bank), Err(SdError::ResetFailed));
     }
 
@@ -525,7 +556,7 @@ mod tests {
         );
         // 400 kHz for init
         driver.set_clock(&mut bank, 400).unwrap();
-        // Should write: disable, then divider+internal_en, then after stable check, SD enable
+        // Should write: disable (with timeout), then divider+internal_en+timeout, then SD enable
         let clock_writes: Vec<u32> = bank
             .writes
             .iter()
@@ -533,16 +564,18 @@ mod tests {
             .map(|(_, v)| *v)
             .collect();
         assert!(clock_writes.len() >= 2);
-        // First write should be 0 (disable)
-        assert_eq!(clock_writes[0], 0);
+        // First write: disable clock but preserve timeout
+        assert_eq!(clock_writes[0], TIMEOUT_VALUE << 16);
+        // Second write: divider + internal_en + timeout in bits [23:16]
+        assert_eq!((clock_writes[1] >> 16) & 0xFF, TIMEOUT_VALUE);
     }
 
     #[test]
     fn set_clock_fails_if_not_stable() {
         let mut driver = SdhciDriver::new();
         let mut bank = MockRegisterBank::new();
-        // Never stable — sticky 0
-        bank.on_read(SDHCI_CLOCK_CONTROL, vec![0]);
+        // Never stable — returns timeout bits but no INTERNAL_STABLE
+        bank.on_read(SDHCI_CLOCK_CONTROL, vec![TIMEOUT_VALUE << 16]);
         assert_eq!(
             driver.set_clock(&mut bank, 400),
             Err(SdError::ClockUnstable)
@@ -578,8 +611,8 @@ mod tests {
         let mut driver = SdhciDriver::new();
         let mut bank = MockRegisterBank::new();
         bank.on_read(SDHCI_PRESENT_STATE, vec![0]);
-        bank.on_read(SDHCI_INT_STATUS, vec![INT_ERROR]);
-        bank.on_read(SDHCI_ERR_INT_STATUS, vec![ERR_CMD_TIMEOUT]);
+        // Error bits in upper 16: ERR_CMD_TIMEOUT; INT_ERROR in lower 16
+        bank.on_read(SDHCI_INT_STATUS, vec![INT_ERROR | (ERR_CMD_TIMEOUT << 16)]);
 
         let result = driver.send_command(&mut bank, CMD0_GO_IDLE, 0, CMD_RESP_NONE, 0);
         assert_eq!(result, Err(SdError::Timeout));
@@ -590,8 +623,8 @@ mod tests {
         let mut driver = SdhciDriver::new();
         let mut bank = MockRegisterBank::new();
         bank.on_read(SDHCI_PRESENT_STATE, vec![0]);
-        bank.on_read(SDHCI_INT_STATUS, vec![INT_ERROR]);
-        bank.on_read(SDHCI_ERR_INT_STATUS, vec![ERR_CMD_CRC]);
+        // Error bits in upper 16: ERR_CMD_CRC; INT_ERROR in lower 16
+        bank.on_read(SDHCI_INT_STATUS, vec![INT_ERROR | (ERR_CMD_CRC << 16)]);
 
         let result = driver.send_command(&mut bank, CMD0_GO_IDLE, 0, CMD_RESP_NONE, 0);
         assert_eq!(result, Err(SdError::CrcError));
@@ -677,7 +710,7 @@ mod tests {
             vec![
                 0x1AA,      // CMD8 response
                 0x0120,     // CMD55 response (app cmd accepted)
-                0x80100000, // ACMD41 response (ready, bit 31 set, CCS bit 30 set)
+                0xC0100000, // ACMD41 response (ready bit 31 + CCS bit 30 = SDHC)
                 0,          // CMD2 uses RESP_136, reads all 4 response regs
                 0x12340000, // CMD3 response (RCA = 0x1234 in upper 16 bits)
                 0,          // CMD7 response
@@ -690,6 +723,8 @@ mod tests {
 
         let info = driver.init_card(&mut bank).unwrap();
         assert_eq!(info.rca, 0x1234);
+        // ACMD41 response has CCS bit (30) set → SDHC
+        assert!(info.is_sdhc);
 
         // Verify the command sequence from the combined writes at SDHCI_TRANSFER_MODE.
         // Upper 16 bits = command register, lower 16 bits = transfer mode (0 for all init cmds).
@@ -772,7 +807,7 @@ mod tests {
         // Verify data was read correctly
         assert_eq!(buf, expected);
 
-        // Verify CMD17 was issued with LBA=42
+        // Verify CMD17 was issued with LBA=42 (default: SDHC block-addressed)
         assert!(bank.writes.contains(&(SDHCI_ARGUMENT, 42)));
 
         // Combined write at SDHCI_TRANSFER_MODE: command in upper 16, transfer mode in lower 16
@@ -787,11 +822,16 @@ mod tests {
         // Verify transfer mode has XFER_READ set
         assert_eq!(combined_writes[0] & 0xFFFF, XFER_READ);
 
-        // Verify block size and count were set
-        assert!(bank
+        // Verify block size (lower 16) + block count (upper 16) in one write
+        let block_writes: Vec<u32> = bank
             .writes
-            .contains(&(SDHCI_BLOCK_SIZE, SD_BLOCK_SIZE as u32)));
-        assert!(bank.writes.contains(&(SDHCI_BLOCK_COUNT, 1)));
+            .iter()
+            .filter(|(off, _)| *off == SDHCI_BLOCK_SIZE)
+            .map(|(_, v)| *v)
+            .collect();
+        assert_eq!(block_writes.len(), 1);
+        assert_eq!(block_writes[0] & 0xFFFF, SD_BLOCK_SIZE as u32);
+        assert_eq!(block_writes[0] >> 16, 1); // block count
     }
 
     #[test]
@@ -808,7 +848,7 @@ mod tests {
         buf[3] = 0xEF;
         driver.write_single_block(&mut bank, 7, &buf).unwrap();
 
-        // Verify CMD24 was issued with LBA=7
+        // Verify CMD24 was issued with LBA=7 (default: SDHC block-addressed)
         assert!(bank.writes.contains(&(SDHCI_ARGUMENT, 7)));
 
         // Combined write at SDHCI_TRANSFER_MODE: command in upper 16, transfer mode in lower 16
@@ -823,11 +863,16 @@ mod tests {
         // Verify transfer mode does NOT have XFER_READ set (write direction)
         assert_eq!(combined_writes[0] & 0xFFFF, 0);
 
-        // Verify block size and count were set
-        assert!(bank
+        // Verify block size (lower 16) + block count (upper 16) in one write
+        let block_writes: Vec<u32> = bank
             .writes
-            .contains(&(SDHCI_BLOCK_SIZE, SD_BLOCK_SIZE as u32)));
-        assert!(bank.writes.contains(&(SDHCI_BLOCK_COUNT, 1)));
+            .iter()
+            .filter(|(off, _)| *off == SDHCI_BLOCK_SIZE)
+            .map(|(_, v)| *v)
+            .collect();
+        assert_eq!(block_writes.len(), 1);
+        assert_eq!(block_writes[0] & 0xFFFF, SD_BLOCK_SIZE as u32);
+        assert_eq!(block_writes[0] >> 16, 1); // block count
 
         // Verify the first data word was written correctly
         let data_writes: Vec<u32> = bank
@@ -845,10 +890,9 @@ mod tests {
         let mut driver = SdhciDriver::new();
         let mut bank = MockRegisterBank::new();
 
-        // CMD17 fails with a timeout
+        // CMD17 fails with a timeout (error bits in upper 16 of INT_STATUS)
         bank.on_read(SDHCI_PRESENT_STATE, vec![0]);
-        bank.on_read(SDHCI_INT_STATUS, vec![INT_ERROR]);
-        bank.on_read(SDHCI_ERR_INT_STATUS, vec![ERR_CMD_TIMEOUT]);
+        bank.on_read(SDHCI_INT_STATUS, vec![INT_ERROR | (ERR_CMD_TIMEOUT << 16)]);
 
         let mut buf = [0u8; 512];
         assert_eq!(
@@ -862,15 +906,52 @@ mod tests {
         let mut driver = SdhciDriver::new();
         let mut bank = MockRegisterBank::new();
 
-        // CMD24 fails with a CRC error
+        // CMD24 fails with a CRC error (error bits in upper 16 of INT_STATUS)
         bank.on_read(SDHCI_PRESENT_STATE, vec![0]);
-        bank.on_read(SDHCI_INT_STATUS, vec![INT_ERROR]);
-        bank.on_read(SDHCI_ERR_INT_STATUS, vec![ERR_CMD_CRC]);
+        bank.on_read(SDHCI_INT_STATUS, vec![INT_ERROR | (ERR_CMD_CRC << 16)]);
 
         let buf = [0u8; 512];
         assert_eq!(
             driver.write_single_block(&mut bank, 0, &buf),
             Err(SdError::CrcError)
         );
+    }
+
+    #[test]
+    fn sdsc_card_uses_byte_addressing() {
+        let mut driver = SdhciDriver::new();
+        // Simulate an SDSC card (is_sdhc = false)
+        driver.card = Some(CardInfo {
+            rca: 0x1234,
+            capacity_blocks: 0,
+            is_sdhc: false,
+        });
+        let mut bank = MockRegisterBank::new();
+        setup_read_single_mock(&mut bank, &[0u8; 512]);
+
+        let mut buf = [0u8; 512];
+        driver.read_single_block(&mut bank, 1, &mut buf).unwrap();
+
+        // SDSC: argument should be byte address = LBA * 512 = 512
+        assert!(bank.writes.contains(&(SDHCI_ARGUMENT, 512)));
+    }
+
+    #[test]
+    fn sdhc_card_uses_block_addressing() {
+        let mut driver = SdhciDriver::new();
+        // Simulate an SDHC card (is_sdhc = true)
+        driver.card = Some(CardInfo {
+            rca: 0x1234,
+            capacity_blocks: 0,
+            is_sdhc: true,
+        });
+        let mut bank = MockRegisterBank::new();
+        setup_read_single_mock(&mut bank, &[0u8; 512]);
+
+        let mut buf = [0u8; 512];
+        driver.read_single_block(&mut bank, 1, &mut buf).unwrap();
+
+        // SDHC: argument should be LBA directly = 1
+        assert!(bank.writes.contains(&(SDHCI_ARGUMENT, 1)));
     }
 }
