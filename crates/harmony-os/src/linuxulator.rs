@@ -1344,7 +1344,6 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 // File-backed: map writable (without execute) so we can
                 // copy data in, then mprotect to the caller's requested
                 // permissions.  This avoids a transient W+X window.
-                const PROT_WRITE: i32 = 2;
                 let write_prot = (prot | PROT_WRITE) & !PROT_EXEC;
                 let mapped = self.sys_mmap_vm(addr, length, write_prot, flags);
                 if mapped < 0 {
@@ -1699,6 +1698,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
     fn sys_getrandom(&mut self, buf_ptr: usize, buflen: usize, _flags: u32) -> i64 {
         if buflen == 0 {
             return 0;
+        }
+        // Linux caps getrandom at 33554431 bytes (~32 MiB).  Guard
+        // against `buflen as i64` wrapping to a negative error code.
+        const GETRANDOM_MAX: usize = 33_554_431;
+        if buflen > GETRANDOM_MAX {
+            return EINVAL;
         }
         let counter = self.getrandom_counter;
         self.getrandom_counter = counter.wrapping_add(1);

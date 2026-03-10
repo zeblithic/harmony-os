@@ -186,6 +186,22 @@ impl InterpreterLoader {
                 )
                 .map_err(|_| ElfLoadError::OverlappingSegments)?;
 
+            // Zero the entire mapped region first.  vm_mmap does not
+            // guarantee zeroed pages, so without this the head padding
+            // (page_start..vaddr) and tail padding (vaddr+memsz..page_end)
+            // could expose stale frame data.  Zeroing the full region also
+            // covers the BSS (memsz > filesz) in one pass.
+            {
+                let chunk_size = (PAGE_SIZE as usize).min(map_len);
+                let chunk = alloc::vec![0u8; chunk_size];
+                let mut written = 0usize;
+                while written < map_len {
+                    let n = chunk.len().min(map_len - written);
+                    backend.vm_write_bytes(page_start + written as u64, &chunk[..n]);
+                    written += n;
+                }
+            }
+
             // Write file-backed portion of the segment.
             if seg.filesz > 0 {
                 let offset = seg.offset as usize;
@@ -196,25 +212,6 @@ impl InterpreterLoader {
                     ));
                 }
                 backend.vm_write_bytes(vaddr, &elf_bytes[offset..end]);
-            }
-
-            // Zero the BSS region (memsz > filesz).  The ELF spec
-            // requires bytes from vaddr+filesz to vaddr+memsz to be
-            // zero.  vm_mmap does not guarantee zeroed pages.
-            // Write in page-sized chunks to bound transient allocation.
-            if seg.memsz > seg.filesz {
-                let bss_start = vaddr
-                    .checked_add(seg.filesz)
-                    .ok_or(ElfLoadError::OverlappingSegments)?;
-                let bss_len = (seg.memsz - seg.filesz) as usize;
-                let chunk_size = (PAGE_SIZE as usize).min(bss_len);
-                let chunk = alloc::vec![0u8; chunk_size];
-                let mut written = 0usize;
-                while written < bss_len {
-                    let n = chunk.len().min(bss_len - written);
-                    backend.vm_write_bytes(bss_start + written as u64, &chunk[..n]);
-                    written += n;
-                }
             }
 
             // Restore the caller's intended permissions.  The initial
@@ -883,16 +880,19 @@ mod tests {
         let mut backend = LoaderMockBackend::new();
         loader.load(&elf, &mut backend).unwrap();
 
-        // One PT_LOAD segment => one mmap + one write.
+        // One PT_LOAD segment => one mmap, one zero-fill, one data write.
         assert_eq!(backend.mapped.len(), 1);
-        assert_eq!(backend.written.len(), 1);
+        assert_eq!(backend.written.len(), 2);
 
         // Segment mapped at page-aligned vaddr.
         assert_eq!(backend.mapped[0].0, page_floor(0x401000));
 
-        // Data written at exact vaddr.
-        assert_eq!(backend.written[0].0, 0x401000);
-        assert_eq!(backend.written[0].1, vec![0x90, 0x90, 0xCC, 0xCC]);
+        // First write: zero-fill of the mapped region.
+        assert_eq!(backend.written[0].0, page_floor(0x401000));
+
+        // Second write: segment data at exact vaddr.
+        assert_eq!(backend.written[1].0, 0x401000);
+        assert_eq!(backend.written[1].1, vec![0x90, 0x90, 0xCC, 0xCC]);
     }
 
     #[test]
