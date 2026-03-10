@@ -119,7 +119,8 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
         if !Self::is_directory(state.qpath) {
             return Err(IpcError::NotDirectory);
         }
-        if self.fids.contains_key(&new_fid) {
+        // 9P2000: new_fid may equal fid (in-place walk replaces the binding)
+        if new_fid != fid && self.fids.contains_key(&new_fid) {
             return Err(IpcError::InvalidFid);
         }
         let qpath = Self::child_qpath(state.qpath, name)?;
@@ -352,6 +353,16 @@ mod tests {
         assert_eq!(srv.walk(1, 4, "mtu").unwrap(), QPATH_MTU);
         assert_eq!(srv.walk(1, 5, "stats").unwrap(), QPATH_STATS);
         assert_eq!(srv.walk(1, 6, "link").unwrap(), QPATH_LINK);
+    }
+
+    #[test]
+    fn walk_in_place_replaces_fid() {
+        let mut srv = test_server();
+        // Walk fid 0 (root) to genet0, in place (new_fid == fid)
+        let qpath = srv.walk(0, 0, "genet0").unwrap();
+        assert_eq!(qpath, QPATH_DIR);
+        // Fid 0 is now genet0 directory, can walk to children
+        assert_eq!(srv.walk(0, 1, "data").unwrap(), QPATH_DATA);
     }
 
     #[test]

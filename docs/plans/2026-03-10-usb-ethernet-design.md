@@ -177,3 +177,21 @@ NetStack → UnikernelRuntime
 ```
 
 No changes to existing crates. GENET is additive.
+
+## Deviations from Plan
+
+The following API signatures changed during implementation and review:
+
+| Design doc | Final implementation | Reason |
+|---|---|---|
+| `GenetDriver { rx_head, tx_tail, tx_pending }` | `{ rx_cons_index, tx_prod_index, tx_cons_index }` | Names match GENET hardware register semantics |
+| `init(bank, mac) -> Result<Self, GenetError>` | `init(bank, mac, poll_count) -> Result<Self, GenetError>` | Sans-I/O: caller controls DMA timeout |
+| `link_status(bank) -> bool` | `link_status(bank, poll_count) -> Result<bool, GenetError>` | MDIO timeout/NACK are reportable errors |
+| `stats(bank) -> GenetStats` | `stats() -> GenetStats` | Stats tracked internally, no register reads needed |
+
+Additional features added during review:
+- `GenetError::MdioReadFail` — distinct from `MdioTimeout` (PHY NACK vs bus hang)
+- SOP/EOP validation on RX descriptors
+- Zero-length RX descriptor rejection
+- 9P offset handling for text pseudo-files
+- Accurate `stat.size` for fixed-content files (mac=18, mtu=5)

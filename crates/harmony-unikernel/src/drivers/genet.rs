@@ -403,10 +403,12 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         bank.write(desc_base + DMA_DESC_LENGTH_STATUS, len_status);
 
         // Advance write pointer (word units) and producer index.
-        // Hardware needs both: WRITE_PTR locates the descriptor in RAM,
-        // PROD_INDEX signals that a new frame is queued.
+        // WRITE_PTR is a "next slot to fill" pointer (producer head) —
+        // it must point past the descriptor just written, matching Linux's
+        // `ring->write_ptr += DMA_WORDS_PER_BD` before the register write.
         let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
-        let write_ptr = (desc_idx * DMA_DESC_NUM_WORDS) as u32;
+        let next_desc = (desc_idx + 1) % TX_RING;
+        let write_ptr = (next_desc * DMA_DESC_NUM_WORDS) as u32;
         bank.write(tx_ring_base + RING_WRITE_PTR, write_ptr);
 
         self.tx_prod_index = (self.tx_prod_index + 1) & DMA_P_INDEX_MASK;
@@ -449,13 +451,10 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         let length = ((len_status >> DMA_BUFLENGTH_SHIFT) & DMA_BUFLENGTH_MASK) as usize;
         let status = len_status & 0xFFFF;
 
-        // Advance read pointer (word units) and consumer index.
-        // Both must be updated: READ_PTR tells hardware which descriptor
-        // has been consumed, CONS_INDEX signals the packet count.
-        let read_ptr = (desc_idx * DMA_DESC_NUM_WORDS) as u32;
-        bank.write(rx_ring_base + RING_READ_PTR, read_ptr);
-
+        // Advance consumer index and read pointer.
+        // Linux writes c_index to both RDMA_CONS_INDEX and RDMA_READ_PTR.
         self.rx_cons_index = (self.rx_cons_index + 1) & DMA_C_INDEX_MASK;
+        bank.write(rx_ring_base + RING_READ_PTR, self.rx_cons_index);
         bank.write(rx_ring_base + RING_CONS_INDEX, self.rx_cons_index);
 
         // Reject zero-length descriptors — no valid Ethernet frame can have
@@ -799,7 +798,7 @@ mod tests {
         bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![0, 0]);
         bank.writes.clear();
 
-        // First send: desc_idx=0, write_ptr = 0 * 3 = 0
+        // First send: desc_idx=0, write_ptr points to NEXT slot = (0+1)%4 * 3 = 3
         driver.send(&mut bank, &[0u8; 64]).unwrap();
         let wp0: Vec<u32> = bank
             .writes
@@ -807,11 +806,11 @@ mod tests {
             .filter(|(off, _)| *off == tx_ring_base + RING_WRITE_PTR)
             .map(|(_, v)| *v)
             .collect();
-        assert_eq!(wp0, vec![0]);
+        assert_eq!(wp0, vec![3]);
 
         bank.writes.clear();
 
-        // Second send: desc_idx=1, write_ptr = 1 * 3 = 3
+        // Second send: desc_idx=1, write_ptr = (1+1)%4 * 3 = 6
         driver.send(&mut bank, &[0u8; 64]).unwrap();
         let wp1: Vec<u32> = bank
             .writes
@@ -819,7 +818,7 @@ mod tests {
             .filter(|(off, _)| *off == tx_ring_base + RING_WRITE_PTR)
             .map(|(_, v)| *v)
             .collect();
-        assert_eq!(wp1, vec![3]);
+        assert_eq!(wp1, vec![6]);
     }
 
     #[test]
@@ -939,7 +938,7 @@ mod tests {
         );
         bank.writes.clear();
 
-        // First poll: desc_idx=0, read_ptr = 0 * 3 = 0
+        // First poll: cons_index advances to 1, READ_PTR = cons_index = 1
         driver.poll_rx(&mut bank);
         let rp0: Vec<u32> = bank
             .writes
@@ -947,11 +946,11 @@ mod tests {
             .filter(|(off, _)| *off == rx_ring_base + RING_READ_PTR)
             .map(|(_, v)| *v)
             .collect();
-        assert_eq!(rp0, vec![0]);
+        assert_eq!(rp0, vec![1]);
 
         bank.writes.clear();
 
-        // Second poll: desc_idx=1, read_ptr = 1 * 3 = 3
+        // Second poll: cons_index advances to 2, READ_PTR = cons_index = 2
         driver.poll_rx(&mut bank);
         let rp1: Vec<u32> = bank
             .writes
@@ -959,7 +958,7 @@ mod tests {
             .filter(|(off, _)| *off == rx_ring_base + RING_READ_PTR)
             .map(|(_, v)| *v)
             .collect();
-        assert_eq!(rp1, vec![3]);
+        assert_eq!(rp1, vec![2]);
     }
 
     #[test]
