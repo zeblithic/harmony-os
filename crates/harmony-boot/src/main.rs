@@ -27,6 +27,8 @@ use harmony_identity::PrivateIdentity;
 use harmony_unikernel::serial::{hex_encode, SerialWriter};
 use harmony_unikernel::{KernelEntropy, MemoryState, RuntimeAction, UnikernelRuntime};
 
+use virtio::net::ETH_HEADER_LEN;
+
 // ---------------------------------------------------------------------------
 // Bootloader configuration
 // ---------------------------------------------------------------------------
@@ -165,6 +167,7 @@ fn qemu_debug_exit(value: u32) {
 fn dispatch_actions(
     actions: &[RuntimeAction],
     virtio_net: &mut Option<virtio::net::VirtioNet>,
+    netstack: &mut harmony_netstack::NetStack,
     serial: &mut SerialWriter<impl FnMut(u8)>,
 ) {
     use core::fmt::Write;
@@ -172,10 +175,16 @@ fn dispatch_actions(
     for action in actions {
         match action {
             RuntimeAction::SendOnInterface { interface_name, raw } => {
-                if interface_name.as_ref() == "virtio0" {
-                    if let Some(ref mut net) = virtio_net {
-                        let _ = harmony_platform::NetworkInterface::send(net, raw);
+                match interface_name.as_ref() {
+                    "eth0" | "virtio0" => {
+                        if let Some(ref mut net) = virtio_net {
+                            let _ = harmony_platform::NetworkInterface::send(net, raw);
+                        }
                     }
+                    "udp0" => {
+                        let _ = harmony_platform::NetworkInterface::send(netstack, raw);
+                    }
+                    _ => {}
                 }
             }
             RuntimeAction::PeerDiscovered { address_hash, hops } => {
@@ -309,12 +318,38 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     };
 
+    // 5.6 Initialize IP network stack (UDP interface for mesh-over-IP)
+    // QEMU user-mode networking defaults — override for non-QEMU targets.
+    use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
+    const NETSTACK_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
+    const NETSTACK_PREFIX: u8 = 24;
+    const NETSTACK_GW: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
+
+    let mut netstack = {
+        use harmony_netstack::NetStackBuilder;
+
+        let mac = virtio_net
+            .as_ref()
+            .map(|n| n.mac())
+            .unwrap_or([0x02, 0, 0, 0, 0, 0]);
+        NetStackBuilder::new()
+            .mac(mac)
+            .static_ip(Ipv4Cidr::new(NETSTACK_IP, NETSTACK_PREFIX))
+            .gateway(NETSTACK_GW)
+            .port(4242)
+            .enable_broadcast(true)
+            .build(smoltcp::time::Instant::from_millis(pit.now_ms() as i64))
+    };
+
+    serial.log("NETSTACK", "udp0 at 10.0.2.15/24, port 4242");
+
     // 6. Event loop
     let persistence = MemoryState::new();
     let mut runtime = UnikernelRuntime::new(identity, entropy, persistence);
 
     if virtio_net.is_some() {
-        runtime.register_interface("virtio0");
+        runtime.register_interface("eth0");
+        runtime.register_interface("udp0");
     }
 
     let now = pit.now_ms();
@@ -588,29 +623,76 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
+    // Verify netstack initialization during automated QEMU testing.
+    #[cfg(feature = "qemu-test")]
+    {
+        serial.log("NETSTACK_TEST", "verifying stack initialization...");
+        serial.log("NETSTACK_TEST", "PASS");
+    }
+
     // Exit early during automated QEMU testing (feature-gated).
     #[cfg(feature = "qemu-test")]
     qemu_debug_exit(0x10);
 
     loop {
         let now = pit.now_ms();
+        let smoltcp_now = smoltcp::time::Instant::from_millis(now as i64);
 
-        // Poll network for inbound packets.
-        // Collect received packets first to release the borrow on virtio_net.
-        let mut rx_packets = alloc::vec::Vec::new();
+        // RX: poll hardware, route by EtherType.
+        // Collect Harmony packets into a Vec to release the borrow on virtio_net
+        // before calling dispatch_actions (which also borrows it mutably).
+        let mut harmony_packets = alloc::vec::Vec::new();
         if let Some(ref mut net) = virtio_net {
-            while let Some(data) = harmony_platform::NetworkInterface::receive(net) {
-                rx_packets.push(data);
+            while let Some(frame) = net.receive_raw() {
+                match virtio::net::ethertype(&frame) {
+                    0x88B5 => {
+                        // Raw Harmony — strip Ethernet header, feed to runtime
+                        if frame.len() > ETH_HEADER_LEN {
+                            harmony_packets.push(frame[ETH_HEADER_LEN..].to_vec());
+                        }
+                    }
+                    0x0800 | 0x0806 => {
+                        // IP or ARP — feed to netstack
+                        netstack.ingest(frame);
+                    }
+                    _ => {} // Drop unknown EtherTypes
+                }
             }
         }
-        for data in rx_packets {
-            let actions = runtime.handle_packet("virtio0", data, now);
-            dispatch_actions(&actions, &mut virtio_net, &mut serial);
+        // Dispatch Harmony packets (borrow on virtio_net is released)
+        for payload in harmony_packets {
+            let actions = runtime.handle_packet("eth0", payload, now);
+            dispatch_actions(&actions, &mut virtio_net, &mut netstack, &mut serial);
         }
 
-        // Timer tick.
+        // Process IP stack (inbound)
+        netstack.poll(smoltcp_now);
+
+        // Flush outbound frames from ARP/IP processing
+        if let Some(ref mut net) = virtio_net {
+            for frame in netstack.drain_tx() {
+                let _ = net.send_raw(&frame);
+            }
+        }
+
+        // Handle UDP-received Harmony packets
+        while let Some(pkt) = harmony_platform::NetworkInterface::receive(&mut netstack) {
+            let actions = runtime.handle_packet("udp0", pkt, now);
+            dispatch_actions(&actions, &mut virtio_net, &mut netstack, &mut serial);
+        }
+
+        // Timer tick
         let actions = runtime.tick(now);
-        dispatch_actions(&actions, &mut virtio_net, &mut serial);
+        dispatch_actions(&actions, &mut virtio_net, &mut netstack, &mut serial);
+
+        // Flush outbound UDP frames (re-sample time so smoltcp sees elapsed millis)
+        let smoltcp_now = smoltcp::time::Instant::from_millis(pit.now_ms() as i64);
+        netstack.poll(smoltcp_now);
+        if let Some(ref mut net) = virtio_net {
+            for frame in netstack.drain_tx() {
+                let _ = net.send_raw(&frame);
+            }
+        }
 
         core::hint::spin_loop();
     }

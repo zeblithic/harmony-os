@@ -1,0 +1,23 @@
+[package]
+name = "harmony-netstack"
+description = "Ring 1: smoltcp-based UDP/IP network interface for Harmony mesh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harmony-platform = { workspace = true }
+smoltcp = { version = "0.11", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-udp",
+    "alloc",
+] }
+
+[features]
+default = ["std"]
+std = ["harmony-platform/std"]
+
+[dev-dependencies]

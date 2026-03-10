@@ -24,7 +24,7 @@ use super::virtqueue::{Virtqueue, BUF_SIZE, QUEUE_SIZE};
 const ETHERTYPE_HARMONY: [u8; 2] = [0x88, 0xB5];
 
 /// Ethernet header length: 6 (dst) + 6 (src) + 2 (ethertype).
-const ETH_HEADER_LEN: usize = 14;
+pub(crate) const ETH_HEADER_LEN: usize = 14;
 
 /// Broadcast MAC address.
 const BROADCAST_MAC: [u8; 6] = [0xFF; 6];
@@ -346,11 +346,67 @@ impl VirtioNet {
             self.tx_queue.free_desc(desc_id);
         }
     }
+
+    /// Receive a raw Ethernet frame (including Ethernet header).
+    /// Returns `None` only when no frames are available.
+    /// Unlike the [`NetworkInterface::receive()`] impl, this does not filter
+    /// by EtherType or strip headers.
+    pub fn receive_raw(&mut self) -> Option<Vec<u8>> {
+        loop {
+            let (desc_id, len) = self.rx_queue.poll_used()?;
+
+            let clamped_len = if (len as usize) > BUF_SIZE {
+                BUF_SIZE as u32
+            } else {
+                len
+            };
+            let buf = self.rx_queue.read_buffer(desc_id, clamped_len);
+
+            // Free descriptor and post new RX buffer (must happen unconditionally).
+            self.rx_queue.free_desc(desc_id);
+            self.rx_queue.post_receive();
+
+            // Notify the device that a new RX buffer is available.
+            unsafe { mmio_write16(self.rx_notify_addr, 0) };
+
+            // Strip VirtIO net header — skip short frames and try the next
+            // descriptor so `None` only means "no more frames available."
+            if buf.len() > VIRTIO_NET_HDR_LEN {
+                return Some(buf[VIRTIO_NET_HDR_LEN..].to_vec());
+            }
+        }
+    }
+
+    /// Send a pre-built raw Ethernet frame (caller provides the full frame
+    /// including Ethernet header). The VirtIO net header is prepended
+    /// automatically.
+    pub fn send_raw(&mut self, frame: &[u8]) -> Result<(), PlatformError> {
+        self.reclaim_tx();
+
+        let total_len = VIRTIO_NET_HDR_LEN + frame.len();
+        if total_len > BUF_SIZE {
+            return Err(PlatformError::SendFailed);
+        }
+
+        // Build virtio_net_hdr + raw frame on the stack.
+        // First VIRTIO_NET_HDR_LEN bytes are zeroed (no GSO, no checksum offload).
+        let mut buf = [0u8; BUF_SIZE];
+        buf[VIRTIO_NET_HDR_LEN..total_len].copy_from_slice(frame);
+
+        match self.tx_queue.submit_send(&buf[..total_len]) {
+            Some(_) => {
+                // Notify the device that a TX buffer is available.
+                unsafe { mmio_write16(self.tx_notify_addr, 1) };
+                Ok(())
+            }
+            None => Err(PlatformError::SendFailed),
+        }
+    }
 }
 
 impl NetworkInterface for VirtioNet {
     fn name(&self) -> &str {
-        "virtio0"
+        "eth0"
     }
 
     fn mtu(&self) -> usize {
@@ -430,4 +486,13 @@ impl NetworkInterface for VirtioNet {
             return Some(eth[ETH_HEADER_LEN..].to_vec());
         }
     }
+}
+
+/// Extract the EtherType from a raw Ethernet frame.
+/// Returns 0 if the frame is too short.
+pub fn ethertype(frame: &[u8]) -> u16 {
+    if frame.len() < ETH_HEADER_LEN {
+        return 0;
+    }
+    ((frame[12] as u16) << 8) | (frame[13] as u16)
 }
