@@ -14,6 +14,7 @@ extern crate alloc;
 #[cfg(feature = "kernel")]
 pub mod content_server;
 pub mod echo;
+pub mod gpio_server;
 #[cfg(feature = "kernel")]
 pub mod kernel;
 #[cfg(feature = "kernel")]
