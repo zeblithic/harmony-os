@@ -38,6 +38,11 @@ pub fn baud_divisors(clock_hz: u32, baud: u32) -> (u16, u8) {
     (ibrd, fbrd)
 }
 
+/// Error returned when [`Pl011Driver::init`] is given parameters that
+/// produce an invalid baud-rate divisor (IBRD = 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidBaudRate;
+
 /// Sans-I/O PL011 UART driver.
 ///
 /// Generic over `N`: the RX ring buffer capacity in bytes.
@@ -67,12 +72,24 @@ impl<const N: usize> Pl011Driver<N> {
     }
 
     /// Initialise the PL011: set baud rate, 8N1, FIFO, enable TX+RX.
-    pub fn init(&self, bank: &mut impl RegisterBank, clock_hz: u32, baud: u32) {
+    ///
+    /// Returns [`InvalidBaudRate`] if the computed baud divisor is zero
+    /// (e.g. when `clock_hz` or `baud` is zero), since IBRD=0 is undefined
+    /// per the PL011 TRM. The UART is left disabled in this case.
+    pub fn init(
+        &self,
+        bank: &mut impl RegisterBank,
+        clock_hz: u32,
+        baud: u32,
+    ) -> Result<(), InvalidBaudRate> {
         // 1. Disable UART
         bank.write(UARTCR, 0);
 
         // 2. Baud-rate divisors
         let (ibrd, fbrd) = baud_divisors(clock_hz, baud);
+        if ibrd == 0 {
+            return Err(InvalidBaudRate);
+        }
         bank.write(UARTIBRD, ibrd as u32);
         bank.write(UARTFBRD, fbrd as u32);
 
@@ -81,6 +98,7 @@ impl<const N: usize> Pl011Driver<N> {
 
         // 4. Enable UART (bit 0) + TX (bit 8) + RX (bit 9) = 0x301
         bank.write(UARTCR, 0x301);
+        Ok(())
     }
 
     /// Check whether the TX FIFO has space.
@@ -144,7 +162,7 @@ mod tests {
     fn init_writes_correct_registers() {
         let driver: Pl011Driver<256> = Pl011Driver::new();
         let mut bank = MockRegisterBank::new();
-        driver.init(&mut bank, 24_000_000, 115_200);
+        driver.init(&mut bank, 24_000_000, 115_200).unwrap();
 
         assert_eq!(
             bank.writes,
@@ -172,6 +190,23 @@ mod tests {
     fn baud_zero_does_not_panic() {
         assert_eq!(baud_divisors(24_000_000, 0), (0, 0));
         assert_eq!(baud_divisors(0, 115_200), (0, 0));
+    }
+
+    #[test]
+    fn init_rejects_zero_baud() {
+        let driver: Pl011Driver<256> = Pl011Driver::new();
+        let mut bank = MockRegisterBank::new();
+        assert_eq!(driver.init(&mut bank, 24_000_000, 0), Err(InvalidBaudRate));
+        // UART should be disabled but no baud registers written.
+        assert_eq!(bank.writes, vec![(UARTCR, 0)]);
+    }
+
+    #[test]
+    fn init_rejects_zero_clock() {
+        let driver: Pl011Driver<256> = Pl011Driver::new();
+        let mut bank = MockRegisterBank::new();
+        assert_eq!(driver.init(&mut bank, 0, 115_200), Err(InvalidBaudRate));
+        assert_eq!(bank.writes, vec![(UARTCR, 0)]);
     }
 
     #[test]
