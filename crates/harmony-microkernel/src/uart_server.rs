@@ -128,7 +128,7 @@ impl<B: RegisterBank, const N: usize> FileServer for UartServer<B, N> {
 
     fn clunk(&mut self, fid: Fid) -> Result<(), IpcError> {
         if fid == 0 {
-            return Ok(()); // Root fid is permanent.
+            return Err(IpcError::PermissionDenied); // Root fid is permanent.
         }
         self.fids.remove(&fid).ok_or(IpcError::InvalidFid)?;
         Ok(())
@@ -276,10 +276,10 @@ mod tests {
     }
 
     #[test]
-    fn clunk_root_is_noop() {
+    fn clunk_root_rejected() {
         let mut srv = test_server();
-        srv.clunk(0).unwrap();
-        // Root should still work.
+        assert_eq!(srv.clunk(0), Err(IpcError::PermissionDenied));
+        // Root should still work after rejected clunk.
         srv.walk(0, 1, "uart0").unwrap();
     }
 

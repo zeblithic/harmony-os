@@ -28,7 +28,7 @@ const UARTFR_RXFE: u32 = 1 << 4; // RX FIFO empty
 ///
 /// Avoids floating-point by working in 128ths then rounding to 64ths.
 pub fn baud_divisors(clock_hz: u32, baud: u32) -> (u16, u8) {
-    if baud == 0 {
+    if baud == 0 || clock_hz == 0 {
         return (0, 0);
     }
     let div_x128 = (clock_hz as u64 * 8) / baud as u64;
