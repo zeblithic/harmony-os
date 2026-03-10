@@ -317,11 +317,13 @@ impl ElfLoader for InterpreterLoader {
                 .ok_or(ElfLoadError::OverlappingSegments)?,
         };
 
+        let at_phdr = exe_base
+            .checked_add(parsed.load_bias)
+            .and_then(|a| a.checked_add(parsed.phdr_offset))
+            .ok_or(ElfLoadError::OverlappingSegments)?;
+
         let auxv = alloc::vec![
-            (
-                auxv::AT_PHDR,
-                exe_base + parsed.load_bias + parsed.phdr_offset
-            ),
+            (auxv::AT_PHDR, at_phdr),
             (auxv::AT_PHENT, parsed.phdr_entry_size as u64),
             (auxv::AT_PHNUM, parsed.phdr_count as u64),
             (auxv::AT_PAGESZ, PAGE_SIZE),

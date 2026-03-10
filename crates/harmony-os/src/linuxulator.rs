@@ -1517,6 +1517,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if addr & (PAGE_SIZE as u64 - 1) != 0 {
             return EINVAL; // must be page-aligned
         }
+        // W^X enforcement: reject simultaneous write+execute.
+        if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+            return EINVAL;
+        }
         let len = ((length as usize) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let page_flags = prot_to_page_flags(prot);
         match self.backend.vm_mprotect(addr, len, page_flags) {
@@ -1728,13 +1732,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
             .wrapping_add(counter)
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buflen) };
+        let mut buf = alloc::vec![0u8; buflen];
         for byte in buf.iter_mut() {
             state = state
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
             *byte = (state >> 33) as u8;
         }
+        self.backend.vm_write_bytes(buf_ptr as u64, &buf);
         buflen as i64
     }
 
@@ -1751,10 +1756,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if size < 2 {
             return ERANGE; // buffer too small for "/\0"
         }
-        let cwd = b"/\0";
-        unsafe {
-            core::ptr::copy_nonoverlapping(cwd.as_ptr(), buf_ptr as *mut u8, 2);
-        }
+        self.backend.vm_write_bytes(buf_ptr as u64, b"/\0");
         2 // bytes written: '/' + '\0'
     }
 
