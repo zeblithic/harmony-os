@@ -27,8 +27,7 @@ use harmony_identity::PrivateIdentity;
 use harmony_unikernel::serial::{hex_encode, SerialWriter};
 use harmony_unikernel::{KernelEntropy, MemoryState, RuntimeAction, UnikernelRuntime};
 
-/// Ethernet header length: 6 (dst MAC) + 6 (src MAC) + 2 (EtherType).
-const ETH_HEADER_LEN: usize = 14;
+use virtio::net::ETH_HEADER_LEN;
 
 // ---------------------------------------------------------------------------
 // Bootloader configuration
@@ -320,9 +319,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     };
 
     // 5.6 Initialize IP network stack (UDP interface for mesh-over-IP)
+    // QEMU user-mode networking defaults — override for non-QEMU targets.
+    use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
+    const NETSTACK_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
+    const NETSTACK_PREFIX: u8 = 24;
+    const NETSTACK_GW: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
+
     let mut netstack = {
         use harmony_netstack::NetStackBuilder;
-        use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
 
         let mac = virtio_net
             .as_ref()
@@ -330,8 +334,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             .unwrap_or([0x02, 0, 0, 0, 0, 0]);
         NetStackBuilder::new()
             .mac(mac)
-            .static_ip(Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24))
-            .gateway(Ipv4Address::new(10, 0, 2, 2))
+            .static_ip(Ipv4Cidr::new(NETSTACK_IP, NETSTACK_PREFIX))
+            .gateway(NETSTACK_GW)
             .port(4242)
             .enable_broadcast(true)
             .build(smoltcp::time::Instant::from_millis(pit.now_ms() as i64))
@@ -345,8 +349,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     if virtio_net.is_some() {
         runtime.register_interface("eth0");
+        runtime.register_interface("udp0");
     }
-    runtime.register_interface("udp0");
 
     let now = pit.now_ms();
     let dest_hash = runtime.register_announcing_destination("harmony", &["node"], 300_000, now);
@@ -681,7 +685,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let actions = runtime.tick(now);
         dispatch_actions(&actions, &mut virtio_net, &mut netstack, &mut serial);
 
-        // Flush outbound UDP frames
+        // Flush outbound UDP frames (re-sample time so smoltcp sees elapsed millis)
+        let smoltcp_now = smoltcp::time::Instant::from_millis(pit.now_ms() as i64);
         netstack.poll(smoltcp_now);
         if let Some(ref mut net) = virtio_net {
             for frame in netstack.drain_tx() {

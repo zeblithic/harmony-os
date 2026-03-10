@@ -24,7 +24,7 @@ use super::virtqueue::{Virtqueue, BUF_SIZE, QUEUE_SIZE};
 const ETHERTYPE_HARMONY: [u8; 2] = [0x88, 0xB5];
 
 /// Ethernet header length: 6 (dst) + 6 (src) + 2 (ethertype).
-const ETH_HEADER_LEN: usize = 14;
+pub(crate) const ETH_HEADER_LEN: usize = 14;
 
 /// Broadcast MAC address.
 const BROADCAST_MAC: [u8; 6] = [0xFF; 6];

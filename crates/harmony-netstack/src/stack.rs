@@ -118,16 +118,24 @@ impl HarmonyNetworkInterface for NetStack {
         // `self.sockets.get_mut()` borrows `self.sockets` mutably.
         let dests: Vec<_> = self.peers.destinations().collect();
         let socket = self.sockets.get_mut::<udp::Socket>(self.udp_handle);
+        // Best-effort: attempt all destinations, report failure only after
+        // trying them all. Avoids torn delivery where broadcast succeeds
+        // but a later unicast failure short-circuits via `?`.
+        let mut failed = false;
         for dest in dests {
             if socket.can_send() {
-                socket
-                    .send_slice(data, dest)
-                    .map_err(|_| PlatformError::SendFailed)?;
+                if socket.send_slice(data, dest).is_err() {
+                    failed = true;
+                }
             } else {
-                return Err(PlatformError::SendFailed);
+                failed = true;
             }
         }
-        Ok(())
+        if failed {
+            Err(PlatformError::SendFailed)
+        } else {
+            Ok(())
+        }
     }
 }
 
