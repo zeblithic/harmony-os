@@ -13,7 +13,9 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use harmony_unikernel::drivers::gpio::{GpioController, PinDirection, PinFunction, Pull};
+use harmony_unikernel::drivers::gpio::{
+    GpioController, GpioError, PinDirection, PinFunction, Pull,
+};
 
 use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
 
@@ -29,6 +31,15 @@ fn qpath_to_pin(qpath: QPath) -> Option<u8> {
         Some((qpath - 1) as u8)
     } else {
         None
+    }
+}
+
+/// Map GPIO errors to IPC errors, distinguishing `UnsupportedFunction`
+/// (→ `InvalidArgument`) from `InvalidPin` (→ `NotFound`).
+fn map_gpio_err(e: GpioError) -> IpcError {
+    match e {
+        GpioError::UnsupportedFunction => IpcError::InvalidArgument,
+        _ => IpcError::NotFound,
     }
 }
 
@@ -148,7 +159,7 @@ impl<G: GpioController> FileServer for GpioServer<G> {
             "in" => {
                 self.gpio
                     .set_function(pin, PinFunction::Input)
-                    .map_err(|_| IpcError::NotFound)?;
+                    .map_err(map_gpio_err)?;
                 self.gpio
                     .set_direction(pin, PinDirection::Input)
                     .map_err(|_| IpcError::NotFound)?;
@@ -156,7 +167,7 @@ impl<G: GpioController> FileServer for GpioServer<G> {
             "out" => {
                 self.gpio
                     .set_function(pin, PinFunction::Output)
-                    .map_err(|_| IpcError::NotFound)?;
+                    .map_err(map_gpio_err)?;
                 self.gpio
                     .set_direction(pin, PinDirection::Output)
                     .map_err(|_| IpcError::NotFound)?;
@@ -164,32 +175,27 @@ impl<G: GpioController> FileServer for GpioServer<G> {
             "alt0" => self
                 .gpio
                 .set_function(pin, PinFunction::Alt0)
-                .map_err(|_| IpcError::NotFound)?,
+                .map_err(map_gpio_err)?,
             "alt1" => self
                 .gpio
                 .set_function(pin, PinFunction::Alt1)
-                .map_err(|_| IpcError::NotFound)?,
+                .map_err(map_gpio_err)?,
             "alt2" => self
                 .gpio
                 .set_function(pin, PinFunction::Alt2)
-                .map_err(|_| IpcError::NotFound)?,
+                .map_err(map_gpio_err)?,
             "alt3" => self
                 .gpio
                 .set_function(pin, PinFunction::Alt3)
-                .map_err(|_| IpcError::NotFound)?,
+                .map_err(map_gpio_err)?,
             "alt4" => self
                 .gpio
                 .set_function(pin, PinFunction::Alt4)
-                .map_err(|_| IpcError::NotFound)?,
+                .map_err(map_gpio_err)?,
             "alt5" => self
                 .gpio
                 .set_function(pin, PinFunction::Alt5)
-                .map_err(|e| match e {
-                    harmony_unikernel::drivers::gpio::GpioError::UnsupportedFunction => {
-                        IpcError::InvalidArgument
-                    }
-                    _ => IpcError::NotFound,
-                })?,
+                .map_err(map_gpio_err)?,
             "pull_up" => self
                 .gpio
                 .set_pull(pin, Pull::Up)

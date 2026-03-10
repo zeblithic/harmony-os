@@ -313,7 +313,7 @@ impl SdhciDriver {
         // Block Size (lower 16) + Block Count (upper 16) in one aligned write
         bank.write(SDHCI_BLOCK_SIZE, (1u32 << 16) | SD_BLOCK_SIZE as u32);
         // SDSC cards use byte addressing; SDHC/SDXC use block addressing
-        let arg = self.lba_to_arg(lba);
+        let arg = self.lba_to_arg(lba)?;
         // Issue CMD17 with address (transfer mode included in combined write)
         self.send_command(
             bank,
@@ -339,7 +339,7 @@ impl SdhciDriver {
         // Block Size (lower 16) + Block Count (upper 16) in one aligned write
         bank.write(SDHCI_BLOCK_SIZE, (1u32 << 16) | SD_BLOCK_SIZE as u32);
         // SDSC cards use byte addressing; SDHC/SDXC use block addressing
-        let arg = self.lba_to_arg(lba);
+        let arg = self.lba_to_arg(lba)?;
         // Issue CMD24 with address (write direction = transfer_mode 0)
         self.send_command(
             bank,
@@ -355,11 +355,12 @@ impl SdhciDriver {
     /// Convert an LBA to the command argument based on card type.
     /// SDHC/SDXC cards use block addressing (LBA directly).
     /// SDSC cards use byte addressing (LBA * 512).
-    fn lba_to_arg(&self, lba: u32) -> u32 {
-        if self.card.map_or(true, |c| c.is_sdhc) {
-            lba
-        } else {
-            lba * SD_BLOCK_SIZE as u32
+    /// Returns `NoCard` if no card has been initialized.
+    fn lba_to_arg(&self, lba: u32) -> Result<u32, SdError> {
+        match self.card {
+            None => Err(SdError::NoCard),
+            Some(c) if c.is_sdhc => Ok(lba),
+            Some(_) => Ok(lba * SD_BLOCK_SIZE as u32),
         }
     }
 
@@ -387,7 +388,20 @@ impl SdhciDriver {
                     buf[offset + 2] = (word >> 16) as u8;
                     buf[offset + 3] = (word >> 24) as u8;
                 }
-                return Ok(());
+                // Wait for transfer complete — the controller must finish
+                // the CRC/end-bit on the DAT lines before the bus is free.
+                for _ in 0..100_000 {
+                    let st = bank.read(SDHCI_INT_STATUS);
+                    if st & INT_ERROR != 0 {
+                        return Err(SdError::DataError);
+                    }
+                    if st & INT_TRANSFER_COMPLETE != 0 {
+                        bank.write(SDHCI_INT_STATUS, INT_TRANSFER_COMPLETE);
+                        return Ok(());
+                    }
+                    core::hint::spin_loop();
+                }
+                return Err(SdError::Timeout);
             }
             core::hint::spin_loop();
         }
@@ -470,9 +484,9 @@ impl SdhciDriver {
             )?;
 
             // ACMD41: SD_SEND_OP_COND
-            // Arg: HCS (bit 30) + voltage window (3.2-3.4V = bit 20)
+            // Arg: HCS (bit 30) + full voltage window 2.7-3.6V (bits 23:15)
             let resp =
-                self.send_command(bank, ACMD41_SD_SEND_OP_COND, 0x40100000, CMD_RESP_48, 0)?;
+                self.send_command(bank, ACMD41_SD_SEND_OP_COND, 0x40FF8000, CMD_RESP_48, 0)?;
 
             if let Response::Short(r) = resp {
                 if r & (1 << 31) != 0 {
@@ -717,8 +731,11 @@ mod tests {
     fn read_block_reads_512_bytes_from_data_port() {
         let mut driver = SdhciDriver::new();
         let mut bank = MockRegisterBank::new();
-        // Buffer read ready
-        bank.on_read(SDHCI_INT_STATUS, vec![INT_BUFFER_READ_READY]);
+        // Buffer read ready, then transfer complete
+        bank.on_read(
+            SDHCI_INT_STATUS,
+            vec![INT_BUFFER_READ_READY, INT_TRANSFER_COMPLETE],
+        );
         // 128 reads of 4 bytes each = 512 bytes
         let mut data_values = Vec::new();
         for i in 0..128u32 {
@@ -831,10 +848,15 @@ mod tests {
         // send_command reads: PRESENT_STATE (not inhibited)
         bank.on_read(SDHCI_PRESENT_STATE, vec![0]);
         // send_command polls INT_STATUS for CMD_COMPLETE,
-        // then read_block polls for BUFFER_READ_READY
+        // then read_block polls for BUFFER_READ_READY,
+        // then waits for TRANSFER_COMPLETE after reading the buffer
         bank.on_read(
             SDHCI_INT_STATUS,
-            vec![INT_CMD_COMPLETE, INT_BUFFER_READ_READY],
+            vec![
+                INT_CMD_COMPLETE,
+                INT_BUFFER_READ_READY,
+                INT_TRANSFER_COMPLETE,
+            ],
         );
         // CMD17 R1 response
         bank.on_read(SDHCI_RESPONSE_0, vec![0]);
@@ -870,9 +892,20 @@ mod tests {
         bank.on_read(SDHCI_RESPONSE_0, vec![0]);
     }
 
+    /// Helper: create a driver with an SDHC card pre-initialized.
+    fn driver_with_sdhc_card() -> SdhciDriver {
+        let mut driver = SdhciDriver::new();
+        driver.card = Some(CardInfo {
+            rca: 0x1234,
+            capacity_blocks: 0,
+            is_sdhc: true,
+        });
+        driver
+    }
+
     #[test]
     fn read_single_block_issues_cmd17_then_reads() {
-        let mut driver = SdhciDriver::new();
+        let mut driver = driver_with_sdhc_card();
         let mut bank = MockRegisterBank::new();
 
         // Fill test data with a recognizable pattern
@@ -917,7 +950,7 @@ mod tests {
 
     #[test]
     fn write_single_block_issues_cmd24_then_writes() {
-        let mut driver = SdhciDriver::new();
+        let mut driver = driver_with_sdhc_card();
         let mut bank = MockRegisterBank::new();
 
         setup_write_single_mock(&mut bank);
@@ -968,7 +1001,7 @@ mod tests {
 
     #[test]
     fn read_single_block_propagates_command_error() {
-        let mut driver = SdhciDriver::new();
+        let mut driver = driver_with_sdhc_card();
         let mut bank = MockRegisterBank::new();
 
         // CMD17 fails with a timeout (error bits in upper 16 of INT_STATUS)
@@ -984,7 +1017,7 @@ mod tests {
 
     #[test]
     fn write_single_block_propagates_command_error() {
-        let mut driver = SdhciDriver::new();
+        let mut driver = driver_with_sdhc_card();
         let mut bank = MockRegisterBank::new();
 
         // CMD24 fails with a CRC error (error bits in upper 16 of INT_STATUS)
@@ -1034,5 +1067,48 @@ mod tests {
 
         // SDHC: argument should be LBA directly = 1
         assert!(bank.writes.contains(&(SDHCI_ARGUMENT, 1)));
+    }
+
+    #[test]
+    fn read_block_waits_for_transfer_complete() {
+        let mut driver = SdhciDriver::new();
+        let mut bank = MockRegisterBank::new();
+        // Buffer read ready, then NOT yet complete, then complete
+        bank.on_read(
+            SDHCI_INT_STATUS,
+            vec![INT_BUFFER_READ_READY, 0, INT_TRANSFER_COMPLETE],
+        );
+        // Provide 128 data words
+        bank.on_read(SDHCI_BUFFER_DATA, vec![0; 128]);
+
+        let mut buf = [0u8; 512];
+        driver.read_block(&mut bank, &mut buf).unwrap();
+
+        // Verify INT_TRANSFER_COMPLETE was cleared
+        assert!(bank
+            .writes
+            .contains(&(SDHCI_INT_STATUS, INT_TRANSFER_COMPLETE)));
+    }
+
+    #[test]
+    fn read_single_block_without_init_returns_no_card() {
+        let mut driver = SdhciDriver::new();
+        let mut bank = MockRegisterBank::new();
+        let mut buf = [0u8; 512];
+        assert_eq!(
+            driver.read_single_block(&mut bank, 0, &mut buf),
+            Err(SdError::NoCard)
+        );
+    }
+
+    #[test]
+    fn write_single_block_without_init_returns_no_card() {
+        let mut driver = SdhciDriver::new();
+        let mut bank = MockRegisterBank::new();
+        let buf = [0u8; 512];
+        assert_eq!(
+            driver.write_single_block(&mut bank, 0, &buf),
+            Err(SdError::NoCard)
+        );
     }
 }

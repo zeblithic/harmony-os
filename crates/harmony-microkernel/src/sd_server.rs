@@ -256,7 +256,11 @@ mod tests {
         srv.bank.on_read(SDHCI_PRESENT_STATE, vec![0]);
         srv.bank.on_read(
             SDHCI_INT_STATUS,
-            vec![INT_CMD_COMPLETE, INT_BUFFER_READ_READY],
+            vec![
+                INT_CMD_COMPLETE,
+                INT_BUFFER_READ_READY,
+                INT_TRANSFER_COMPLETE,
+            ],
         );
         srv.bank.on_read(SDHCI_RESPONSE_0, vec![0]);
         let words: Vec<u32> = (0..128)
