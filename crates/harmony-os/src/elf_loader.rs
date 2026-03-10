@@ -42,8 +42,12 @@ fn page_floor(addr: u64) -> u64 {
 }
 
 /// Round `size` up to the nearest page multiple.
-fn page_ceil(size: u64) -> u64 {
-    (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+///
+/// Returns `None` if the addition would overflow (e.g. `size` near
+/// `u64::MAX`).
+fn page_ceil(size: u64) -> Option<u64> {
+    size.checked_add(PAGE_SIZE - 1)
+        .map(|v| v & !(PAGE_SIZE - 1))
 }
 
 // ── Error type ──────────────────────────────────────────────────────
@@ -153,6 +157,11 @@ impl InterpreterLoader {
         backend: &mut dyn SyscallBackend,
     ) -> Result<(), ElfLoadError> {
         for seg in &parsed.segments {
+            // W^X enforcement: reject before allocating any pages.
+            if seg.flags.write && seg.flags.execute {
+                return Err(ElfLoadError::WXViolation);
+            }
+
             let vaddr = base
                 .checked_add(seg.vaddr)
                 .ok_or(ElfLoadError::OverlappingSegments)?;
@@ -160,7 +169,7 @@ impl InterpreterLoader {
             let end_vaddr = vaddr
                 .checked_add(seg.memsz)
                 .ok_or(ElfLoadError::OverlappingSegments)?;
-            let page_end = page_ceil(end_vaddr);
+            let page_end = page_ceil(end_vaddr).ok_or(ElfLoadError::OverlappingSegments)?;
             let map_len = (page_end - page_start) as usize;
 
             let pf = segment_flags_to_page_flags(&seg.flags);
@@ -205,14 +214,6 @@ impl InterpreterLoader {
                     backend.vm_write_bytes(bss_start + written as u64, &chunk[..n]);
                     written += n;
                 }
-            }
-
-            // W^X enforcement: reject segments that are both writable
-            // and executable.  Standard toolchains never produce W+X
-            // segments; their presence indicates a malformed or
-            // intentionally exotic binary.
-            if seg.flags.write && seg.flags.execute {
-                return Err(ElfLoadError::WXViolation);
             }
 
             // Restore the caller's intended permissions (remove

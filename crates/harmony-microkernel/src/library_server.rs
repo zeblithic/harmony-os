@@ -115,6 +115,10 @@ impl FileServer for LibraryServer {
         if !state.is_open {
             return Err(IpcError::NotOpen);
         }
+        // Root fid is a directory — reading it is not supported.
+        if state.name.is_empty() {
+            return Err(IpcError::IsDirectory);
+        }
         let data = self.manifest.get(&state.name).ok_or(IpcError::NotFound)?;
         let off = offset as usize;
         if off >= data.len() {
