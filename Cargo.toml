@@ -4,6 +4,7 @@ members = [
     "crates/harmony-unikernel",
     "crates/harmony-microkernel",
     "crates/harmony-os",
+    "crates/harmony-netstack",
 ]
 # harmony-boot is excluded from the workspace because it targets bare metal
 # (x86_64-unknown-none) and Cargo's workspace feature unification would force
