@@ -1521,7 +1521,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
             return EINVAL;
         }
-        let len = ((length as usize) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let len = match (length as usize).checked_add(PAGE_SIZE - 1) {
+            Some(v) => v & !(PAGE_SIZE - 1),
+            None => return EINVAL,
+        };
         let page_flags = prot_to_page_flags(prot);
         match self.backend.vm_mprotect(addr, len, page_flags) {
             Ok(()) => 0,
@@ -1732,14 +1735,23 @@ impl<B: SyscallBackend> Linuxulator<B> {
             .wrapping_add(counter)
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        let mut buf = alloc::vec![0u8; buflen];
-        for byte in buf.iter_mut() {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            *byte = (state >> 33) as u8;
+        // Generate and write in page-sized chunks to bound transient
+        // allocation (buflen can be up to ~32 MiB).
+        const CHUNK: usize = 4096;
+        let mut written = 0usize;
+        while written < buflen {
+            let n = CHUNK.min(buflen - written);
+            let mut chunk = [0u8; CHUNK];
+            for byte in chunk[..n].iter_mut() {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *byte = (state >> 33) as u8;
+            }
+            self.backend
+                .vm_write_bytes(buf_ptr as u64 + written as u64, &chunk[..n]);
+            written += n;
         }
-        self.backend.vm_write_bytes(buf_ptr as u64, &buf);
         buflen as i64
     }
 

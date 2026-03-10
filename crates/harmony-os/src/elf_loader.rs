@@ -207,7 +207,12 @@ impl InterpreterLoader {
             // Write file-backed portion of the segment.
             if seg.filesz > 0 {
                 let offset = seg.offset as usize;
-                let end = offset + seg.filesz as usize;
+                let end =
+                    offset
+                        .checked_add(seg.filesz as usize)
+                        .ok_or(ElfLoadError::ParseError(
+                            crate::elf::ElfError::SegmentOutOfBounds,
+                        ))?;
                 if end > elf_bytes.len() {
                     return Err(ElfLoadError::ParseError(
                         crate::elf::ElfError::SegmentOutOfBounds,
