@@ -3,10 +3,12 @@
 //! Minimal ELF64 parser for x86_64 and aarch64 executables.
 //!
 //! Supports both ET_EXEC (static) and ET_DYN (PIE / shared library)
-//! binaries with PT_LOAD segments. No section headers, no interpreter
-//! handling. Returns metadata only — the caller allocates memory and
-//! copies segments.
+//! binaries. Parses PT_LOAD segments and PT_INTERP (interpreter path).
+//! Exposes program header metadata for auxiliary vector construction.
+//! Returns metadata only — the caller allocates memory and copies
+//! segments.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
 // ── ELF constants ───────────────────────────────────────────────────
@@ -21,6 +23,7 @@ const EM_X86_64: u16 = 0x3E;
 #[cfg(target_arch = "aarch64")]
 const EM_AARCH64: u16 = 0xB7;
 const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3;
 
 const ELF64_HEADER_SIZE: usize = 64;
 const ELF64_PHDR_SIZE: usize = 56;
@@ -43,6 +46,7 @@ pub enum ElfError {
     UnsupportedMachine,
     InvalidPhdr,
     SegmentOutOfBounds,
+    InterpreterPathInvalid,
 }
 
 // ── ELF type ────────────────────────────────────────────────────────
@@ -85,6 +89,14 @@ pub struct ParsedElf {
     pub entry_point: u64,
     pub elf_type: ElfType,
     pub segments: Vec<ElfSegment>,
+    /// Interpreter path from PT_INTERP (None for statically-linked binaries).
+    pub interpreter: Option<String>,
+    /// Offset of the program header table in the ELF file.
+    pub phdr_offset: u64,
+    /// Size of each program header entry.
+    pub phdr_entry_size: u16,
+    /// Number of program header entries.
+    pub phdr_count: u16,
 }
 
 // ── Little-endian helpers ───────────────────────────────────────────
@@ -189,53 +201,78 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, ElfError> {
         return Err(ElfError::TooShort);
     }
 
-    // Parse PT_LOAD segments
+    // Parse program headers: PT_LOAD segments and PT_INTERP
     let mut segments = Vec::new();
+    let mut interpreter = None;
+
     for i in 0..e_phnum {
         let ph = &data[e_phoff + i * e_phentsize..];
         let p_type = u32_le(ph, 0);
-        if p_type != PT_LOAD {
-            continue;
+
+        match p_type {
+            PT_LOAD => {
+                let p_flags = u32_le(ph, 4);
+                let p_offset = u64_le(ph, 8);
+                let p_vaddr = u64_le(ph, 16);
+                let p_filesz = u64_le(ph, 32);
+                let p_memsz = u64_le(ph, 40);
+                let p_align = u64_le(ph, 48);
+
+                // Validate memsz >= filesz (ELF spec requirement)
+                if p_memsz < p_filesz {
+                    return Err(ElfError::SegmentOutOfBounds);
+                }
+
+                // Validate segment data fits in the ELF
+                let seg_end = p_offset
+                    .checked_add(p_filesz)
+                    .ok_or(ElfError::SegmentOutOfBounds)?;
+                if seg_end as usize > data.len() {
+                    return Err(ElfError::SegmentOutOfBounds);
+                }
+
+                segments.push(ElfSegment {
+                    vaddr: p_vaddr,
+                    offset: p_offset,
+                    filesz: p_filesz,
+                    memsz: p_memsz,
+                    flags: SegmentFlags {
+                        read: p_flags & PF_R != 0,
+                        write: p_flags & PF_W != 0,
+                        execute: p_flags & PF_X != 0,
+                    },
+                    align: p_align,
+                });
+            }
+            PT_INTERP => {
+                let p_offset = u64_le(ph, 8) as usize;
+                let p_filesz = u64_le(ph, 32) as usize;
+
+                if p_offset
+                    .checked_add(p_filesz)
+                    .map_or(true, |end| end > data.len())
+                {
+                    return Err(ElfError::InterpreterPathInvalid);
+                }
+
+                let interp_bytes = &data[p_offset..p_offset + p_filesz];
+                let path = interp_bytes.strip_suffix(&[0]).unwrap_or(interp_bytes);
+                let path_str = core::str::from_utf8(path)
+                    .map_err(|_| ElfError::InterpreterPathInvalid)?;
+                interpreter = Some(String::from(path_str));
+            }
+            _ => {}
         }
-
-        let p_flags = u32_le(ph, 4);
-        let p_offset = u64_le(ph, 8);
-        let p_vaddr = u64_le(ph, 16);
-        let p_filesz = u64_le(ph, 32);
-        let p_memsz = u64_le(ph, 40);
-        let p_align = u64_le(ph, 48);
-
-        // Validate memsz >= filesz (ELF spec requirement)
-        if p_memsz < p_filesz {
-            return Err(ElfError::SegmentOutOfBounds);
-        }
-
-        // Validate segment data fits in the ELF
-        let seg_end = p_offset
-            .checked_add(p_filesz)
-            .ok_or(ElfError::SegmentOutOfBounds)?;
-        if seg_end as usize > data.len() {
-            return Err(ElfError::SegmentOutOfBounds);
-        }
-
-        segments.push(ElfSegment {
-            vaddr: p_vaddr,
-            offset: p_offset,
-            filesz: p_filesz,
-            memsz: p_memsz,
-            flags: SegmentFlags {
-                read: p_flags & PF_R != 0,
-                write: p_flags & PF_W != 0,
-                execute: p_flags & PF_X != 0,
-            },
-            align: p_align,
-        });
     }
 
     Ok(ParsedElf {
         entry_point,
         elf_type,
         segments,
+        interpreter,
+        phdr_offset: e_phoff as u64,
+        phdr_entry_size: e_phentsize as u16,
+        phdr_count: e_phnum as u16,
     })
 }
 
@@ -418,6 +455,108 @@ mod tests {
         let mut elf = build_test_elf(code);
         elf[18..20].copy_from_slice(&machine.to_le_bytes());
         elf
+    }
+
+    /// Build a test ELF with a PT_INTERP segment in addition to PT_LOAD.
+    fn build_test_elf_with_interp(code: &[u8], interp: &[u8]) -> Vec<u8> {
+        let phdr_size = 56;
+        let phnum = 2;
+        let code_offset = 64 + phnum * phdr_size;
+        let interp_offset = code_offset + code.len();
+        let total = interp_offset + interp.len();
+        let mut elf = vec![0u8; total];
+
+        // ELF header
+        elf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // ELFDATA2LSB
+        elf[6] = 1; // EV_CURRENT
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        #[cfg(target_arch = "x86_64")]
+        elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
+        #[cfg(target_arch = "aarch64")]
+        elf[18..20].copy_from_slice(&0xB7u16.to_le_bytes());
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf[24..32].copy_from_slice(&0x401000u64.to_le_bytes());
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&(phnum as u16).to_le_bytes());
+
+        // PT_LOAD program header
+        let ph = &mut elf[64..64 + phdr_size];
+        ph[0..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        ph[4..8].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
+        ph[8..16].copy_from_slice(&(code_offset as u64).to_le_bytes());
+        ph[16..24].copy_from_slice(&0x401000u64.to_le_bytes());
+        ph[24..32].copy_from_slice(&0x401000u64.to_le_bytes());
+        ph[32..40].copy_from_slice(&(code.len() as u64).to_le_bytes());
+        ph[40..48].copy_from_slice(&(code.len() as u64).to_le_bytes());
+        ph[48..56].copy_from_slice(&0x1000u64.to_le_bytes());
+
+        // PT_INTERP program header
+        let pt_interp: u32 = 3;
+        let iph = &mut elf[64 + phdr_size..64 + 2 * phdr_size];
+        iph[0..4].copy_from_slice(&pt_interp.to_le_bytes());
+        iph[4..8].copy_from_slice(&4u32.to_le_bytes()); // PF_R
+        iph[8..16].copy_from_slice(&(interp_offset as u64).to_le_bytes());
+        iph[32..40].copy_from_slice(&(interp.len() as u64).to_le_bytes());
+        iph[40..48].copy_from_slice(&(interp.len() as u64).to_le_bytes());
+        iph[48..56].copy_from_slice(&1u64.to_le_bytes());
+
+        elf[code_offset..code_offset + code.len()].copy_from_slice(code);
+        elf[interp_offset..interp_offset + interp.len()].copy_from_slice(interp);
+
+        elf
+    }
+
+    #[test]
+    fn parse_pt_interp() {
+        let interp_path = b"/lib/ld-musl-aarch64.so.1\0";
+        let elf = build_test_elf_with_interp(&[0xCC; 16], interp_path);
+        let parsed = parse_elf(&elf).unwrap();
+        assert_eq!(
+            parsed.interpreter.as_deref(),
+            Some("/lib/ld-musl-aarch64.so.1")
+        );
+    }
+
+    #[test]
+    fn no_interp_for_static_elf() {
+        let code = [0xCC; 16];
+        let elf = build_test_elf(&code);
+        let parsed = parse_elf(&elf).unwrap();
+        assert!(parsed.interpreter.is_none());
+    }
+
+    #[test]
+    fn phdr_metadata_present() {
+        let code = [0xCC; 16];
+        let elf = build_test_elf(&code);
+        let parsed = parse_elf(&elf).unwrap();
+        assert_eq!(parsed.phdr_offset, 64);
+        assert_eq!(parsed.phdr_entry_size, 56);
+        assert_eq!(parsed.phdr_count, 1);
+    }
+
+    #[test]
+    fn interp_with_phdr_metadata() {
+        let interp_path = b"/lib/ld-musl-aarch64.so.1\0";
+        let elf = build_test_elf_with_interp(&[0xCC; 16], interp_path);
+        let parsed = parse_elf(&elf).unwrap();
+        assert_eq!(parsed.phdr_count, 2); // PT_LOAD + PT_INTERP
+    }
+
+    #[test]
+    fn invalid_interp_path() {
+        let mut elf = build_test_elf_with_interp(&[0xCC; 16], b"/lib/ld\0");
+        // Corrupt the PT_INTERP offset to point past the file
+        let interp_ph_start = 64 + 56; // second phdr
+        let bad_offset = (elf.len() as u64 + 100).to_le_bytes();
+        elf[interp_ph_start + 8..interp_ph_start + 16].copy_from_slice(&bad_offset);
+        assert_eq!(parse_elf(&elf), Err(ElfError::InterpreterPathInvalid));
     }
 
     #[test]
