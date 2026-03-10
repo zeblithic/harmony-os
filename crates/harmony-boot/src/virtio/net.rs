@@ -348,31 +348,33 @@ impl VirtioNet {
     }
 
     /// Receive a raw Ethernet frame (including Ethernet header).
-    /// Returns `None` if no frames are available.
+    /// Returns `None` only when no frames are available.
     /// Unlike the [`NetworkInterface::receive()`] impl, this does not filter
     /// by EtherType or strip headers.
     pub fn receive_raw(&mut self) -> Option<Vec<u8>> {
-        let (desc_id, len) = self.rx_queue.poll_used()?;
+        loop {
+            let (desc_id, len) = self.rx_queue.poll_used()?;
 
-        let clamped_len = if (len as usize) > BUF_SIZE {
-            BUF_SIZE as u32
-        } else {
-            len
-        };
-        let buf = self.rx_queue.read_buffer(desc_id, clamped_len);
+            let clamped_len = if (len as usize) > BUF_SIZE {
+                BUF_SIZE as u32
+            } else {
+                len
+            };
+            let buf = self.rx_queue.read_buffer(desc_id, clamped_len);
 
-        // Free descriptor and post new RX buffer (must happen unconditionally).
-        self.rx_queue.free_desc(desc_id);
-        self.rx_queue.post_receive();
+            // Free descriptor and post new RX buffer (must happen unconditionally).
+            self.rx_queue.free_desc(desc_id);
+            self.rx_queue.post_receive();
 
-        // Notify the device that a new RX buffer is available.
-        unsafe { mmio_write16(self.rx_notify_addr, 0) };
+            // Notify the device that a new RX buffer is available.
+            unsafe { mmio_write16(self.rx_notify_addr, 0) };
 
-        // Strip VirtIO net header, return the full Ethernet frame.
-        if buf.len() <= VIRTIO_NET_HDR_LEN {
-            return None;
+            // Strip VirtIO net header — skip short frames and try the next
+            // descriptor so `None` only means "no more frames available."
+            if buf.len() > VIRTIO_NET_HDR_LEN {
+                return Some(buf[VIRTIO_NET_HDR_LEN..].to_vec());
+            }
         }
-        Some(buf[VIRTIO_NET_HDR_LEN..].to_vec())
     }
 
     /// Send a pre-built raw Ethernet frame (caller provides the full frame

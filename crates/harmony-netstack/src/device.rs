@@ -107,7 +107,7 @@ impl Device for FrameBuffer {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
         caps.max_transmission_unit = 1514;
-        caps.max_burst_size = Some(1);
+        caps.max_burst_size = None;
         caps
     }
 }
