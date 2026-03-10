@@ -55,6 +55,13 @@ const CMD_RESP_48_BUSY: u32 = 0x03; // R1b
 const CMD_CRC_CHECK: u32 = 1 << 3;
 const CMD_INDEX_CHECK: u32 = 1 << 4;
 
+// ── Transfer mode / data-present bits ────────────────────────────
+const SDHCI_TRANSFER_MODE: usize = 0x0C;
+const SDHCI_BLOCK_SIZE: usize = 0x04;
+const SDHCI_BLOCK_COUNT: usize = 0x06;
+const CMD_DATA_PRESENT: u32 = 1 << 5;
+const XFER_READ: u32 = 1 << 4;
+
 // ── SD command numbers ──────────────────────────────────────────
 const CMD0_GO_IDLE: u8 = 0;
 const CMD2_ALL_SEND_CID: u8 = 2;
@@ -62,6 +69,8 @@ const CMD3_SEND_RCA: u8 = 3;
 const CMD7_SELECT_CARD: u8 = 7;
 const CMD8_SEND_IF_COND: u8 = 8;
 const CMD16_SET_BLOCKLEN: u8 = 16;
+const CMD17_READ_SINGLE: u8 = 17;
+const CMD24_WRITE_SINGLE: u8 = 24;
 const CMD55_APP_CMD: u8 = 55;
 const ACMD41_SD_SEND_OP_COND: u8 = 41;
 
@@ -244,6 +253,58 @@ impl SdhciDriver {
             ]),
             _ => Response::Short(bank.read(SDHCI_RESPONSE_0)), // CMD_RESP_48, CMD_RESP_48_BUSY
         }
+    }
+
+    /// Read a single 512-byte block from the card at the given LBA.
+    ///
+    /// Issues CMD17 (READ_SINGLE_BLOCK) with the LBA as argument,
+    /// then performs PIO to transfer the data.
+    pub fn read_single_block(
+        &mut self,
+        bank: &mut impl RegisterBank,
+        lba: u32,
+        buf: &mut [u8; 512],
+    ) -> Result<(), SdError> {
+        // Set up block size and count
+        bank.write(SDHCI_BLOCK_SIZE, SD_BLOCK_SIZE as u32);
+        bank.write(SDHCI_BLOCK_COUNT, 1);
+        // Transfer mode: read direction
+        bank.write(SDHCI_TRANSFER_MODE, XFER_READ);
+        // Issue CMD17 with LBA
+        self.send_command(
+            bank,
+            CMD17_READ_SINGLE,
+            lba,
+            CMD_RESP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK | CMD_DATA_PRESENT,
+        )?;
+        // PIO data transfer
+        self.read_block(bank, buf)
+    }
+
+    /// Write a single 512-byte block to the card at the given LBA.
+    ///
+    /// Issues CMD24 (WRITE_SINGLE_BLOCK) with the LBA as argument,
+    /// then performs PIO to transfer the data.
+    pub fn write_single_block(
+        &mut self,
+        bank: &mut impl RegisterBank,
+        lba: u32,
+        buf: &[u8; 512],
+    ) -> Result<(), SdError> {
+        // Set up block size and count
+        bank.write(SDHCI_BLOCK_SIZE, SD_BLOCK_SIZE as u32);
+        bank.write(SDHCI_BLOCK_COUNT, 1);
+        // Transfer mode: write direction (no XFER_READ)
+        bank.write(SDHCI_TRANSFER_MODE, 0);
+        // Issue CMD24 with LBA
+        self.send_command(
+            bank,
+            CMD24_WRITE_SINGLE,
+            lba,
+            CMD_RESP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK | CMD_DATA_PRESENT,
+        )?;
+        // PIO data transfer
+        self.write_block(bank, buf)
     }
 
     /// Read a single 512-byte block via PIO.
@@ -634,5 +695,163 @@ mod tests {
         assert_eq!(cmd_writes[5] >> 8, 3); // CMD3
         assert_eq!(cmd_writes[6] >> 8, 7); // CMD7
         assert_eq!(cmd_writes[7] >> 8, 16); // CMD16
+    }
+
+    /// Helper: set up mock for a successful read_single_block.
+    ///
+    /// Programs the mock to handle CMD17 (send_command) followed by
+    /// PIO read (read_block). `data` is the 512-byte payload.
+    fn setup_read_single_mock(bank: &mut MockRegisterBank, data: &[u8; 512]) {
+        // send_command reads: PRESENT_STATE (not inhibited)
+        bank.on_read(SDHCI_PRESENT_STATE, vec![0]);
+        // send_command polls INT_STATUS for CMD_COMPLETE,
+        // then read_block polls for BUFFER_READ_READY
+        bank.on_read(
+            SDHCI_INT_STATUS,
+            vec![INT_CMD_COMPLETE, INT_BUFFER_READ_READY],
+        );
+        // CMD17 R1 response
+        bank.on_read(SDHCI_RESPONSE_0, vec![0]);
+        // Buffer data: 128 little-endian u32 words
+        let words: Vec<u32> = (0..128)
+            .map(|i| {
+                let off = i * 4;
+                data[off] as u32
+                    | (data[off + 1] as u32) << 8
+                    | (data[off + 2] as u32) << 16
+                    | (data[off + 3] as u32) << 24
+            })
+            .collect();
+        bank.on_read(SDHCI_BUFFER_DATA, words);
+    }
+
+    /// Helper: set up mock for a successful write_single_block.
+    fn setup_write_single_mock(bank: &mut MockRegisterBank) {
+        // send_command reads: PRESENT_STATE (not inhibited)
+        bank.on_read(SDHCI_PRESENT_STATE, vec![0]);
+        // send_command polls INT_STATUS for CMD_COMPLETE,
+        // then write_block polls for BUFFER_WRITE_READY
+        bank.on_read(
+            SDHCI_INT_STATUS,
+            vec![INT_CMD_COMPLETE, INT_BUFFER_WRITE_READY],
+        );
+        // CMD24 R1 response
+        bank.on_read(SDHCI_RESPONSE_0, vec![0]);
+    }
+
+    #[test]
+    fn read_single_block_issues_cmd17_then_reads() {
+        let mut driver = SdhciDriver::new();
+        let mut bank = MockRegisterBank::new();
+
+        // Fill test data with a recognizable pattern
+        let mut expected = [0u8; 512];
+        for (i, byte) in expected.iter_mut().enumerate() {
+            *byte = (i & 0xFF) as u8;
+        }
+        setup_read_single_mock(&mut bank, &expected);
+
+        let mut buf = [0u8; 512];
+        driver.read_single_block(&mut bank, 42, &mut buf).unwrap();
+
+        // Verify data was read correctly
+        assert_eq!(buf, expected);
+
+        // Verify CMD17 was issued with LBA=42
+        assert!(bank.writes.contains(&(SDHCI_ARGUMENT, 42)));
+        let cmd_writes: Vec<u32> = bank
+            .writes
+            .iter()
+            .filter(|(off, _)| *off == SDHCI_COMMAND)
+            .map(|(_, v)| *v)
+            .collect();
+        assert_eq!(cmd_writes.len(), 1);
+        assert_eq!(cmd_writes[0] >> 8, CMD17_READ_SINGLE as u32);
+
+        // Verify block size and count were set
+        assert!(bank
+            .writes
+            .contains(&(SDHCI_BLOCK_SIZE, SD_BLOCK_SIZE as u32)));
+        assert!(bank.writes.contains(&(SDHCI_BLOCK_COUNT, 1)));
+        // Verify transfer mode has XFER_READ set
+        assert!(bank.writes.contains(&(SDHCI_TRANSFER_MODE, XFER_READ)));
+    }
+
+    #[test]
+    fn write_single_block_issues_cmd24_then_writes() {
+        let mut driver = SdhciDriver::new();
+        let mut bank = MockRegisterBank::new();
+
+        setup_write_single_mock(&mut bank);
+
+        let mut buf = [0u8; 512];
+        buf[0] = 0xDE;
+        buf[1] = 0xAD;
+        buf[2] = 0xBE;
+        buf[3] = 0xEF;
+        driver.write_single_block(&mut bank, 7, &buf).unwrap();
+
+        // Verify CMD24 was issued with LBA=7
+        assert!(bank.writes.contains(&(SDHCI_ARGUMENT, 7)));
+        let cmd_writes: Vec<u32> = bank
+            .writes
+            .iter()
+            .filter(|(off, _)| *off == SDHCI_COMMAND)
+            .map(|(_, v)| *v)
+            .collect();
+        assert_eq!(cmd_writes.len(), 1);
+        assert_eq!(cmd_writes[0] >> 8, CMD24_WRITE_SINGLE as u32);
+
+        // Verify block size and count were set
+        assert!(bank
+            .writes
+            .contains(&(SDHCI_BLOCK_SIZE, SD_BLOCK_SIZE as u32)));
+        assert!(bank.writes.contains(&(SDHCI_BLOCK_COUNT, 1)));
+        // Verify transfer mode does NOT have XFER_READ set
+        assert!(bank.writes.contains(&(SDHCI_TRANSFER_MODE, 0)));
+
+        // Verify the first data word was written correctly
+        let data_writes: Vec<u32> = bank
+            .writes
+            .iter()
+            .filter(|(off, _)| *off == SDHCI_BUFFER_DATA)
+            .map(|(_, v)| *v)
+            .collect();
+        assert_eq!(data_writes.len(), 128);
+        assert_eq!(data_writes[0], 0xEFBEADDE);
+    }
+
+    #[test]
+    fn read_single_block_propagates_command_error() {
+        let mut driver = SdhciDriver::new();
+        let mut bank = MockRegisterBank::new();
+
+        // CMD17 fails with a timeout
+        bank.on_read(SDHCI_PRESENT_STATE, vec![0]);
+        bank.on_read(SDHCI_INT_STATUS, vec![INT_ERROR]);
+        bank.on_read(SDHCI_ERR_INT_STATUS, vec![ERR_CMD_TIMEOUT]);
+
+        let mut buf = [0u8; 512];
+        assert_eq!(
+            driver.read_single_block(&mut bank, 0, &mut buf),
+            Err(SdError::Timeout)
+        );
+    }
+
+    #[test]
+    fn write_single_block_propagates_command_error() {
+        let mut driver = SdhciDriver::new();
+        let mut bank = MockRegisterBank::new();
+
+        // CMD24 fails with a CRC error
+        bank.on_read(SDHCI_PRESENT_STATE, vec![0]);
+        bank.on_read(SDHCI_INT_STATUS, vec![INT_ERROR]);
+        bank.on_read(SDHCI_ERR_INT_STATUS, vec![ERR_CMD_CRC]);
+
+        let buf = [0u8; 512];
+        assert_eq!(
+            driver.write_single_block(&mut bank, 0, &buf),
+            Err(SdError::CrcError)
+        );
     }
 }
