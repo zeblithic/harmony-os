@@ -1317,13 +1317,15 @@ impl<B: SyscallBackend> Linuxulator<B> {
         };
 
         if self.backend.has_vm_support() {
-            let mapped = self.sys_mmap_vm(addr, length, prot, flags);
-            if mapped < 0 {
-                return mapped;
-            }
-            // For file-backed mappings in the VM path, read file content
-            // and write it into the mapped region via `vm_write_bytes`.
             if let Some(fid) = file_fid {
+                // File-backed: map writable first so we can copy data in,
+                // then mprotect to the caller's requested permissions.
+                const PROT_WRITE: i32 = 2;
+                let write_prot = prot | PROT_WRITE;
+                let mapped = self.sys_mmap_vm(addr, length, write_prot, flags);
+                if mapped < 0 {
+                    return mapped;
+                }
                 let len = ((length as usize) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
                 let capped = len.min(u32::MAX as usize) as u32;
                 match self.backend.read(fid, offset, capped) {
@@ -1335,14 +1337,23 @@ impl<B: SyscallBackend> Linuxulator<B> {
                         }
                     }
                     Err(e) => {
-                        // Clean up the mapping on read failure.
-                        let len = ((length as usize) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
                         let _ = self.backend.vm_munmap(mapped as u64, len);
                         return ipc_err_to_errno(e);
                     }
                 }
+                // Restore the caller's requested permissions.
+                if write_prot != prot {
+                    let page_flags = prot_to_page_flags(prot);
+                    if let Err(e) = self.backend.vm_mprotect(mapped as u64, len, page_flags) {
+                        let _ = self.backend.vm_munmap(mapped as u64, len);
+                        return vm_err_to_errno(e);
+                    }
+                }
+                return mapped;
+            } else {
+                // Anonymous: allocate with requested permissions directly.
+                return self.sys_mmap_vm(addr, length, prot, flags);
             }
-            return mapped;
         }
 
         // Arena fallback path.
