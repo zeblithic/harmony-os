@@ -309,8 +309,16 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
             rx_ring_base + RING_BUF_SIZE,
             (RX_RING as u32) << DMA_RING_SIZE_SHIFT | DMA_BUF_LENGTH,
         );
-        // Flow control: XOFF (pause) threshold derived from ring size, XON (resume) low
-        let fc_thresh_hi = (RX_RING as u32) >> 4;
+        // Flow control: XOFF (pause) threshold derived from ring size, XON (resume) low.
+        // Guard: XOFF must exceed XON for valid hysteresis (matters for RX_RING < 80).
+        let fc_thresh_hi = {
+            let derived = (RX_RING as u32) >> 4;
+            if derived <= DMA_FC_THRESH_LO {
+                DMA_FC_THRESH_LO + 1
+            } else {
+                derived
+            }
+        };
         bank.write(
             rx_ring_base + RING_XON_XOFF_THRESH,
             fc_thresh_hi << DMA_XOFF_THRESHOLD_SHIFT | DMA_FC_THRESH_LO,
@@ -928,9 +936,28 @@ mod tests {
             .map(|(_, v)| *v)
             .collect();
 
-        // fc_thresh_hi (XOFF) = 64 >> 4 = 4, fc_thresh_lo (XON) = 5
-        // Expected: (4 << 16) | 5 = 0x0004_0005
-        let expected = ((64u32 >> 4) << DMA_XOFF_THRESHOLD_SHIFT) | DMA_FC_THRESH_LO;
+        // 64 >> 4 = 4, but guard clamps to DMA_FC_THRESH_LO + 1 = 6 (XOFF must exceed XON)
+        // Expected: (6 << 16) | 5 = 0x0006_0005
+        let expected = ((DMA_FC_THRESH_LO + 1) << DMA_XOFF_THRESHOLD_SHIFT) | DMA_FC_THRESH_LO;
+        assert_eq!(xon_xoff_writes, vec![expected]);
+    }
+
+    #[test]
+    fn init_flow_control_threshold_large_ring_uses_derived() {
+        // With RX_RING=256, 256 >> 4 = 16 > DMA_FC_THRESH_LO (5), no clamping needed
+        let mut bank = init_bank();
+        GenetDriver::<256, 256>::init(&mut bank, TEST_MAC, 10).unwrap();
+
+        let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
+        let xon_xoff_writes: Vec<u32> = bank
+            .writes
+            .iter()
+            .filter(|(off, _)| *off == rx_ring_base + RING_XON_XOFF_THRESH)
+            .map(|(_, v)| *v)
+            .collect();
+
+        // 256 >> 4 = 16, no guard needed: (16 << 16) | 5 = 0x0010_0005
+        let expected = ((256u32 >> 4) << DMA_XOFF_THRESHOLD_SHIFT) | DMA_FC_THRESH_LO;
         assert_eq!(xon_xoff_writes, vec![expected]);
     }
 }

@@ -195,7 +195,11 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
                 let up = self
                     .driver
                     .link_status(&mut self.bank, self.mdio_polls)
-                    .map_err(|_| IpcError::ResourceExhausted)?;
+                    .map_err(|_e: GenetError| {
+                        // MdioTimeout: PHY bus unresponsive; no perfect IpcError variant —
+                        // ResourceExhausted is the closest available approximation.
+                        IpcError::ResourceExhausted
+                    })?;
                 let mut bytes = if up {
                     b"up\n".to_vec()
                 } else {
