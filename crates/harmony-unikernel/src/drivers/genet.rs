@@ -368,12 +368,15 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
     /// but not the FCS (hardware appends CRC).
     pub fn send(&mut self, bank: &mut impl RegisterBank, frame: &[u8]) -> Result<(), GenetError> {
         if frame.len() < ENET_MIN_FRAME {
+            self.stats.tx_errors += 1;
             return Err(GenetError::FrameTooSmall);
         }
         if frame.len() > ENET_MAX_MTU_SIZE as usize {
+            self.stats.tx_errors += 1;
             return Err(GenetError::FrameTooLarge);
         }
         if !self.tx_ready(bank) {
+            self.stats.tx_errors += 1;
             return Err(GenetError::TxRingFull);
         }
 
@@ -920,6 +923,29 @@ mod tests {
         );
         // Exactly 14 bytes — minimum valid
         assert!(driver.send(&mut bank, &[0u8; 14]).is_ok());
+    }
+
+    #[test]
+    fn send_errors_increment_tx_errors() {
+        let mut bank = init_bank();
+        let mut driver: GenetDriver<4, 4> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+
+        let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
+        bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![0]);
+
+        // FrameTooSmall
+        let _ = driver.send(&mut bank, &[]);
+        assert_eq!(driver.stats().tx_errors, 1);
+
+        // FrameTooLarge
+        let _ = driver.send(&mut bank, &[0u8; 2048]);
+        assert_eq!(driver.stats().tx_errors, 2);
+
+        // TxRingFull — fill the ring first
+        driver.tx_prod_index = 4;
+        bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![0]);
+        let _ = driver.send(&mut bank, &[0u8; 64]);
+        assert_eq!(driver.stats().tx_errors, 3);
     }
 
     #[test]

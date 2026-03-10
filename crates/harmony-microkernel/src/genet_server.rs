@@ -88,6 +88,14 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> GenetServer<B, RX, TX> {
         }
     }
 
+    /// Slice `bytes` starting at `offset`, returning at most `max` bytes.
+    /// Returns an empty vec if offset is past the end — signaling EOF to 9P clients.
+    fn slice_at_offset(bytes: &[u8], offset: u64, max: usize) -> Vec<u8> {
+        let start = (offset as usize).min(bytes.len());
+        let end = (start + max).min(bytes.len());
+        bytes[start..end].to_vec()
+    }
+
     fn qpath_name(qpath: QPath) -> &'static str {
         match qpath {
             QPATH_ROOT => "/",
@@ -128,8 +136,7 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
         if state.is_open {
             return Err(IpcError::PermissionDenied);
         }
-        if Self::is_directory(state.qpath) && matches!(mode, OpenMode::Write | OpenMode::ReadWrite)
-        {
+        if Self::is_directory(state.qpath) {
             return Err(IpcError::IsDirectory);
         }
         if Self::is_read_only(state.qpath) && matches!(mode, OpenMode::Write | OpenMode::ReadWrite)
@@ -141,7 +148,7 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
         Ok(())
     }
 
-    fn read(&mut self, fid: Fid, _offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
+    fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
         let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
         if !state.is_open {
             return Err(IpcError::NotOpen);
@@ -156,7 +163,8 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
         let max = count as usize;
         match state.qpath {
             QPATH_DATA => {
-                // Return next RX frame, or empty if none pending
+                // Streaming semantics: offset is ignored, each read returns
+                // the next pending frame (or empty if none available).
                 match self.driver.poll_rx(&mut self.bank) {
                     Some(frame) => {
                         let mut data = frame.data;
@@ -172,14 +180,12 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
                     "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
                     m[0], m[1], m[2], m[3], m[4], m[5]
                 );
-                let mut bytes = s.into_bytes();
-                bytes.truncate(max);
-                Ok(bytes)
+                let bytes = s.into_bytes();
+                Ok(Self::slice_at_offset(&bytes, offset, max))
             }
             QPATH_MTU => {
-                let mut bytes = b"1500\n".to_vec();
-                bytes.truncate(max);
-                Ok(bytes)
+                let bytes = b"1500\n";
+                Ok(Self::slice_at_offset(bytes, offset, max))
             }
             QPATH_STATS => {
                 let stats = self.driver.stats();
@@ -187,9 +193,8 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
                     "rx_packets: {}\ntx_packets: {}\nrx_errors: {}\ntx_errors: {}\n",
                     stats.rx_packets, stats.tx_packets, stats.rx_errors, stats.tx_errors
                 );
-                let mut bytes = s.into_bytes();
-                bytes.truncate(max);
-                Ok(bytes)
+                let bytes = s.into_bytes();
+                Ok(Self::slice_at_offset(&bytes, offset, max))
             }
             QPATH_LINK => {
                 let up = self
@@ -200,13 +205,8 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
                         // ResourceExhausted is the closest available approximation.
                         IpcError::ResourceExhausted
                     })?;
-                let mut bytes = if up {
-                    b"up\n".to_vec()
-                } else {
-                    b"down\n".to_vec()
-                };
-                bytes.truncate(max);
-                Ok(bytes)
+                let bytes: &[u8] = if up { b"up\n" } else { b"down\n" };
+                Ok(Self::slice_at_offset(bytes, offset, max))
             }
             _ => Err(IpcError::NotFound),
         }
@@ -361,6 +361,15 @@ mod tests {
     }
 
     #[test]
+    fn open_directory_rejected() {
+        let mut srv = test_server();
+        srv.walk(0, 1, "genet0").unwrap();
+        assert_eq!(srv.open(1, OpenMode::Read), Err(IpcError::IsDirectory));
+        assert_eq!(srv.open(1, OpenMode::Write), Err(IpcError::IsDirectory));
+        assert_eq!(srv.open(1, OpenMode::ReadWrite), Err(IpcError::IsDirectory));
+    }
+
+    #[test]
     fn open_data_readwrite() {
         let mut srv = test_server();
         srv.walk(0, 1, "genet0").unwrap();
@@ -438,6 +447,22 @@ mod tests {
     }
 
     #[test]
+    fn read_mac_with_offset() {
+        let mut srv = test_server();
+        srv.walk(0, 1, "genet0").unwrap();
+        srv.walk(1, 2, "mac").unwrap();
+        srv.open(2, OpenMode::Read).unwrap();
+        // Full content is "de:ad:be:ef:ca:fe\n" (18 bytes)
+        let chunk1 = srv.read(2, 0, 10).unwrap();
+        let chunk2 = srv.read(2, 10, 10).unwrap();
+        assert_eq!(chunk1, b"de:ad:be:e");
+        assert_eq!(chunk2, b"f:ca:fe\n");
+        // Past end returns empty (EOF)
+        let eof = srv.read(2, 18, 10).unwrap();
+        assert!(eof.is_empty());
+    }
+
+    #[test]
     fn read_mtu() {
         let mut srv = test_server();
         srv.walk(0, 1, "genet0").unwrap();
@@ -445,6 +470,16 @@ mod tests {
         srv.open(2, OpenMode::Read).unwrap();
         let data = srv.read(2, 0, 256).unwrap();
         assert_eq!(data, b"1500\n");
+    }
+
+    #[test]
+    fn read_mtu_with_offset() {
+        let mut srv = test_server();
+        srv.walk(0, 1, "genet0").unwrap();
+        srv.walk(1, 2, "mtu").unwrap();
+        srv.open(2, OpenMode::Read).unwrap();
+        let chunk = srv.read(2, 3, 256).unwrap();
+        assert_eq!(chunk, b"0\n");
     }
 
     #[test]
