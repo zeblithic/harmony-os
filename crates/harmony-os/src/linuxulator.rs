@@ -23,6 +23,7 @@ const ENOTTY: i64 = -25;
 const ESRCH: i64 = -3;
 const ERANGE: i64 = -34;
 const ENOSYS: i64 = -38;
+const EOVERFLOW: i64 = -75;
 
 fn ipc_err_to_errno(e: IpcError) -> i64 {
     match e {
@@ -1604,13 +1605,19 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         let new_offset = match whence {
             SEEK_SET => offset,
-            SEEK_CUR => (entry.offset as i64).saturating_add(offset),
+            SEEK_CUR => match (entry.offset as i64).checked_add(offset) {
+                Some(v) => v,
+                None => return EOVERFLOW,
+            },
             SEEK_END => {
                 let stat = match self.backend.stat(entry.fid) {
                     Ok(s) => s,
                     Err(e) => return ipc_err_to_errno(e),
                 };
-                (stat.size as i64).saturating_add(offset)
+                match (stat.size as i64).checked_add(offset) {
+                    Some(v) => v,
+                    None => return EOVERFLOW,
+                }
             }
             _ => return EINVAL,
         };

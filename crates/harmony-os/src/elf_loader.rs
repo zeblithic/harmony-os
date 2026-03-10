@@ -231,6 +231,18 @@ impl ElfLoader for InterpreterLoader {
             backend
                 .open(INTERP_FID, OpenMode::Read)
                 .map_err(ElfLoadError::BackendError)?;
+
+            // Check file size before reading to detect truncation.
+            let interp_stat = backend
+                .stat(INTERP_FID)
+                .map_err(ElfLoadError::BackendError)?;
+            if interp_stat.size > MAX_INTERP_SIZE as u64 {
+                let _ = backend.clunk(INTERP_FID);
+                return Err(ElfLoadError::InterpreterParseError(
+                    crate::elf::ElfError::TooShort,
+                ));
+            }
+
             let interp_bytes = backend
                 .read(INTERP_FID, 0, MAX_INTERP_SIZE)
                 .map_err(ElfLoadError::BackendError)?;
@@ -238,9 +250,14 @@ impl ElfLoader for InterpreterLoader {
                 .clunk(INTERP_FID)
                 .map_err(ElfLoadError::BackendError)?;
 
-            // Parse interpreter ELF.
+            // Parse interpreter ELF — must be ET_DYN (position-independent).
             let interp_parsed =
                 parse_elf(&interp_bytes).map_err(ElfLoadError::InterpreterParseError)?;
+            if interp_parsed.elf_type != ElfType::Dyn {
+                return Err(ElfLoadError::InterpreterParseError(
+                    crate::elf::ElfError::NotExecutable,
+                ));
+            }
 
             // Load interpreter segments at interp_base.
             self.load_segments(&interp_parsed, &interp_bytes, self.interp_base, backend)?;
