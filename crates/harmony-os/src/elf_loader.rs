@@ -176,12 +176,14 @@ impl InterpreterLoader {
 
             // Map the pages writable (without execute) so we can copy
             // segment data.  mprotect restores the real permissions
-            // afterward, avoiding a transient W+X window.
+            // afterward, avoiding a transient W+X window.  Include
+            // USER so the mapping is consistent with the final flags
+            // set by segment_flags_to_page_flags.
             backend
                 .vm_mmap(
                     page_start,
                     map_len,
-                    PageFlags::READABLE | PageFlags::WRITABLE,
+                    PageFlags::USER | PageFlags::READABLE | PageFlags::WRITABLE,
                     FrameClassification::empty(),
                 )
                 .map_err(|_| ElfLoadError::OverlappingSegments)?;

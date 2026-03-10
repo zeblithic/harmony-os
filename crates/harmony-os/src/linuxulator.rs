@@ -16,14 +16,15 @@ use harmony_microkernel::{Fid, FileStat, FileType, IpcError, OpenMode, QPath};
 // ── Linux errno constants ───────────────────────────────────────────
 
 const EPERM: i64 = -1;
+const ESRCH: i64 = -3;
 const EBADF: i64 = -9;
+const EFAULT: i64 = -14;
 const ENOMEM: i64 = -12;
 const EINVAL: i64 = -22;
 const ENOTTY: i64 = -25;
-const ESRCH: i64 = -3;
+const ESPIPE: i64 = -29;
 const ERANGE: i64 = -34;
 const ENOSYS: i64 = -38;
-const ESPIPE: i64 = -29;
 const EOVERFLOW: i64 = -75;
 
 fn ipc_err_to_errno(e: IpcError) -> i64 {
@@ -1699,6 +1700,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if buflen == 0 {
             return 0;
         }
+        if buf_ptr == 0 {
+            return EFAULT;
+        }
         // Linux caps getrandom at 33554431 bytes (~32 MiB).  Guard
         // against `buflen as i64` wrapping to a negative error code.
         const GETRANDOM_MAX: usize = 33_554_431;
@@ -1731,6 +1735,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// the null terminator), not the buffer pointer.  Musl calls the
     /// raw syscall and interprets the return value as a byte count.
     fn sys_getcwd(&mut self, buf_ptr: usize, size: usize) -> i64 {
+        if buf_ptr == 0 {
+            return EFAULT;
+        }
         if size < 2 {
             return ERANGE; // buffer too small for "/\0"
         }
