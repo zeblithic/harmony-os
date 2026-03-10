@@ -1350,7 +1350,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 // File-backed: map writable (without execute) so we can
                 // copy data in, then mprotect to the caller's requested
                 // permissions.  This avoids a transient W+X window.
-                let write_prot = (prot | PROT_WRITE) & !PROT_EXEC;
+                let write_prot = (prot | PROT_READ | PROT_WRITE) & !PROT_EXEC;
                 let mapped = self.sys_mmap_vm(addr, length, write_prot, flags);
                 if mapped < 0 {
                     return mapped;
