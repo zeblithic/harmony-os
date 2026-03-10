@@ -28,9 +28,11 @@ const SDHCI_INT_STATUS: usize = 0x30; // also packs Error Interrupt Status in up
 
 // ── Present state bits ──────────────────────────────────────────
 const STATE_CMD_INHIBIT: u32 = 1 << 0;
+const STATE_DAT_INHIBIT: u32 = 1 << 1;
 
 // ── Interrupt status bits ───────────────────────────────────────
 const INT_CMD_COMPLETE: u32 = 1 << 0;
+const INT_TRANSFER_COMPLETE: u32 = 1 << 1;
 const INT_BUFFER_WRITE_READY: u32 = 1 << 4;
 const INT_BUFFER_READ_READY: u32 = 1 << 5;
 const INT_ERROR: u32 = 1 << 15;
@@ -221,8 +223,14 @@ impl SdhciDriver {
         cmd_flags: u32,
         transfer_mode: u16,
     ) -> Result<Response, SdError> {
-        // Check command inhibit
-        if bank.read(SDHCI_PRESENT_STATE) & STATE_CMD_INHIBIT != 0 {
+        // Check inhibit bits: CMD_INHIBIT for all commands,
+        // plus DAT_INHIBIT for data-bearing commands (SDHCI §3.7.4).
+        let inhibit_mask = if cmd_flags & CMD_DATA_PRESENT != 0 {
+            STATE_CMD_INHIBIT | STATE_DAT_INHIBIT
+        } else {
+            STATE_CMD_INHIBIT
+        };
+        if bank.read(SDHCI_PRESENT_STATE) & inhibit_mask != 0 {
             return Err(SdError::Busy);
         }
 
@@ -410,7 +418,21 @@ impl SdhciDriver {
                         | (buf[offset + 3] as u32) << 24;
                     bank.write(SDHCI_BUFFER_DATA, word);
                 }
-                return Ok(());
+                // Wait for transfer complete — the controller has accepted
+                // the data from the host buffer but must still clock it out
+                // to the SD card. Returning early would give a false success.
+                for _ in 0..100_000 {
+                    let st = bank.read(SDHCI_INT_STATUS);
+                    if st & INT_ERROR != 0 {
+                        return Err(SdError::DataError);
+                    }
+                    if st & INT_TRANSFER_COMPLETE != 0 {
+                        bank.write(SDHCI_INT_STATUS, INT_TRANSFER_COMPLETE);
+                        return Ok(());
+                    }
+                    core::hint::spin_loop();
+                }
+                return Err(SdError::Timeout);
             }
             core::hint::spin_loop();
         }
@@ -500,7 +522,9 @@ impl SdhciDriver {
         // Determine card type and capacity from OCR
         // CCS bit (30) distinguishes SDHC/SDXC (block-addressed) from SDSC (byte-addressed)
         let is_sdhc = ocr & (1 << 30) != 0;
-        let capacity_blocks = 0; // Would come from CMD9 (CSD); placeholder for now
+        // TODO(cmd9): Parse CSD register via CMD9 to obtain real card capacity.
+        // Until then, stat() will report size=0 and callers cannot bounds-check LBAs.
+        let capacity_blocks = 0;
 
         let info = CardInfo {
             rca,
@@ -641,6 +665,55 @@ mod tests {
     }
 
     #[test]
+    fn data_command_checks_dat_inhibit() {
+        let mut driver = SdhciDriver::new();
+        let mut bank = MockRegisterBank::new();
+        // DAT_INHIBIT set, CMD_INHIBIT clear — should reject data commands
+        bank.on_read(SDHCI_PRESENT_STATE, vec![STATE_DAT_INHIBIT]);
+
+        let result = driver.send_command(
+            &mut bank,
+            CMD17_READ_SINGLE,
+            0,
+            CMD_RESP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK | CMD_DATA_PRESENT,
+            XFER_READ as u16,
+        );
+        assert_eq!(result, Err(SdError::Busy));
+    }
+
+    #[test]
+    fn non_data_command_ignores_dat_inhibit() {
+        let mut driver = SdhciDriver::new();
+        let mut bank = MockRegisterBank::new();
+        // DAT_INHIBIT set but CMD_INHIBIT clear — non-data commands should proceed
+        bank.on_read(SDHCI_PRESENT_STATE, vec![STATE_DAT_INHIBIT]);
+        bank.on_read(SDHCI_INT_STATUS, vec![INT_CMD_COMPLETE]);
+        bank.on_read(SDHCI_RESPONSE_0, vec![0]);
+
+        let result = driver.send_command(&mut bank, CMD0_GO_IDLE, 0, CMD_RESP_NONE, 0);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn write_block_waits_for_transfer_complete() {
+        let mut driver = SdhciDriver::new();
+        let mut bank = MockRegisterBank::new();
+        // Buffer write ready, then NOT yet complete, then complete
+        bank.on_read(
+            SDHCI_INT_STATUS,
+            vec![INT_BUFFER_WRITE_READY, 0, INT_TRANSFER_COMPLETE],
+        );
+
+        let buf = [0u8; 512];
+        driver.write_block(&mut bank, &buf).unwrap();
+
+        // Verify INT_TRANSFER_COMPLETE was cleared
+        assert!(bank
+            .writes
+            .contains(&(SDHCI_INT_STATUS, INT_TRANSFER_COMPLETE)));
+    }
+
+    #[test]
     fn read_block_reads_512_bytes_from_data_port() {
         let mut driver = SdhciDriver::new();
         let mut bank = MockRegisterBank::new();
@@ -665,8 +738,11 @@ mod tests {
     fn write_block_writes_512_bytes_to_data_port() {
         let mut driver = SdhciDriver::new();
         let mut bank = MockRegisterBank::new();
-        // Buffer write ready
-        bank.on_read(SDHCI_INT_STATUS, vec![INT_BUFFER_WRITE_READY]);
+        // Buffer write ready, then transfer complete
+        bank.on_read(
+            SDHCI_INT_STATUS,
+            vec![INT_BUFFER_WRITE_READY, INT_TRANSFER_COMPLETE],
+        );
 
         let mut buf = [0u8; 512];
         buf[0] = 0xAB;
@@ -780,10 +856,15 @@ mod tests {
         // send_command reads: PRESENT_STATE (not inhibited)
         bank.on_read(SDHCI_PRESENT_STATE, vec![0]);
         // send_command polls INT_STATUS for CMD_COMPLETE,
-        // then write_block polls for BUFFER_WRITE_READY
+        // then write_block polls for BUFFER_WRITE_READY,
+        // then waits for TRANSFER_COMPLETE after filling the buffer
         bank.on_read(
             SDHCI_INT_STATUS,
-            vec![INT_CMD_COMPLETE, INT_BUFFER_WRITE_READY],
+            vec![
+                INT_CMD_COMPLETE,
+                INT_BUFFER_WRITE_READY,
+                INT_TRANSFER_COMPLETE,
+            ],
         );
         // CMD24 R1 response
         bank.on_read(SDHCI_RESPONSE_0, vec![0]);

@@ -205,6 +205,7 @@ mod tests {
     const SDHCI_BUFFER_DATA: usize = 0x20;
 
     const INT_CMD_COMPLETE: u32 = 1 << 0;
+    const INT_TRANSFER_COMPLETE: u32 = 1 << 1;
     const INT_BUFFER_READ_READY: u32 = 1 << 5;
     const INT_BUFFER_WRITE_READY: u32 = 1 << 4;
 
@@ -275,7 +276,11 @@ mod tests {
         srv.bank.on_read(SDHCI_PRESENT_STATE, vec![0]);
         srv.bank.on_read(
             SDHCI_INT_STATUS,
-            vec![INT_CMD_COMPLETE, INT_BUFFER_WRITE_READY],
+            vec![
+                INT_CMD_COMPLETE,
+                INT_BUFFER_WRITE_READY,
+                INT_TRANSFER_COMPLETE,
+            ],
         );
         srv.bank.on_read(SDHCI_RESPONSE_0, vec![0]);
     }

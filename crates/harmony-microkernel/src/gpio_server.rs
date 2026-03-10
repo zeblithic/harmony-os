@@ -102,7 +102,7 @@ impl<G: GpioController> FileServer for GpioServer<G> {
         Ok(())
     }
 
-    fn read(&mut self, fid: Fid, _offset: u64, _count: u32) -> Result<Vec<u8>, IpcError> {
+    fn read(&mut self, fid: Fid, _offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
         let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
         if !state.is_open {
             return Err(IpcError::NotOpen);
@@ -115,11 +115,9 @@ impl<G: GpioController> FileServer for GpioServer<G> {
         }
         let pin = qpath_to_pin(state.qpath).ok_or(IpcError::NotFound)?;
         let value = self.gpio.read_pin(pin).map_err(|_| IpcError::NotFound)?;
-        if value {
-            Ok(alloc::vec![b'1', b'\n'])
-        } else {
-            Ok(alloc::vec![b'0', b'\n'])
-        }
+        let full: &[u8] = if value { b"1\n" } else { b"0\n" };
+        let n = (count as usize).min(full.len());
+        Ok(full[..n].to_vec())
     }
 
     fn write(&mut self, fid: Fid, _offset: u64, data: &[u8]) -> Result<u32, IpcError> {
@@ -186,7 +184,12 @@ impl<G: GpioController> FileServer for GpioServer<G> {
             "alt5" => self
                 .gpio
                 .set_function(pin, PinFunction::Alt5)
-                .map_err(|_| IpcError::NotFound)?,
+                .map_err(|e| match e {
+                    harmony_unikernel::drivers::gpio::GpioError::UnsupportedFunction => {
+                        IpcError::InvalidArgument
+                    }
+                    _ => IpcError::NotFound,
+                })?,
             "pull_up" => self
                 .gpio
                 .set_pull(pin, Pull::Up)
@@ -296,6 +299,9 @@ mod tests {
         fn set_function(&mut self, pin: u8, func: PinFunction) -> Result<(), GpioError> {
             if pin >= 28 {
                 return Err(GpioError::InvalidPin);
+            }
+            if func == PinFunction::Alt5 {
+                return Err(GpioError::UnsupportedFunction);
             }
             self.last_function = Some((pin, func));
             Ok(())
@@ -409,6 +415,25 @@ mod tests {
         assert_eq!(srv.read(1, 0, 256), Err(IpcError::PermissionDenied));
     }
 
+    #[test]
+    fn read_respects_count_zero() {
+        let mut srv = test_server();
+        srv.walk(0, 1, "14").unwrap();
+        srv.open(1, OpenMode::Read).unwrap();
+        let data = srv.read(1, 0, 0).unwrap();
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn read_respects_count_one() {
+        let mut srv = test_server();
+        srv.gpio.pins[14] = true;
+        srv.walk(0, 1, "14").unwrap();
+        srv.open(1, OpenMode::Read).unwrap();
+        let data = srv.read(1, 0, 1).unwrap();
+        assert_eq!(data, b"1");
+    }
+
     // ── Write tests ──────────────────────────────────────────────────
 
     #[test]
@@ -465,6 +490,15 @@ mod tests {
         srv.open(1, OpenMode::Write).unwrap();
         srv.write(1, 0, b"pull_up").unwrap();
         assert_eq!(srv.gpio.last_pull, Some((5, Pull::Up)));
+    }
+
+    #[test]
+    fn write_alt5_returns_invalid_argument() {
+        let mut srv = test_server();
+        srv.walk(0, 1, "5").unwrap();
+        srv.open(1, OpenMode::Write).unwrap();
+        // Alt5 is unsupported on RP1 — should map to InvalidArgument, not NotFound
+        assert_eq!(srv.write(1, 0, b"alt5"), Err(IpcError::InvalidArgument));
     }
 
     #[test]
