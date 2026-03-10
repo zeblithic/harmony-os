@@ -102,9 +102,7 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> GenetServer<B, RX, TX> {
     }
 }
 
-impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer
-    for GenetServer<B, RX, TX>
-{
+impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServer<B, RX, TX> {
     fn walk(&mut self, fid: Fid, new_fid: Fid, name: &str) -> Result<QPath, IpcError> {
         let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
         if !Self::is_directory(state.qpath) {
@@ -130,13 +128,11 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer
         if state.is_open {
             return Err(IpcError::PermissionDenied);
         }
-        if Self::is_directory(state.qpath)
-            && matches!(mode, OpenMode::Write | OpenMode::ReadWrite)
+        if Self::is_directory(state.qpath) && matches!(mode, OpenMode::Write | OpenMode::ReadWrite)
         {
             return Err(IpcError::IsDirectory);
         }
-        if Self::is_read_only(state.qpath)
-            && matches!(mode, OpenMode::Write | OpenMode::ReadWrite)
+        if Self::is_read_only(state.qpath) && matches!(mode, OpenMode::Write | OpenMode::ReadWrite)
         {
             return Err(IpcError::ReadOnly);
         }
@@ -196,7 +192,10 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer
                 Ok(bytes)
             }
             QPATH_LINK => {
-                let up = self.driver.link_status(&mut self.bank, self.mdio_polls);
+                let up = self
+                    .driver
+                    .link_status(&mut self.bank, self.mdio_polls)
+                    .map_err(|_| IpcError::ResourceExhausted)?;
                 let mut bytes = if up {
                     b"up\n".to_vec()
                 } else {

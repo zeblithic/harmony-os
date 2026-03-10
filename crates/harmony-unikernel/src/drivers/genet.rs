@@ -110,8 +110,7 @@ const DMA_RX_OV: u32 = 0x0001;
 const DMA_RX_RXER: u32 = 0x0004;
 const DMA_RX_LG: u32 = 0x0010;
 const DMA_RX_NO: u32 = 0x0008;
-const DMA_RX_ERROR_MASK: u32 =
-    DMA_RX_CRC_ERROR | DMA_RX_OV | DMA_RX_RXER | DMA_RX_LG | DMA_RX_NO;
+const DMA_RX_ERROR_MASK: u32 = DMA_RX_CRC_ERROR | DMA_RX_OV | DMA_RX_RXER | DMA_RX_LG | DMA_RX_NO;
 
 // ── DMA ring registers (per-ring, relative to RDMA/TDMA block) ───
 // Ring register offset = ring_index * DMA_RING_SIZE + register_offset
@@ -267,12 +266,17 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         // Poll for DMA disabled
         let tdma_status = TDMA_OFF + DMA_STATUS;
         let rdma_status = RDMA_OFF + DMA_STATUS;
+        let mut dma_disabled = false;
         for _ in 0..poll_count {
             let ts = bank.read(tdma_status);
             let rs = bank.read(rdma_status);
             if ts & DMA_DISABLED != 0 && rs & DMA_DISABLED != 0 {
+                dma_disabled = true;
                 break;
             }
+        }
+        if !dma_disabled {
+            return Err(GenetError::DmaTimeout);
         }
 
         // 9. Configure DMA burst size
@@ -351,11 +355,7 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
     /// Writes the frame data to a TX descriptor and advances the
     /// producer index. The frame must include the Ethernet header
     /// but not the FCS (hardware appends CRC).
-    pub fn send(
-        &mut self,
-        bank: &mut impl RegisterBank,
-        frame: &[u8],
-    ) -> Result<(), GenetError> {
+    pub fn send(&mut self, bank: &mut impl RegisterBank, frame: &[u8]) -> Result<(), GenetError> {
         if frame.len() > ENET_MAX_MTU_SIZE as usize {
             return Err(GenetError::FrameTooLarge);
         }
@@ -370,10 +370,8 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         // model we write the frame content through the RegisterBank so
         // tests can verify what was "sent".
         let desc_base = TDMA_OFF + DMA_RINGS_SIZE + 0x10 + desc_idx * DMA_DESC_SIZE;
-        let len_status = ((frame.len() as u32) << DMA_BUFLENGTH_SHIFT)
-            | DMA_SOP
-            | DMA_EOP
-            | DMA_TX_APPEND_CRC;
+        let len_status =
+            ((frame.len() as u32) << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP | DMA_TX_APPEND_CRC;
         bank.write(desc_base + DMA_DESC_LENGTH_STATUS, len_status);
 
         // Advance producer index and notify hardware
@@ -447,25 +445,28 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         &mut self,
         bank: &mut impl RegisterBank,
         poll_count: u32,
-    ) -> bool {
+    ) -> Result<bool, GenetError> {
         // Build MDIO read command for BMSR (reg 1) on PHY_ADDR
-        let cmd = MDIO_START_BUSY
-            | MDIO_RD
-            | (PHY_ADDR << MDIO_PMD_SHIFT)
-            | (MII_BMSR << MDIO_REG_SHIFT);
+        let cmd =
+            MDIO_START_BUSY | MDIO_RD | (PHY_ADDR << MDIO_PMD_SHIFT) | (MII_BMSR << MDIO_REG_SHIFT);
         bank.write(UMAC_MDIO_CMD, cmd);
 
         // Poll for completion
+        let mut completed = false;
         let mut result = 0u32;
         for _ in 0..poll_count {
             result = bank.read(UMAC_MDIO_CMD);
             if result & MDIO_START_BUSY == 0 {
+                completed = true;
                 break;
             }
         }
+        if !completed {
+            return Err(GenetError::MdioTimeout);
+        }
 
         self.link_up = result & BMSR_LSTATUS != 0;
-        self.link_up
+        Ok(self.link_up)
     }
 
     /// Return current interface statistics.
@@ -495,8 +496,7 @@ mod tests {
     #[test]
     fn init_writes_mac_address() {
         let mut bank = init_bank();
-        let driver: GenetDriver<256, 256> =
-            GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
 
         // MAC0 = big-endian upper 4 bytes
         let mac0_writes: Vec<(usize, u32)> = bank
@@ -609,8 +609,7 @@ mod tests {
     #[test]
     fn tx_ready_when_ring_has_space() {
         let mut bank = init_bank();
-        let driver: GenetDriver<256, 256> =
-            GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
 
         // Cons index = prod index = 0, so ring is empty (all free)
         let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
@@ -621,8 +620,7 @@ mod tests {
     #[test]
     fn tx_not_ready_when_ring_full() {
         let mut bank = init_bank();
-        let mut driver: GenetDriver<4, 4> =
-            GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut driver: GenetDriver<4, 4> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
 
         // Advance prod_index to fill the ring
         driver.tx_prod_index = 4;
@@ -635,8 +633,7 @@ mod tests {
     #[test]
     fn send_frame_advances_prod_index() {
         let mut bank = init_bank();
-        let mut driver: GenetDriver<256, 256> =
-            GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
 
         // Consumer has caught up — ring is empty
         let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
@@ -652,8 +649,7 @@ mod tests {
     #[test]
     fn send_writes_descriptor() {
         let mut bank = init_bank();
-        let mut driver: GenetDriver<256, 256> =
-            GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
 
         let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![0]);
@@ -683,8 +679,7 @@ mod tests {
     #[test]
     fn send_rejects_oversized_frame() {
         let mut bank = init_bank();
-        let mut driver: GenetDriver<256, 256> =
-            GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
 
         let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![0]);
@@ -699,25 +694,20 @@ mod tests {
     #[test]
     fn send_returns_error_when_ring_full() {
         let mut bank = init_bank();
-        let mut driver: GenetDriver<4, 4> =
-            GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut driver: GenetDriver<4, 4> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
 
         driver.tx_prod_index = 4;
         let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![0]);
 
         let frame = [0u8; 64];
-        assert_eq!(
-            driver.send(&mut bank, &frame),
-            Err(GenetError::TxRingFull)
-        );
+        assert_eq!(driver.send(&mut bank, &frame), Err(GenetError::TxRingFull));
     }
 
     #[test]
     fn tx_complete_reclaims_descriptors() {
         let mut bank = init_bank();
-        let mut driver: GenetDriver<256, 256> =
-            GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
 
         // Simulate: we sent 3 frames (prod=3), hardware consumed 2 (cons=2)
         driver.tx_prod_index = 3;
@@ -736,8 +726,7 @@ mod tests {
     #[test]
     fn poll_rx_returns_none_when_empty() {
         let mut bank = init_bank();
-        let mut driver: GenetDriver<256, 256> =
-            GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
 
         // RX prod index = cons index = 0 — nothing to read
         let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
@@ -748,8 +737,7 @@ mod tests {
     #[test]
     fn poll_rx_returns_frame() {
         let mut bank = init_bank();
-        let mut driver: GenetDriver<256, 256> =
-            GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
 
         // Hardware has produced 1 frame (prod=1, cons=0)
         let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
@@ -771,16 +759,14 @@ mod tests {
     #[test]
     fn poll_rx_detects_error_frames() {
         let mut bank = init_bank();
-        let mut driver: GenetDriver<256, 256> =
-            GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
 
         let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         bank.on_read(rx_ring_base + RING_PROD_INDEX, vec![1]);
 
         // Descriptor with CRC error flag
         let desc_base = RDMA_OFF + DMA_RINGS_SIZE + 0x10;
-        let len_status =
-            (64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP | DMA_RX_CRC_ERROR;
+        let len_status = (64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP | DMA_RX_CRC_ERROR;
         bank.on_read(desc_base + DMA_DESC_LENGTH_STATUS, vec![len_status]);
 
         let frame = driver.poll_rx(&mut bank);
@@ -793,8 +779,7 @@ mod tests {
     #[test]
     fn poll_rx_advances_cons_index() {
         let mut bank = init_bank();
-        let mut driver: GenetDriver<256, 256> =
-            GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
 
         // Two frames available
         let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
@@ -821,8 +806,7 @@ mod tests {
     #[test]
     fn link_status_reads_phy_bmsr() {
         let mut bank = init_bank();
-        let mut driver: GenetDriver<256, 256> =
-            GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
 
         // MDIO read: first read returns BUSY, second returns result with LSTATUS
         bank.on_read(
@@ -833,7 +817,7 @@ mod tests {
             ],
         );
 
-        let up = driver.link_status(&mut bank, 100);
+        let up = driver.link_status(&mut bank, 100).unwrap();
         assert!(up);
         assert!(driver.link_up);
     }
@@ -841,15 +825,36 @@ mod tests {
     #[test]
     fn link_status_down() {
         let mut bank = init_bank();
-        let mut driver: GenetDriver<256, 256> =
-            GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
 
         // MDIO returns 0 (no LSTATUS bit)
         bank.on_read(UMAC_MDIO_CMD, vec![0]);
 
-        let up = driver.link_status(&mut bank, 100);
+        let up = driver.link_status(&mut bank, 100).unwrap();
         assert!(!up);
         assert!(!driver.link_up);
+    }
+
+    #[test]
+    fn init_returns_dma_timeout() {
+        let mut bank = MockRegisterBank::new();
+        // DMA never reports disabled
+        bank.on_read(TDMA_OFF + DMA_STATUS, vec![0]);
+        bank.on_read(RDMA_OFF + DMA_STATUS, vec![0]);
+        let result = GenetDriver::<256, 256>::init(&mut bank, TEST_MAC, 5);
+        assert!(matches!(result, Err(GenetError::DmaTimeout)));
+    }
+
+    #[test]
+    fn link_status_returns_mdio_timeout() {
+        let mut bank = init_bank();
+        let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+
+        // MDIO always busy
+        bank.on_read(UMAC_MDIO_CMD, vec![MDIO_START_BUSY]);
+
+        let result = driver.link_status(&mut bank, 5);
+        assert_eq!(result, Err(GenetError::MdioTimeout));
     }
 
     // ── Stats tests ───────────────────────────────────────────────
@@ -857,8 +862,7 @@ mod tests {
     #[test]
     fn stats_tracks_tx_and_rx() {
         let mut bank = init_bank();
-        let mut driver: GenetDriver<256, 256> =
-            GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
 
         // Send a frame
         let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
