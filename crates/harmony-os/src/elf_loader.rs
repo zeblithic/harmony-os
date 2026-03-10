@@ -293,13 +293,18 @@ impl ElfLoader for InterpreterLoader {
             // For ET_DYN interpreters, e_entry is a relative offset from
             // the image base.  The absolute entry in the process's
             // address space is interp_base + e_entry.
-            let entry = self.interp_base + interp_parsed.entry_point;
+            let entry = self
+                .interp_base
+                .checked_add(interp_parsed.entry_point)
+                .ok_or(ElfLoadError::OverlappingSegments)?;
             (entry, self.interp_base)
         } else {
             // Static binary — entry is the exe's own entry point.
             let entry = match parsed.elf_type {
                 ElfType::Exec => parsed.entry_point,
-                ElfType::Dyn => exe_base + parsed.entry_point,
+                ElfType::Dyn => exe_base
+                    .checked_add(parsed.entry_point)
+                    .ok_or(ElfLoadError::OverlappingSegments)?,
             };
             (entry, 0u64)
         };
@@ -307,7 +312,9 @@ impl ElfLoader for InterpreterLoader {
         // 5. Build auxiliary vector.
         let at_entry = match parsed.elf_type {
             ElfType::Exec => parsed.entry_point,
-            ElfType::Dyn => exe_base + parsed.entry_point,
+            ElfType::Dyn => exe_base
+                .checked_add(parsed.entry_point)
+                .ok_or(ElfLoadError::OverlappingSegments)?,
         };
 
         let auxv = alloc::vec![
@@ -1199,11 +1206,6 @@ mod tests {
         found
     }
 
-    /// Helper: find a value in collected auxv entries.
-    fn find_auxv(entries: &[(u64, u64)], key: u64) -> Option<u64> {
-        entries.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
-    }
-
     #[test]
     fn end_to_end_static_elf_load() {
         // 1. Build a synthetic ET_EXEC ELF.
@@ -1271,7 +1273,7 @@ mod tests {
         // For ET_EXEC, exe_base == 0.
         let parsed = parse_elf(&elf).unwrap();
         let expected_phdr = parsed.load_bias + parsed.phdr_offset;
-        let at_phdr = find_auxv(&stack_auxv, auxv::AT_PHDR).expect("AT_PHDR must be in stack auxv");
+        let at_phdr = auxv_get(&stack_auxv, auxv::AT_PHDR).expect("AT_PHDR must be in stack auxv");
         assert_eq!(
             at_phdr, expected_phdr,
             "AT_PHDR should point to exe's phdr table in memory"
@@ -1279,17 +1281,17 @@ mod tests {
 
         // AT_ENTRY must equal exe's entry point.
         let at_entry =
-            find_auxv(&stack_auxv, auxv::AT_ENTRY).expect("AT_ENTRY must be in stack auxv");
+            auxv_get(&stack_auxv, auxv::AT_ENTRY).expect("AT_ENTRY must be in stack auxv");
         assert_eq!(at_entry, exe_entry, "AT_ENTRY should be exe's entry point");
 
         // AT_PAGESZ must be present and == 4096.
         let at_pagesz =
-            find_auxv(&stack_auxv, auxv::AT_PAGESZ).expect("AT_PAGESZ must be in stack auxv");
+            auxv_get(&stack_auxv, auxv::AT_PAGESZ).expect("AT_PAGESZ must be in stack auxv");
         assert_eq!(at_pagesz, 4096, "AT_PAGESZ should be 4096");
 
         // AT_RANDOM must point to the random bytes we provided.
         let at_random_ptr =
-            find_auxv(&stack_auxv, auxv::AT_RANDOM).expect("AT_RANDOM must be in stack auxv");
+            auxv_get(&stack_auxv, auxv::AT_RANDOM).expect("AT_RANDOM must be in stack auxv");
         let random_offset = (at_random_ptr - stack_base) as usize;
         assert_eq!(
             &stack[random_offset..random_offset + 16],
@@ -1362,14 +1364,14 @@ mod tests {
         // AT_ENTRY == exe's entry point (this is what ld-musl reads
         // to find the program's main).
         let at_entry =
-            find_auxv(&stack_auxv, auxv::AT_ENTRY).expect("AT_ENTRY must be in stack auxv");
+            auxv_get(&stack_auxv, auxv::AT_ENTRY).expect("AT_ENTRY must be in stack auxv");
         assert_eq!(
             at_entry, exe_entry,
             "AT_ENTRY should be the exe's entry point, not the interpreter's"
         );
 
         // AT_BASE == interp_base (interpreter's load address).
-        let at_base = find_auxv(&stack_auxv, auxv::AT_BASE).expect("AT_BASE must be in stack auxv");
+        let at_base = auxv_get(&stack_auxv, auxv::AT_BASE).expect("AT_BASE must be in stack auxv");
         assert_eq!(
             at_base, expected_interp_base,
             "AT_BASE should be the interpreter's base address"
@@ -1378,7 +1380,7 @@ mod tests {
         // AT_PHDR = exe_base + load_bias + phdr_offset.
         let parsed_exe = parse_elf(&exe_elf).unwrap();
         let expected_phdr = parsed_exe.load_bias + parsed_exe.phdr_offset;
-        let at_phdr = find_auxv(&stack_auxv, auxv::AT_PHDR).expect("AT_PHDR must be in stack auxv");
+        let at_phdr = auxv_get(&stack_auxv, auxv::AT_PHDR).expect("AT_PHDR must be in stack auxv");
         assert_eq!(
             at_phdr, expected_phdr,
             "AT_PHDR should point to exe's program header table in memory"
@@ -1386,7 +1388,7 @@ mod tests {
 
         // AT_RANDOM points to the random bytes we provided.
         let at_random_ptr =
-            find_auxv(&stack_auxv, auxv::AT_RANDOM).expect("AT_RANDOM must be in stack auxv");
+            auxv_get(&stack_auxv, auxv::AT_RANDOM).expect("AT_RANDOM must be in stack auxv");
         let random_offset = (at_random_ptr - stack_base) as usize;
         assert_eq!(
             &stack[random_offset..random_offset + 16],

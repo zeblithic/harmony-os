@@ -80,8 +80,11 @@ impl LibraryServer {
 
 impl FileServer for LibraryServer {
     fn walk(&mut self, fid: Fid, new_fid: Fid, name: &str) -> Result<QPath, IpcError> {
-        // Validate source fid exists (root fid comes from clone_fid).
-        self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
+        // Only directory fids (root, name == "") may be walked.
+        let source = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
+        if !source.name.is_empty() {
+            return Err(IpcError::InvalidFid);
+        }
         if self.fids.contains_key(&new_fid) {
             return Err(IpcError::InvalidFid);
         }
@@ -355,6 +358,17 @@ mod tests {
         // new_fid 1 is already in use
         assert_eq!(
             srv.walk(0, 1, "ld-musl-aarch64.so.1"),
+            Err(IpcError::InvalidFid)
+        );
+    }
+
+    #[test]
+    fn walk_from_non_directory_fid_rejected() {
+        let mut srv = test_server();
+        srv.walk(0, 1, "libc.so").unwrap();
+        // fid 1 points to a regular file — walks from it should fail.
+        assert_eq!(
+            srv.walk(1, 2, "ld-musl-aarch64.so.1"),
             Err(IpcError::InvalidFid)
         );
     }
