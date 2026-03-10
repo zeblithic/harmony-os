@@ -16,12 +16,16 @@ use harmony_microkernel::{Fid, FileStat, FileType, IpcError, OpenMode, QPath};
 // ── Linux errno constants ───────────────────────────────────────────
 
 const EPERM: i64 = -1;
+const ESRCH: i64 = -3;
 const EBADF: i64 = -9;
+const EFAULT: i64 = -14;
 const ENOMEM: i64 = -12;
 const EINVAL: i64 = -22;
 const ENOTTY: i64 = -25;
-const ESRCH: i64 = -3;
+const ESPIPE: i64 = -29;
+const ERANGE: i64 = -34;
 const ENOSYS: i64 = -38;
+const EOVERFLOW: i64 = -75;
 
 fn ipc_err_to_errno(e: IpcError) -> i64 {
     match e {
@@ -127,6 +131,30 @@ pub enum LinuxSyscall {
         old_limit_buf: u64,
     },
     Rseq,
+    Writev {
+        fd: i32,
+        iov: u64,
+        iovcnt: i32,
+    },
+    Lseek {
+        fd: i32,
+        offset: i64,
+        whence: i32,
+    },
+    Getrandom {
+        buf: u64,
+        buflen: u64,
+        flags: u32,
+    },
+    Getcwd {
+        buf: u64,
+        size: u64,
+    },
+    Readlink {
+        pathname: u64,
+        buf: u64,
+        bufsiz: u64,
+    },
     Unknown {
         nr: u64,
     },
@@ -150,6 +178,11 @@ impl LinuxSyscall {
             5 => LinuxSyscall::Fstat {
                 fd: args[0] as i32,
                 buf: args[1],
+            },
+            8 => LinuxSyscall::Lseek {
+                fd: args[0] as i32,
+                offset: args[1] as i64,
+                whence: args[2] as i32,
             },
             9 => LinuxSyscall::Mmap {
                 addr: args[0],
@@ -175,8 +208,22 @@ impl LinuxSyscall {
                 fd: args[0] as i32,
                 request: args[1],
             },
+            20 => LinuxSyscall::Writev {
+                fd: args[0] as i32,
+                iov: args[1],
+                iovcnt: args[2] as i32,
+            },
             60 => LinuxSyscall::Exit {
                 code: args[0] as i32,
+            },
+            79 => LinuxSyscall::Getcwd {
+                buf: args[0],
+                size: args[1],
+            },
+            89 => LinuxSyscall::Readlink {
+                pathname: args[0],
+                buf: args[1],
+                bufsiz: args[2],
             },
             158 => LinuxSyscall::ArchPrctl {
                 code: args[0] as i32,
@@ -198,6 +245,11 @@ impl LinuxSyscall {
                 new_limit: args[2],
                 old_limit_buf: args[3],
             },
+            318 => LinuxSyscall::Getrandom {
+                buf: args[0],
+                buflen: args[1],
+                flags: args[2] as u32,
+            },
             334 => LinuxSyscall::Rseq,
             _ => LinuxSyscall::Unknown { nr },
         }
@@ -209,6 +261,10 @@ impl LinuxSyscall {
     /// (aarch64 uses the generic syscall table).
     pub fn from_aarch64(nr: u64, args: [u64; 6]) -> Self {
         match nr {
+            17 => LinuxSyscall::Getcwd {
+                buf: args[0],
+                size: args[1],
+            },
             29 => LinuxSyscall::Ioctl {
                 fd: args[0] as i32,
                 request: args[1],
@@ -219,6 +275,11 @@ impl LinuxSyscall {
                 flags: args[2] as i32,
             },
             57 => LinuxSyscall::Close { fd: args[0] as i32 },
+            62 => LinuxSyscall::Lseek {
+                fd: args[0] as i32,
+                offset: args[1] as i64,
+                whence: args[2] as i32,
+            },
             63 => LinuxSyscall::Read {
                 fd: args[0] as i32,
                 buf: args[1],
@@ -229,6 +290,27 @@ impl LinuxSyscall {
                 buf: args[1],
                 count: args[2],
             },
+            66 => LinuxSyscall::Writev {
+                fd: args[0] as i32,
+                iov: args[1],
+                iovcnt: args[2] as i32,
+            },
+            // aarch64 nr 78 is readlinkat(dirfd, pathname, buf, bufsiz).
+            // readlinkat(dirfd, pathname, buf, bufsiz).  Only AT_FDCWD
+            // is supported; explicit dirfds return ENOSYS until a full
+            // implementation is added.
+            78 => {
+                const AT_FDCWD: i64 = -100;
+                if args[0] as i64 != AT_FDCWD {
+                    LinuxSyscall::Unknown { nr: 78 }
+                } else {
+                    LinuxSyscall::Readlink {
+                        pathname: args[1],
+                        buf: args[2],
+                        bufsiz: args[3],
+                    }
+                }
+            }
             80 => LinuxSyscall::Fstat {
                 fd: args[0] as i32,
                 buf: args[1],
@@ -266,6 +348,11 @@ impl LinuxSyscall {
                 resource: args[1] as i32,
                 new_limit: args[2],
                 old_limit_buf: args[3],
+            },
+            278 => LinuxSyscall::Getrandom {
+                buf: args[0],
+                buflen: args[1],
+                flags: args[2] as u32,
             },
             293 => LinuxSyscall::Rseq,
             _ => LinuxSyscall::Unknown { nr },
@@ -322,6 +409,24 @@ pub trait SyscallBackend {
     fn vm_find_free_region(&self, _len: usize) -> Result<u64, VmError> {
         Err(VmError::PageTableError)
     }
+
+    /// Write bytes into a mapped VM region.
+    ///
+    /// Default implementation uses an unsafe pointer write, which works
+    /// when the mapped address is directly accessible (arena, real VM
+    /// with identity-mapped memory). Mock backends override this to
+    /// record the write without dereferencing the simulated address.
+    ///
+    /// # Safety
+    /// The default implementation dereferences `addr` as a raw pointer.
+    /// Callers must ensure the region at `addr` is mapped and writable.
+    fn vm_write_bytes(&mut self, addr: u64, data: &[u8]) {
+        if !data.is_empty() {
+            unsafe {
+                core::ptr::copy_nonoverlapping(data.as_ptr(), addr as usize as *mut u8, data.len());
+            }
+        }
+    }
 }
 
 // ── MockBackend ─────────────────────────────────────────────────────
@@ -339,6 +444,9 @@ pub struct MockBackend {
     pub reads: Vec<(Fid, u64, u32)>,
     pub clunks: Vec<Fid>,
     pub stats: Vec<Fid>,
+    /// File content keyed by fid. Populated via `set_file_content` so that
+    /// `read()` returns real data instead of an empty Vec.
+    file_content: BTreeMap<Fid, Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -351,7 +459,14 @@ impl MockBackend {
             reads: Vec::new(),
             clunks: Vec::new(),
             stats: Vec::new(),
+            file_content: BTreeMap::new(),
         }
+    }
+
+    /// Register file content for a fid. Subsequent `read()` calls on this
+    /// fid will return data from the content buffer at the requested offset.
+    pub fn set_file_content(&mut self, fid: Fid, content: Vec<u8>) {
+        self.file_content.insert(fid, content);
     }
 }
 
@@ -374,10 +489,14 @@ pub struct VmMockBackend {
     pub vm_munmaps: Vec<(u64, usize)>,
     /// Recorded vm_mprotect calls: (vaddr, len, flags).
     pub vm_mprotects: Vec<(u64, usize, PageFlags)>,
+    /// Recorded vm_write_bytes calls: (addr, data).
+    pub vm_writes: Vec<(u64, Vec<u8>)>,
     /// Next virtual address to hand out from find_free_region.
     next_vaddr: u64,
     /// Per-page budget remaining. When 0, vm_mmap returns BudgetExceeded.
     budget_pages: usize,
+    /// File content keyed by fid.
+    file_content: BTreeMap<Fid, Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -393,9 +512,16 @@ impl VmMockBackend {
             vm_mmaps: Vec::new(),
             vm_munmaps: Vec::new(),
             vm_mprotects: Vec::new(),
+            vm_writes: Vec::new(),
             next_vaddr: 0x1_0000, // start above null guard
             budget_pages,
+            file_content: BTreeMap::new(),
         }
+    }
+
+    /// Register file content for a fid.
+    pub fn set_file_content(&mut self, fid: Fid, content: Vec<u8>) {
+        self.file_content.insert(fid, content);
     }
 }
 
@@ -414,7 +540,14 @@ impl SyscallBackend for MockBackend {
 
     fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
         self.reads.push((fid, offset, count));
-        Ok(Vec::new())
+        // Return file content if registered for this fid.
+        if let Some(content) = self.file_content.get(&fid) {
+            let start = (offset as usize).min(content.len());
+            let end = (start + count as usize).min(content.len());
+            Ok(content[start..end].to_vec())
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     fn write(&mut self, fid: Fid, _offset: u64, data: &[u8]) -> Result<u32, IpcError> {
@@ -453,7 +586,13 @@ impl SyscallBackend for VmMockBackend {
 
     fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
         self.reads.push((fid, offset, count));
-        Ok(Vec::new())
+        if let Some(content) = self.file_content.get(&fid) {
+            let start = (offset as usize).min(content.len());
+            let end = (start + count as usize).min(content.len());
+            Ok(content[start..end].to_vec())
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     fn write(&mut self, fid: Fid, _offset: u64, data: &[u8]) -> Result<u32, IpcError> {
@@ -526,6 +665,11 @@ impl SyscallBackend for VmMockBackend {
             return Err(VmError::OutOfMemory);
         }
         Ok(self.next_vaddr)
+    }
+
+    fn vm_write_bytes(&mut self, addr: u64, data: &[u8]) {
+        // Record but do NOT dereference — addresses are simulated.
+        self.vm_writes.push((addr, data.to_vec()));
     }
 }
 
@@ -728,6 +872,9 @@ pub struct Linuxulator<B: SyscallBackend> {
     vm_brk_base: u64,
     /// VM-backed brk: current program break.
     vm_brk_current: u64,
+    /// Call counter for getrandom — ensures repeated calls to the same
+    /// buffer address produce distinct output.
+    getrandom_counter: u64,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -748,6 +895,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             chardev_fids: Vec::new(),
             vm_brk_base: 0,
             vm_brk_current: 0,
+            getrandom_counter: 0,
         }
     }
 
@@ -917,6 +1065,17 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 old_limit_buf,
             } => self.sys_prlimit64(pid, resource, new_limit, old_limit_buf as usize),
             LinuxSyscall::Rseq => ENOSYS,
+            LinuxSyscall::Writev { fd, iov, iovcnt } => self.sys_writev(fd, iov as usize, iovcnt),
+            LinuxSyscall::Lseek { fd, offset, whence } => self.sys_lseek(fd, offset, whence),
+            LinuxSyscall::Getrandom { buf, buflen, flags } => {
+                self.sys_getrandom(buf as usize, buflen as usize, flags)
+            }
+            LinuxSyscall::Getcwd { buf, size } => self.sys_getcwd(buf as usize, size as usize),
+            LinuxSyscall::Readlink {
+                pathname,
+                buf,
+                bufsiz,
+            } => self.sys_readlink(pathname, buf, bufsiz),
             LinuxSyscall::Unknown { .. } => ENOSYS,
         }
     }
@@ -1139,21 +1298,22 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.vm_brk_current as i64
     }
 
-    /// Linux mmap(2): map anonymous memory.
+    /// Linux mmap(2): map memory (anonymous or file-backed).
     ///
     /// When the backend supports VM operations, delegates to the VM layer.
     /// Otherwise uses the MemoryArena allocator.
     ///
-    /// Only `MAP_ANONYMOUS` is supported. Returns the mapped address or a
-    /// negative errno.
+    /// Supports both `MAP_ANONYMOUS` (zeroed pages) and file-backed mappings
+    /// (reads file content from the backend via the fd table). Returns the
+    /// mapped address or a negative errno.
     fn sys_mmap(
         &mut self,
         addr: u64,
         length: u64,
         prot: i32,
         flags: i32,
-        _fd: i32,
-        _offset: u64,
+        fd: i32,
+        offset: u64,
     ) -> i64 {
         const MAP_ANONYMOUS: i32 = 0x20;
         const MAP_FIXED: i32 = 0x10;
@@ -1161,12 +1321,90 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if length == 0 {
             return EINVAL;
         }
-        if flags & MAP_ANONYMOUS == 0 {
-            return EINVAL; // file-backed mmap not supported
+
+        // W^X enforcement: reject simultaneous write+execute.
+        if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+            return EINVAL;
         }
 
+        // NOTE: Linux requires page-aligned mmap offsets because it maps
+        // file pages directly from the page cache.  Our emulator reads
+        // bytes via 9P and copies them, so sub-page offsets work correctly.
+        // No alignment check here — callers (including the ELF loader)
+        // may pass arbitrary file offsets.
+
+        let is_anonymous = flags & MAP_ANONYMOUS != 0;
+
+        // For file-backed mappings, validate the fd up front.
+        let file_fid = if !is_anonymous {
+            match self.fd_table.get(&fd) {
+                Some(entry) => Some(entry.fid),
+                None => return EBADF,
+            }
+        } else {
+            None
+        };
+
         if self.backend.has_vm_support() {
-            return self.sys_mmap_vm(addr, length, prot, flags);
+            if let Some(fid) = file_fid {
+                // File-backed: map writable (without execute) so we can
+                // copy data in, then mprotect to the caller's requested
+                // permissions.  This avoids a transient W+X window.
+                let write_prot = (prot | PROT_READ | PROT_WRITE) & !PROT_EXEC;
+                let mapped = self.sys_mmap_vm(addr, length, write_prot, flags);
+                if mapped < 0 {
+                    return mapped;
+                }
+                let len = match (length as usize).checked_add(PAGE_SIZE - 1) {
+                    Some(v) => v & !(PAGE_SIZE - 1),
+                    None => return EINVAL,
+                };
+                // 9P read count is u32 — cap to avoid truncation.
+                // Mappings > 4 GiB are not expected in practice (musl
+                // .so files are a few MiB at most).
+                let capped = len.min(u32::MAX as usize) as u32;
+                match self.backend.read(fid, offset, capped) {
+                    Ok(data) => {
+                        let copy_len = data.len().min(len);
+                        if copy_len > 0 {
+                            self.backend
+                                .vm_write_bytes(mapped as u64, &data[..copy_len]);
+                        }
+                        // Zero any tail bytes beyond file data (vm_mmap
+                        // does not guarantee zeroed pages).  Write in
+                        // page-sized chunks to bound transient allocation.
+                        let tail = len - copy_len;
+                        if tail > 0 {
+                            let chunk = alloc::vec![0u8; PAGE_SIZE.min(tail)];
+                            let mut written = 0usize;
+                            while written < tail {
+                                let n = chunk.len().min(tail - written);
+                                self.backend.vm_write_bytes(
+                                    mapped as u64 + (copy_len + written) as u64,
+                                    &chunk[..n],
+                                );
+                                written += n;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = self.backend.vm_munmap(mapped as u64, len);
+                        return ipc_err_to_errno(e);
+                    }
+                }
+                // Restore the caller's requested permissions.
+                if write_prot != prot {
+                    let page_flags = prot_to_page_flags(prot);
+                    if let Err(e) = self.backend.vm_mprotect(mapped as u64, len, page_flags) {
+                        let _ = self.backend.vm_munmap(mapped as u64, len);
+                        return vm_err_to_errno(e);
+                    }
+                }
+                return mapped;
+            } else {
+                // Anonymous: allocate with requested permissions directly.
+                return self.sys_mmap_vm(addr, length, prot, flags);
+            }
         }
 
         // Arena fallback path.
@@ -1174,7 +1412,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return ENOMEM; // arena allocator cannot place at fixed address
         }
         let _ = addr; // hint addr is intentionally unused (no MAP_FIXED support)
-        let len = ((length as usize) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let len = match (length as usize).checked_add(PAGE_SIZE - 1) {
+            Some(v) => v & !(PAGE_SIZE - 1),
+            None => return EINVAL,
+        };
         if len > self.arena.mmap_top.saturating_sub(self.arena.brk_offset) {
             return ENOMEM;
         }
@@ -1185,6 +1426,28 @@ impl<B: SyscallBackend> Linuxulator<B> {
             core::ptr::write_bytes(ptr as *mut u8, 0, len);
         }
         self.arena.mmap_regions.push((self.arena.mmap_top, len));
+
+        // For file-backed arena mappings, read file content into the region.
+        if let Some(fid) = file_fid {
+            let capped = len.min(u32::MAX as usize) as u32;
+            match self.backend.read(fid, offset, capped) {
+                Ok(data) => {
+                    let copy_len = data.len().min(len);
+                    if copy_len > 0 {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, copy_len);
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Reclaim the arena allocation and return the error.
+                    self.arena.mmap_top += len;
+                    self.arena.mmap_regions.pop();
+                    return ipc_err_to_errno(e);
+                }
+            }
+        }
+
         ptr as i64
     }
 
@@ -1192,7 +1455,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
     fn sys_mmap_vm(&mut self, addr: u64, length: u64, prot: i32, flags: i32) -> i64 {
         const MAP_FIXED: i32 = 0x10;
 
-        let len = ((length as usize) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let len = match (length as usize).checked_add(PAGE_SIZE - 1) {
+            Some(v) => v & !(PAGE_SIZE - 1),
+            None => return EINVAL,
+        };
         let page_flags = prot_to_page_flags(prot);
 
         let vaddr = if flags & MAP_FIXED != 0 {
@@ -1251,7 +1517,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if addr & (PAGE_SIZE as u64 - 1) != 0 {
             return EINVAL; // must be page-aligned
         }
-        let len = ((length as usize) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        // W^X enforcement: reject simultaneous write+execute.
+        if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+            return EINVAL;
+        }
+        let len = match (length as usize).checked_add(PAGE_SIZE - 1) {
+            Some(v) => v & !(PAGE_SIZE - 1),
+            None => return EINVAL,
+        };
         let page_flags = prot_to_page_flags(prot);
         match self.backend.vm_mprotect(addr, len, page_flags) {
             Ok(()) => 0,
@@ -1344,6 +1617,170 @@ impl<B: SyscallBackend> Linuxulator<B> {
             }
             _ => EINVAL,
         }
+    }
+
+    /// Linux writev(2): write from multiple buffers (scatter-gather).
+    ///
+    /// Iterates `iovcnt` iovec structs at `iov_ptr`. Each iovec is 16 bytes:
+    /// `iov_base: u64` + `iov_len: u64`. Calls `sys_write` for each buffer
+    /// and returns the total bytes written.
+    fn sys_writev(&mut self, fd: i32, iov_ptr: usize, iovcnt: i32) -> i64 {
+        const IOV_MAX: i32 = 1024;
+        if iovcnt == 0 {
+            return 0; // Linux permits zero iovcnt.
+        }
+        if !(1..=IOV_MAX).contains(&iovcnt) {
+            return EINVAL;
+        }
+        if !self.fd_table.contains_key(&fd) {
+            return EBADF;
+        }
+
+        let mut total: i64 = 0;
+        for i in 0..iovcnt as usize {
+            let iov_addr = iov_ptr + i * 16;
+            // Each iovec is { iov_base: *void, iov_len: size_t } — 16 bytes on 64-bit.
+            let base = unsafe { core::ptr::read_unaligned(iov_addr as *const u64) } as usize;
+            let len = unsafe { core::ptr::read_unaligned((iov_addr + 8) as *const u64) } as usize;
+
+            if len == 0 {
+                continue;
+            }
+            let result = self.sys_write(fd, base, len);
+            if result < 0 {
+                // If we haven't written anything yet, return the error.
+                // Otherwise return what we've written so far (POSIX partial write).
+                return if total == 0 { result } else { total };
+            }
+            total = total.saturating_add(result);
+        }
+        total
+    }
+
+    /// Linux lseek(2): reposition file offset.
+    ///
+    /// - SEEK_SET (0): set offset to `offset`
+    /// - SEEK_CUR (1): set offset to current + `offset`
+    /// - SEEK_END (2): set offset to file size + `offset`
+    fn sys_lseek(&mut self, fd: i32, offset: i64, whence: i32) -> i64 {
+        const SEEK_SET: i32 = 0;
+        const SEEK_CUR: i32 = 1;
+        const SEEK_END: i32 = 2;
+
+        let entry = match self.fd_table.get(&fd) {
+            Some(e) => *e,
+            None => return EBADF,
+        };
+
+        // Character devices (stdin/stdout/stderr) are not seekable.
+        if self.chardev_fids.contains(&entry.fid) {
+            return ESPIPE;
+        }
+
+        let new_offset = match whence {
+            SEEK_SET => offset,
+            SEEK_CUR => match (entry.offset as i64).checked_add(offset) {
+                Some(v) => v,
+                None => return EOVERFLOW,
+            },
+            SEEK_END => {
+                let stat = match self.backend.stat(entry.fid) {
+                    Ok(s) => s,
+                    Err(e) => return ipc_err_to_errno(e),
+                };
+                // Guard against files larger than i64::MAX — the
+                // `as i64` cast would wrap to negative.
+                if stat.size > i64::MAX as u64 {
+                    return EOVERFLOW;
+                }
+                match (stat.size as i64).checked_add(offset) {
+                    Some(v) => v,
+                    None => return EOVERFLOW,
+                }
+            }
+            _ => return EINVAL,
+        };
+
+        if new_offset < 0 {
+            return EINVAL;
+        }
+
+        self.fd_table.get_mut(&fd).unwrap().offset = new_offset as u64;
+        new_offset
+    }
+
+    /// Linux getrandom(2): fill buffer with pseudo-random bytes.
+    ///
+    /// Uses a deterministic LCG seeded from the buffer address and a
+    /// monotonic call counter so that repeated calls to the same address
+    /// produce distinct output.  This is sufficient for ld-musl stack
+    /// canaries and ASLR seeds in the Linuxulator environment (no real
+    /// security boundary).
+    fn sys_getrandom(&mut self, buf_ptr: usize, buflen: usize, _flags: u32) -> i64 {
+        if buflen == 0 {
+            return 0;
+        }
+        if buf_ptr == 0 {
+            return EFAULT;
+        }
+        // Linux caps getrandom at 33554431 bytes (~32 MiB).  Guard
+        // against `buflen as i64` wrapping to a negative error code.
+        const GETRANDOM_MAX: usize = 33_554_431;
+        if buflen > GETRANDOM_MAX {
+            return EINVAL;
+        }
+        let counter = self.getrandom_counter;
+        self.getrandom_counter = counter.wrapping_add(1);
+        // Seed from address + counter, then iterate the LCG so each
+        // byte depends on the previous state (not an independent seed
+        // differing by 1, which would produce near-linear output).
+        let mut state = (buf_ptr as u64)
+            .wrapping_add(counter)
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        // Generate and write in page-sized chunks to bound transient
+        // allocation (buflen can be up to ~32 MiB).
+        const CHUNK: usize = 4096;
+        let mut written = 0usize;
+        while written < buflen {
+            let n = CHUNK.min(buflen - written);
+            let mut chunk = [0u8; CHUNK];
+            for byte in chunk[..n].iter_mut() {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *byte = (state >> 33) as u8;
+            }
+            self.backend
+                .vm_write_bytes(buf_ptr as u64 + written as u64, &chunk[..n]);
+            written += n;
+        }
+        buflen as i64
+    }
+
+    /// Linux getcwd(2): get current working directory.
+    ///
+    /// Always returns "/" since the Linuxulator uses a flat namespace.
+    /// The raw syscall returns the number of bytes written (including
+    /// the null terminator), not the buffer pointer.  Musl calls the
+    /// raw syscall and interprets the return value as a byte count.
+    fn sys_getcwd(&mut self, buf_ptr: usize, size: usize) -> i64 {
+        if buf_ptr == 0 {
+            return EFAULT;
+        }
+        if size < 2 {
+            return ERANGE; // buffer too small for "/\0"
+        }
+        self.backend.vm_write_bytes(buf_ptr as u64, b"/\0");
+        2 // bytes written: '/' + '\0'
+    }
+
+    /// Linux readlink(2): read the value of a symbolic link.
+    ///
+    /// Returns ENOSYS — ld-musl has fallbacks for /proc/self/exe and
+    /// similar paths.
+    fn sys_readlink(&self, _pathname: u64, _buf: u64, _bufsiz: u64) -> i64 {
+        ENOSYS
     }
 }
 
@@ -2091,6 +2528,525 @@ mod tests {
             count: msg.len() as u64,
         });
         assert_eq!(result, msg.len() as i64);
+    }
+
+    // ── sys_writev tests ────────────────────────────────────────────
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_writev_single_iovec() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        let msg = b"Hello writev\n";
+        // Build a single iovec: { iov_base: *msg, iov_len: 13 }
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(msg.as_ptr() as u64).to_le_bytes());
+        iov[8..16].copy_from_slice(&(msg.len() as u64).to_le_bytes());
+
+        // writev(stdout=1, iov, iovcnt=1)  — x86_64 nr=20
+        let result = lx.handle_syscall(20, [1, iov.as_ptr() as u64, 1, 0, 0, 0]);
+        assert_eq!(result, msg.len() as i64);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_writev_multiple_iovecs() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        let msg1 = b"Hello";
+        let msg2 = b" world\n";
+        // Build two iovecs (32 bytes total)
+        let mut iovs = [0u8; 32];
+        iovs[0..8].copy_from_slice(&(msg1.as_ptr() as u64).to_le_bytes());
+        iovs[8..16].copy_from_slice(&(msg1.len() as u64).to_le_bytes());
+        iovs[16..24].copy_from_slice(&(msg2.as_ptr() as u64).to_le_bytes());
+        iovs[24..32].copy_from_slice(&(msg2.len() as u64).to_le_bytes());
+
+        let result = lx.handle_syscall(20, [1, iovs.as_ptr() as u64, 2, 0, 0, 0]);
+        assert_eq!(result, (msg1.len() + msg2.len()) as i64);
+
+        // Verify both chunks were written to the backend
+        let stdout_fid = lx.fid_for_fd(1).unwrap();
+        let stdout_writes: Vec<_> = lx
+            .backend()
+            .writes
+            .iter()
+            .filter(|(fid, _)| *fid == stdout_fid)
+            .collect();
+        assert_eq!(stdout_writes.len(), 2);
+        assert_eq!(stdout_writes[0].1, b"Hello");
+        assert_eq!(stdout_writes[1].1, b" world\n");
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_writev_bad_fd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let msg = b"test";
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(msg.as_ptr() as u64).to_le_bytes());
+        iov[8..16].copy_from_slice(&(msg.len() as u64).to_le_bytes());
+
+        let result = lx.handle_syscall(20, [99, iov.as_ptr() as u64, 1, 0, 0, 0]);
+        assert_eq!(result, EBADF);
+    }
+
+    // ── sys_lseek tests ────────────────────────────────────────────
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_lseek_set() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        // Open a file via openat to get fd 3
+        let path = b"/dev/serial/log\0";
+        let at_fdcwd = (-100i32) as u64;
+        let fd = lx.handle_syscall(257, [at_fdcwd, path.as_ptr() as u64, 0, 0, 0, 0]);
+        assert!(fd >= 0);
+
+        // lseek(fd, 42, SEEK_SET=0)  — x86_64 nr=8
+        let result = lx.handle_syscall(8, [fd as u64, 42, 0, 0, 0, 0]);
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_lseek_cur() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        let path = b"/dev/serial/log\0";
+        let at_fdcwd = (-100i32) as u64;
+        let fd = lx.handle_syscall(257, [at_fdcwd, path.as_ptr() as u64, 0, 0, 0, 0]);
+        assert!(fd >= 0);
+
+        // First seek to position 10
+        lx.handle_syscall(8, [fd as u64, 10, 0, 0, 0, 0]);
+        // Then seek +5 from current (SEEK_CUR=1)
+        let result = lx.handle_syscall(8, [fd as u64, 5, 1, 0, 0, 0]);
+        assert_eq!(result, 15);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_lseek_bad_fd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let result = lx.handle_syscall(8, [99, 0, 0, 0, 0, 0]);
+        assert_eq!(result, EBADF);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_lseek_bad_whence() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        // Open a file to get a seekable fd
+        let path = b"/dev/serial/log\0";
+        let at_fdcwd = (-100i32) as u64;
+        let fd = lx.handle_syscall(257, [at_fdcwd, path.as_ptr() as u64, 0, 0, 0, 0]);
+        assert!(fd >= 0);
+
+        // whence=99 is invalid
+        let result = lx.handle_syscall(8, [fd as u64, 0, 99, 0, 0, 0]);
+        assert_eq!(result, EINVAL);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_lseek_stdio_returns_espipe() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        // stdin (0), stdout (1), stderr (2) are character devices — not seekable.
+        for fd in 0..=2u64 {
+            let result = lx.handle_syscall(8, [fd, 0, 0, 0, 0, 0]);
+            assert_eq!(
+                result, ESPIPE,
+                "lseek on stdio fd {} should return ESPIPE",
+                fd
+            );
+        }
+    }
+
+    // ── sys_getrandom tests ────────────────────────────────────────
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_getrandom_fills_buffer() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let mut buf = [0u8; 32];
+        // getrandom(buf, 32, 0)  — x86_64 nr=318
+        let result = lx.handle_syscall(318, [buf.as_mut_ptr() as u64, 32, 0, 0, 0, 0]);
+        assert_eq!(result, 32);
+        // At least some bytes should be non-zero (deterministic LCG output)
+        assert!(
+            buf.iter().any(|&b| b != 0),
+            "getrandom should produce non-zero bytes"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_getrandom_zero_len() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let result = lx.handle_syscall(318, [0, 0, 0, 0, 0, 0]);
+        assert_eq!(result, 0);
+    }
+
+    // ── sys_getcwd tests ───────────────────────────────────────────
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_getcwd_returns_root() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let mut buf = [0xFFu8; 64];
+        // getcwd(buf, 64)  — x86_64 nr=79
+        let result = lx.handle_syscall(79, [buf.as_mut_ptr() as u64, 64, 0, 0, 0, 0]);
+        assert_eq!(result, 2); // raw syscall returns byte count, not pointer
+        assert_eq!(buf[0], b'/');
+        assert_eq!(buf[1], 0); // null terminator
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_getcwd_too_small() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let mut buf = [0u8; 1];
+        let result = lx.handle_syscall(79, [buf.as_mut_ptr() as u64, 1, 0, 0, 0, 0]);
+        assert_eq!(result, ERANGE);
+    }
+
+    // ── sys_readlink tests ─────────────────────────────────────────
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_readlink_returns_enosys() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let path = b"/proc/self/exe\0";
+        let mut buf = [0u8; 128];
+        // readlink(path, buf, 128)  — x86_64 nr=89
+        let result = lx.handle_syscall(
+            89,
+            [path.as_ptr() as u64, buf.as_mut_ptr() as u64, 128, 0, 0, 0],
+        );
+        assert_eq!(result, ENOSYS);
+    }
+
+    // ── from_x86_64 mapping tests for new syscalls ─────────────────
+
+    #[test]
+    fn from_x86_64_writev() {
+        let syscall = LinuxSyscall::from_x86_64(20, [1, 0x2000, 3, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Writev { fd, iov, iovcnt } => {
+                assert_eq!(fd, 1);
+                assert_eq!(iov, 0x2000);
+                assert_eq!(iovcnt, 3);
+            }
+            other => panic!("expected Writev, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_x86_64_lseek() {
+        let syscall = LinuxSyscall::from_x86_64(8, [3, 100, 0, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Lseek { fd, offset, whence } => {
+                assert_eq!(fd, 3);
+                assert_eq!(offset, 100);
+                assert_eq!(whence, 0);
+            }
+            other => panic!("expected Lseek, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_x86_64_getcwd() {
+        let syscall = LinuxSyscall::from_x86_64(79, [0x3000, 256, 0, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Getcwd { buf, size } => {
+                assert_eq!(buf, 0x3000);
+                assert_eq!(size, 256);
+            }
+            other => panic!("expected Getcwd, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_x86_64_readlink() {
+        let syscall = LinuxSyscall::from_x86_64(89, [0x1000, 0x2000, 128, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Readlink {
+                pathname,
+                buf,
+                bufsiz,
+            } => {
+                assert_eq!(pathname, 0x1000);
+                assert_eq!(buf, 0x2000);
+                assert_eq!(bufsiz, 128);
+            }
+            other => panic!("expected Readlink, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_x86_64_getrandom() {
+        let syscall = LinuxSyscall::from_x86_64(318, [0x4000, 32, 0, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Getrandom { buf, buflen, flags } => {
+                assert_eq!(buf, 0x4000);
+                assert_eq!(buflen, 32);
+                assert_eq!(flags, 0);
+            }
+            other => panic!("expected Getrandom, got {:?}", other),
+        }
+    }
+
+    // ── from_aarch64 mapping tests for new syscalls ─────────────────
+
+    #[test]
+    fn from_aarch64_writev() {
+        let syscall = LinuxSyscall::from_aarch64(66, [1, 0x2000, 3, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Writev { fd, iov, iovcnt } => {
+                assert_eq!(fd, 1);
+                assert_eq!(iov, 0x2000);
+                assert_eq!(iovcnt, 3);
+            }
+            other => panic!("expected Writev, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_aarch64_lseek() {
+        let syscall = LinuxSyscall::from_aarch64(62, [3, 100, 0, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Lseek { fd, offset, whence } => {
+                assert_eq!(fd, 3);
+                assert_eq!(offset, 100);
+                assert_eq!(whence, 0);
+            }
+            other => panic!("expected Lseek, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_aarch64_getcwd() {
+        let syscall = LinuxSyscall::from_aarch64(17, [0x3000, 256, 0, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Getcwd { buf, size } => {
+                assert_eq!(buf, 0x3000);
+                assert_eq!(size, 256);
+            }
+            other => panic!("expected Getcwd, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_aarch64_readlink() {
+        // aarch64 nr 78 = readlinkat(dirfd, pathname, buf, bufsiz).
+        // Only AT_FDCWD (-100) is supported; other dirfds map to Unknown.
+        let at_fdcwd = (-100i64) as u64;
+        let syscall = LinuxSyscall::from_aarch64(78, [at_fdcwd, 0x1000, 0x2000, 128, 0, 0]);
+        match syscall {
+            LinuxSyscall::Readlink {
+                pathname,
+                buf,
+                bufsiz,
+            } => {
+                assert_eq!(pathname, 0x1000);
+                assert_eq!(buf, 0x2000);
+                assert_eq!(bufsiz, 128);
+            }
+            other => panic!("expected Readlink, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_aarch64_getrandom() {
+        let syscall = LinuxSyscall::from_aarch64(278, [0x4000, 32, 0, 0, 0, 0]);
+        match syscall {
+            LinuxSyscall::Getrandom { buf, buflen, flags } => {
+                assert_eq!(buf, 0x4000);
+                assert_eq!(buflen, 32);
+                assert_eq!(flags, 0);
+            }
+            other => panic!("expected Getrandom, got {:?}", other),
+        }
+    }
+
+    // ── File-backed mmap tests (arena path) ──────────────────────────
+
+    #[test]
+    fn file_backed_mmap_reads_content() {
+        let mut mock = MockBackend::new();
+        // Pre-register content for fid 100 (the first fid alloc_fid will return).
+        let file_data = vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE];
+        mock.set_file_content(100, file_data.clone());
+        let mut lx = Linuxulator::with_arena(mock, 64 * 1024);
+
+        // Open a file via openat to get an fd. This will use fid 100.
+        let path = b"/lib/test.so\0";
+        let at_fdcwd = (-100i32) as u64;
+        let fd = lx.handle_syscall(257, [at_fdcwd, path.as_ptr() as u64, 0, 0, 0, 0]);
+        assert!(fd >= 0, "openat should succeed, got {}", fd);
+
+        // mmap with that fd (NOT MAP_ANONYMOUS). flags = MAP_PRIVATE (0x02).
+        // PROT_READ | PROT_WRITE = 3
+        let addr = lx.handle_syscall(9, [0, 4096, 3, 0x02, fd as u64, 0]);
+        assert!(
+            addr > 0,
+            "file-backed mmap should return valid address, got {}",
+            addr
+        );
+
+        // Verify the mapped memory contains the file content.
+        let mapped = unsafe { core::slice::from_raw_parts(addr as usize as *const u8, 4096) };
+        assert_eq!(
+            &mapped[..8],
+            &file_data[..],
+            "file content should be copied into mapped region"
+        );
+        // Rest should be zero-filled.
+        assert!(
+            mapped[8..].iter().all(|&b| b == 0),
+            "remaining bytes should be zero"
+        );
+    }
+
+    #[test]
+    fn file_backed_mmap_with_offset() {
+        let mut mock = MockBackend::new();
+        // File content: 16 bytes total.
+        let file_data: Vec<u8> = (0..16).collect();
+        mock.set_file_content(100, file_data);
+        let mut lx = Linuxulator::with_arena(mock, 64 * 1024);
+
+        let path = b"/lib/test.so\0";
+        let at_fdcwd = (-100i32) as u64;
+        let fd = lx.handle_syscall(257, [at_fdcwd, path.as_ptr() as u64, 0, 0, 0, 0]);
+        assert!(fd >= 0);
+
+        // mmap at file offset 8.
+        let addr = lx.handle_syscall(9, [0, 4096, 3, 0x02, fd as u64, 8]);
+        assert!(
+            addr > 0,
+            "file-backed mmap with offset should succeed, got {}",
+            addr
+        );
+
+        // Should contain bytes 8..16 from the file (8 bytes), then zeros.
+        let mapped = unsafe { core::slice::from_raw_parts(addr as usize as *const u8, 4096) };
+        assert_eq!(
+            &mapped[..8],
+            &[8, 9, 10, 11, 12, 13, 14, 15],
+            "should read from offset 8"
+        );
+        assert!(
+            mapped[8..].iter().all(|&b| b == 0),
+            "remaining bytes should be zero"
+        );
+    }
+
+    #[test]
+    fn file_backed_mmap_bad_fd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::with_arena(mock, 64 * 1024);
+
+        // mmap with invalid fd (not MAP_ANONYMOUS). flags = MAP_PRIVATE (0x02).
+        let result = lx.handle_syscall(9, [0, 4096, 3, 0x02, 99, 0]);
+        assert_eq!(
+            result, EBADF,
+            "file-backed mmap with bad fd should return EBADF"
+        );
+    }
+
+    // ── File-backed mmap tests (VM path) ─────────────────────────────
+
+    #[test]
+    fn vm_file_backed_mmap_reads_content() {
+        let mut mock = VmMockBackend::new(16);
+        let file_data = vec![0x7F, b'E', b'L', b'F', 0x02, 0x01, 0x01, 0x00];
+        mock.set_file_content(100, file_data.clone());
+        let mut lx = Linuxulator::new(mock);
+
+        // Open a file.
+        let path = b"/lib/libc.so\0";
+        let at_fdcwd = (-100i32) as u64;
+        let fd = lx.handle_syscall(257, [at_fdcwd, path.as_ptr() as u64, 0, 0, 0, 0]);
+        assert!(fd >= 0);
+
+        // File-backed mmap via VM path.
+        let addr = lx.handle_syscall(9, [0, 4096, 3, 0x02, fd as u64, 0]);
+        assert!(
+            addr > 0,
+            "VM file-backed mmap should return valid address, got {}",
+            addr
+        );
+
+        // VM path should have recorded a vm_mmap call.
+        assert_eq!(lx.backend().vm_mmaps.len(), 1);
+
+        // Backend read should have been called for the file content.
+        let file_fid = lx.fid_for_fd(fd as i32).unwrap();
+        let mmap_reads: Vec<_> = lx
+            .backend()
+            .reads
+            .iter()
+            .filter(|(fid, _, _)| *fid == file_fid)
+            .collect();
+        assert!(
+            !mmap_reads.is_empty(),
+            "mmap should read file content via backend"
+        );
+
+        // File data should have been written to the mapped address via vm_write_bytes.
+        // Expect 2 writes: file content + zero-fill for the remainder of the page.
+        assert_eq!(lx.backend().vm_writes.len(), 2);
+        let (write_addr, write_data) = &lx.backend().vm_writes[0];
+        assert_eq!(*write_addr, addr as u64);
+        assert_eq!(write_data, &file_data);
+        // Second write zeroes the tail (4096 - 8 = 4088 bytes).
+        let (zero_addr, zero_data) = &lx.backend().vm_writes[1];
+        assert_eq!(*zero_addr, addr as u64 + file_data.len() as u64);
+        assert!(zero_data.iter().all(|&b| b == 0), "tail must be zeroed");
+    }
+
+    #[test]
+    fn vm_file_backed_mmap_bad_fd() {
+        let mock = VmMockBackend::new(16);
+        let mut lx = Linuxulator::new(mock);
+
+        // mmap with invalid fd (not MAP_ANONYMOUS).
+        let result = lx.handle_syscall(9, [0, 4096, 3, 0x02, 99, 0]);
+        assert_eq!(
+            result, EBADF,
+            "VM file-backed mmap with bad fd should return EBADF"
+        );
     }
 }
 

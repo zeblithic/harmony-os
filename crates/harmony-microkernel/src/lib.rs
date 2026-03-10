@@ -16,6 +16,8 @@ pub mod content_server;
 pub mod echo;
 #[cfg(feature = "kernel")]
 pub mod kernel;
+#[cfg(feature = "kernel")]
+pub mod library_server;
 pub mod namespace;
 pub mod serial_server;
 pub mod vm;
