@@ -1335,7 +1335,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 if mapped < 0 {
                     return mapped;
                 }
-                let len = ((length as usize) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                let len = match (length as usize).checked_add(PAGE_SIZE - 1) {
+                    Some(v) => v & !(PAGE_SIZE - 1),
+                    None => return EINVAL,
+                };
                 // 9P read count is u32 — cap to avoid truncation.
                 // Mappings > 4 GiB are not expected in practice (musl
                 // .so files are a few MiB at most).
@@ -1389,7 +1392,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return ENOMEM; // arena allocator cannot place at fixed address
         }
         let _ = addr; // hint addr is intentionally unused (no MAP_FIXED support)
-        let len = ((length as usize) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let len = match (length as usize).checked_add(PAGE_SIZE - 1) {
+            Some(v) => v & !(PAGE_SIZE - 1),
+            None => return EINVAL,
+        };
         if len > self.arena.mmap_top.saturating_sub(self.arena.brk_offset) {
             return ENOMEM;
         }
@@ -1429,7 +1435,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
     fn sys_mmap_vm(&mut self, addr: u64, length: u64, prot: i32, flags: i32) -> i64 {
         const MAP_FIXED: i32 = 0x10;
 
-        let len = ((length as usize) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let len = match (length as usize).checked_add(PAGE_SIZE - 1) {
+            Some(v) => v & !(PAGE_SIZE - 1),
+            None => return EINVAL,
+        };
         let page_flags = prot_to_page_flags(prot);
 
         let vaddr = if flags & MAP_FIXED != 0 {

@@ -157,11 +157,17 @@ fn load_real_musl_hello() {
             Ok(())
         }
 
-        fn stat(&mut self, _fid: Fid) -> Result<FileStat, IpcError> {
+        fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
+            let size = self
+                .fid_to_path
+                .get(&fid)
+                .and_then(|path| self.interp_files.get(path))
+                .map(|bytes| bytes.len() as u64)
+                .unwrap_or(0);
             Ok(FileStat {
                 qpath: 0,
                 name: Arc::from("fixture"),
-                size: 0,
+                size,
                 file_type: FileType::Regular,
             })
         }

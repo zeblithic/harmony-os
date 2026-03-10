@@ -55,6 +55,8 @@ pub enum ElfLoadError {
     InterpreterParseError(ElfError),
     BackendError(IpcError),
     OverlappingSegments,
+    /// A PT_LOAD segment has both W and X flags — rejected by W^X policy.
+    WXViolation,
 }
 
 // ── Load result ─────────────────────────────────────────────────────
@@ -205,14 +207,13 @@ impl InterpreterLoader {
                 }
             }
 
-            // W^X check: standard ELFs should not have segments that
-            // are both writable and executable.  If one appears, it is
-            // likely a malformed or intentionally exotic binary.
-            debug_assert!(
-                !(seg.flags.write && seg.flags.execute),
-                "W^X violation: segment at vaddr {:#x} is both W and X",
-                seg.vaddr,
-            );
+            // W^X enforcement: reject segments that are both writable
+            // and executable.  Standard toolchains never produce W+X
+            // segments; their presence indicates a malformed or
+            // intentionally exotic binary.
+            if seg.flags.write && seg.flags.execute {
+                return Err(ElfLoadError::WXViolation);
+            }
 
             // Restore the caller's intended permissions (remove
             // the temporary WRITABLE if segment is not writable).
