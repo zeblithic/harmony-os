@@ -255,7 +255,11 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
         Ok(FileStat {
             qpath: state.qpath,
             name: Arc::from(name),
-            size: 0, // stream/dynamic content
+            size: match state.qpath {
+                QPATH_MAC => 18, // "aa:bb:cc:dd:ee:ff\n"
+                QPATH_MTU => 5,  // "1500\n"
+                _ => 0,          // stream or dynamic content
+            },
             file_type,
         })
     }
@@ -404,6 +408,25 @@ mod tests {
         let st = srv.stat(2).unwrap();
         assert_eq!(&*st.name, "data");
         assert_eq!(st.file_type, FileType::Regular);
+        assert_eq!(st.size, 0); // streaming — size unknown
+    }
+
+    #[test]
+    fn stat_fixed_size_files() {
+        let mut srv = test_server();
+        srv.walk(0, 1, "genet0").unwrap();
+
+        srv.walk(1, 2, "mac").unwrap();
+        assert_eq!(srv.stat(2).unwrap().size, 18); // "aa:bb:cc:dd:ee:ff\n"
+
+        srv.walk(1, 3, "mtu").unwrap();
+        assert_eq!(srv.stat(3).unwrap().size, 5); // "1500\n"
+
+        srv.walk(1, 4, "stats").unwrap();
+        assert_eq!(srv.stat(4).unwrap().size, 0); // dynamic
+
+        srv.walk(1, 5, "link").unwrap();
+        assert_eq!(srv.stat(5).unwrap().size, 0); // dynamic
     }
 
     // ── Clunk tests ───────────────────────────────────────────────
