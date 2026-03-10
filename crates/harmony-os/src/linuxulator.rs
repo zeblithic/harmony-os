@@ -21,6 +21,7 @@ const ENOMEM: i64 = -12;
 const EINVAL: i64 = -22;
 const ENOTTY: i64 = -25;
 const ESRCH: i64 = -3;
+const ERANGE: i64 = -34;
 const ENOSYS: i64 = -38;
 
 fn ipc_err_to_errno(e: IpcError) -> i64 {
@@ -989,9 +990,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 old_limit_buf,
             } => self.sys_prlimit64(pid, resource, new_limit, old_limit_buf as usize),
             LinuxSyscall::Rseq => ENOSYS,
-            LinuxSyscall::Writev { fd, iov, iovcnt } => {
-                self.sys_writev(fd, iov as usize, iovcnt)
-            }
+            LinuxSyscall::Writev { fd, iov, iovcnt } => self.sys_writev(fd, iov as usize, iovcnt),
             LinuxSyscall::Lseek { fd, offset, whence } => self.sys_lseek(fd, offset, whence),
             LinuxSyscall::Getrandom { buf, buflen, flags } => {
                 self.sys_getrandom(buf as usize, buflen as usize, flags)
@@ -1449,8 +1448,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             let iov_addr = iov_ptr + i * 16;
             // Each iovec is { iov_base: *void, iov_len: size_t } — 16 bytes on 64-bit.
             let base = unsafe { core::ptr::read_unaligned(iov_addr as *const u64) } as usize;
-            let len =
-                unsafe { core::ptr::read_unaligned((iov_addr + 8) as *const u64) } as usize;
+            let len = unsafe { core::ptr::read_unaligned((iov_addr + 8) as *const u64) } as usize;
 
             if len == 0 {
                 continue;
@@ -1483,7 +1481,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         let new_offset = match whence {
             SEEK_SET => offset,
-            SEEK_CUR => entry.offset as i64 + offset,
+            SEEK_CUR => (entry.offset as i64).saturating_add(offset),
             SEEK_END => {
                 let stat = match self.backend.stat(entry.fid) {
                     Ok(s) => s,
@@ -1528,7 +1526,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// On success, returns the pointer to the buffer (Linux convention).
     fn sys_getcwd(&self, buf_ptr: usize, size: usize) -> i64 {
         if size < 2 {
-            return EINVAL; // need room for "/\0"
+            return ERANGE; // buffer too small for "/\0"
         }
         let cwd = b"/\0";
         unsafe {
@@ -2433,7 +2431,10 @@ mod tests {
         let result = lx.handle_syscall(318, [buf.as_mut_ptr() as u64, 32, 0, 0, 0, 0]);
         assert_eq!(result, 32);
         // At least some bytes should be non-zero (deterministic LCG output)
-        assert!(buf.iter().any(|&b| b != 0), "getrandom should produce non-zero bytes");
+        assert!(
+            buf.iter().any(|&b| b != 0),
+            "getrandom should produce non-zero bytes"
+        );
     }
 
     #[test]
@@ -2470,7 +2471,7 @@ mod tests {
 
         let mut buf = [0u8; 1];
         let result = lx.handle_syscall(79, [buf.as_mut_ptr() as u64, 1, 0, 0, 0, 0]);
-        assert_eq!(result, EINVAL);
+        assert_eq!(result, ERANGE);
     }
 
     // ── sys_readlink tests ─────────────────────────────────────────
@@ -2535,7 +2536,11 @@ mod tests {
     fn from_x86_64_readlink() {
         let syscall = LinuxSyscall::from_x86_64(89, [0x1000, 0x2000, 128, 0, 0, 0]);
         match syscall {
-            LinuxSyscall::Readlink { pathname, buf, bufsiz } => {
+            LinuxSyscall::Readlink {
+                pathname,
+                buf,
+                bufsiz,
+            } => {
                 assert_eq!(pathname, 0x1000);
                 assert_eq!(buf, 0x2000);
                 assert_eq!(bufsiz, 128);
@@ -2601,7 +2606,11 @@ mod tests {
     fn from_aarch64_readlink() {
         let syscall = LinuxSyscall::from_aarch64(78, [0x1000, 0x2000, 128, 0, 0, 0]);
         match syscall {
-            LinuxSyscall::Readlink { pathname, buf, bufsiz } => {
+            LinuxSyscall::Readlink {
+                pathname,
+                buf,
+                bufsiz,
+            } => {
                 assert_eq!(pathname, 0x1000);
                 assert_eq!(buf, 0x2000);
                 assert_eq!(bufsiz, 128);
