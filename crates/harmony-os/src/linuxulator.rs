@@ -295,13 +295,21 @@ impl LinuxSyscall {
                 iovcnt: args[2] as i32,
             },
             // aarch64 nr 78 is readlinkat(dirfd, pathname, buf, bufsiz).
-            // We ignore dirfd (args[0]) and map to Readlink with the
-            // remaining three arguments.
-            78 => LinuxSyscall::Readlink {
-                pathname: args[1],
-                buf: args[2],
-                bufsiz: args[3],
-            },
+            // readlinkat(dirfd, pathname, buf, bufsiz).  Only AT_FDCWD
+            // is supported; explicit dirfds return ENOSYS until a full
+            // implementation is added.
+            78 => {
+                const AT_FDCWD: i64 = -100;
+                if args[0] as i64 != AT_FDCWD {
+                    LinuxSyscall::Unknown { nr: 78 }
+                } else {
+                    LinuxSyscall::Readlink {
+                        pathname: args[1],
+                        buf: args[2],
+                        bufsiz: args[3],
+                    }
+                }
+            }
             80 => LinuxSyscall::Fstat {
                 fd: args[0] as i32,
                 buf: args[1],
@@ -1313,6 +1321,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return EINVAL;
         }
 
+        // NOTE: Linux requires page-aligned mmap offsets because it maps
+        // file pages directly from the page cache.  Our emulator reads
+        // bytes via 9P and copies them, so sub-page offsets work correctly.
+        // No alignment check here — callers (including the ELF loader)
+        // may pass arbitrary file offsets.
+
         let is_anonymous = flags & MAP_ANONYMOUS != 0;
 
         // For file-backed mappings, validate the fd up front.
@@ -1637,15 +1651,15 @@ impl<B: SyscallBackend> Linuxulator<B> {
         const SEEK_CUR: i32 = 1;
         const SEEK_END: i32 = 2;
 
-        // stdin/stdout/stderr are character devices — not seekable.
-        if (0..=2).contains(&fd) {
-            return ESPIPE;
-        }
-
         let entry = match self.fd_table.get(&fd) {
             Some(e) => *e,
             None => return EBADF,
         };
+
+        // Character devices (stdin/stdout/stderr) are not seekable.
+        if self.chardev_fids.contains(&entry.fid) {
+            return ESPIPE;
+        }
 
         let new_offset = match whence {
             SEEK_SET => offset,
@@ -2810,8 +2824,9 @@ mod tests {
     #[test]
     fn from_aarch64_readlink() {
         // aarch64 nr 78 = readlinkat(dirfd, pathname, buf, bufsiz).
-        // dirfd (args[0]) is ignored; Readlink maps args[1..3].
-        let syscall = LinuxSyscall::from_aarch64(78, [0xFF9C, 0x1000, 0x2000, 128, 0, 0]);
+        // Only AT_FDCWD (-100) is supported; other dirfds map to Unknown.
+        let at_fdcwd = (-100i64) as u64;
+        let syscall = LinuxSyscall::from_aarch64(78, [at_fdcwd, 0x1000, 0x2000, 128, 0, 0]);
         match syscall {
             LinuxSyscall::Readlink {
                 pathname,
