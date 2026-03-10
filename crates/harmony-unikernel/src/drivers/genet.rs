@@ -136,6 +136,11 @@ const DMA_CTRL: usize = DMA_RINGS_SIZE;
 const DMA_STATUS: usize = DMA_RINGS_SIZE + 0x04;
 const DMA_SCB_BURST_SIZE: usize = DMA_RINGS_SIZE + 0x0C;
 
+// After the ring-register block, four global DMA control registers
+// (CTRL / STATUS / reserved / SCB_BURST_SIZE = 4 × 4 = 16 bytes)
+// precede the descriptor array.
+const DMA_DESC_BASE_OFFSET: usize = 0x10;
+
 // Default ring index
 const DEFAULT_RING: usize = 16;
 
@@ -388,7 +393,7 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         // sans-I/O model those registers are not written and the frame bytes
         // are not stored — DMA buffer management is left to the MMIO
         // integration layer.
-        let desc_base = TDMA_OFF + DMA_RINGS_SIZE + 0x10 + desc_idx * DMA_DESC_SIZE;
+        let desc_base = TDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET + desc_idx * DMA_DESC_SIZE;
         let len_status =
             ((frame.len() as u32) << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP | DMA_TX_APPEND_CRC;
         bank.write(desc_base + DMA_DESC_LENGTH_STATUS, len_status);
@@ -429,7 +434,7 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         }
 
         let desc_idx = (self.rx_cons_index as usize) % RX_RING;
-        let desc_base = RDMA_OFF + DMA_RINGS_SIZE + 0x10 + desc_idx * DMA_DESC_SIZE;
+        let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET + desc_idx * DMA_DESC_SIZE;
 
         let len_status = bank.read(desc_base + DMA_DESC_LENGTH_STATUS);
         let length = ((len_status >> DMA_BUFLENGTH_SHIFT) & DMA_BUFLENGTH_MASK) as usize;
@@ -679,8 +684,8 @@ mod tests {
         driver.send(&mut bank, &frame).unwrap();
 
         // First write after clear should be the descriptor length_status.
-        // Descriptor base = TDMA_OFF + DMA_RINGS_SIZE + 0x10 + desc_idx * DMA_DESC_SIZE
-        let desc_base = TDMA_OFF + DMA_RINGS_SIZE + 0x10;
+        // Descriptor base = TDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET + desc_idx * DMA_DESC_SIZE
+        let desc_base = TDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
         let len_status_writes: Vec<(usize, u32)> = bank
             .writes
             .iter()
@@ -764,7 +769,7 @@ mod tests {
         bank.on_read(rx_ring_base + RING_PROD_INDEX, vec![1]);
 
         // Descriptor: 64-byte frame, SOP|EOP set, no errors
-        let desc_base = RDMA_OFF + DMA_RINGS_SIZE + 0x10;
+        let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
         let len_status = (64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP;
         bank.on_read(desc_base + DMA_DESC_LENGTH_STATUS, vec![len_status]);
 
@@ -785,7 +790,7 @@ mod tests {
         bank.on_read(rx_ring_base + RING_PROD_INDEX, vec![1]);
 
         // Descriptor with CRC error flag
-        let desc_base = RDMA_OFF + DMA_RINGS_SIZE + 0x10;
+        let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
         let len_status = (64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP | DMA_RX_CRC_ERROR;
         bank.on_read(desc_base + DMA_DESC_LENGTH_STATUS, vec![len_status]);
 
@@ -805,7 +810,7 @@ mod tests {
         let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         bank.on_read(rx_ring_base + RING_PROD_INDEX, vec![1, 2]);
 
-        let desc_base = RDMA_OFF + DMA_RINGS_SIZE + 0x10;
+        let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
         let len_status = (64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP;
         bank.on_read(desc_base + DMA_DESC_LENGTH_STATUS, vec![len_status]);
         bank.on_read(
@@ -892,7 +897,7 @@ mod tests {
         // Receive a frame
         let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         bank.on_read(rx_ring_base + RING_PROD_INDEX, vec![1]);
-        let desc_base = RDMA_OFF + DMA_RINGS_SIZE + 0x10;
+        let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
         bank.on_read(
             desc_base + DMA_DESC_LENGTH_STATUS,
             vec![(64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP],

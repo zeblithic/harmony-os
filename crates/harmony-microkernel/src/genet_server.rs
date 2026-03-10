@@ -113,6 +113,9 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> GenetServer<B, RX, TX> {
 impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServer<B, RX, TX> {
     fn walk(&mut self, fid: Fid, new_fid: Fid, name: &str) -> Result<QPath, IpcError> {
         let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
+        if state.is_open {
+            return Err(IpcError::PermissionDenied); // 9P: cannot walk from an open fid
+        }
         if !Self::is_directory(state.qpath) {
             return Err(IpcError::NotDirectory);
         }
@@ -295,7 +298,8 @@ mod tests {
     const RDMA_OFF: usize = 0x2000;
     const DMA_RINGS_SIZE: usize = 0x40 * 17;
     const DMA_STATUS: usize = DMA_RINGS_SIZE + 0x04;
-    const DMA_DISABLED: u32 = 1 << 0;
+    const DMA_STATUS_DISABLED: u32 = 1 << 0; // matches genet::DMA_STATUS_DISABLED
+    const DMA_DESC_BASE_OFFSET: usize = 0x10; // matches genet::DMA_DESC_BASE_OFFSET
 
     // UMAC MDIO register for link status tests
     const UMAC_MDIO_CMD: usize = 0x0800 + 0x614;
@@ -305,8 +309,8 @@ mod tests {
 
     fn test_server() -> GenetServer<MockRegisterBank, 256, 256> {
         let mut bank = MockRegisterBank::new();
-        bank.on_read(TDMA_OFF + DMA_STATUS, alloc::vec![DMA_DISABLED]);
-        bank.on_read(RDMA_OFF + DMA_STATUS, alloc::vec![DMA_DISABLED]);
+        bank.on_read(TDMA_OFF + DMA_STATUS, alloc::vec![DMA_STATUS_DISABLED]);
+        bank.on_read(RDMA_OFF + DMA_STATUS, alloc::vec![DMA_STATUS_DISABLED]);
         let driver = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
         GenetServer::new(driver, bank)
     }
@@ -343,6 +347,16 @@ mod tests {
     fn walk_invalid_name() {
         let mut srv = test_server();
         assert_eq!(srv.walk(0, 1, "nonexistent"), Err(IpcError::NotFound));
+    }
+
+    #[test]
+    fn walk_from_open_fid_rejected() {
+        let mut srv = test_server();
+        srv.walk(0, 1, "genet0").unwrap();
+        srv.walk(1, 2, "data").unwrap();
+        srv.open(2, OpenMode::Read).unwrap();
+        // 9P forbids walking from an open fid
+        assert_eq!(srv.walk(2, 3, "mac"), Err(IpcError::PermissionDenied));
     }
 
     #[test]
@@ -591,7 +605,7 @@ mod tests {
         srv.bank
             .on_read(rx_ring_base + RING_PROD_INDEX, alloc::vec![1]);
 
-        let desc_base = RDMA_OFF + DMA_RINGS_SIZE + 0x10;
+        let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
         let len_status = (64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP;
         srv.bank
             .on_read(desc_base + DMA_DESC_LENGTH_STATUS, alloc::vec![len_status]);
