@@ -1339,6 +1339,13 @@ impl<B: SyscallBackend> Linuxulator<B> {
                             self.backend
                                 .vm_write_bytes(mapped as u64, &data[..copy_len]);
                         }
+                        // Zero any tail bytes beyond file data (vm_mmap
+                        // does not guarantee zeroed pages).
+                        if copy_len < len {
+                            let zeros = alloc::vec![0u8; len - copy_len];
+                            self.backend
+                                .vm_write_bytes(mapped as u64 + copy_len as u64, &zeros);
+                        }
                     }
                     Err(e) => {
                         let _ = self.backend.vm_munmap(mapped as u64, len);
@@ -2890,10 +2897,15 @@ mod tests {
         );
 
         // File data should have been written to the mapped address via vm_write_bytes.
-        assert_eq!(lx.backend().vm_writes.len(), 1);
+        // Expect 2 writes: file content + zero-fill for the remainder of the page.
+        assert_eq!(lx.backend().vm_writes.len(), 2);
         let (write_addr, write_data) = &lx.backend().vm_writes[0];
         assert_eq!(*write_addr, addr as u64);
         assert_eq!(write_data, &file_data);
+        // Second write zeroes the tail (4096 - 8 = 4088 bytes).
+        let (zero_addr, zero_data) = &lx.backend().vm_writes[1];
+        assert_eq!(*zero_addr, addr as u64 + file_data.len() as u64);
+        assert!(zero_data.iter().all(|&b| b == 0), "tail must be zeroed");
     }
 
     #[test]

@@ -154,7 +154,10 @@ impl InterpreterLoader {
                 .checked_add(seg.vaddr)
                 .ok_or(ElfLoadError::OverlappingSegments)?;
             let page_start = page_floor(vaddr);
-            let page_end = page_ceil(vaddr + seg.memsz);
+            let end_vaddr = vaddr
+                .checked_add(seg.memsz)
+                .ok_or(ElfLoadError::OverlappingSegments)?;
+            let page_end = page_ceil(end_vaddr);
             let map_len = (page_end - page_start) as usize;
 
             let pf = segment_flags_to_page_flags(&seg.flags);
@@ -180,6 +183,16 @@ impl InterpreterLoader {
                     ));
                 }
                 backend.vm_write_bytes(vaddr, &elf_bytes[offset..end]);
+            }
+
+            // Zero the BSS region (memsz > filesz).  The ELF spec
+            // requires bytes from vaddr+filesz to vaddr+memsz to be
+            // zero.  vm_mmap does not guarantee zeroed pages.
+            if seg.memsz > seg.filesz {
+                let bss_start = vaddr + seg.filesz;
+                let bss_len = (seg.memsz - seg.filesz) as usize;
+                let zeros = alloc::vec![0u8; bss_len];
+                backend.vm_write_bytes(bss_start, &zeros);
             }
 
             // W^X check: standard ELFs should not have segments that
