@@ -106,7 +106,7 @@ impl<B: RegisterBank> FileServer for SdServer<B> {
         if offset % BLOCK_SIZE != 0 {
             return Err(IpcError::InvalidArgument);
         }
-        let lba = (offset / BLOCK_SIZE) as u32;
+        let lba = u32::try_from(offset / BLOCK_SIZE).map_err(|_| IpcError::InvalidArgument)?;
         let mut buf = [0u8; 512];
         self.driver
             .read_single_block(&mut self.bank, lba, &mut buf)
@@ -132,7 +132,7 @@ impl<B: RegisterBank> FileServer for SdServer<B> {
         if data.len() != 512 {
             return Err(IpcError::InvalidArgument);
         }
-        let lba = (offset / BLOCK_SIZE) as u32;
+        let lba = u32::try_from(offset / BLOCK_SIZE).map_err(|_| IpcError::InvalidArgument)?;
         let buf: &[u8; 512] = data.try_into().map_err(|_| IpcError::InvalidArgument)?;
         self.driver
             .write_single_block(&mut self.bank, lba, buf)

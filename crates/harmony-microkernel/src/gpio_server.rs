@@ -44,7 +44,7 @@ struct FidState {
 /// Read returns the pin's current logic level as `"0\n"` or `"1\n"`.
 /// Write accepts value or configuration commands.
 pub struct GpioServer<G: GpioController> {
-    pub gpio: G,
+    pub(crate) gpio: G,
     fids: BTreeMap<Fid, FidState>,
 }
 

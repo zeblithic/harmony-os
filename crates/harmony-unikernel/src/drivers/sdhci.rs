@@ -10,7 +10,6 @@ use super::register_bank::RegisterBank;
 
 // ── SDHCI register offsets ──────────────────────────────────────
 const SDHCI_ARGUMENT: usize = 0x08;
-const SDHCI_COMMAND: usize = 0x0E;
 const SDHCI_RESPONSE_0: usize = 0x10;
 const SDHCI_RESPONSE_1: usize = 0x14;
 const SDHCI_RESPONSE_2: usize = 0x18;
@@ -47,6 +46,8 @@ const CLOCK_DIVIDER_SHIFT: u32 = 8;
 const RESET_ALL: u32 = 1 << 0;
 
 // ── Command register encoding ───────────────────────────────────
+// These values encode bits within the 16-bit Command register (upper
+// half of the combined 32-bit write at SDHCI_TRANSFER_MODE).
 const CMD_INDEX_SHIFT: u32 = 8;
 const CMD_RESP_NONE: u32 = 0x00;
 const CMD_RESP_136: u32 = 0x01; // R2
@@ -56,6 +57,11 @@ const CMD_CRC_CHECK: u32 = 1 << 3;
 const CMD_INDEX_CHECK: u32 = 1 << 4;
 
 // ── Transfer mode / data-present bits ────────────────────────────
+// SDHCI Transfer Mode (0x0C) and Command (0x0E) are adjacent 16-bit
+// registers. We issue a single aligned 32-bit write at 0x0C:
+//   bits 15:0  = Transfer Mode
+//   bits 31:16 = Command
+// Writing the Command portion triggers the command on the SD bus.
 const SDHCI_TRANSFER_MODE: usize = 0x0C;
 const SDHCI_BLOCK_SIZE: usize = 0x04;
 const SDHCI_BLOCK_COUNT: usize = 0x06;
@@ -183,13 +189,20 @@ impl SdhciDriver {
 
     /// Send an SD command and wait for completion.
     ///
-    /// `cmd_flags` encodes response type, CRC check, and index check bits.
+    /// `cmd_flags` encodes response type, CRC check, index check, and
+    /// data-present bits for the 16-bit Command register.
+    /// `transfer_mode` is the 16-bit Transfer Mode value (0 for non-data
+    /// commands, `XFER_READ` for reads, 0 for writes).
+    ///
+    /// Both values are packed into a single aligned 32-bit write at 0x0C
+    /// to avoid an unaligned write at 0x0E that would overlap RESPONSE_0.
     pub fn send_command(
         &mut self,
         bank: &mut impl RegisterBank,
         cmd: u8,
         arg: u32,
         cmd_flags: u32,
+        transfer_mode: u16,
     ) -> Result<Response, SdError> {
         // Check command inhibit
         if bank.read(SDHCI_PRESENT_STATE) & STATE_CMD_INHIBIT != 0 {
@@ -202,9 +215,13 @@ impl SdhciDriver {
         // Write argument
         bank.write(SDHCI_ARGUMENT, arg);
 
-        // Write command (index + flags)
+        // Combined 32-bit write at 0x0C: transfer mode (low 16) + command (high 16).
+        // Writing the command portion triggers the command on the SD bus.
         let cmd_reg = ((cmd as u32) << CMD_INDEX_SHIFT) | cmd_flags;
-        bank.write(SDHCI_COMMAND, cmd_reg);
+        bank.write(
+            SDHCI_TRANSFER_MODE,
+            (cmd_reg << 16) | (transfer_mode as u32),
+        );
 
         // Poll for completion
         for _ in 0..100_000 {
@@ -268,14 +285,13 @@ impl SdhciDriver {
         // Set up block size and count
         bank.write(SDHCI_BLOCK_SIZE, SD_BLOCK_SIZE as u32);
         bank.write(SDHCI_BLOCK_COUNT, 1);
-        // Transfer mode: read direction
-        bank.write(SDHCI_TRANSFER_MODE, XFER_READ);
-        // Issue CMD17 with LBA
+        // Issue CMD17 with LBA (transfer mode included in combined write)
         self.send_command(
             bank,
             CMD17_READ_SINGLE,
             lba,
             CMD_RESP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK | CMD_DATA_PRESENT,
+            XFER_READ as u16,
         )?;
         // PIO data transfer
         self.read_block(bank, buf)
@@ -294,14 +310,13 @@ impl SdhciDriver {
         // Set up block size and count
         bank.write(SDHCI_BLOCK_SIZE, SD_BLOCK_SIZE as u32);
         bank.write(SDHCI_BLOCK_COUNT, 1);
-        // Transfer mode: write direction (no XFER_READ)
-        bank.write(SDHCI_TRANSFER_MODE, 0);
-        // Issue CMD24 with LBA
+        // Issue CMD24 with LBA (write direction = transfer_mode 0)
         self.send_command(
             bank,
             CMD24_WRITE_SINGLE,
             lba,
             CMD_RESP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK | CMD_DATA_PRESENT,
+            0,
         )?;
         // PIO data transfer
         self.write_block(bank, buf)
@@ -375,7 +390,7 @@ impl SdhciDriver {
     /// CMD0 -> CMD8 -> ACMD41 loop -> CMD2 -> CMD3 -> CMD7 -> CMD16
     pub fn init_card(&mut self, bank: &mut impl RegisterBank) -> Result<CardInfo, SdError> {
         // CMD0: GO_IDLE_STATE (no response)
-        self.send_command(bank, CMD0_GO_IDLE, 0, CMD_RESP_NONE)?;
+        self.send_command(bank, CMD0_GO_IDLE, 0, CMD_RESP_NONE, 0)?;
 
         // CMD8: SEND_IF_COND (voltage check, 0x1AA pattern)
         self.send_command(
@@ -383,6 +398,7 @@ impl SdhciDriver {
             CMD8_SEND_IF_COND,
             0x1AA,
             CMD_RESP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK,
+            0,
         )?;
 
         // ACMD41 loop: wait for card to become ready
@@ -395,11 +411,13 @@ impl SdhciDriver {
                 CMD55_APP_CMD,
                 0,
                 CMD_RESP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK,
+                0,
             )?;
 
             // ACMD41: SD_SEND_OP_COND
             // Arg: HCS (bit 30) + voltage window (3.2-3.4V = bit 20)
-            let resp = self.send_command(bank, ACMD41_SD_SEND_OP_COND, 0x40100000, CMD_RESP_48)?;
+            let resp =
+                self.send_command(bank, ACMD41_SD_SEND_OP_COND, 0x40100000, CMD_RESP_48, 0)?;
 
             if let Response::Short(r) = resp {
                 if r & (1 << 31) != 0 {
@@ -414,7 +432,7 @@ impl SdhciDriver {
         }
 
         // CMD2: ALL_SEND_CID (get card identification)
-        self.send_command(bank, CMD2_ALL_SEND_CID, 0, CMD_RESP_136)?;
+        self.send_command(bank, CMD2_ALL_SEND_CID, 0, CMD_RESP_136, 0)?;
 
         // CMD3: SEND_RELATIVE_ADDR (get RCA)
         let rca = match self.send_command(
@@ -422,6 +440,7 @@ impl SdhciDriver {
             CMD3_SEND_RCA,
             0,
             CMD_RESP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK,
+            0,
         )? {
             Response::Short(r) => (r >> 16) as u16,
             _ => return Err(SdError::InitFailed),
@@ -433,6 +452,7 @@ impl SdhciDriver {
             CMD7_SELECT_CARD,
             (rca as u32) << 16,
             CMD_RESP_48_BUSY | CMD_CRC_CHECK | CMD_INDEX_CHECK,
+            0,
         )?;
 
         // CMD16: SET_BLOCKLEN (512 bytes)
@@ -441,6 +461,7 @@ impl SdhciDriver {
             CMD16_SET_BLOCKLEN,
             SD_BLOCK_SIZE as u32,
             CMD_RESP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK,
+            0,
         )?;
 
         // Determine capacity (simplified: use OCR to check SDHC)
@@ -545,6 +566,7 @@ mod tests {
                 CMD8_SEND_IF_COND,
                 0x1AA,
                 CMD_RESP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK,
+                0,
             )
             .unwrap();
         assert_eq!(resp, Response::Short(0x1234));
@@ -559,7 +581,7 @@ mod tests {
         bank.on_read(SDHCI_INT_STATUS, vec![INT_ERROR]);
         bank.on_read(SDHCI_ERR_INT_STATUS, vec![ERR_CMD_TIMEOUT]);
 
-        let result = driver.send_command(&mut bank, CMD0_GO_IDLE, 0, CMD_RESP_NONE);
+        let result = driver.send_command(&mut bank, CMD0_GO_IDLE, 0, CMD_RESP_NONE, 0);
         assert_eq!(result, Err(SdError::Timeout));
     }
 
@@ -571,7 +593,7 @@ mod tests {
         bank.on_read(SDHCI_INT_STATUS, vec![INT_ERROR]);
         bank.on_read(SDHCI_ERR_INT_STATUS, vec![ERR_CMD_CRC]);
 
-        let result = driver.send_command(&mut bank, CMD0_GO_IDLE, 0, CMD_RESP_NONE);
+        let result = driver.send_command(&mut bank, CMD0_GO_IDLE, 0, CMD_RESP_NONE, 0);
         assert_eq!(result, Err(SdError::CrcError));
     }
 
@@ -581,7 +603,7 @@ mod tests {
         let mut bank = MockRegisterBank::new();
         bank.on_read(SDHCI_PRESENT_STATE, vec![STATE_CMD_INHIBIT]);
 
-        let result = driver.send_command(&mut bank, CMD0_GO_IDLE, 0, CMD_RESP_NONE);
+        let result = driver.send_command(&mut bank, CMD0_GO_IDLE, 0, CMD_RESP_NONE, 0);
         assert_eq!(result, Err(SdError::Busy));
     }
 
@@ -669,24 +691,17 @@ mod tests {
         let info = driver.init_card(&mut bank).unwrap();
         assert_eq!(info.rca, 0x1234);
 
-        // Verify the command sequence by checking SDHCI_COMMAND writes
+        // Verify the command sequence from the combined writes at SDHCI_TRANSFER_MODE.
+        // Upper 16 bits = command register, lower 16 bits = transfer mode (0 for all init cmds).
         let cmd_writes: Vec<u32> = bank
             .writes
             .iter()
-            .filter(|(off, _)| *off == SDHCI_COMMAND)
-            .map(|(_, v)| *v)
+            .filter(|(off, _)| *off == SDHCI_TRANSFER_MODE)
+            .map(|(_, v)| v >> 16) // extract command portion
             .collect();
 
-        // CMD0: (0 << 8) | RESP_NONE = 0x0000
-        // CMD8: (8 << 8) | RESP_48 | CRC | INDEX = 0x081A
-        // CMD55: (55 << 8) | RESP_48 | CRC | INDEX = 0x371A
-        // ACMD41: (41 << 8) | RESP_48 = 0x2902
-        // CMD2: (2 << 8) | RESP_136 = 0x0201
-        // CMD3: (3 << 8) | RESP_48 | CRC | INDEX = 0x031A
-        // CMD7: (7 << 8) | RESP_48_BUSY | CRC | INDEX = 0x071B
-        // CMD16: (16 << 8) | RESP_48 | CRC | INDEX = 0x101A
         assert_eq!(cmd_writes.len(), 8);
-        // Verify command indices (upper byte)
+        // Verify command indices (bits 13:8 of the command register)
         assert_eq!(cmd_writes[0] >> 8, 0); // CMD0
         assert_eq!(cmd_writes[1] >> 8, 8); // CMD8
         assert_eq!(cmd_writes[2] >> 8, 55); // CMD55
@@ -759,22 +774,24 @@ mod tests {
 
         // Verify CMD17 was issued with LBA=42
         assert!(bank.writes.contains(&(SDHCI_ARGUMENT, 42)));
-        let cmd_writes: Vec<u32> = bank
+
+        // Combined write at SDHCI_TRANSFER_MODE: command in upper 16, transfer mode in lower 16
+        let combined_writes: Vec<u32> = bank
             .writes
             .iter()
-            .filter(|(off, _)| *off == SDHCI_COMMAND)
+            .filter(|(off, _)| *off == SDHCI_TRANSFER_MODE)
             .map(|(_, v)| *v)
             .collect();
-        assert_eq!(cmd_writes.len(), 1);
-        assert_eq!(cmd_writes[0] >> 8, CMD17_READ_SINGLE as u32);
+        assert_eq!(combined_writes.len(), 1);
+        assert_eq!((combined_writes[0] >> 16) >> 8, CMD17_READ_SINGLE as u32);
+        // Verify transfer mode has XFER_READ set
+        assert_eq!(combined_writes[0] & 0xFFFF, XFER_READ);
 
         // Verify block size and count were set
         assert!(bank
             .writes
             .contains(&(SDHCI_BLOCK_SIZE, SD_BLOCK_SIZE as u32)));
         assert!(bank.writes.contains(&(SDHCI_BLOCK_COUNT, 1)));
-        // Verify transfer mode has XFER_READ set
-        assert!(bank.writes.contains(&(SDHCI_TRANSFER_MODE, XFER_READ)));
     }
 
     #[test]
@@ -793,22 +810,24 @@ mod tests {
 
         // Verify CMD24 was issued with LBA=7
         assert!(bank.writes.contains(&(SDHCI_ARGUMENT, 7)));
-        let cmd_writes: Vec<u32> = bank
+
+        // Combined write at SDHCI_TRANSFER_MODE: command in upper 16, transfer mode in lower 16
+        let combined_writes: Vec<u32> = bank
             .writes
             .iter()
-            .filter(|(off, _)| *off == SDHCI_COMMAND)
+            .filter(|(off, _)| *off == SDHCI_TRANSFER_MODE)
             .map(|(_, v)| *v)
             .collect();
-        assert_eq!(cmd_writes.len(), 1);
-        assert_eq!(cmd_writes[0] >> 8, CMD24_WRITE_SINGLE as u32);
+        assert_eq!(combined_writes.len(), 1);
+        assert_eq!((combined_writes[0] >> 16) >> 8, CMD24_WRITE_SINGLE as u32);
+        // Verify transfer mode does NOT have XFER_READ set (write direction)
+        assert_eq!(combined_writes[0] & 0xFFFF, 0);
 
         // Verify block size and count were set
         assert!(bank
             .writes
             .contains(&(SDHCI_BLOCK_SIZE, SD_BLOCK_SIZE as u32)));
         assert!(bank.writes.contains(&(SDHCI_BLOCK_COUNT, 1)));
-        // Verify transfer mode does NOT have XFER_READ set
-        assert!(bank.writes.contains(&(SDHCI_TRANSFER_MODE, 0)));
 
         // Verify the first data word was written correctly
         let data_writes: Vec<u32> = bank

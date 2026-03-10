@@ -15,6 +15,8 @@ use super::register_bank::RegisterBank;
 pub enum GpioError {
     /// Pin number exceeds the controller's pin count.
     InvalidPin,
+    /// Requested function is not available on this controller.
+    UnsupportedFunction,
 }
 
 // ── Pin configuration enums ─────────────────────────────────────
@@ -87,7 +89,6 @@ const FUNCSEL_ALT1: u32 = 1;
 const FUNCSEL_ALT2: u32 = 2;
 const FUNCSEL_ALT3: u32 = 3;
 const FUNCSEL_ALT4: u32 = 4;
-const FUNCSEL_NULL: u32 = 0x1F; // disabled
 
 // Pads bank: per-pin electrical configuration
 const PADS_PIN_OFFSET: usize = 0x04; // pin * 4 + 0x04 (pad 0 is at 0x04)
@@ -151,7 +152,7 @@ impl<IO: RegisterBank, PADS: RegisterBank, RIO: RegisterBank> GpioController
             PinFunction::Alt2 => FUNCSEL_ALT2,
             PinFunction::Alt3 => FUNCSEL_ALT3,
             PinFunction::Alt4 => FUNCSEL_ALT4,
-            PinFunction::Alt5 => FUNCSEL_NULL, // alt5 = disabled on RP1
+            PinFunction::Alt5 => return Err(GpioError::UnsupportedFunction), // no Alt5 on RP1 bank 0
         };
         let ctrl_offset = pin as usize * IO_PIN_STRIDE + IO_CTRL_OFFSET;
         let current = self.io.read(ctrl_offset);
@@ -248,6 +249,15 @@ mod tests {
         assert_eq!(gpio.set_pull(28, Pull::Up), Err(GpioError::InvalidPin));
         assert_eq!(gpio.read_pin(28), Err(GpioError::InvalidPin));
         assert_eq!(gpio.write_pin(28, true), Err(GpioError::InvalidPin));
+    }
+
+    #[test]
+    fn set_function_alt5_unsupported() {
+        let mut gpio = test_gpio();
+        assert_eq!(
+            gpio.set_function(14, PinFunction::Alt5),
+            Err(GpioError::UnsupportedFunction)
+        );
     }
 
     #[test]
