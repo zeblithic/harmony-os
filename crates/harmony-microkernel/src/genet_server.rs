@@ -16,7 +16,7 @@ use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use harmony_unikernel::drivers::genet::GenetDriver;
+use harmony_unikernel::drivers::genet::{GenetDriver, GenetError};
 use harmony_unikernel::drivers::RegisterBank;
 
 use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
@@ -222,9 +222,10 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
 
         match state.qpath {
             QPATH_DATA => {
-                self.driver
-                    .send(&mut self.bank, data)
-                    .map_err(|_| IpcError::ResourceExhausted)?;
+                self.driver.send(&mut self.bank, data).map_err(|e| match e {
+                    GenetError::TxRingFull => IpcError::ResourceExhausted,
+                    _ => IpcError::InvalidArgument,
+                })?;
                 Ok(data.len() as u32)
             }
             _ => Err(IpcError::ReadOnly),
