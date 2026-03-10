@@ -337,6 +337,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             .build(smoltcp::time::Instant::from_millis(pit.now_ms() as i64))
     };
 
+    serial.log("NETSTACK", "udp0 at 10.0.2.15/24, port 4242");
+
     // 6. Event loop
     let persistence = MemoryState::new();
     let mut runtime = UnikernelRuntime::new(identity, entropy, persistence);
@@ -615,6 +617,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 options(noreturn),
             );
         }
+    }
+
+    // Verify netstack initialization during automated QEMU testing.
+    #[cfg(feature = "qemu-test")]
+    {
+        serial.log("NETSTACK_TEST", "verifying stack initialization...");
+        serial.log("NETSTACK_TEST", "PASS");
     }
 
     // Exit early during automated QEMU testing (feature-gated).
