@@ -197,6 +197,28 @@ pub enum LinuxSyscall {
         pathname: u64,
         flags: i32,
     },
+    Getpid,
+    Getppid,
+    Gettid,
+    Getuid,
+    Geteuid,
+    Getgid,
+    Getegid,
+    Madvise {
+        addr: u64,
+        len: u64,
+        advice: i32,
+    },
+    Futex {
+        uaddr: u64,
+        op: i32,
+        val: u32,
+    },
+    SchedGetaffinity {
+        pid: i32,
+        cpusetsize: u64,
+        mask: u64,
+    },
     Unknown {
         nr: u64,
     },
@@ -255,6 +277,12 @@ impl LinuxSyscall {
                 iov: args[1],
                 iovcnt: args[2] as i32,
             },
+            28 => LinuxSyscall::Madvise {
+                addr: args[0],
+                len: args[1],
+                advice: args[2] as i32,
+            },
+            39 => LinuxSyscall::Getpid,
             60 => LinuxSyscall::Exit {
                 code: args[0] as i32,
             },
@@ -273,9 +301,25 @@ impl LinuxSyscall {
                 buf: args[1],
                 bufsiz: args[2],
             },
+            102 => LinuxSyscall::Getuid,
+            104 => LinuxSyscall::Getgid,
+            107 => LinuxSyscall::Geteuid,
+            108 => LinuxSyscall::Getegid,
+            110 => LinuxSyscall::Getppid,
             158 => LinuxSyscall::ArchPrctl {
                 code: args[0] as i32,
                 addr: args[1],
+            },
+            186 => LinuxSyscall::Gettid,
+            202 => LinuxSyscall::Futex {
+                uaddr: args[0],
+                op: args[1] as i32,
+                val: args[2] as u32,
+            },
+            204 => LinuxSyscall::SchedGetaffinity {
+                pid: args[0] as i32,
+                cpusetsize: args[1],
+                mask: args[2],
             },
             217 => LinuxSyscall::Getdents64 {
                 fd: args[0] as i32,
@@ -443,9 +487,26 @@ impl LinuxSyscall {
                 code: args[0] as i32,
             },
             96 => LinuxSyscall::SetTidAddress,
+            98 => LinuxSyscall::Futex {
+                uaddr: args[0],
+                op: args[1] as i32,
+                val: args[2] as u32,
+            },
             99 => LinuxSyscall::SetRobustList,
+            123 => LinuxSyscall::SchedGetaffinity {
+                pid: args[0] as i32,
+                cpusetsize: args[1],
+                mask: args[2],
+            },
             134 => LinuxSyscall::RtSigaction,
             135 => LinuxSyscall::RtSigprocmask,
+            172 => LinuxSyscall::Getpid,
+            173 => LinuxSyscall::Getppid,
+            174 => LinuxSyscall::Getuid,
+            175 => LinuxSyscall::Geteuid,
+            176 => LinuxSyscall::Getgid,
+            177 => LinuxSyscall::Getegid,
+            178 => LinuxSyscall::Gettid,
             214 => LinuxSyscall::Brk { addr: args[0] },
             215 => LinuxSyscall::Munmap {
                 addr: args[0],
@@ -463,6 +524,11 @@ impl LinuxSyscall {
                 addr: args[0],
                 len: args[1],
                 prot: args[2] as i32,
+            },
+            233 => LinuxSyscall::Madvise {
+                addr: args[0],
+                len: args[1],
+                advice: args[2] as i32,
             },
             261 => LinuxSyscall::Prlimit64 {
                 pid: args[0] as i32,
@@ -1302,6 +1368,18 @@ impl<B: SyscallBackend> Linuxulator<B> {
             LinuxSyscall::Fchdir { fd } => self.sys_fchdir(fd),
             LinuxSyscall::Mkdirat { .. } => self.sys_mkdirat(),
             LinuxSyscall::Unlinkat { .. } => self.sys_unlinkat(),
+            LinuxSyscall::Getpid => self.sys_getpid(),
+            LinuxSyscall::Getppid => self.sys_getppid(),
+            LinuxSyscall::Gettid => self.sys_gettid(),
+            LinuxSyscall::Getuid => self.sys_getuid(),
+            LinuxSyscall::Geteuid => self.sys_geteuid(),
+            LinuxSyscall::Getgid => self.sys_getgid(),
+            LinuxSyscall::Getegid => self.sys_getegid(),
+            LinuxSyscall::Madvise { .. } => self.sys_madvise(),
+            LinuxSyscall::Futex { op, .. } => self.sys_futex(op),
+            LinuxSyscall::SchedGetaffinity {
+                cpusetsize, mask, ..
+            } => self.sys_sched_getaffinity(cpusetsize, mask),
             LinuxSyscall::Unknown { .. } => ENOSYS,
         }
     }
@@ -2287,6 +2365,97 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Returns EROFS — the Linuxulator filesystem is read-only.
     fn sys_unlinkat(&mut self) -> i64 {
         EROFS
+    }
+
+    /// Linux getpid(2): return process ID.
+    ///
+    /// Single-user init process — always PID 1.
+    fn sys_getpid(&self) -> i64 {
+        1
+    }
+
+    /// Linux getppid(2): return parent process ID.
+    ///
+    /// Init process has no parent — returns 0.
+    fn sys_getppid(&self) -> i64 {
+        0
+    }
+
+    /// Linux gettid(2): return thread ID.
+    ///
+    /// Single-threaded init process — TID matches PID (1).
+    fn sys_gettid(&self) -> i64 {
+        1
+    }
+
+    /// Linux getuid(2): return real user ID.
+    ///
+    /// Single-user system running as root — returns 0.
+    fn sys_getuid(&self) -> i64 {
+        0
+    }
+
+    /// Linux geteuid(2): return effective user ID.
+    ///
+    /// Single-user system running as root — returns 0.
+    fn sys_geteuid(&self) -> i64 {
+        0
+    }
+
+    /// Linux getgid(2): return real group ID.
+    ///
+    /// Single-user system running as root — returns 0.
+    fn sys_getgid(&self) -> i64 {
+        0
+    }
+
+    /// Linux getegid(2): return effective group ID.
+    ///
+    /// Single-user system running as root — returns 0.
+    fn sys_getegid(&self) -> i64 {
+        0
+    }
+
+    /// Linux madvise(2): advise kernel about memory usage.
+    ///
+    /// Advisory only — always succeeds.
+    fn sys_madvise(&self) -> i64 {
+        0
+    }
+
+    /// Linux futex(2): fast userspace mutex.
+    ///
+    /// FUTEX_WAKE (cmd 1) returns 0 (no waiters woken — single-threaded).
+    /// All other operations return ENOSYS.
+    fn sys_futex(&self, op: i32) -> i64 {
+        // The op field's lower bits encode the command; upper bits are
+        // flags (FUTEX_PRIVATE_FLAG, etc.).  Mask to the command bits.
+        const FUTEX_CMD_MASK: i32 = 0x7f;
+        const FUTEX_WAKE: i32 = 1;
+        if (op & FUTEX_CMD_MASK) == FUTEX_WAKE {
+            0
+        } else {
+            ENOSYS
+        }
+    }
+
+    /// Linux sched_getaffinity(2): get CPU affinity mask.
+    ///
+    /// Writes a single-CPU bitmask (bit 0 set) to the user buffer and
+    /// returns 8 (size of the mask in bytes). Returns EINVAL if the
+    /// buffer is too small.
+    fn sys_sched_getaffinity(&mut self, cpusetsize: u64, mask: u64) -> i64 {
+        if mask == 0 {
+            return EFAULT;
+        }
+        // Linux requires at least 8 bytes for the cpu_set_t.
+        if cpusetsize < 8 {
+            return EINVAL;
+        }
+        // Single-CPU bitmask: only CPU 0.
+        let bitmask: [u8; 8] = [1, 0, 0, 0, 0, 0, 0, 0];
+        self.backend.vm_write_bytes(mask, &bitmask);
+        8
     }
 
     /// Linux getcwd(2): get current working directory.
@@ -4692,5 +4861,357 @@ mod integration_tests {
         let walks = &lx.backend().walks;
         let last_walk = &walks[walks.len() - 1];
         assert_eq!(last_walk.0, "/nix/store/abc123-hello");
+    }
+
+    // ── process identity syscall tests ────────────────────────────
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_getpid_returns_one() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // x86_64 nr 39
+        let result = lx.handle_syscall(39, [0; 6]);
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn sys_getpid_dispatch() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.dispatch_syscall(LinuxSyscall::Getpid);
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_getppid_returns_zero() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // x86_64 nr 110
+        let result = lx.handle_syscall(110, [0; 6]);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn sys_getppid_dispatch() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.dispatch_syscall(LinuxSyscall::Getppid);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_gettid_returns_one() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // x86_64 nr 186
+        let result = lx.handle_syscall(186, [0; 6]);
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn sys_gettid_dispatch() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.dispatch_syscall(LinuxSyscall::Gettid);
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_getuid_returns_zero() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // x86_64 nr 102
+        let result = lx.handle_syscall(102, [0; 6]);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn sys_getuid_dispatch() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.dispatch_syscall(LinuxSyscall::Getuid);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_geteuid_returns_zero() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // x86_64 nr 107
+        let result = lx.handle_syscall(107, [0; 6]);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn sys_geteuid_dispatch() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.dispatch_syscall(LinuxSyscall::Geteuid);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_getgid_returns_zero() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // x86_64 nr 104
+        let result = lx.handle_syscall(104, [0; 6]);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn sys_getgid_dispatch() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.dispatch_syscall(LinuxSyscall::Getgid);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_getegid_returns_zero() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // x86_64 nr 108
+        let result = lx.handle_syscall(108, [0; 6]);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn sys_getegid_dispatch() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.dispatch_syscall(LinuxSyscall::Getegid);
+        assert_eq!(result, 0);
+    }
+
+    // ── madvise tests ─────────────────────────────────────────────
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_madvise_returns_zero() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // x86_64 nr 28: madvise(addr, len, advice)
+        let result = lx.handle_syscall(28, [0x1000, 4096, 0, 0, 0, 0]);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn sys_madvise_dispatch() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.dispatch_syscall(LinuxSyscall::Madvise {
+            addr: 0x1000,
+            len: 4096,
+            advice: 4, // MADV_DONTNEED
+        });
+        assert_eq!(result, 0);
+    }
+
+    // ── futex tests ───────────────────────────────────────────────
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_futex_wake_returns_zero() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // x86_64 nr 202: futex(uaddr, FUTEX_WAKE=1, val, ...)
+        let result = lx.handle_syscall(202, [0x1000, 1, 1, 0, 0, 0]);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn sys_futex_wake_dispatch() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.dispatch_syscall(LinuxSyscall::Futex {
+            uaddr: 0x1000,
+            op: 1, // FUTEX_WAKE
+            val: 1,
+        });
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn sys_futex_wake_private_returns_zero() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // FUTEX_WAKE | FUTEX_PRIVATE_FLAG = 1 | 128 = 129
+        let result = lx.dispatch_syscall(LinuxSyscall::Futex {
+            uaddr: 0x1000,
+            op: 129,
+            val: 1,
+        });
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn sys_futex_wait_returns_enosys() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // FUTEX_WAIT = 0
+        let result = lx.dispatch_syscall(LinuxSyscall::Futex {
+            uaddr: 0x1000,
+            op: 0,
+            val: 0,
+        });
+        assert_eq!(result, ENOSYS);
+    }
+
+    #[test]
+    fn sys_futex_unknown_cmd_returns_enosys() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // FUTEX_LOCK_PI = 6
+        let result = lx.dispatch_syscall(LinuxSyscall::Futex {
+            uaddr: 0x1000,
+            op: 6,
+            val: 0,
+        });
+        assert_eq!(result, ENOSYS);
+    }
+
+    // ── sched_getaffinity tests ───────────────────────────────────
+
+    #[test]
+    fn sys_sched_getaffinity_writes_mask() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let mut buf = [0u8; 8];
+        let result = lx.dispatch_syscall(LinuxSyscall::SchedGetaffinity {
+            pid: 0,
+            cpusetsize: 8,
+            mask: buf.as_mut_ptr() as u64,
+        });
+        assert_eq!(result, 8);
+        // Bit 0 should be set (CPU 0), rest zero.
+        assert_eq!(buf[0], 1);
+        assert_eq!(buf[1..], [0; 7]);
+    }
+
+    #[test]
+    fn sys_sched_getaffinity_larger_buffer() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let mut buf = [0xFFu8; 128];
+        let result = lx.dispatch_syscall(LinuxSyscall::SchedGetaffinity {
+            pid: 0,
+            cpusetsize: 128,
+            mask: buf.as_mut_ptr() as u64,
+        });
+        // Still returns 8 (size of the written mask).
+        assert_eq!(result, 8);
+        // First 8 bytes overwritten with the bitmask.
+        assert_eq!(buf[0], 1);
+        assert_eq!(buf[1..8], [0; 7]);
+    }
+
+    #[test]
+    fn sys_sched_getaffinity_too_small() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let mut buf = [0u8; 4];
+        let result = lx.dispatch_syscall(LinuxSyscall::SchedGetaffinity {
+            pid: 0,
+            cpusetsize: 4,
+            mask: buf.as_mut_ptr() as u64,
+        });
+        assert_eq!(result, EINVAL);
+    }
+
+    #[test]
+    fn sys_sched_getaffinity_null_mask() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.dispatch_syscall(LinuxSyscall::SchedGetaffinity {
+            pid: 0,
+            cpusetsize: 8,
+            mask: 0,
+        });
+        assert_eq!(result, EFAULT);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_sched_getaffinity_x86_64_nr() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let mut buf = [0u8; 8];
+        // x86_64 nr 204: sched_getaffinity(pid, cpusetsize, mask)
+        let result = lx.handle_syscall(
+            204,
+            [0, 8, buf.as_mut_ptr() as u64, 0, 0, 0],
+        );
+        assert_eq!(result, 8);
+        assert_eq!(buf[0], 1);
+    }
+
+    // ── aarch64 number mapping tests ──────────────────────────────
+
+    #[test]
+    fn aarch64_getpid_mapping() {
+        let syscall = LinuxSyscall::from_aarch64(172, [0; 6]);
+        assert!(matches!(syscall, LinuxSyscall::Getpid));
+    }
+
+    #[test]
+    fn aarch64_getppid_mapping() {
+        let syscall = LinuxSyscall::from_aarch64(173, [0; 6]);
+        assert!(matches!(syscall, LinuxSyscall::Getppid));
+    }
+
+    #[test]
+    fn aarch64_gettid_mapping() {
+        let syscall = LinuxSyscall::from_aarch64(178, [0; 6]);
+        assert!(matches!(syscall, LinuxSyscall::Gettid));
+    }
+
+    #[test]
+    fn aarch64_getuid_mapping() {
+        let syscall = LinuxSyscall::from_aarch64(174, [0; 6]);
+        assert!(matches!(syscall, LinuxSyscall::Getuid));
+    }
+
+    #[test]
+    fn aarch64_geteuid_mapping() {
+        let syscall = LinuxSyscall::from_aarch64(175, [0; 6]);
+        assert!(matches!(syscall, LinuxSyscall::Geteuid));
+    }
+
+    #[test]
+    fn aarch64_getgid_mapping() {
+        let syscall = LinuxSyscall::from_aarch64(176, [0; 6]);
+        assert!(matches!(syscall, LinuxSyscall::Getgid));
+    }
+
+    #[test]
+    fn aarch64_getegid_mapping() {
+        let syscall = LinuxSyscall::from_aarch64(177, [0; 6]);
+        assert!(matches!(syscall, LinuxSyscall::Getegid));
+    }
+
+    #[test]
+    fn aarch64_madvise_mapping() {
+        let syscall = LinuxSyscall::from_aarch64(233, [0x1000, 4096, 0, 0, 0, 0]);
+        assert!(matches!(syscall, LinuxSyscall::Madvise { .. }));
+    }
+
+    #[test]
+    fn aarch64_futex_mapping() {
+        let syscall = LinuxSyscall::from_aarch64(98, [0x1000, 1, 1, 0, 0, 0]);
+        assert!(matches!(syscall, LinuxSyscall::Futex { .. }));
+    }
+
+    #[test]
+    fn aarch64_sched_getaffinity_mapping() {
+        let syscall = LinuxSyscall::from_aarch64(123, [0, 8, 0x2000, 0, 0, 0]);
+        assert!(matches!(syscall, LinuxSyscall::SchedGetaffinity { .. }));
     }
 }
