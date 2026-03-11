@@ -858,10 +858,11 @@ fn prot_to_page_flags(prot: i32) -> PageFlags {
 // ── Linuxulator ─────────────────────────────────────────────────────
 
 /// Per-fd state: the 9P fid and the current file offset.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct FdEntry {
     fid: Fid,
     offset: u64,
+    path: Option<alloc::string::String>,
 }
 
 /// Linux syscall-to-9P translation engine.
@@ -890,6 +891,10 @@ pub struct Linuxulator<B: SyscallBackend> {
     /// Call counter for getrandom — ensures repeated calls to the same
     /// buffer address produce distinct output.
     getrandom_counter: u64,
+    /// Current working directory (absolute path).
+    cwd: alloc::string::String,
+    /// 9P fid for the cwd, if one has been walked.
+    cwd_fid: Option<Fid>,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -911,6 +916,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
             vm_brk_base: 0,
             vm_brk_current: 0,
             getrandom_counter: 0,
+            cwd: alloc::string::String::from("/"),
+            cwd_fid: None,
         }
     }
 
@@ -944,6 +951,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             FdEntry {
                 fid: stdin_fid,
                 offset: 0,
+                path: None,
             },
         );
 
@@ -956,6 +964,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             FdEntry {
                 fid: stdout_fid,
                 offset: 0,
+                path: None,
             },
         );
 
@@ -968,6 +977,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             FdEntry {
                 fid: stderr_fid,
                 offset: 0,
+                path: None,
             },
         );
 
@@ -1130,15 +1140,15 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return 0;
         }
 
-        let entry = match self.fd_table.get(&fd) {
-            Some(e) => *e,
+        let (fid, file_offset) = match self.fd_table.get(&fd) {
+            Some(e) => (e.fid, e.offset),
             None => return EBADF,
         };
 
         // 9P count is u32; cap to avoid silent truncation on large reads.
         let capped = count.min(u32::MAX as usize) as u32;
 
-        match self.backend.read(entry.fid, entry.offset, capped) {
+        match self.backend.read(fid, file_offset, capped) {
             Ok(data) => {
                 let n = data.len().min(count);
                 if n > 0 {
@@ -1210,7 +1220,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
 
         let fd = self.alloc_fd();
-        self.fd_table.insert(fd, FdEntry { fid, offset: 0 });
+        self.fd_table.insert(
+            fd,
+            FdEntry {
+                fid,
+                offset: 0,
+                path: Some(path),
+            },
+        );
         fd as i64
     }
 
@@ -1682,24 +1699,24 @@ impl<B: SyscallBackend> Linuxulator<B> {
         const SEEK_CUR: i32 = 1;
         const SEEK_END: i32 = 2;
 
-        let entry = match self.fd_table.get(&fd) {
-            Some(e) => *e,
+        let (entry_fid, entry_offset) = match self.fd_table.get(&fd) {
+            Some(e) => (e.fid, e.offset),
             None => return EBADF,
         };
 
         // Character devices (stdin/stdout/stderr) are not seekable.
-        if self.chardev_fids.contains(&entry.fid) {
+        if self.chardev_fids.contains(&entry_fid) {
             return ESPIPE;
         }
 
         let new_offset = match whence {
             SEEK_SET => offset,
-            SEEK_CUR => match (entry.offset as i64).checked_add(offset) {
+            SEEK_CUR => match (entry_offset as i64).checked_add(offset) {
                 Some(v) => v,
                 None => return EOVERFLOW,
             },
             SEEK_END => {
-                let stat = match self.backend.stat(entry.fid) {
+                let stat = match self.backend.stat(entry_fid) {
                     Ok(s) => s,
                     Err(e) => return ipc_err_to_errno(e),
                 };
