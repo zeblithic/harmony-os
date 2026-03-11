@@ -1401,15 +1401,13 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
 
         const AT_FDCWD: i32 = -100;
-        if dirfd != AT_FDCWD && !self.fd_table.contains_key(&dirfd) {
-            return EBADF;
-        }
-
         let path = if dirfd == AT_FDCWD || raw_path.starts_with('/') {
             self.resolve_path(&raw_path)
-        } else {
+        } else if self.fd_table.contains_key(&dirfd) {
             // dirfd-relative: not yet supported
             return ENOSYS;
+        } else {
+            return EBADF;
         };
 
         let fid = self.alloc_fid();
@@ -2024,19 +2022,35 @@ impl<B: SyscallBackend> Linuxulator<B> {
         // Non-empty pathname is resolved normally even with the flag set.
         if path.is_empty() {
             if flags & AT_EMPTY_PATH != 0 {
+                if dirfd == AT_FDCWD {
+                    // Stat the current working directory by path.
+                    let cwd = self.cwd.clone();
+                    let fid = self.alloc_fid();
+                    if let Err(e) = self.backend.walk(&cwd, fid) {
+                        return ipc_err_to_errno(e);
+                    }
+                    let result = match self.backend.stat(fid) {
+                        Ok(stat) => {
+                            write_linux_stat(statbuf_ptr, &stat, false);
+                            0
+                        }
+                        Err(e) => ipc_err_to_errno(e),
+                    };
+                    let _ = self.backend.clunk(fid);
+                    return result;
+                }
                 return self.sys_fstat(dirfd, statbuf_ptr);
             }
             return ENOENT;
         }
 
-        if dirfd != AT_FDCWD && !self.fd_table.contains_key(&dirfd) {
-            return EBADF;
-        }
         let resolved = if dirfd == AT_FDCWD || path.starts_with('/') {
             self.resolve_path(&path)
-        } else {
+        } else if self.fd_table.contains_key(&dirfd) {
             // dirfd-relative paths: not yet supported
             return ENOSYS;
+        } else {
+            return EBADF;
         };
 
         let fid = self.alloc_fid();
@@ -2068,14 +2082,13 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return ENOENT;
         }
 
-        if dirfd != AT_FDCWD && !self.fd_table.contains_key(&dirfd) {
-            return EBADF;
-        }
         let resolved = if dirfd == AT_FDCWD || path.starts_with('/') {
             self.resolve_path(&path)
-        } else {
+        } else if self.fd_table.contains_key(&dirfd) {
             // dirfd-relative paths: not yet supported
             return ENOSYS;
+        } else {
+            return EBADF;
         };
 
         let fid = self.alloc_fid();
@@ -3399,6 +3412,49 @@ mod tests {
     }
 
     #[test]
+    fn sys_newfstatat_at_empty_path_at_fdcwd_stats_cwd() {
+        let mut mock = MockBackend::new();
+        mock.directory_paths
+            .insert(alloc::string::String::from("/nix/store"));
+        let mut lx = Linuxulator::new(mock);
+        lx.cwd = alloc::string::String::from("/nix/store");
+        #[cfg(target_arch = "x86_64")]
+        let mut statbuf = [0u8; 144];
+        #[cfg(not(target_arch = "x86_64"))]
+        let mut statbuf = [0u8; 128];
+        let empty = b"\0";
+        let at_empty_path: i32 = 0x1000;
+        let ret = lx.dispatch_syscall(LinuxSyscall::Newfstatat {
+            dirfd: -100, // AT_FDCWD
+            pathname: empty.as_ptr() as u64,
+            statbuf: statbuf.as_mut_ptr() as u64,
+            flags: at_empty_path,
+        });
+        assert_eq!(ret, 0);
+        // Should have walked the cwd path
+        assert_eq!(lx.backend().walks[0].0, "/nix/store");
+    }
+
+    #[test]
+    fn sys_newfstatat_absolute_path_ignores_invalid_dirfd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        #[cfg(target_arch = "x86_64")]
+        let mut statbuf = [0u8; 144];
+        #[cfg(not(target_arch = "x86_64"))]
+        let mut statbuf = [0u8; 128];
+        let path = b"/dev/serial/log\0";
+        // dirfd=999 (invalid) with absolute path — should succeed
+        let ret = lx.dispatch_syscall(LinuxSyscall::Newfstatat {
+            dirfd: 999,
+            pathname: path.as_ptr() as u64,
+            statbuf: statbuf.as_mut_ptr() as u64,
+            flags: 0,
+        });
+        assert_eq!(ret, 0);
+    }
+
+    #[test]
     fn sys_newfstatat_null_pathname_without_at_empty_path() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
@@ -3454,6 +3510,19 @@ mod tests {
             mode: 0,
         });
         assert_eq!(ret, ENOENT);
+    }
+
+    #[test]
+    fn sys_faccessat_absolute_path_ignores_invalid_dirfd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let path = b"/dev/serial/log\0";
+        let ret = lx.dispatch_syscall(LinuxSyscall::Faccessat {
+            dirfd: 999, // invalid fd, but path is absolute
+            pathname: path.as_ptr() as u64,
+            mode: 0,
+        });
+        assert_eq!(ret, 0);
     }
 
     // ── from_x86_64 mapping tests for new syscalls ─────────────────
