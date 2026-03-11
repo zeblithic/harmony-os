@@ -21,7 +21,10 @@ use harmony_athenaeum::{sha256_hash, Book, PageAddr, BOOK_MAX_SIZE};
 use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
 
 /// Maximum concurrent ingest sessions. Each session can buffer up to
-/// `BOOK_MAX_SIZE` (1 MB), so this caps ingest memory at 4 MB.
+/// `BOOK_MAX_SIZE` (1 MB), so steady-state ingest memory is capped at
+/// 4 MB. During finalization, `page_data_from_blob` allocates an
+/// additional page-buffer of the same size, so the transient peak can
+/// reach ~8 MB if all sessions finalize simultaneously.
 const MAX_CONCURRENT_INGESTS: usize = 4;
 
 // ── QPath constants ─────────────────────────────────────────────────
