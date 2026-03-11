@@ -16,20 +16,23 @@ use harmony_microkernel::{Fid, FileStat, FileType, IpcError, OpenMode, QPath};
 // ── Linux errno constants ───────────────────────────────────────────
 
 const EPERM: i64 = -1;
+const ENOENT: i64 = -2;
 const ESRCH: i64 = -3;
 const EBADF: i64 = -9;
 const EFAULT: i64 = -14;
 const ENOMEM: i64 = -12;
+const ENOTDIR: i64 = -20;
 const EINVAL: i64 = -22;
 const ENOTTY: i64 = -25;
 const ESPIPE: i64 = -29;
+const EROFS: i64 = -30;
 const ERANGE: i64 = -34;
 const ENOSYS: i64 = -38;
 const EOVERFLOW: i64 = -75;
 
 fn ipc_err_to_errno(e: IpcError) -> i64 {
     match e {
-        IpcError::NotFound => -2,           // ENOENT
+        IpcError::NotFound => ENOENT,
         IpcError::PermissionDenied => -13,  // EACCES
         IpcError::NotOpen => -9,            // EBADF
         IpcError::InvalidFid => -9,         // EBADF
@@ -56,6 +59,13 @@ fn vm_err_to_errno(e: VmError) -> i64 {
         VmError::PageTableError => ENOMEM,
         VmError::ProcessExists(_) => EINVAL,
     }
+}
+
+/// Directory entry returned by [`SyscallBackend::readdir`].
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    pub name: alloc::string::String,
+    pub file_type: FileType,
 }
 
 // ── LinuxSyscall — CPU-agnostic syscall representation ──────────
@@ -155,6 +165,38 @@ pub enum LinuxSyscall {
         buf: u64,
         bufsiz: u64,
     },
+    Newfstatat {
+        dirfd: i32,
+        pathname: u64,
+        statbuf: u64,
+        flags: i32,
+    },
+    Faccessat {
+        dirfd: i32,
+        pathname: u64,
+        mode: i32,
+    },
+    Getdents64 {
+        fd: i32,
+        dirp: u64,
+        count: u64,
+    },
+    Chdir {
+        pathname: u64,
+    },
+    Fchdir {
+        fd: i32,
+    },
+    Mkdirat {
+        dirfd: i32,
+        pathname: u64,
+        mode: u32,
+    },
+    Unlinkat {
+        dirfd: i32,
+        pathname: u64,
+        flags: i32,
+    },
     Unknown {
         nr: u64,
     },
@@ -220,6 +262,12 @@ impl LinuxSyscall {
                 buf: args[0],
                 size: args[1],
             },
+            80 => LinuxSyscall::Chdir {
+                pathname: args[0],
+            },
+            81 => LinuxSyscall::Fchdir {
+                fd: args[0] as i32,
+            },
             89 => LinuxSyscall::Readlink {
                 pathname: args[0],
                 buf: args[1],
@@ -229,6 +277,11 @@ impl LinuxSyscall {
                 code: args[0] as i32,
                 addr: args[1],
             },
+            217 => LinuxSyscall::Getdents64 {
+                fd: args[0] as i32,
+                dirp: args[1],
+                count: args[2],
+            },
             218 => LinuxSyscall::SetTidAddress,
             231 => LinuxSyscall::ExitGroup {
                 code: args[0] as i32,
@@ -237,6 +290,42 @@ impl LinuxSyscall {
                 dirfd: args[0] as i32,
                 pathname: args[1],
                 flags: args[2] as i32,
+            },
+            258 => LinuxSyscall::Mkdirat {
+                dirfd: args[0] as i32,
+                pathname: args[1],
+                mode: args[2] as u32,
+            },
+            262 => LinuxSyscall::Newfstatat {
+                dirfd: args[0] as i32,
+                pathname: args[1],
+                statbuf: args[2],
+                flags: args[3] as i32,
+            },
+            263 => LinuxSyscall::Unlinkat {
+                dirfd: args[0] as i32,
+                pathname: args[1],
+                flags: args[2] as i32,
+            },
+            // x86_64 nr 267 is readlinkat(dirfd, pathname, buf, bufsiz).
+            // Only AT_FDCWD is supported; explicit dirfds return ENOSYS
+            // via the Unknown fallback.
+            267 => {
+                const AT_FDCWD: i32 = -100;
+                if args[0] as i32 != AT_FDCWD {
+                    LinuxSyscall::Unknown { nr: 267 }
+                } else {
+                    LinuxSyscall::Readlink {
+                        pathname: args[1],
+                        buf: args[2],
+                        bufsiz: args[3],
+                    }
+                }
+            }
+            269 => LinuxSyscall::Faccessat {
+                dirfd: args[0] as i32,
+                pathname: args[1],
+                mode: args[2] as i32,
             },
             273 => LinuxSyscall::SetRobustList,
             302 => LinuxSyscall::Prlimit64 {
@@ -269,12 +358,38 @@ impl LinuxSyscall {
                 fd: args[0] as i32,
                 request: args[1],
             },
+            34 => LinuxSyscall::Mkdirat {
+                dirfd: args[0] as i32,
+                pathname: args[1],
+                mode: args[2] as u32,
+            },
+            35 => LinuxSyscall::Unlinkat {
+                dirfd: args[0] as i32,
+                pathname: args[1],
+                flags: args[2] as i32,
+            },
+            48 => LinuxSyscall::Faccessat {
+                dirfd: args[0] as i32,
+                pathname: args[1],
+                mode: args[2] as i32,
+            },
+            49 => LinuxSyscall::Chdir {
+                pathname: args[0],
+            },
+            50 => LinuxSyscall::Fchdir {
+                fd: args[0] as i32,
+            },
             56 => LinuxSyscall::Openat {
                 dirfd: args[0] as i32,
                 pathname: args[1],
                 flags: args[2] as i32,
             },
             57 => LinuxSyscall::Close { fd: args[0] as i32 },
+            61 => LinuxSyscall::Getdents64 {
+                fd: args[0] as i32,
+                dirp: args[1],
+                count: args[2],
+            },
             62 => LinuxSyscall::Lseek {
                 fd: args[0] as i32,
                 offset: args[1] as i64,
@@ -300,8 +415,8 @@ impl LinuxSyscall {
             // is supported; explicit dirfds return ENOSYS until a full
             // implementation is added.
             78 => {
-                const AT_FDCWD: i64 = -100;
-                if args[0] as i64 != AT_FDCWD {
+                const AT_FDCWD: i32 = -100;
+                if args[0] as i32 != AT_FDCWD {
                     LinuxSyscall::Unknown { nr: 78 }
                 } else {
                     LinuxSyscall::Readlink {
@@ -311,6 +426,12 @@ impl LinuxSyscall {
                     }
                 }
             }
+            79 => LinuxSyscall::Newfstatat {
+                dirfd: args[0] as i32,
+                pathname: args[1],
+                statbuf: args[2],
+                flags: args[3] as i32,
+            },
             80 => LinuxSyscall::Fstat {
                 fd: args[0] as i32,
                 buf: args[1],
@@ -427,6 +548,14 @@ pub trait SyscallBackend {
             }
         }
     }
+
+    /// List directory entries for the given fid.
+    ///
+    /// Default implementation returns `IpcError::NotDirectory` — backends that
+    /// expose a real filesystem override this.
+    fn readdir(&mut self, _fid: Fid) -> Result<Vec<DirEntry>, IpcError> {
+        Err(IpcError::NotDirectory)
+    }
 }
 
 // ── MockBackend ─────────────────────────────────────────────────────
@@ -447,11 +576,25 @@ pub struct MockBackend {
     /// File content keyed by fid. Populated via `set_file_content` so that
     /// `read()` returns real data instead of an empty Vec.
     file_content: BTreeMap<Fid, Vec<u8>>,
+    /// Directory entries keyed by fid, for readdir testing.
+    pub readdir_entries: BTreeMap<Fid, Vec<DirEntry>>,
+    /// Paths that are directories (for stat to return FileType::Directory).
+    pub directory_paths: alloc::collections::BTreeSet<alloc::string::String>,
+    /// Fids that represent directories.
+    pub directory_fids: alloc::collections::BTreeSet<Fid>,
+    /// Paths that are character devices (for stat to return FileType::CharDev).
+    pub chardev_paths: alloc::collections::BTreeSet<alloc::string::String>,
+    /// Fids that represent character devices.
+    chardev_fids: alloc::collections::BTreeSet<Fid>,
 }
 
 #[cfg(test)]
 impl MockBackend {
     pub fn new() -> Self {
+        let mut chardev_paths = alloc::collections::BTreeSet::new();
+        // init_stdio walks /dev/serial/log — register as chardev so stat
+        // reports FileType::CharDev for stdio fids.
+        chardev_paths.insert(alloc::string::String::from("/dev/serial/log"));
         Self {
             walks: Vec::new(),
             opens: Vec::new(),
@@ -460,6 +603,11 @@ impl MockBackend {
             clunks: Vec::new(),
             stats: Vec::new(),
             file_content: BTreeMap::new(),
+            readdir_entries: BTreeMap::new(),
+            directory_paths: alloc::collections::BTreeSet::new(),
+            directory_fids: alloc::collections::BTreeSet::new(),
+            chardev_paths,
+            chardev_fids: alloc::collections::BTreeSet::new(),
         }
     }
 
@@ -530,6 +678,12 @@ impl SyscallBackend for MockBackend {
     fn walk(&mut self, path: &str, new_fid: Fid) -> Result<QPath, IpcError> {
         self.walks
             .push((alloc::string::String::from(path), new_fid));
+        if self.directory_paths.contains(path) {
+            self.directory_fids.insert(new_fid);
+        }
+        if self.chardev_paths.contains(path) {
+            self.chardev_fids.insert(new_fid);
+        }
         Ok(0)
     }
 
@@ -562,12 +716,26 @@ impl SyscallBackend for MockBackend {
 
     fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
         self.stats.push(fid);
+        let file_type = if self.directory_fids.contains(&fid) {
+            FileType::Directory
+        } else if self.chardev_fids.contains(&fid) {
+            FileType::CharDev
+        } else {
+            FileType::Regular
+        };
         Ok(FileStat {
             qpath: 0,
             name: alloc::sync::Arc::from("mock"),
             size: 0,
-            file_type: FileType::Regular,
+            file_type,
         })
+    }
+
+    fn readdir(&mut self, fid: Fid) -> Result<Vec<DirEntry>, IpcError> {
+        self.readdir_entries
+            .get(&fid)
+            .cloned()
+            .ok_or(IpcError::NotDirectory)
     }
 }
 
@@ -781,14 +949,11 @@ fn flags_to_open_mode(flags: i32) -> OpenMode {
 ///   60      4     __pad2
 ///   64      8     st_blocks
 ///   72-128        timestamps (zeroed for MVP)
-fn write_linux_stat(buf_ptr: usize, stat: &FileStat, is_chardev: bool) {
-    let mode: u32 = if is_chardev {
-        0o020000 | 0o666 // S_IFCHR | rw-rw-rw-
-    } else {
-        match stat.file_type {
-            FileType::Regular => 0o100000 | 0o644,   // S_IFREG | rw-r--r--
-            FileType::Directory => 0o040000 | 0o755, // S_IFDIR | rwxr-xr-x
-        }
+fn write_linux_stat(buf_ptr: usize, stat: &FileStat) {
+    let mode: u32 = match stat.file_type {
+        FileType::Regular => 0o100000 | 0o644,   // S_IFREG | rw-r--r--
+        FileType::Directory => 0o040000 | 0o755, // S_IFDIR | rwxr-xr-x
+        FileType::CharDev => 0o020000 | 0o666,   // S_IFCHR | rw-rw-rw-
     };
 
     #[cfg(target_arch = "x86_64")]
@@ -843,10 +1008,13 @@ fn prot_to_page_flags(prot: i32) -> PageFlags {
 // ── Linuxulator ─────────────────────────────────────────────────────
 
 /// Per-fd state: the 9P fid and the current file offset.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct FdEntry {
     fid: Fid,
     offset: u64,
+    path: Option<alloc::string::String>,
+    /// Cached file type — avoids IPC stat on every lseek.
+    file_type: FileType,
 }
 
 /// Linux syscall-to-9P translation engine.
@@ -865,9 +1033,6 @@ pub struct Linuxulator<B: SyscallBackend> {
     arena: MemoryArena,
     /// FS segment base register (TLS pointer for arch_prctl).
     fs_base: u64,
-    /// Fids that represent character devices (stdio).
-    /// Used by fstat to report S_IFCHR instead of S_IFREG.
-    chardev_fids: Vec<Fid>,
     /// VM-backed brk: base address of the heap (0 = not yet established).
     vm_brk_base: u64,
     /// VM-backed brk: current program break.
@@ -875,6 +1040,8 @@ pub struct Linuxulator<B: SyscallBackend> {
     /// Call counter for getrandom — ensures repeated calls to the same
     /// buffer address produce distinct output.
     getrandom_counter: u64,
+    /// Current working directory (absolute path).
+    cwd: alloc::string::String,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -892,10 +1059,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
             exit_code: None,
             arena: MemoryArena::new(arena_size),
             fs_base: 0,
-            chardev_fids: Vec::new(),
             vm_brk_base: 0,
             vm_brk_current: 0,
             getrandom_counter: 0,
+            cwd: alloc::string::String::from("/"),
         }
     }
 
@@ -915,6 +1082,45 @@ impl<B: SyscallBackend> Linuxulator<B> {
         fd
     }
 
+    /// Mutable access to the fd table (test-only).
+    #[cfg(test)]
+    fn fd_table_mut(&mut self) -> &mut BTreeMap<i32, FdEntry> {
+        &mut self.fd_table
+    }
+
+    /// Resolve a path relative to `self.cwd`.
+    ///
+    /// Absolute paths (starting with `/`) pass through unchanged.
+    /// Relative paths get `self.cwd` prepended.
+    /// Normalises `.` and `..` segments so `chdir("..")` produces the
+    /// correct parent path rather than forwarding `/foo/..` verbatim.
+    fn resolve_path(&self, path: &str) -> alloc::string::String {
+        let base = if path.starts_with('/') {
+            alloc::string::String::from(path)
+        } else if self.cwd == "/" {
+            alloc::format!("/{}", path)
+        } else {
+            alloc::format!("{}/{}", self.cwd, path)
+        };
+
+        // Normalise . and ..
+        let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+        for seg in base.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                s => parts.push(s),
+            }
+        }
+        if parts.is_empty() {
+            alloc::string::String::from("/")
+        } else {
+            alloc::format!("/{}", parts.join("/"))
+        }
+    }
+
     /// Pre-populate fd 0 (stdin), 1 (stdout), 2 (stderr) by walking
     /// to the serial server and opening the log file.
     ///
@@ -929,6 +1135,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
             FdEntry {
                 fid: stdin_fid,
                 offset: 0,
+                path: None,
+                file_type: FileType::CharDev,
             },
         );
 
@@ -941,6 +1149,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
             FdEntry {
                 fid: stdout_fid,
                 offset: 0,
+                path: None,
+                file_type: FileType::CharDev,
             },
         );
 
@@ -953,12 +1163,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
             FdEntry {
                 fid: stderr_fid,
                 offset: 0,
+                path: None,
+                file_type: FileType::CharDev,
             },
         );
-
-        // Track stdio fids as character devices for fstat.
-        self.chardev_fids
-            .extend_from_slice(&[stdin_fid, stdout_fid, stderr_fid]);
 
         Ok(())
     }
@@ -1076,6 +1284,24 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 buf,
                 bufsiz,
             } => self.sys_readlink(pathname, buf, bufsiz),
+            LinuxSyscall::Newfstatat {
+                dirfd,
+                pathname,
+                statbuf,
+                flags,
+            } => self.sys_newfstatat(dirfd, pathname as usize, statbuf as usize, flags),
+            LinuxSyscall::Faccessat {
+                dirfd,
+                pathname,
+                mode,
+            } => self.sys_faccessat(dirfd, pathname as usize, mode),
+            LinuxSyscall::Getdents64 { fd, dirp, count } => {
+                self.sys_getdents64(fd, dirp as usize, count as usize)
+            }
+            LinuxSyscall::Chdir { pathname } => self.sys_chdir(pathname as usize),
+            LinuxSyscall::Fchdir { fd } => self.sys_fchdir(fd),
+            LinuxSyscall::Mkdirat { .. } => self.sys_mkdirat(),
+            LinuxSyscall::Unlinkat { .. } => self.sys_unlinkat(),
             LinuxSyscall::Unknown { .. } => ENOSYS,
         }
     }
@@ -1115,15 +1341,15 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return 0;
         }
 
-        let entry = match self.fd_table.get(&fd) {
-            Some(e) => *e,
+        let (fid, file_offset) = match self.fd_table.get(&fd) {
+            Some(e) => (e.fid, e.offset),
             None => return EBADF,
         };
 
         // 9P count is u32; cap to avoid silent truncation on large reads.
         let capped = count.min(u32::MAX as usize) as u32;
 
-        match self.backend.read(entry.fid, entry.offset, capped) {
+        match self.backend.read(fid, file_offset, capped) {
             Ok(data) => {
                 let n = data.len().min(count);
                 if n > 0 {
@@ -1146,7 +1372,6 @@ impl<B: SyscallBackend> Linuxulator<B> {
             Some(e) => e,
             None => return EBADF,
         };
-        self.chardev_fids.retain(|&f| f != entry.fid);
         let _ = self.backend.clunk(entry.fid);
         0
     }
@@ -1154,16 +1379,15 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Linux fstat(2): get file status.
     fn sys_fstat(&mut self, fd: i32, statbuf_ptr: usize) -> i64 {
         if statbuf_ptr == 0 {
-            return EINVAL;
+            return EFAULT;
         }
         let fid = match self.fd_table.get(&fd) {
             Some(e) => e.fid,
             None => return EBADF,
         };
-        let is_chardev = self.chardev_fids.contains(&fid);
         match self.backend.stat(fid) {
             Ok(stat) => {
-                write_linux_stat(statbuf_ptr, &stat, is_chardev);
+                write_linux_stat(statbuf_ptr, &stat);
                 0
             }
             Err(e) => ipc_err_to_errno(e),
@@ -1172,16 +1396,23 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux openat(2): open a file relative to a directory fd.
     fn sys_openat(&mut self, dirfd: i32, pathname_ptr: usize, flags: i32) -> i64 {
-        let path = unsafe { read_c_string(pathname_ptr) };
-
-        let at_fdcwd: i32 = -100;
-        // TODO: relative-path resolution relative to dirfd is not yet implemented.
-        // All current callers use AT_FDCWD or absolute paths, so this is fine for
-        // the MVP. A future implementation should resolve path components starting
-        // from the fid mapped to dirfd.
-        if dirfd != at_fdcwd && !self.fd_table.contains_key(&dirfd) {
-            return EBADF;
+        if pathname_ptr == 0 {
+            return EFAULT;
         }
+        let raw_path = unsafe { read_c_string(pathname_ptr) };
+        if raw_path.is_empty() {
+            return ENOENT;
+        }
+
+        const AT_FDCWD: i32 = -100;
+        let path = if dirfd == AT_FDCWD || raw_path.starts_with('/') {
+            self.resolve_path(&raw_path)
+        } else if self.fd_table.contains_key(&dirfd) {
+            // dirfd-relative: not yet supported
+            return ENOSYS;
+        } else {
+            return EBADF;
+        };
 
         let fid = self.alloc_fid();
         let mode = flags_to_open_mode(flags);
@@ -1194,8 +1425,22 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return ipc_err_to_errno(e);
         }
 
+        // Cache file type at open time to avoid IPC on every lseek.
+        let file_type = match self.backend.stat(fid) {
+            Ok(s) => s.file_type,
+            Err(_) => FileType::Regular, // best-effort default
+        };
+
         let fd = self.alloc_fd();
-        self.fd_table.insert(fd, FdEntry { fid, offset: 0 });
+        self.fd_table.insert(
+            fd,
+            FdEntry {
+                fid,
+                offset: 0,
+                path: Some(path),
+                file_type,
+            },
+        );
         fd as i64
     }
 
@@ -1667,24 +1912,26 @@ impl<B: SyscallBackend> Linuxulator<B> {
         const SEEK_CUR: i32 = 1;
         const SEEK_END: i32 = 2;
 
-        let entry = match self.fd_table.get(&fd) {
-            Some(e) => *e,
+        let (entry_fid, entry_offset, entry_file_type) = match self.fd_table.get(&fd) {
+            Some(e) => (e.fid, e.offset, e.file_type),
             None => return EBADF,
         };
 
         // Character devices (stdin/stdout/stderr) are not seekable.
-        if self.chardev_fids.contains(&entry.fid) {
+        // Uses cached file_type from FdEntry — no IPC needed.
+        if entry_file_type == FileType::CharDev {
             return ESPIPE;
         }
 
         let new_offset = match whence {
             SEEK_SET => offset,
-            SEEK_CUR => match (entry.offset as i64).checked_add(offset) {
+            SEEK_CUR => match (entry_offset as i64).checked_add(offset) {
                 Some(v) => v,
                 None => return EOVERFLOW,
             },
             SEEK_END => {
-                let stat = match self.backend.stat(entry.fid) {
+                // SEEK_END needs the current file size — stat required.
+                let stat = match self.backend.stat(entry_fid) {
                     Ok(s) => s,
                     Err(e) => return ipc_err_to_errno(e),
                 };
@@ -1758,9 +2005,293 @@ impl<B: SyscallBackend> Linuxulator<B> {
         buflen as i64
     }
 
+    /// Stat an fd or the cwd (when dirfd == AT_FDCWD).
+    /// Used by `sys_newfstatat` for the AT_EMPTY_PATH cases.
+    fn sys_stat_fd_or_cwd(&mut self, dirfd: i32, statbuf_ptr: usize) -> i64 {
+        const AT_FDCWD: i32 = -100;
+        if dirfd == AT_FDCWD {
+            let cwd = self.cwd.clone();
+            // Note: alloc_fid() advances the monotonic counter even if walk
+            // fails. This is acceptable — the u32 counter won't wrap in
+            // practice, and clunking a never-walked fid is a 9P violation.
+            let fid = self.alloc_fid();
+            if let Err(e) = self.backend.walk(&cwd, fid) {
+                return ipc_err_to_errno(e);
+            }
+            let result = match self.backend.stat(fid) {
+                Ok(stat) => {
+                    write_linux_stat(statbuf_ptr, &stat);
+                    0
+                }
+                Err(e) => ipc_err_to_errno(e),
+            };
+            let _ = self.backend.clunk(fid);
+            result
+        } else {
+            self.sys_fstat(dirfd, statbuf_ptr)
+        }
+    }
+
+    /// Linux newfstatat(2): stat a file by path or fd.
+    ///
+    /// Supports AT_FDCWD + absolute/relative paths, and AT_EMPTY_PATH
+    /// (stat an open fd, like fstat).
+    fn sys_newfstatat(
+        &mut self,
+        dirfd: i32,
+        pathname_ptr: usize,
+        statbuf_ptr: usize,
+        flags: i32,
+    ) -> i64 {
+        if statbuf_ptr == 0 {
+            return EFAULT;
+        }
+        const AT_FDCWD: i32 = -100;
+        const AT_EMPTY_PATH: i32 = 0x1000;
+
+        // Handle null/empty pathname for AT_EMPTY_PATH, or return EFAULT/ENOENT.
+        if pathname_ptr == 0 {
+            if flags & AT_EMPTY_PATH != 0 {
+                return self.sys_stat_fd_or_cwd(dirfd, statbuf_ptr);
+            }
+            return EFAULT;
+        }
+        let path = unsafe { read_c_string(pathname_ptr) };
+        if path.is_empty() {
+            if flags & AT_EMPTY_PATH != 0 {
+                return self.sys_stat_fd_or_cwd(dirfd, statbuf_ptr);
+            }
+            return ENOENT;
+        }
+
+        let resolved = if dirfd == AT_FDCWD || path.starts_with('/') {
+            self.resolve_path(&path)
+        } else if self.fd_table.contains_key(&dirfd) {
+            // dirfd-relative paths: not yet supported
+            return ENOSYS;
+        } else {
+            return EBADF;
+        };
+
+        let fid = self.alloc_fid();
+        if let Err(e) = self.backend.walk(&resolved, fid) {
+            return ipc_err_to_errno(e);
+        }
+        let result = match self.backend.stat(fid) {
+            Ok(stat) => {
+                write_linux_stat(statbuf_ptr, &stat);
+                0
+            }
+            Err(e) => ipc_err_to_errno(e),
+        };
+        let _ = self.backend.clunk(fid);
+        result
+    }
+
+    /// Linux faccessat(2): check file accessibility.
+    ///
+    /// Walks the path and stats to check existence. Permission bits always
+    /// pass (single-user, no capability enforcement yet). Note: `W_OK`
+    /// succeeds even though the filesystem is read-only; callers that use
+    /// `faccessat(W_OK)` for writability detection will be misled.
+    fn sys_faccessat(&mut self, dirfd: i32, pathname_ptr: usize, _mode: i32) -> i64 {
+        if pathname_ptr == 0 {
+            return EFAULT;
+        }
+        const AT_FDCWD: i32 = -100;
+        let path = unsafe { read_c_string(pathname_ptr) };
+        if path.is_empty() {
+            return ENOENT;
+        }
+
+        let resolved = if dirfd == AT_FDCWD || path.starts_with('/') {
+            self.resolve_path(&path)
+        } else if self.fd_table.contains_key(&dirfd) {
+            // dirfd-relative paths: not yet supported
+            return ENOSYS;
+        } else {
+            return EBADF;
+        };
+
+        let fid = self.alloc_fid();
+        if let Err(e) = self.backend.walk(&resolved, fid) {
+            return ipc_err_to_errno(e);
+        }
+        // File exists — clunk and return success.
+        let _ = self.backend.clunk(fid);
+        0
+    }
+
+    /// Linux getdents64(2): read directory entries.
+    ///
+    /// Calls `backend.readdir(fid)` to get all entries, then packs
+    /// `linux_dirent64` structs into the user buffer starting from
+    /// the entry index stored in `FdEntry.offset`.
+    fn sys_getdents64(&mut self, fd: i32, dirp: usize, count: usize) -> i64 {
+        if dirp == 0 {
+            return EFAULT;
+        }
+        let entry = match self.fd_table.get(&fd) {
+            Some(e) => e.clone(),
+            None => return EBADF,
+        };
+        let start_idx = entry.offset as usize;
+
+        let entries = match self.backend.readdir(entry.fid) {
+            Ok(e) => e,
+            Err(e) => return ipc_err_to_errno(e),
+        };
+
+        if start_idx >= entries.len() {
+            return 0; // End of directory
+        }
+
+        // Cap the kernel-side allocation to avoid OOM from user-controlled count.
+        // 256 KiB matches a common glibc getdents64 buffer size.
+        const GETDENTS_BUF_MAX: usize = 256 * 1024;
+        let capped_count = count.min(GETDENTS_BUF_MAX);
+        let mut buf = vec![0u8; capped_count];
+        let mut bytes_written: usize = 0;
+        let mut idx = start_idx;
+
+        while idx < entries.len() {
+            let e = &entries[idx];
+            let name_bytes = e.name.as_bytes();
+            // d_ino(8) + d_off(8) + d_reclen(2) + d_type(1) + name + NUL
+            let reclen_unaligned = 8 + 8 + 2 + 1 + name_bytes.len() + 1;
+            let reclen = (reclen_unaligned + 7) & !7; // 8-byte align
+
+            // Guard against filenames exceeding d_reclen's u16 range.
+            if reclen > u16::MAX as usize {
+                return EINVAL;
+            }
+
+            if bytes_written + reclen > capped_count {
+                break; // Buffer full
+            }
+
+            let d_type: u8 = match e.file_type {
+                FileType::Regular => 8,   // DT_REG
+                FileType::Directory => 4, // DT_DIR
+                FileType::CharDev => 2,   // DT_CHR
+            };
+
+            // Pack the entry into the pre-allocated buffer.
+            let rec = &mut buf[bytes_written..bytes_written + reclen];
+            // rec is already zeroed (NUL terminator included)
+            let d_ino = (idx + 1) as u64; // non-zero placeholder; 0 means "deleted"
+            rec[0..8].copy_from_slice(&d_ino.to_le_bytes()); // d_ino
+            // d_off: entry index used as seek position (Linuxulator-internal
+            // convention — not a byte offset, but consistent with how
+            // FdEntry.offset tracks pagination via lseek).
+            let next_off = (idx + 1) as i64;
+            rec[8..16].copy_from_slice(&next_off.to_le_bytes()); // d_off
+            rec[16..18].copy_from_slice(&(reclen as u16).to_le_bytes()); // d_reclen
+            rec[18] = d_type; // d_type
+            rec[19..19 + name_bytes.len()].copy_from_slice(name_bytes); // d_name
+
+            bytes_written += reclen;
+            idx += 1;
+        }
+
+        // Single write for all packed entries.
+        if bytes_written > 0 {
+            self.backend
+                .vm_write_bytes(dirp as u64, &buf[..bytes_written]);
+        }
+
+        if bytes_written == 0 && idx < entries.len() {
+            return EINVAL; // Buffer too small for even one entry
+        }
+
+        // Update the offset to track position.
+        if let Some(entry) = self.fd_table.get_mut(&fd) {
+            entry.offset = idx as u64;
+        }
+
+        bytes_written as i64
+    }
+
+    /// Linux chdir(2): change working directory.
+    ///
+    /// Walks the path, verifies it's a directory via stat, then
+    /// updates `self.cwd`. The walked fid is transient — clunked
+    /// immediately after verification.
+    fn sys_chdir(&mut self, pathname_ptr: usize) -> i64 {
+        if pathname_ptr == 0 {
+            return EFAULT;
+        }
+        let path = unsafe { read_c_string(pathname_ptr) };
+        if path.is_empty() {
+            return ENOENT;
+        }
+        let resolved = self.resolve_path(&path);
+
+        let fid = self.alloc_fid();
+        if let Err(e) = self.backend.walk(&resolved, fid) {
+            return ipc_err_to_errno(e);
+        }
+
+        // Verify it's a directory, then clunk the transient fid
+        let result = match self.backend.stat(fid) {
+            Ok(stat) if stat.file_type == FileType::Directory => {
+                self.cwd = resolved;
+                0
+            }
+            Ok(_) => ENOTDIR,
+            Err(e) => ipc_err_to_errno(e),
+        };
+        let _ = self.backend.clunk(fid);
+        result
+    }
+
+    /// Linux fchdir(2): change working directory to an open fd.
+    fn sys_fchdir(&mut self, fd: i32) -> i64 {
+        let entry = match self.fd_table.get(&fd) {
+            Some(e) => e.clone(),
+            None => return EBADF,
+        };
+
+        // Verify it's a directory before checking path — a valid non-directory
+        // fd (e.g. stdio) should return ENOTDIR, not EBADF.
+        match self.backend.stat(entry.fid) {
+            Ok(stat) if stat.file_type == FileType::Directory => {}
+            Ok(_) => return ENOTDIR,
+            Err(e) => return ipc_err_to_errno(e),
+        }
+
+        let path = match &entry.path {
+            Some(p) => p.clone(),
+            None => {
+                // fd is confirmed directory but has no tracked path —
+                // implementation limitation. All current directory fds have
+                // paths, so this is effectively unreachable.
+                debug_assert!(false, "directory fd {} has no tracked path", fd);
+                return EINVAL;
+            }
+        };
+
+        self.cwd = path;
+        0
+    }
+
+    /// Linux mkdirat(2): create a directory relative to a directory fd.
+    ///
+    /// Returns EROFS — the Linuxulator filesystem is read-only.
+    fn sys_mkdirat(&mut self) -> i64 {
+        EROFS
+    }
+
+    /// Linux unlinkat(2): remove a file relative to a directory fd.
+    ///
+    /// Returns EROFS — the Linuxulator filesystem is read-only.
+    fn sys_unlinkat(&mut self) -> i64 {
+        EROFS
+    }
+
     /// Linux getcwd(2): get current working directory.
     ///
-    /// Always returns "/" since the Linuxulator uses a flat namespace.
+    /// Returns the tracked current working directory path.
     /// The raw syscall returns the number of bytes written (including
     /// the null terminator), not the buffer pointer.  Musl calls the
     /// raw syscall and interprets the return value as a byte count.
@@ -1768,17 +2299,26 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if buf_ptr == 0 {
             return EFAULT;
         }
-        if size < 2 {
-            return ERANGE; // buffer too small for "/\0"
+        let cwd_bytes = self.cwd.as_bytes();
+        let needed = cwd_bytes.len() + 1; // +1 for NUL terminator
+        if size < needed {
+            return ERANGE;
         }
-        self.backend.vm_write_bytes(buf_ptr as u64, b"/\0");
-        2 // bytes written: '/' + '\0'
+        let mut out = Vec::with_capacity(needed);
+        out.extend_from_slice(cwd_bytes);
+        out.push(0);
+        self.backend.vm_write_bytes(buf_ptr as u64, &out);
+        needed as i64
     }
 
     /// Linux readlink(2): read the value of a symbolic link.
     ///
-    /// Returns ENOSYS — ld-musl has fallbacks for /proc/self/exe and
-    /// similar paths.
+    /// Returns ENOSYS — no symlinks in the 9P namespace.
+    /// Returning ENOSYS (rather than EINVAL) preserves the fallback
+    /// behaviour that ld-musl relies on for /proc/self/exe and similar
+    /// virtual paths: the runtime treats ENOSYS as "syscall not supported"
+    /// and falls back gracefully, whereas EINVAL means "path is not a
+    /// symlink" — a claim we cannot make without first walking the path.
     fn sys_readlink(&self, _pathname: u64, _buf: u64, _bufsiz: u64) -> i64 {
         ENOSYS
     }
@@ -2079,15 +2619,14 @@ mod tests {
     }
 
     #[test]
-    fn sys_close_cleans_chardev_fids() {
+    fn sys_close_clunks_chardev_fd() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
         lx.init_stdio().unwrap();
-        // Closing stdout should remove its fid from chardev_fids
-        let stdout_fid = lx.fid_for_fd(1).unwrap();
-        assert!(lx.chardev_fids.contains(&stdout_fid));
+        // Closing stdout should clunk the fid and remove the fd
+        assert!(lx.has_fd(1));
         lx.handle_syscall(3, [1, 0, 0, 0, 0, 0]);
-        assert!(!lx.chardev_fids.contains(&stdout_fid));
+        assert!(!lx.has_fd(1));
     }
 
     // ── sys_openat tests ──────────────────────────────────────────────
@@ -2162,12 +2701,12 @@ mod tests {
     }
 
     #[test]
-    fn sys_fstat_null_ptr_returns_einval() {
+    fn sys_fstat_null_ptr_returns_efault() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
         lx.init_stdio().unwrap();
         let result = lx.handle_syscall(5, [1, 0, 0, 0, 0, 0]);
-        assert_eq!(result, EINVAL);
+        assert_eq!(result, EFAULT);
     }
 
     // ── stub syscall tests ──────────────────────────────────────────
@@ -2606,8 +3145,8 @@ mod tests {
         let mut lx = Linuxulator::new(mock);
         lx.init_stdio().unwrap();
 
-        // Open a file via openat to get fd 3
-        let path = b"/dev/serial/log\0";
+        // Open a regular file (not chardev) via openat to get fd 3
+        let path = b"/data/file.txt\0";
         let at_fdcwd = (-100i32) as u64;
         let fd = lx.handle_syscall(257, [at_fdcwd, path.as_ptr() as u64, 0, 0, 0, 0]);
         assert!(fd >= 0);
@@ -2624,7 +3163,7 @@ mod tests {
         let mut lx = Linuxulator::new(mock);
         lx.init_stdio().unwrap();
 
-        let path = b"/dev/serial/log\0";
+        let path = b"/data/file.txt\0";
         let at_fdcwd = (-100i32) as u64;
         let fd = lx.handle_syscall(257, [at_fdcwd, path.as_ptr() as u64, 0, 0, 0, 0]);
         assert!(fd >= 0);
@@ -2653,8 +3192,8 @@ mod tests {
         let mut lx = Linuxulator::new(mock);
         lx.init_stdio().unwrap();
 
-        // Open a file to get a seekable fd
-        let path = b"/dev/serial/log\0";
+        // Open a regular file to get a seekable fd
+        let path = b"/data/file.txt\0";
         let at_fdcwd = (-100i32) as u64;
         let fd = lx.handle_syscall(257, [at_fdcwd, path.as_ptr() as u64, 0, 0, 0, 0]);
         assert!(fd >= 0);
@@ -2738,6 +3277,77 @@ mod tests {
         assert_eq!(result, ERANGE);
     }
 
+    // ── resolve_path tests ──────────────────────────────────────────
+
+    #[test]
+    fn resolve_path_absolute() {
+        let mock = MockBackend::new();
+        let lx = Linuxulator::new(mock);
+        assert_eq!(lx.resolve_path("/foo/bar"), "/foo/bar");
+    }
+
+    #[test]
+    fn resolve_path_relative_from_root() {
+        let mock = MockBackend::new();
+        let lx = Linuxulator::new(mock);
+        assert_eq!(lx.resolve_path("bar"), "/bar");
+    }
+
+    #[test]
+    fn resolve_path_relative_from_subdir() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.cwd = alloc::string::String::from("/foo");
+        assert_eq!(lx.resolve_path("bar"), "/foo/bar");
+    }
+
+    #[test]
+    fn resolve_path_normalises_dotdot() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.cwd = alloc::string::String::from("/nix/store");
+        assert_eq!(lx.resolve_path(".."), "/nix");
+    }
+
+    #[test]
+    fn resolve_path_normalises_dot() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.cwd = alloc::string::String::from("/nix/store");
+        assert_eq!(lx.resolve_path("./pkg"), "/nix/store/pkg");
+    }
+
+    #[test]
+    fn resolve_path_dotdot_at_root() {
+        let mock = MockBackend::new();
+        let lx = Linuxulator::new(mock);
+        assert_eq!(lx.resolve_path("/.."), "/");
+    }
+
+    #[test]
+    fn resolve_path_complex_dotdot() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.cwd = alloc::string::String::from("/a/b/c");
+        assert_eq!(lx.resolve_path("../../d"), "/a/d");
+    }
+
+    // ── sys_getcwd upgraded tests ─────────────────────────────────────
+
+    #[test]
+    fn sys_getcwd_tracks_cwd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.cwd = alloc::string::String::from("/nix/store");
+        let mut buf = [0u8; 64];
+        let ret = lx.dispatch_syscall(LinuxSyscall::Getcwd {
+            buf: buf.as_mut_ptr() as u64,
+            size: 64,
+        });
+        assert_eq!(ret, 11); // "/nix/store\0" = 11 bytes
+        assert_eq!(&buf[..11], b"/nix/store\0");
+    }
+
     // ── sys_readlink tests ─────────────────────────────────────────
 
     #[test]
@@ -2754,6 +3364,216 @@ mod tests {
             [path.as_ptr() as u64, buf.as_mut_ptr() as u64, 128, 0, 0, 0],
         );
         assert_eq!(result, ENOSYS);
+    }
+
+    // ── sys_newfstatat tests ─────────────────────────────────────────
+
+    #[test]
+    fn sys_newfstatat_absolute_path() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        #[cfg(target_arch = "x86_64")]
+        let mut statbuf = [0u8; 144];
+        #[cfg(not(target_arch = "x86_64"))]
+        let mut statbuf = [0u8; 128];
+        let path = b"/dev/serial/log\0";
+        let at_fdcwd: i32 = -100;
+        let ret = lx.dispatch_syscall(LinuxSyscall::Newfstatat {
+            dirfd: at_fdcwd,
+            pathname: path.as_ptr() as u64,
+            statbuf: statbuf.as_mut_ptr() as u64,
+            flags: 0,
+        });
+        assert_eq!(ret, 0);
+        // Verify walk was called with the path
+        assert_eq!(lx.backend().walks[0].0, "/dev/serial/log");
+        // /dev/serial/log is a chardev — st_mode should be S_IFCHR | 0o666
+        #[cfg(target_arch = "x86_64")]
+        const ST_MODE_OFFSET: usize = 24;
+        #[cfg(not(target_arch = "x86_64"))]
+        const ST_MODE_OFFSET: usize = 16;
+        let o = ST_MODE_OFFSET;
+        let st_mode =
+            u32::from_le_bytes([statbuf[o], statbuf[o + 1], statbuf[o + 2], statbuf[o + 3]]);
+        assert_eq!(st_mode, 0o020666, "path-based stat on chardev should report S_IFCHR");
+    }
+
+    #[test]
+    fn sys_newfstatat_at_empty_path() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+        #[cfg(target_arch = "x86_64")]
+        let mut statbuf = [0u8; 144];
+        #[cfg(not(target_arch = "x86_64"))]
+        let mut statbuf = [0u8; 128];
+        let empty = b"\0";
+        let at_empty_path: i32 = 0x1000;
+        let ret = lx.dispatch_syscall(LinuxSyscall::Newfstatat {
+            dirfd: 1, // stdout
+            pathname: empty.as_ptr() as u64,
+            statbuf: statbuf.as_mut_ptr() as u64,
+            flags: at_empty_path,
+        });
+        assert_eq!(ret, 0);
+    }
+
+    #[test]
+    fn sys_newfstatat_at_empty_path_with_nonempty_pathname_resolves_path() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        #[cfg(target_arch = "x86_64")]
+        let mut statbuf = [0u8; 144];
+        #[cfg(not(target_arch = "x86_64"))]
+        let mut statbuf = [0u8; 128];
+        let path = b"/dev/serial/log\0";
+        let at_empty_path: i32 = 0x1000;
+        // AT_EMPTY_PATH with a non-empty path should resolve the path normally
+        let ret = lx.dispatch_syscall(LinuxSyscall::Newfstatat {
+            dirfd: -100,
+            pathname: path.as_ptr() as u64,
+            statbuf: statbuf.as_mut_ptr() as u64,
+            flags: at_empty_path,
+        });
+        assert_eq!(ret, 0);
+        // Verify the walk was called with the path (not an fstat on dirfd)
+        assert_eq!(lx.backend().walks[0].0, "/dev/serial/log");
+    }
+
+    #[test]
+    fn sys_newfstatat_at_empty_path_at_fdcwd_stats_cwd() {
+        let mut mock = MockBackend::new();
+        mock.directory_paths
+            .insert(alloc::string::String::from("/nix/store"));
+        let mut lx = Linuxulator::new(mock);
+        lx.cwd = alloc::string::String::from("/nix/store");
+        #[cfg(target_arch = "x86_64")]
+        let mut statbuf = [0u8; 144];
+        #[cfg(not(target_arch = "x86_64"))]
+        let mut statbuf = [0u8; 128];
+        let empty = b"\0";
+        let at_empty_path: i32 = 0x1000;
+        let ret = lx.dispatch_syscall(LinuxSyscall::Newfstatat {
+            dirfd: -100, // AT_FDCWD
+            pathname: empty.as_ptr() as u64,
+            statbuf: statbuf.as_mut_ptr() as u64,
+            flags: at_empty_path,
+        });
+        assert_eq!(ret, 0);
+        // Should have walked the cwd path
+        assert_eq!(lx.backend().walks[0].0, "/nix/store");
+    }
+
+    #[test]
+    fn sys_newfstatat_null_pathname_at_empty_path_at_fdcwd_stats_cwd() {
+        let mut mock = MockBackend::new();
+        mock.directory_paths
+            .insert(alloc::string::String::from("/nix/store"));
+        let mut lx = Linuxulator::new(mock);
+        lx.cwd = alloc::string::String::from("/nix/store");
+        #[cfg(target_arch = "x86_64")]
+        let mut statbuf = [0u8; 144];
+        #[cfg(not(target_arch = "x86_64"))]
+        let mut statbuf = [0u8; 128];
+        let at_empty_path: i32 = 0x1000;
+        let ret = lx.dispatch_syscall(LinuxSyscall::Newfstatat {
+            dirfd: -100, // AT_FDCWD
+            pathname: 0, // NULL
+            statbuf: statbuf.as_mut_ptr() as u64,
+            flags: at_empty_path,
+        });
+        assert_eq!(ret, 0);
+        assert_eq!(lx.backend().walks[0].0, "/nix/store");
+    }
+
+    #[test]
+    fn sys_newfstatat_absolute_path_ignores_invalid_dirfd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        #[cfg(target_arch = "x86_64")]
+        let mut statbuf = [0u8; 144];
+        #[cfg(not(target_arch = "x86_64"))]
+        let mut statbuf = [0u8; 128];
+        let path = b"/dev/serial/log\0";
+        // dirfd=999 (invalid) with absolute path — should succeed
+        let ret = lx.dispatch_syscall(LinuxSyscall::Newfstatat {
+            dirfd: 999,
+            pathname: path.as_ptr() as u64,
+            statbuf: statbuf.as_mut_ptr() as u64,
+            flags: 0,
+        });
+        assert_eq!(ret, 0);
+    }
+
+    #[test]
+    fn sys_newfstatat_null_pathname_without_at_empty_path() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        #[cfg(target_arch = "x86_64")]
+        let mut statbuf = [0u8; 144];
+        #[cfg(not(target_arch = "x86_64"))]
+        let mut statbuf = [0u8; 128];
+        let ret = lx.dispatch_syscall(LinuxSyscall::Newfstatat {
+            dirfd: -100,
+            pathname: 0, // NULL
+            statbuf: statbuf.as_mut_ptr() as u64,
+            flags: 0, // no AT_EMPTY_PATH
+        });
+        assert_eq!(ret, EFAULT);
+    }
+
+    // ── sys_faccessat tests ────────────────────────────────────────────
+
+    #[test]
+    fn sys_faccessat_exists() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let path = b"/dev/serial/log\0";
+        let at_fdcwd: i32 = -100;
+        let ret = lx.dispatch_syscall(LinuxSyscall::Faccessat {
+            dirfd: at_fdcwd,
+            pathname: path.as_ptr() as u64,
+            mode: 0, // F_OK
+        });
+        assert_eq!(ret, 0);
+    }
+
+    #[test]
+    fn sys_faccessat_null_pathname() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let ret = lx.dispatch_syscall(LinuxSyscall::Faccessat {
+            dirfd: -100,
+            pathname: 0,
+            mode: 0,
+        });
+        assert_eq!(ret, EFAULT);
+    }
+
+    #[test]
+    fn sys_faccessat_empty_pathname() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let empty = b"\0";
+        let ret = lx.dispatch_syscall(LinuxSyscall::Faccessat {
+            dirfd: -100,
+            pathname: empty.as_ptr() as u64,
+            mode: 0,
+        });
+        assert_eq!(ret, ENOENT);
+    }
+
+    #[test]
+    fn sys_faccessat_absolute_path_ignores_invalid_dirfd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let path = b"/dev/serial/log\0";
+        let ret = lx.dispatch_syscall(LinuxSyscall::Faccessat {
+            dirfd: 999, // invalid fd, but path is absolute
+            pathname: path.as_ptr() as u64,
+            mode: 0,
+        });
+        assert_eq!(ret, 0);
     }
 
     // ── from_x86_64 mapping tests for new syscalls ─────────────────
@@ -2810,6 +3630,44 @@ mod tests {
                 assert_eq!(bufsiz, 128);
             }
             other => panic!("expected Readlink, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_x86_64_readlinkat_at_fdcwd() {
+        let at_fdcwd = (-100i64) as u64;
+        let syscall = LinuxSyscall::from_x86_64(267, [at_fdcwd, 0x1000, 0x2000, 128, 0, 0]);
+        match syscall {
+            LinuxSyscall::Readlink {
+                pathname,
+                buf,
+                bufsiz,
+            } => {
+                assert_eq!(pathname, 0x1000);
+                assert_eq!(buf, 0x2000);
+                assert_eq!(bufsiz, 128);
+            }
+            other => panic!("expected Readlink, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_x86_64_readlinkat_at_fdcwd_zero_extended() {
+        // Simulate 32-bit AT_FDCWD (-100 = 0xFFFFFF9C) zero-extended to 64 bits
+        let at_fdcwd_zext: u64 = 0x00000000FFFFFF9C;
+        let syscall = LinuxSyscall::from_x86_64(267, [at_fdcwd_zext, 0x1000, 0x2000, 128, 0, 0]);
+        match syscall {
+            LinuxSyscall::Readlink { .. } => {} // should match via i32 truncation
+            other => panic!("expected Readlink for zero-extended AT_FDCWD, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_x86_64_readlinkat_explicit_dirfd() {
+        let syscall = LinuxSyscall::from_x86_64(267, [5, 0x1000, 0x2000, 128, 0, 0]);
+        match syscall {
+            LinuxSyscall::Unknown { nr } => assert_eq!(nr, 267),
+            other => panic!("expected Unknown, got {:?}", other),
         }
     }
 
@@ -3595,5 +4453,244 @@ mod integration_tests {
             2,
             "Process should have exactly 2 regions (text + data)"
         );
+    }
+
+    #[test]
+    fn sys_getdents64_packs_entries() {
+        let mut mock = MockBackend::new();
+        let dir_fid: Fid = 200;
+        mock.readdir_entries.insert(
+            dir_fid,
+            vec![
+                DirEntry {
+                    name: alloc::string::String::from("hello.txt"),
+                    file_type: FileType::Regular,
+                },
+                DirEntry {
+                    name: alloc::string::String::from("subdir"),
+                    file_type: FileType::Directory,
+                },
+            ],
+        );
+        let mut lx = Linuxulator::new(mock);
+        // Manually insert a directory fd.
+        lx.fd_table_mut().insert(
+            3,
+            FdEntry {
+                fid: dir_fid,
+                offset: 0,
+                path: Some(alloc::string::String::from("/test")),
+                file_type: FileType::Directory,
+            },
+        );
+
+        let mut buf = [0u8; 512];
+        let ret = lx.dispatch_syscall(LinuxSyscall::Getdents64 {
+            fd: 3,
+            dirp: buf.as_mut_ptr() as u64,
+            count: 512,
+        });
+        assert!(ret > 0, "should have written some bytes, got {ret}");
+
+        // Verify first entry header: d_reclen at offset 16..18
+        let reclen1 = u16::from_le_bytes([buf[16], buf[17]]) as usize;
+        // d_type at offset 18
+        assert_eq!(buf[18], 8, "first entry should be DT_REG");
+        // d_name starts at offset 19
+        assert_eq!(&buf[19..28], b"hello.txt");
+
+        // Verify second entry starts at reclen1
+        assert_eq!(buf[reclen1 + 18], 4, "second entry should be DT_DIR");
+        assert_eq!(&buf[reclen1 + 19..reclen1 + 25], b"subdir");
+
+        // Calling again should return 0 (end of directory).
+        let ret2 = lx.dispatch_syscall(LinuxSyscall::Getdents64 {
+            fd: 3,
+            dirp: buf.as_mut_ptr() as u64,
+            count: 512,
+        });
+        assert_eq!(ret2, 0, "second call should return 0 (end of dir)");
+    }
+
+    #[test]
+    fn sys_getdents64_empty_dir() {
+        let mut mock = MockBackend::new();
+        let dir_fid: Fid = 200;
+        mock.readdir_entries.insert(dir_fid, vec![]);
+        let mut lx = Linuxulator::new(mock);
+        lx.fd_table_mut().insert(
+            3,
+            FdEntry {
+                fid: dir_fid,
+                offset: 0,
+                path: Some(alloc::string::String::from("/empty")),
+                file_type: FileType::Directory,
+            },
+        );
+
+        let mut buf = [0u8; 512];
+        let ret = lx.dispatch_syscall(LinuxSyscall::Getdents64 {
+            fd: 3,
+            dirp: buf.as_mut_ptr() as u64,
+            count: 512,
+        });
+        assert_eq!(ret, 0, "empty directory should return 0");
+    }
+
+    #[test]
+    fn sys_getdents64_non_directory_returns_enotdir() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+        // getdents64 on stdout (fd 1) — a regular file, not a directory
+        let mut buf = [0u8; 256];
+        let ret = lx.dispatch_syscall(LinuxSyscall::Getdents64 {
+            fd: 1,
+            dirp: buf.as_mut_ptr() as u64,
+            count: 256,
+        });
+        assert_eq!(ret, ENOTDIR);
+    }
+
+    // ── sys_chdir tests ───────────────────────────────────────────
+
+    #[test]
+    fn sys_chdir_updates_cwd() {
+        let mut mock = MockBackend::new();
+        mock.directory_paths
+            .insert(alloc::string::String::from("/nix/store"));
+        let mut lx = Linuxulator::new(mock);
+        let path = b"/nix/store\0";
+        let ret = lx.dispatch_syscall(LinuxSyscall::Chdir {
+            pathname: path.as_ptr() as u64,
+        });
+        assert_eq!(ret, 0);
+        // Verify getcwd returns updated path
+        let mut buf = [0u8; 64];
+        let ret = lx.dispatch_syscall(LinuxSyscall::Getcwd {
+            buf: buf.as_mut_ptr() as u64,
+            size: 64,
+        });
+        assert_eq!(ret, 11); // "/nix/store\0"
+        assert_eq!(&buf[..11], b"/nix/store\0");
+    }
+
+    #[test]
+    fn sys_chdir_empty_path_returns_enoent() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let empty = b"\0";
+        let ret = lx.dispatch_syscall(LinuxSyscall::Chdir {
+            pathname: empty.as_ptr() as u64,
+        });
+        assert_eq!(ret, ENOENT);
+    }
+
+    // ── sys_fchdir tests ──────────────────────────────────────────
+
+    #[test]
+    fn sys_fchdir_from_open_fd() {
+        let mut mock = MockBackend::new();
+        mock.directory_paths
+            .insert(alloc::string::String::from("/nix/store"));
+        let mut lx = Linuxulator::new(mock);
+        // Open a directory
+        let path = b"/nix/store\0";
+        let fd = lx.dispatch_syscall(LinuxSyscall::Openat {
+            dirfd: -100,
+            pathname: path.as_ptr() as u64,
+            flags: 0,
+        });
+        assert!(fd >= 0);
+        let ret = lx.dispatch_syscall(LinuxSyscall::Fchdir { fd: fd as i32 });
+        assert_eq!(ret, 0);
+        // getcwd should reflect the change
+        let mut buf = [0u8; 64];
+        let _ret = lx.dispatch_syscall(LinuxSyscall::Getcwd {
+            buf: buf.as_mut_ptr() as u64,
+            size: 64,
+        });
+        assert_eq!(&buf[..11], b"/nix/store\0");
+    }
+
+    #[test]
+    fn sys_fchdir_stdio_returns_enotdir() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+        // fchdir(1) on stdout — valid fd but not a directory
+        let ret = lx.dispatch_syscall(LinuxSyscall::Fchdir { fd: 1 });
+        assert_eq!(ret, ENOTDIR);
+    }
+
+    // ── sys_readlinkat tests (dispatch_syscall) ───────────────────
+
+    #[test]
+    fn sys_readlinkat_returns_enosys() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let path = b"/some/link\0";
+        let mut buf = [0u8; 64];
+        let ret = lx.dispatch_syscall(LinuxSyscall::Readlink {
+            pathname: path.as_ptr() as u64,
+            buf: buf.as_mut_ptr() as u64,
+            bufsiz: 64,
+        });
+        assert_eq!(ret, ENOSYS);
+    }
+
+    // ── sys_mkdirat tests ─────────────────────────────────────────
+
+    #[test]
+    fn sys_mkdirat_returns_erofs() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let path = b"/tmp/newdir\0";
+        let ret = lx.dispatch_syscall(LinuxSyscall::Mkdirat {
+            dirfd: -100,
+            pathname: path.as_ptr() as u64,
+            mode: 0o755,
+        });
+        assert_eq!(ret, -30); // EROFS
+    }
+
+    #[test]
+    fn sys_unlinkat_returns_erofs() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let path = b"/tmp/oldfile\0";
+        let ret = lx.dispatch_syscall(LinuxSyscall::Unlinkat {
+            dirfd: -100,
+            pathname: path.as_ptr() as u64,
+            flags: 0,
+        });
+        assert_eq!(ret, -30); // EROFS
+    }
+
+    // ── openat resolve_path tests ────────────────────────────────
+
+    #[test]
+    fn sys_openat_relative_path_uses_cwd() {
+        let mut mock = MockBackend::new();
+        mock.directory_paths
+            .insert(alloc::string::String::from("/nix/store"));
+        let mut lx = Linuxulator::new(mock);
+        // chdir to /nix/store
+        let dir = b"/nix/store\0";
+        lx.dispatch_syscall(LinuxSyscall::Chdir {
+            pathname: dir.as_ptr() as u64,
+        });
+        // openat with relative path
+        let file = b"abc123-hello\0";
+        let fd = lx.dispatch_syscall(LinuxSyscall::Openat {
+            dirfd: -100,
+            pathname: file.as_ptr() as u64,
+            flags: 0,
+        });
+        assert!(fd >= 0);
+        // Verify the walk used the resolved path
+        let walks = &lx.backend().walks;
+        let last_walk = &walks[walks.len() - 1];
+        assert_eq!(last_walk.0, "/nix/store/abc123-hello");
     }
 }
