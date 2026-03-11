@@ -1978,7 +1978,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux getcwd(2): get current working directory.
     ///
-    /// Always returns "/" since the Linuxulator uses a flat namespace.
+    /// Returns the tracked current working directory path.
     /// The raw syscall returns the number of bytes written (including
     /// the null terminator), not the buffer pointer.  Musl calls the
     /// raw syscall and interprets the return value as a byte count.
