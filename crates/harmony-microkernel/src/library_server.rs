@@ -14,20 +14,8 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use crate::fid_tracker::FidTracker;
 use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
-
-// ── Per-fid state ───────────────────────────────────────────────────
-
-/// Tracks each fid's association with a library entry and open state.
-#[derive(Debug, Clone)]
-struct FidState {
-    /// The library name this fid was walked to.
-    name: Arc<str>,
-    /// Stable file identity derived from the library name.
-    qpath: QPath,
-    /// Whether `open()` has been called on this fid.
-    is_open: bool,
-}
 
 // ── LibraryServer ───────────────────────────────────────────────────
 
@@ -39,7 +27,7 @@ pub struct LibraryServer {
     /// Library name -> raw ELF bytes.
     manifest: BTreeMap<Arc<str>, Vec<u8>>,
     /// Active fid -> state mapping.
-    fids: BTreeMap<Fid, FidState>,
+    tracker: FidTracker<Arc<str>>,
 }
 
 impl LibraryServer {
@@ -49,16 +37,10 @@ impl LibraryServer {
     /// A root fid (0) is pre-allocated to represent the `/lib/`
     /// directory itself. Walks originate from this root fid.
     pub fn new(manifest: BTreeMap<Arc<str>, Vec<u8>>) -> Self {
-        let mut fids = BTreeMap::new();
-        fids.insert(
-            0,
-            FidState {
-                name: Arc::from(""),
-                qpath: 0,
-                is_open: false,
-            },
-        );
-        Self { manifest, fids }
+        Self {
+            manifest,
+            tracker: FidTracker::new(0, Arc::from("")),
+        }
     }
 
     /// Compute a stable QPath from a library name.
@@ -80,12 +62,9 @@ impl LibraryServer {
 
 impl FileServer for LibraryServer {
     fn walk(&mut self, fid: Fid, new_fid: Fid, name: &str) -> Result<QPath, IpcError> {
-        // Only directory fids (root, name == "") may be walked.
-        let source = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        if !source.name.is_empty() {
-            return Err(IpcError::InvalidFid);
-        }
-        if self.fids.contains_key(&new_fid) {
+        // Only directory fids (root, payload == "") may be walked.
+        let entry = self.tracker.get(fid)?;
+        if !entry.payload.is_empty() {
             return Err(IpcError::InvalidFid);
         }
         let key: Arc<str> = Arc::from(name);
@@ -93,36 +72,30 @@ impl FileServer for LibraryServer {
             return Err(IpcError::NotFound);
         }
         let qpath = Self::qpath_for(name);
-        self.fids.insert(
-            new_fid,
-            FidState {
-                name: key,
-                qpath,
-                is_open: false,
-            },
-        );
+        self.tracker.insert(new_fid, qpath, key)?;
         Ok(qpath)
     }
 
     fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
-        let state = self.fids.get_mut(&fid).ok_or(IpcError::InvalidFid)?;
+        let entry = self.tracker.get_mut(fid)?;
         if mode != OpenMode::Read {
             return Err(IpcError::ReadOnly);
         }
-        state.is_open = true;
+        entry.is_open = true;
         Ok(())
     }
 
     fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        if !state.is_open {
+        let entry = self.tracker.get(fid)?;
+        if !entry.is_open {
             return Err(IpcError::NotOpen);
         }
         // Root fid is a directory — reading it is not supported.
-        if state.name.is_empty() {
+        if entry.payload.is_empty() {
             return Err(IpcError::IsDirectory);
         }
-        let data = self.manifest.get(&state.name).ok_or(IpcError::NotFound)?;
+        let name = Arc::clone(&entry.payload);
+        let data = self.manifest.get(&name).ok_or(IpcError::NotFound)?;
         let off = offset as usize;
         if off >= data.len() {
             return Ok(Vec::new());
@@ -141,15 +114,14 @@ impl FileServer for LibraryServer {
             // breaking the server for the rest of its lifetime.
             return Ok(());
         }
-        self.fids.remove(&fid).ok_or(IpcError::InvalidFid)?;
-        Ok(())
+        self.tracker.clunk(fid)
     }
 
     fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
+        let entry = self.tracker.get(fid)?;
 
-        // Root fid (name == "") is the /lib directory itself.
-        if state.name.is_empty() {
+        // Root fid (payload == "") is the /lib directory itself.
+        if entry.payload.is_empty() {
             return Ok(FileStat {
                 qpath: 0,
                 name: Arc::from("lib"),
@@ -158,28 +130,19 @@ impl FileServer for LibraryServer {
             });
         }
 
-        let data = self.manifest.get(&state.name).ok_or(IpcError::NotFound)?;
+        let qpath = entry.qpath;
+        let name = Arc::clone(&entry.payload);
+        let data = self.manifest.get(&name).ok_or(IpcError::NotFound)?;
         Ok(FileStat {
-            qpath: state.qpath,
-            name: Arc::clone(&state.name),
+            qpath,
+            name,
             size: data.len() as u64,
             file_type: FileType::Regular,
         })
     }
 
     fn clone_fid(&mut self, fid: Fid, new_fid: Fid) -> Result<QPath, IpcError> {
-        if self.fids.contains_key(&new_fid) {
-            return Err(IpcError::InvalidFid);
-        }
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        let qpath = state.qpath;
-        let cloned = FidState {
-            name: Arc::clone(&state.name),
-            qpath,
-            is_open: false,
-        };
-        self.fids.insert(new_fid, cloned);
-        Ok(qpath)
+        self.tracker.clone_fid(fid, new_fid)
     }
 }
 
