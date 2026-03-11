@@ -307,6 +307,21 @@ impl LinuxSyscall {
                 pathname: args[1],
                 flags: args[2] as i32,
             },
+            // x86_64 nr 267 is readlinkat(dirfd, pathname, buf, bufsiz).
+            // Only AT_FDCWD is supported; explicit dirfds return ENOSYS
+            // via the Unknown fallback.
+            267 => {
+                const AT_FDCWD: i64 = -100;
+                if args[0] as i64 != AT_FDCWD {
+                    LinuxSyscall::Unknown { nr: 267 }
+                } else {
+                    LinuxSyscall::Readlink {
+                        pathname: args[1],
+                        buf: args[2],
+                        bufsiz: args[3],
+                    }
+                }
+            }
             269 => LinuxSyscall::Faccessat {
                 dirfd: args[0] as i32,
                 pathname: args[1],
@@ -1070,13 +1085,32 @@ impl<B: SyscallBackend> Linuxulator<B> {
     ///
     /// Absolute paths (starting with `/`) pass through unchanged.
     /// Relative paths get `self.cwd` prepended.
+    /// Normalises `.` and `..` segments so `chdir("..")` produces the
+    /// correct parent path rather than forwarding `/foo/..` verbatim.
     fn resolve_path(&self, path: &str) -> alloc::string::String {
-        if path.starts_with('/') {
+        let base = if path.starts_with('/') {
             alloc::string::String::from(path)
         } else if self.cwd == "/" {
             alloc::format!("/{}", path)
         } else {
             alloc::format!("{}/{}", self.cwd, path)
+        };
+
+        // Normalise . and ..
+        let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+        for seg in base.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                s => parts.push(s),
+            }
+        }
+        if parts.is_empty() {
+            alloc::string::String::from("/")
+        } else {
+            alloc::format!("/{}", parts.join("/"))
         }
     }
 
@@ -1358,7 +1392,13 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux openat(2): open a file relative to a directory fd.
     fn sys_openat(&mut self, dirfd: i32, pathname_ptr: usize, flags: i32) -> i64 {
+        if pathname_ptr == 0 {
+            return EFAULT;
+        }
         let raw_path = unsafe { read_c_string(pathname_ptr) };
+        if raw_path.is_empty() {
+            return ENOENT;
+        }
 
         const AT_FDCWD: i32 = -100;
         if dirfd != AT_FDCWD && !self.fd_table.contains_key(&dirfd) {
@@ -2008,8 +2048,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Walks the path and stats to check existence. Permission bits always
     /// pass (single-user, no capability enforcement yet).
     fn sys_faccessat(&mut self, dirfd: i32, pathname_ptr: usize, _mode: i32) -> i64 {
+        if pathname_ptr == 0 {
+            return EFAULT;
+        }
         const AT_FDCWD: i32 = -100;
         let path = unsafe { read_c_string(pathname_ptr) };
+        if path.is_empty() {
+            return ENOENT;
+        }
 
         let resolved = if dirfd == AT_FDCWD || path.starts_with('/') {
             self.resolve_path(&path)
@@ -2104,6 +2150,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Walks the path, verifies it's a directory via stat, then
     /// updates `self.cwd`. Clunks the old cwd fid if set.
     fn sys_chdir(&mut self, pathname_ptr: usize) -> i64 {
+        if pathname_ptr == 0 {
+            return EFAULT;
+        }
         let path = unsafe { read_c_string(pathname_ptr) };
         let resolved = self.resolve_path(&path);
 
@@ -2208,9 +2257,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux readlink(2): read the value of a symbolic link.
     ///
-    /// Returns EINVAL — no symlinks in the 9P namespace.
+    /// Returns ENOSYS — no symlinks in the 9P namespace.
+    /// Returning ENOSYS (rather than EINVAL) preserves the fallback
+    /// behaviour that ld-musl relies on for /proc/self/exe and similar
+    /// virtual paths: the runtime treats ENOSYS as "syscall not supported"
+    /// and falls back gracefully, whereas EINVAL means "path is not a
+    /// symlink" — a claim we cannot make without first walking the path.
     fn sys_readlink(&self, _pathname: u64, _buf: u64, _bufsiz: u64) -> i64 {
-        EINVAL // No symlinks in the 9P namespace
+        ENOSYS
     }
 }
 
@@ -3192,6 +3246,37 @@ mod tests {
         assert_eq!(lx.resolve_path("bar"), "/foo/bar");
     }
 
+    #[test]
+    fn resolve_path_normalises_dotdot() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.cwd = alloc::string::String::from("/nix/store");
+        assert_eq!(lx.resolve_path(".."), "/nix");
+    }
+
+    #[test]
+    fn resolve_path_normalises_dot() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.cwd = alloc::string::String::from("/nix/store");
+        assert_eq!(lx.resolve_path("./pkg"), "/nix/store/pkg");
+    }
+
+    #[test]
+    fn resolve_path_dotdot_at_root() {
+        let mock = MockBackend::new();
+        let lx = Linuxulator::new(mock);
+        assert_eq!(lx.resolve_path("/.."), "/");
+    }
+
+    #[test]
+    fn resolve_path_complex_dotdot() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.cwd = alloc::string::String::from("/a/b/c");
+        assert_eq!(lx.resolve_path("../../d"), "/a/d");
+    }
+
     // ── sys_getcwd upgraded tests ─────────────────────────────────────
 
     #[test]
@@ -3212,7 +3297,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn sys_readlink_returns_einval() {
+    fn sys_readlink_returns_enosys() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
 
@@ -3223,7 +3308,7 @@ mod tests {
             89,
             [path.as_ptr() as u64, buf.as_mut_ptr() as u64, 128, 0, 0, 0],
         );
-        assert_eq!(result, EINVAL);
+        assert_eq!(result, ENOSYS);
     }
 
     // ── sys_newfstatat tests ─────────────────────────────────────────
@@ -3285,6 +3370,31 @@ mod tests {
         assert_eq!(ret, 0);
     }
 
+    #[test]
+    fn sys_faccessat_null_pathname() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let ret = lx.dispatch_syscall(LinuxSyscall::Faccessat {
+            dirfd: -100,
+            pathname: 0,
+            mode: 0,
+        });
+        assert_eq!(ret, EFAULT);
+    }
+
+    #[test]
+    fn sys_faccessat_empty_pathname() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let empty = b"\0";
+        let ret = lx.dispatch_syscall(LinuxSyscall::Faccessat {
+            dirfd: -100,
+            pathname: empty.as_ptr() as u64,
+            mode: 0,
+        });
+        assert_eq!(ret, ENOENT);
+    }
+
     // ── from_x86_64 mapping tests for new syscalls ─────────────────
 
     #[test]
@@ -3339,6 +3449,33 @@ mod tests {
                 assert_eq!(bufsiz, 128);
             }
             other => panic!("expected Readlink, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_x86_64_readlinkat_at_fdcwd() {
+        let at_fdcwd = (-100i64) as u64;
+        let syscall = LinuxSyscall::from_x86_64(267, [at_fdcwd, 0x1000, 0x2000, 128, 0, 0]);
+        match syscall {
+            LinuxSyscall::Readlink {
+                pathname,
+                buf,
+                bufsiz,
+            } => {
+                assert_eq!(pathname, 0x1000);
+                assert_eq!(buf, 0x2000);
+                assert_eq!(bufsiz, 128);
+            }
+            other => panic!("expected Readlink, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_x86_64_readlinkat_explicit_dirfd() {
+        let syscall = LinuxSyscall::from_x86_64(267, [5, 0x1000, 0x2000, 128, 0, 0]);
+        match syscall {
+            LinuxSyscall::Unknown { nr } => assert_eq!(nr, 267),
+            other => panic!("expected Unknown, got {:?}", other),
         }
     }
 
@@ -4259,7 +4396,7 @@ mod integration_tests {
     // ── sys_readlinkat tests (dispatch_syscall) ───────────────────
 
     #[test]
-    fn sys_readlinkat_returns_einval() {
+    fn sys_readlinkat_returns_enosys() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
         let path = b"/some/link\0";
@@ -4269,7 +4406,7 @@ mod integration_tests {
             buf: buf.as_mut_ptr() as u64,
             bufsiz: 64,
         });
-        assert_eq!(ret, -22); // EINVAL
+        assert_eq!(ret, ENOSYS);
     }
 
     // ── sys_mkdirat tests ─────────────────────────────────────────
