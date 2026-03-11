@@ -1921,24 +1921,76 @@ impl<B: SyscallBackend> Linuxulator<B> {
         buflen as i64
     }
 
-    /// Linux newfstatat(2): stat a file relative to a directory fd.
+    /// Linux newfstatat(2): stat a file by path or fd.
     ///
-    /// Stub — returns ENOSYS until path resolution is implemented.
+    /// Supports AT_FDCWD + absolute/relative paths, and AT_EMPTY_PATH
+    /// (stat an open fd, like fstat).
     fn sys_newfstatat(
         &mut self,
-        _dirfd: i32,
-        _pathname_ptr: usize,
-        _statbuf_ptr: usize,
-        _flags: i32,
+        dirfd: i32,
+        pathname_ptr: usize,
+        statbuf_ptr: usize,
+        flags: i32,
     ) -> i64 {
-        ENOSYS
+        if statbuf_ptr == 0 {
+            return EINVAL;
+        }
+        const AT_FDCWD: i32 = -100;
+        const AT_EMPTY_PATH: i32 = 0x1000;
+
+        // AT_EMPTY_PATH: stat the fd itself (like fstat)
+        if flags & AT_EMPTY_PATH != 0 {
+            return self.sys_fstat(dirfd, statbuf_ptr);
+        }
+
+        let path = unsafe { read_c_string(pathname_ptr) };
+        if path.is_empty() {
+            return EINVAL;
+        }
+
+        let resolved = if dirfd == AT_FDCWD || path.starts_with('/') {
+            self.resolve_path(&path)
+        } else {
+            // dirfd-relative paths: not yet supported
+            return ENOSYS;
+        };
+
+        let fid = self.alloc_fid();
+        if let Err(e) = self.backend.walk(&resolved, fid) {
+            return ipc_err_to_errno(e);
+        }
+        let result = match self.backend.stat(fid) {
+            Ok(stat) => {
+                write_linux_stat(statbuf_ptr, &stat, false);
+                0
+            }
+            Err(e) => ipc_err_to_errno(e),
+        };
+        let _ = self.backend.clunk(fid);
+        result
     }
 
-    /// Linux faccessat(2): check file permissions relative to a directory fd.
+    /// Linux faccessat(2): check file accessibility.
     ///
-    /// Stub — returns ENOSYS until path resolution is implemented.
-    fn sys_faccessat(&mut self, _dirfd: i32, _pathname_ptr: usize, _mode: i32) -> i64 {
-        ENOSYS
+    /// Walks the path and stats to check existence. Permission bits always
+    /// pass (single-user, no capability enforcement yet).
+    fn sys_faccessat(&mut self, dirfd: i32, pathname_ptr: usize, _mode: i32) -> i64 {
+        const AT_FDCWD: i32 = -100;
+        let path = unsafe { read_c_string(pathname_ptr) };
+
+        let resolved = if dirfd == AT_FDCWD || path.starts_with('/') {
+            self.resolve_path(&path)
+        } else {
+            return ENOSYS;
+        };
+
+        let fid = self.alloc_fid();
+        if let Err(e) = self.backend.walk(&resolved, fid) {
+            return ipc_err_to_errno(e);
+        }
+        // File exists — clunk and return success.
+        let _ = self.backend.clunk(fid);
+        0
     }
 
     /// Linux getdents64(2): read directory entries.
@@ -3017,6 +3069,65 @@ mod tests {
             [path.as_ptr() as u64, buf.as_mut_ptr() as u64, 128, 0, 0, 0],
         );
         assert_eq!(result, ENOSYS);
+    }
+
+    // ── sys_newfstatat tests ─────────────────────────────────────────
+
+    #[test]
+    fn sys_newfstatat_absolute_path() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        #[cfg(target_arch = "x86_64")]
+        let mut statbuf = [0u8; 144];
+        #[cfg(not(target_arch = "x86_64"))]
+        let mut statbuf = [0u8; 128];
+        let path = b"/dev/serial/log\0";
+        let at_fdcwd: i32 = -100;
+        let ret = lx.dispatch_syscall(LinuxSyscall::Newfstatat {
+            dirfd: at_fdcwd,
+            pathname: path.as_ptr() as u64,
+            statbuf: statbuf.as_mut_ptr() as u64,
+            flags: 0,
+        });
+        assert_eq!(ret, 0);
+        // Verify walk was called with the path
+        assert_eq!(lx.backend().walks[0].0, "/dev/serial/log");
+    }
+
+    #[test]
+    fn sys_newfstatat_at_empty_path() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+        #[cfg(target_arch = "x86_64")]
+        let mut statbuf = [0u8; 144];
+        #[cfg(not(target_arch = "x86_64"))]
+        let mut statbuf = [0u8; 128];
+        let empty = b"\0";
+        let at_empty_path: i32 = 0x1000;
+        let ret = lx.dispatch_syscall(LinuxSyscall::Newfstatat {
+            dirfd: 1, // stdout
+            pathname: empty.as_ptr() as u64,
+            statbuf: statbuf.as_mut_ptr() as u64,
+            flags: at_empty_path,
+        });
+        assert_eq!(ret, 0);
+    }
+
+    // ── sys_faccessat tests ────────────────────────────────────────────
+
+    #[test]
+    fn sys_faccessat_exists() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let path = b"/dev/serial/log\0";
+        let at_fdcwd: i32 = -100;
+        let ret = lx.dispatch_syscall(LinuxSyscall::Faccessat {
+            dirfd: at_fdcwd,
+            pathname: path.as_ptr() as u64,
+            mode: 0, // F_OK
+        });
+        assert_eq!(ret, 0);
     }
 
     // ── from_x86_64 mapping tests for new syscalls ─────────────────
