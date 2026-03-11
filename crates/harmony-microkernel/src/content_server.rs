@@ -220,6 +220,11 @@ impl ContentServer {
 
                 // Split blob into 4KB page buffers (zero-padded).
                 let page_bufs = book.page_data_from_blob(&data);
+                debug_assert_eq!(
+                    page_bufs.len(),
+                    book.pages.len(),
+                    "page_data_from_blob must return exactly one buffer per page"
+                );
 
                 // Two-pass page commit: validate first, then insert.
                 // Detects cross-blob hash_bits collisions (different data at the
@@ -296,9 +301,11 @@ impl ContentServer {
         let pages = &self.pages;
         let data = book
             .reassemble(|idx| {
-                let addr = *book.pages[idx as usize]
-                    .first()
-                    .expect("Book: page must have variants");
+                let addr = book
+                    .pages
+                    .get(idx as usize)
+                    .and_then(|v| v.first())
+                    .copied()?;
                 pages.get(&addr.hash_bits()).map(|(_, d)| d.clone())
             })
             .map_err(|_| IpcError::NotFound)?;
