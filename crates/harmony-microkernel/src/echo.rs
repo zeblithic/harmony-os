@@ -3,10 +3,10 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use crate::fid_tracker::FidTracker;
 use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
 
 // ── QPath constants ─────────────────────────────────────────────────
@@ -17,38 +17,20 @@ const ECHO: QPath = 2;
 
 const HELLO_GREETING: &[u8] = b"Hello from echo server!";
 
-// ── Per-fid state ───────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-struct FidState {
-    qpath: QPath,
-    is_open: bool,
-    mode: Option<OpenMode>,
-}
-
 // ── EchoServer ──────────────────────────────────────────────────────
 
 /// A minimal `FileServer` with a root directory, a read-only "hello"
 /// file, and a writable "echo" file that returns whatever was last written.
 pub struct EchoServer {
-    fids: BTreeMap<Fid, FidState>,
+    tracker: FidTracker<()>,
     echo_data: Vec<u8>,
 }
 
 impl EchoServer {
     /// Create a new EchoServer with fid 0 pre-attached to the root directory.
     pub fn new() -> Self {
-        let mut fids = BTreeMap::new();
-        fids.insert(
-            0,
-            FidState {
-                qpath: ROOT,
-                is_open: false,
-                mode: None,
-            },
-        );
         Self {
-            fids,
+            tracker: FidTracker::new(ROOT, ()),
             echo_data: Vec::new(),
         }
     }
@@ -62,15 +44,11 @@ impl Default for EchoServer {
 
 impl FileServer for EchoServer {
     fn walk(&mut self, fid: Fid, new_fid: Fid, name: &str) -> Result<QPath, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
+        let entry = self.tracker.get(fid)?;
 
         // Can only walk from the root directory.
-        if state.qpath != ROOT {
+        if entry.qpath != ROOT {
             return Err(IpcError::NotDirectory);
-        }
-
-        if self.fids.contains_key(&new_fid) {
-            return Err(IpcError::InvalidFid);
         }
 
         let qpath = match name {
@@ -79,45 +57,35 @@ impl FileServer for EchoServer {
             _ => return Err(IpcError::NotFound),
         };
 
-        self.fids.insert(
-            new_fid,
-            FidState {
-                qpath,
-                is_open: false,
-                mode: None,
-            },
-        );
+        self.tracker.insert(new_fid, qpath, ())?;
 
         Ok(qpath)
     }
 
     fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
-        let state = self.fids.get_mut(&fid).ok_or(IpcError::InvalidFid)?;
-        if state.is_open {
-            return Err(IpcError::PermissionDenied);
-        }
+        let entry = self.tracker.begin_open(fid)?;
         // Reject incompatible modes at open time (9P semantics).
-        if state.qpath == ROOT && matches!(mode, OpenMode::Write | OpenMode::ReadWrite) {
+        if entry.qpath == ROOT && matches!(mode, OpenMode::Write | OpenMode::ReadWrite) {
             return Err(IpcError::IsDirectory);
         }
-        if state.qpath == HELLO && matches!(mode, OpenMode::Write | OpenMode::ReadWrite) {
+        if entry.qpath == HELLO && matches!(mode, OpenMode::Write | OpenMode::ReadWrite) {
             return Err(IpcError::ReadOnly);
         }
-        state.is_open = true;
-        state.mode = Some(mode);
+        entry.mark_open(mode);
         Ok(())
     }
 
     fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        if !state.is_open {
+        let entry = self.tracker.get(fid)?;
+        if !entry.is_open {
             return Err(IpcError::NotOpen);
         }
-        if matches!(state.mode, Some(OpenMode::Write)) {
+        if matches!(entry.mode, Some(OpenMode::Write)) {
             return Err(IpcError::PermissionDenied);
         }
+        let qpath = entry.qpath;
 
-        let data: &[u8] = match state.qpath {
+        let data: &[u8] = match qpath {
             ROOT => return Err(IpcError::IsDirectory),
             HELLO => HELLO_GREETING,
             ECHO => &self.echo_data,
@@ -136,15 +104,16 @@ impl FileServer for EchoServer {
     /// intentionally ignored — this is a simple echo device, not a
     /// seekable file).
     fn write(&mut self, fid: Fid, _offset: u64, data: &[u8]) -> Result<u32, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        if !state.is_open {
+        let entry = self.tracker.get(fid)?;
+        if !entry.is_open {
             return Err(IpcError::NotOpen);
         }
-        if matches!(state.mode, Some(OpenMode::Read)) {
+        if matches!(entry.mode, Some(OpenMode::Read)) {
             return Err(IpcError::PermissionDenied);
         }
+        let qpath = entry.qpath;
 
-        match state.qpath {
+        match qpath {
             ROOT => Err(IpcError::IsDirectory),
             HELLO => Err(IpcError::ReadOnly),
             ECHO => {
@@ -157,34 +126,17 @@ impl FileServer for EchoServer {
     }
 
     fn clunk(&mut self, fid: Fid) -> Result<(), IpcError> {
-        if fid == 0 {
-            return Err(IpcError::PermissionDenied);
-        }
-        self.fids.remove(&fid).ok_or(IpcError::InvalidFid)?;
-        Ok(())
+        self.tracker.clunk(fid)
     }
 
     fn clone_fid(&mut self, fid: Fid, new_fid: Fid) -> Result<QPath, IpcError> {
-        if self.fids.contains_key(&new_fid) {
-            return Err(IpcError::InvalidFid);
-        }
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        let qpath = state.qpath;
-        self.fids.insert(
-            new_fid,
-            FidState {
-                qpath,
-                is_open: false,
-                mode: None,
-            },
-        );
-        Ok(qpath)
+        self.tracker.clone_fid(fid, new_fid)
     }
 
     fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
+        let qpath = self.tracker.get(fid)?.qpath;
 
-        match state.qpath {
+        match qpath {
             ROOT => Ok(FileStat {
                 qpath: ROOT,
                 name: Arc::from("/"),
