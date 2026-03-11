@@ -262,7 +262,7 @@ fn main() -> Status {
     {
         use harmony_microkernel::serial_server::SerialServer;
         use harmony_microkernel::FileServer;
-        use harmony_os::linuxulator::{Linuxulator, LinuxSyscall, SyscallBackend};
+        use harmony_os::linuxulator::{LinuxSyscall, Linuxulator, SyscallBackend};
 
         let _ = writeln!(serial, "[Linux] Initializing Linuxulator");
 
@@ -360,6 +360,150 @@ fn main() -> Status {
     unsafe { vectors::init() };
     let _ = writeln!(serial, "[Vectors] Exception vector table installed");
 
+    // ── Phase 3: Load and run embedded test ELF ──
+    let test_exit_code: i64;
+    {
+        use harmony_microkernel::vm::{FrameClassification, PageFlags, VmError};
+        use harmony_os::elf_loader::{ElfLoader, InterpreterLoader};
+        use harmony_os::linuxulator::SyscallBackend;
+
+        // Embedded at compile time from the cross-compiled test binary.
+        // Path: crates/harmony-test-elf/target/aarch64-unknown-linux-musl/release/
+        static TEST_ELF: &[u8] = include_bytes!(
+            "../../../crates/harmony-test-elf/target/aarch64-unknown-linux-musl/release/harmony-test-elf"
+        );
+
+        let _ = writeln!(
+            serial,
+            "[ELF] Loading test binary ({} bytes)",
+            TEST_ELF.len()
+        );
+
+        // Bare-metal identity-map backend for the ELF loader.
+        //
+        // On QEMU virt with MMU identity mapping, all RAM is directly
+        // accessible at its physical address.  vm_mmap just returns the
+        // requested address (no page table manipulation needed — the
+        // identity map already covers it).  vm_write_bytes uses the
+        // default unsafe ptr::copy implementation.
+        struct IdentityMapBackend;
+
+        impl SyscallBackend for IdentityMapBackend {
+            fn walk(
+                &mut self,
+                _path: &str,
+                _new_fid: harmony_microkernel::Fid,
+            ) -> Result<harmony_microkernel::QPath, harmony_microkernel::IpcError> {
+                Err(harmony_microkernel::IpcError::NotFound)
+            }
+            fn open(
+                &mut self,
+                _fid: harmony_microkernel::Fid,
+                _mode: harmony_microkernel::OpenMode,
+            ) -> Result<(), harmony_microkernel::IpcError> {
+                Err(harmony_microkernel::IpcError::NotFound)
+            }
+            fn read(
+                &mut self,
+                _fid: harmony_microkernel::Fid,
+                _offset: u64,
+                _count: u32,
+            ) -> Result<alloc::vec::Vec<u8>, harmony_microkernel::IpcError> {
+                Err(harmony_microkernel::IpcError::NotFound)
+            }
+            fn write(
+                &mut self,
+                _fid: harmony_microkernel::Fid,
+                _offset: u64,
+                _data: &[u8],
+            ) -> Result<u32, harmony_microkernel::IpcError> {
+                Err(harmony_microkernel::IpcError::NotFound)
+            }
+            fn clunk(
+                &mut self,
+                _fid: harmony_microkernel::Fid,
+            ) -> Result<(), harmony_microkernel::IpcError> {
+                Ok(())
+            }
+            fn stat(
+                &mut self,
+                _fid: harmony_microkernel::Fid,
+            ) -> Result<harmony_microkernel::FileStat, harmony_microkernel::IpcError> {
+                Err(harmony_microkernel::IpcError::NotFound)
+            }
+
+            fn has_vm_support(&self) -> bool {
+                true
+            }
+
+            fn vm_mmap(
+                &mut self,
+                vaddr: u64,
+                _len: usize,
+                _flags: PageFlags,
+                _classification: FrameClassification,
+            ) -> Result<u64, VmError> {
+                // Identity-mapped: the address is already accessible.
+                Ok(vaddr)
+            }
+
+            fn vm_munmap(&mut self, _vaddr: u64, _len: usize) -> Result<(), VmError> {
+                Ok(())
+            }
+
+            fn vm_mprotect(
+                &mut self,
+                _vaddr: u64,
+                _len: usize,
+                _flags: PageFlags,
+            ) -> Result<(), VmError> {
+                // No-op: identity map has full RWX in EL1.
+                Ok(())
+            }
+
+            fn vm_find_free_region(&self, _len: usize) -> Result<u64, VmError> {
+                Err(VmError::PageTableError)
+            }
+        }
+
+        let mut backend = IdentityMapBackend;
+        let mut loader = InterpreterLoader::default();
+
+        match loader.load(TEST_ELF, &mut backend) {
+            Ok(load_result) => {
+                let _ = writeln!(serial, "[ELF] Loaded: entry={:#x}", load_result.entry_point,);
+
+                // Allocate an 8 KiB stack (2 pages) for the test binary.
+                let stack_base = bump.alloc_frame().expect("stack page 1 alloc failed").0;
+                let _ = bump.alloc_frame().expect("stack page 2 alloc failed");
+                let stack_top = stack_base + 8192;
+
+                let _ = writeln!(
+                    serial,
+                    "[ELF] Stack: base={:#x} top={:#x}",
+                    stack_base, stack_top,
+                );
+
+                let _ = writeln!(serial, "[ELF] Jumping to entry point...");
+
+                let code = unsafe { run_elf_binary(load_result.entry_point, stack_top) };
+                test_exit_code = code;
+
+                let _ = writeln!(serial, "[ELF] Test binary exited with code {}", code,);
+            }
+            Err(e) => {
+                let _ = writeln!(serial, "[ELF] FATAL: Load failed: {:?}", e);
+                test_exit_code = -1;
+            }
+        }
+    }
+
+    let _ = writeln!(
+        serial,
+        "[Runtime] Entering idle loop (test exit code: {})",
+        test_exit_code,
+    );
+
     loop {
         let now = timer::now_ms();
         let actions = runtime.tick(now);
@@ -369,6 +513,50 @@ fn main() -> Status {
         // WFE = Wait For Event — ARM equivalent of HLT, saves power
         unsafe { core::arch::asm!("wfe") };
     }
+}
+
+// ── ELF binary trampoline ─────────────────────────────────────────────
+// Saves kernel context (SP, LR), installs a return-address for the SVC
+// handler's exit_group path, switches to the binary's stack, and jumps
+// to the ELF entry point.  When exit_group fires, the SVC handler
+// rewrites ELR to .Lelf_return (via set_return_context), restoring the
+// kernel SP and LR so that `ret` returns to the Rust caller.
+
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(
+    ".global run_elf_binary",
+    "run_elf_binary:",
+    // x0 = entry_point, x1 = stack_top
+    // Save entry and stack_top in callee-saved regs
+    "mov x19, x0", // x19 = entry_point
+    "mov x20, x1", // x20 = stack_top
+    // Compute return context
+    "adr x0, .Lelf_return", // arg0 = return address
+    "mov x1, sp",           // arg1 = kernel SP
+    "mov x2, x30",          // arg2 = kernel LR
+    "bl set_return_context",
+    // Switch to binary stack and jump to entry
+    "mov sp, x20",
+    "br x19",
+    // Landing pad — SVC handler sets ELR here on exit_group.
+    // Register state is fully controlled by the TrapFrame restore:
+    //   x0 = exit code
+    //   x1 = saved kernel SP
+    //   x2 = saved kernel LR
+    ".Lelf_return:",
+    "mov sp, x1",  // restore kernel SP
+    "mov x30, x2", // restore kernel LR
+    "ret",         // return to Rust caller
+);
+
+#[cfg(target_arch = "aarch64")]
+extern "C" {
+    /// Run an ELF binary at `entry_point` with `stack_top` as its SP.
+    ///
+    /// Returns the process exit code when exit_group fires.  The SVC
+    /// handler redirects control to `.Lelf_return` which restores the
+    /// kernel context and returns here.
+    fn run_elf_binary(entry_point: u64, stack_top: u64) -> i64;
 }
 
 // ── Panic handler ──────────────────────────────────────────────────────
