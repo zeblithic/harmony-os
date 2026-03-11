@@ -32,7 +32,7 @@ const EOVERFLOW: i64 = -75;
 
 fn ipc_err_to_errno(e: IpcError) -> i64 {
     match e {
-        IpcError::NotFound => -2,           // ENOENT
+        IpcError::NotFound => ENOENT,
         IpcError::PermissionDenied => -13,  // EACCES
         IpcError::NotOpen => -9,            // EBADF
         IpcError::InvalidFid => -9,         // EBADF
@@ -4283,6 +4283,19 @@ mod integration_tests {
             dirfd: -100,
             pathname: path.as_ptr() as u64,
             mode: 0o755,
+        });
+        assert_eq!(ret, -30); // EROFS
+    }
+
+    #[test]
+    fn sys_unlinkat_returns_erofs() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let path = b"/tmp/oldfile\0";
+        let ret = lx.dispatch_syscall(LinuxSyscall::Unlinkat {
+            dirfd: -100,
+            pathname: path.as_ptr() as u64,
+            flags: 0,
         });
         assert_eq!(ret, -30); // EROFS
     }
