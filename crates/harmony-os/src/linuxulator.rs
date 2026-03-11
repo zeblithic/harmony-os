@@ -1238,10 +1238,16 @@ impl<B: SyscallBackend> Linuxulator<B> {
         fd
     }
 
-    /// Mutable access to the fd table (test-only).
+    /// Insert an fd with proper refcounting (test-only).
+    ///
+    /// Prefer this over raw `fd_table` access to keep fd_table and
+    /// fid_refcount in sync — `release_fid` panics if the refcount
+    /// entry is missing.
     #[cfg(test)]
-    fn fd_table_mut(&mut self) -> &mut BTreeMap<i32, FdEntry> {
-        &mut self.fd_table
+    fn insert_test_fd(&mut self, fd: i32, entry: FdEntry) {
+        let fid = entry.fid;
+        self.fd_table.insert(fd, entry);
+        *self.fid_refcount.entry(fid).or_insert(0) += 1;
     }
 
     /// Resolve a path relative to `self.cwd`.
@@ -5023,7 +5029,7 @@ mod integration_tests {
         );
         let mut lx = Linuxulator::new(mock);
         // Manually insert a directory fd.
-        lx.fd_table_mut().insert(
+        lx.insert_test_fd(
             3,
             FdEntry {
                 fid: dir_fid,
@@ -5068,7 +5074,7 @@ mod integration_tests {
         let dir_fid: Fid = 200;
         mock.readdir_entries.insert(dir_fid, vec![]);
         let mut lx = Linuxulator::new(mock);
-        lx.fd_table_mut().insert(
+        lx.insert_test_fd(
             3,
             FdEntry {
                 fid: dir_fid,
