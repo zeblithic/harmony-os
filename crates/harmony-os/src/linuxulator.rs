@@ -219,6 +219,17 @@ pub enum LinuxSyscall {
         cpusetsize: u64,
         mask: u64,
     },
+    Uname {
+        buf: u64,
+    },
+    ClockGettime {
+        clockid: i32,
+        tp: u64,
+    },
+    ClockGetres {
+        clockid: i32,
+        tp: u64,
+    },
     Unknown {
         nr: u64,
     },
@@ -286,6 +297,7 @@ impl LinuxSyscall {
             60 => LinuxSyscall::Exit {
                 code: args[0] as i32,
             },
+            63 => LinuxSyscall::Uname { buf: args[0] },
             79 => LinuxSyscall::Getcwd {
                 buf: args[0],
                 size: args[1],
@@ -327,6 +339,14 @@ impl LinuxSyscall {
                 count: args[2],
             },
             218 => LinuxSyscall::SetTidAddress,
+            228 => LinuxSyscall::ClockGettime {
+                clockid: args[0] as i32,
+                tp: args[1],
+            },
+            229 => LinuxSyscall::ClockGetres {
+                clockid: args[0] as i32,
+                tp: args[1],
+            },
             231 => LinuxSyscall::ExitGroup {
                 code: args[0] as i32,
             },
@@ -493,6 +513,14 @@ impl LinuxSyscall {
                 val: args[2] as u32,
             },
             99 => LinuxSyscall::SetRobustList,
+            113 => LinuxSyscall::ClockGettime {
+                clockid: args[0] as i32,
+                tp: args[1],
+            },
+            114 => LinuxSyscall::ClockGetres {
+                clockid: args[0] as i32,
+                tp: args[1],
+            },
             123 => LinuxSyscall::SchedGetaffinity {
                 pid: args[0] as i32,
                 cpusetsize: args[1],
@@ -500,6 +528,7 @@ impl LinuxSyscall {
             },
             134 => LinuxSyscall::RtSigaction,
             135 => LinuxSyscall::RtSigprocmask,
+            160 => LinuxSyscall::Uname { buf: args[0] },
             172 => LinuxSyscall::Getpid,
             173 => LinuxSyscall::Getppid,
             174 => LinuxSyscall::Getuid,
@@ -1108,6 +1137,9 @@ pub struct Linuxulator<B: SyscallBackend> {
     getrandom_counter: u64,
     /// Current working directory (absolute path).
     cwd: alloc::string::String,
+    /// Monotonic clock counter in nanoseconds. Incremented by 1_000_000
+    /// (1 ms) on each `clock_gettime` call.
+    monotonic_ns: u64,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -1129,6 +1161,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             vm_brk_current: 0,
             getrandom_counter: 0,
             cwd: alloc::string::String::from("/"),
+            monotonic_ns: 0,
         }
     }
 
@@ -1380,6 +1413,13 @@ impl<B: SyscallBackend> Linuxulator<B> {
             LinuxSyscall::SchedGetaffinity {
                 cpusetsize, mask, ..
             } => self.sys_sched_getaffinity(cpusetsize, mask),
+            LinuxSyscall::Uname { buf } => self.sys_uname(buf as usize),
+            LinuxSyscall::ClockGettime { clockid, tp } => {
+                self.sys_clock_gettime(clockid, tp as usize)
+            }
+            LinuxSyscall::ClockGetres { clockid, tp } => {
+                self.sys_clock_getres(clockid, tp as usize)
+            }
             LinuxSyscall::Unknown { .. } => ENOSYS,
         }
     }
@@ -2490,6 +2530,98 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// symlink" — a claim we cannot make without first walking the path.
     fn sys_readlink(&self, _pathname: u64, _buf: u64, _bufsiz: u64) -> i64 {
         ENOSYS
+    }
+
+    /// Linux uname(2): fill a `struct utsname` buffer with system identity.
+    ///
+    /// Each of the 6 fields is a 65-byte null-terminated C string (390 bytes total).
+    /// We report "Linux" as sysname for compatibility — programs check this.
+    fn sys_uname(&self, buf_ptr: usize) -> i64 {
+        if buf_ptr == 0 {
+            return EFAULT;
+        }
+
+        // struct utsname: 6 fields × 65 bytes = 390 bytes
+        const FIELD_LEN: usize = 65;
+        const UTSNAME_SIZE: usize = FIELD_LEN * 6;
+
+        let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, UTSNAME_SIZE) };
+        buf.fill(0);
+
+        // Helper: copy a string into a 65-byte field (already zero-filled).
+        fn write_field(buf: &mut [u8], offset: usize, value: &[u8]) {
+            let len = value.len().min(64); // leave room for NUL terminator
+            buf[offset..offset + len].copy_from_slice(&value[..len]);
+        }
+
+        write_field(buf, 0, b"Linux");                              // sysname
+        write_field(buf, FIELD_LEN, b"harmony");                   // nodename
+        write_field(buf, FIELD_LEN * 2, b"6.1.0-harmony");        // release
+        write_field(buf, FIELD_LEN * 3, b"#1 SMP");               // version
+        #[cfg(target_arch = "x86_64")]
+        write_field(buf, FIELD_LEN * 4, b"x86_64");               // machine
+        #[cfg(target_arch = "aarch64")]
+        write_field(buf, FIELD_LEN * 4, b"aarch64");              // machine
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        write_field(buf, FIELD_LEN * 4, b"unknown");              // machine
+        write_field(buf, FIELD_LEN * 5, b"(none)");               // domainname
+
+        0
+    }
+
+    /// Linux clock_gettime(2): write a `struct timespec` to the buffer.
+    ///
+    /// Supports CLOCK_REALTIME (0) and CLOCK_MONOTONIC (1). Uses a
+    /// deterministic monotonic counter that increments by 1 ms per call.
+    fn sys_clock_gettime(&mut self, clockid: i32, tp_ptr: usize) -> i64 {
+        if tp_ptr == 0 {
+            return EFAULT;
+        }
+
+        const CLOCK_REALTIME: i32 = 0;
+        const CLOCK_MONOTONIC: i32 = 1;
+
+        match clockid {
+            CLOCK_REALTIME | CLOCK_MONOTONIC => {
+                // Increment the monotonic counter.
+                let ns = self.monotonic_ns;
+                self.monotonic_ns = ns.wrapping_add(1_000_000);
+
+                let tv_sec = ns / 1_000_000_000;
+                let tv_nsec = ns % 1_000_000_000;
+
+                // struct timespec: 16 bytes (u64 tv_sec + u64 tv_nsec), LE
+                let buf =
+                    unsafe { core::slice::from_raw_parts_mut(tp_ptr as *mut u8, 16) };
+                buf[0..8].copy_from_slice(&tv_sec.to_le_bytes());
+                buf[8..16].copy_from_slice(&tv_nsec.to_le_bytes());
+
+                0
+            }
+            _ => EINVAL,
+        }
+    }
+
+    /// Linux clock_getres(2): write clock resolution as a `struct timespec`.
+    ///
+    /// Reports 1 ms resolution for CLOCK_REALTIME and CLOCK_MONOTONIC.
+    /// A null `tp` is allowed — Linux uses this to validate the clock ID.
+    fn sys_clock_getres(&self, clockid: i32, tp_ptr: usize) -> i64 {
+        const CLOCK_REALTIME: i32 = 0;
+        const CLOCK_MONOTONIC: i32 = 1;
+
+        match clockid {
+            CLOCK_REALTIME | CLOCK_MONOTONIC => {
+                if tp_ptr != 0 {
+                    let buf =
+                        unsafe { core::slice::from_raw_parts_mut(tp_ptr as *mut u8, 16) };
+                    buf[0..8].copy_from_slice(&0u64.to_le_bytes()); // tv_sec = 0
+                    buf[8..16].copy_from_slice(&1_000_000u64.to_le_bytes()); // tv_nsec = 1ms
+                }
+                0
+            }
+            _ => EINVAL,
+        }
     }
 }
 
@@ -5213,5 +5345,315 @@ mod integration_tests {
     fn aarch64_sched_getaffinity_mapping() {
         let syscall = LinuxSyscall::from_aarch64(123, [0, 8, 0x2000, 0, 0, 0]);
         assert!(matches!(syscall, LinuxSyscall::SchedGetaffinity { .. }));
+    }
+
+    // ── uname tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn sys_uname_sysname_is_linux() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let mut buf = [0u8; 390];
+        let result = lx.dispatch_syscall(LinuxSyscall::Uname {
+            buf: buf.as_mut_ptr() as u64,
+        });
+        assert_eq!(result, 0);
+        // sysname is the first 65-byte field
+        assert_eq!(&buf[0..5], b"Linux");
+        assert_eq!(buf[5], 0); // null-terminated
+    }
+
+    #[test]
+    fn sys_uname_nodename_is_harmony() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let mut buf = [0u8; 390];
+        lx.dispatch_syscall(LinuxSyscall::Uname {
+            buf: buf.as_mut_ptr() as u64,
+        });
+        // nodename at offset 65
+        assert_eq!(&buf[65..72], b"harmony");
+        assert_eq!(buf[72], 0);
+    }
+
+    #[test]
+    fn sys_uname_machine_matches_target_arch() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let mut buf = [0u8; 390];
+        lx.dispatch_syscall(LinuxSyscall::Uname {
+            buf: buf.as_mut_ptr() as u64,
+        });
+        // machine field at offset 4 * 65 = 260
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(&buf[260..266], b"x86_64");
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(&buf[260..267], b"aarch64");
+    }
+
+    #[test]
+    fn sys_uname_all_fields_null_terminated() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let mut buf = [0xFFu8; 390]; // fill with non-zero to detect missing NUL
+        lx.dispatch_syscall(LinuxSyscall::Uname {
+            buf: buf.as_mut_ptr() as u64,
+        });
+        // Each field ends at offset (i+1)*65 - 1 and must contain a NUL
+        for i in 0..6 {
+            let field_start = i * 65;
+            let field = &buf[field_start..field_start + 65];
+            // Find the string content, then verify there's a NUL in the field
+            assert!(
+                field.contains(&0),
+                "field {} is not null-terminated",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn sys_uname_null_buffer_returns_efault() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.dispatch_syscall(LinuxSyscall::Uname { buf: 0 });
+        assert_eq!(result, EFAULT);
+    }
+
+    #[test]
+    fn sys_uname_release_and_version() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let mut buf = [0u8; 390];
+        lx.dispatch_syscall(LinuxSyscall::Uname {
+            buf: buf.as_mut_ptr() as u64,
+        });
+        // release at offset 2*65 = 130
+        assert_eq!(&buf[130..143], b"6.1.0-harmony");
+        // version at offset 3*65 = 195
+        assert_eq!(&buf[195..201], b"#1 SMP");
+    }
+
+    #[test]
+    fn x86_64_uname_mapping() {
+        let syscall = LinuxSyscall::from_x86_64(63, [0x1000, 0, 0, 0, 0, 0]);
+        assert!(matches!(syscall, LinuxSyscall::Uname { buf: 0x1000 }));
+    }
+
+    #[test]
+    fn aarch64_uname_mapping() {
+        let syscall = LinuxSyscall::from_aarch64(160, [0x2000, 0, 0, 0, 0, 0]);
+        assert!(matches!(syscall, LinuxSyscall::Uname { buf: 0x2000 }));
+    }
+
+    // ── clock_gettime tests ──────────────────────────────────────────
+
+    #[test]
+    fn sys_clock_gettime_realtime_works() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let mut ts = [0u8; 16];
+        let result = lx.dispatch_syscall(LinuxSyscall::ClockGettime {
+            clockid: 0, // CLOCK_REALTIME
+            tp: ts.as_mut_ptr() as u64,
+        });
+        assert_eq!(result, 0);
+        let tv_sec = u64::from_le_bytes(ts[0..8].try_into().unwrap());
+        let tv_nsec = u64::from_le_bytes(ts[8..16].try_into().unwrap());
+        // First call: monotonic_ns was 0, so sec=0, nsec=0
+        assert_eq!(tv_sec, 0);
+        assert_eq!(tv_nsec, 0);
+    }
+
+    #[test]
+    fn sys_clock_gettime_monotonic_increments() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // First call: returns ns=0, then increments to 1_000_000
+        let mut ts1 = [0u8; 16];
+        lx.dispatch_syscall(LinuxSyscall::ClockGettime {
+            clockid: 1, // CLOCK_MONOTONIC
+            tp: ts1.as_mut_ptr() as u64,
+        });
+        let nsec1 = u64::from_le_bytes(ts1[8..16].try_into().unwrap());
+        assert_eq!(nsec1, 0);
+
+        // Second call: returns ns=1_000_000, then increments to 2_000_000
+        let mut ts2 = [0u8; 16];
+        lx.dispatch_syscall(LinuxSyscall::ClockGettime {
+            clockid: 1,
+            tp: ts2.as_mut_ptr() as u64,
+        });
+        let nsec2 = u64::from_le_bytes(ts2[8..16].try_into().unwrap());
+        assert_eq!(nsec2, 1_000_000);
+
+        // Third call: returns ns=2_000_000
+        let mut ts3 = [0u8; 16];
+        lx.dispatch_syscall(LinuxSyscall::ClockGettime {
+            clockid: 1,
+            tp: ts3.as_mut_ptr() as u64,
+        });
+        let nsec3 = u64::from_le_bytes(ts3[8..16].try_into().unwrap());
+        assert_eq!(nsec3, 2_000_000);
+    }
+
+    #[test]
+    fn sys_clock_gettime_monotonic_wraps_to_seconds() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // Pre-set monotonic_ns to just under 1 second
+        lx.monotonic_ns = 999_000_000;
+
+        let mut ts = [0u8; 16];
+        lx.dispatch_syscall(LinuxSyscall::ClockGettime {
+            clockid: 1,
+            tp: ts.as_mut_ptr() as u64,
+        });
+        let tv_sec = u64::from_le_bytes(ts[0..8].try_into().unwrap());
+        let tv_nsec = u64::from_le_bytes(ts[8..16].try_into().unwrap());
+        assert_eq!(tv_sec, 0);
+        assert_eq!(tv_nsec, 999_000_000);
+
+        // Next call should wrap to tv_sec=1
+        let mut ts2 = [0u8; 16];
+        lx.dispatch_syscall(LinuxSyscall::ClockGettime {
+            clockid: 1,
+            tp: ts2.as_mut_ptr() as u64,
+        });
+        let tv_sec2 = u64::from_le_bytes(ts2[0..8].try_into().unwrap());
+        let tv_nsec2 = u64::from_le_bytes(ts2[8..16].try_into().unwrap());
+        assert_eq!(tv_sec2, 1);
+        assert_eq!(tv_nsec2, 0);
+    }
+
+    #[test]
+    fn sys_clock_gettime_invalid_clock_returns_einval() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let mut ts = [0u8; 16];
+        let result = lx.dispatch_syscall(LinuxSyscall::ClockGettime {
+            clockid: 99,
+            tp: ts.as_mut_ptr() as u64,
+        });
+        assert_eq!(result, EINVAL);
+    }
+
+    #[test]
+    fn sys_clock_gettime_null_pointer_returns_efault() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.dispatch_syscall(LinuxSyscall::ClockGettime {
+            clockid: 0,
+            tp: 0,
+        });
+        assert_eq!(result, EFAULT);
+    }
+
+    #[test]
+    fn x86_64_clock_gettime_mapping() {
+        let syscall = LinuxSyscall::from_x86_64(228, [1, 0x3000, 0, 0, 0, 0]);
+        assert!(matches!(
+            syscall,
+            LinuxSyscall::ClockGettime {
+                clockid: 1,
+                tp: 0x3000
+            }
+        ));
+    }
+
+    #[test]
+    fn aarch64_clock_gettime_mapping() {
+        let syscall = LinuxSyscall::from_aarch64(113, [0, 0x4000, 0, 0, 0, 0]);
+        assert!(matches!(
+            syscall,
+            LinuxSyscall::ClockGettime {
+                clockid: 0,
+                tp: 0x4000
+            }
+        ));
+    }
+
+    // ── clock_getres tests ───────────────────────────────────────────
+
+    #[test]
+    fn sys_clock_getres_returns_1ms_resolution() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let mut ts = [0u8; 16];
+
+        // CLOCK_REALTIME
+        let result = lx.dispatch_syscall(LinuxSyscall::ClockGetres {
+            clockid: 0,
+            tp: ts.as_mut_ptr() as u64,
+        });
+        assert_eq!(result, 0);
+        let tv_sec = u64::from_le_bytes(ts[0..8].try_into().unwrap());
+        let tv_nsec = u64::from_le_bytes(ts[8..16].try_into().unwrap());
+        assert_eq!(tv_sec, 0);
+        assert_eq!(tv_nsec, 1_000_000);
+
+        // CLOCK_MONOTONIC
+        let mut ts2 = [0u8; 16];
+        let result2 = lx.dispatch_syscall(LinuxSyscall::ClockGetres {
+            clockid: 1,
+            tp: ts2.as_mut_ptr() as u64,
+        });
+        assert_eq!(result2, 0);
+        let tv_nsec2 = u64::from_le_bytes(ts2[8..16].try_into().unwrap());
+        assert_eq!(tv_nsec2, 1_000_000);
+    }
+
+    #[test]
+    fn sys_clock_getres_null_tp_is_ok() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // Linux allows null tp — just validates the clock ID
+        let result = lx.dispatch_syscall(LinuxSyscall::ClockGetres {
+            clockid: 0,
+            tp: 0,
+        });
+        assert_eq!(result, 0);
+
+        let result2 = lx.dispatch_syscall(LinuxSyscall::ClockGetres {
+            clockid: 1,
+            tp: 0,
+        });
+        assert_eq!(result2, 0);
+    }
+
+    #[test]
+    fn sys_clock_getres_invalid_clock_returns_einval() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let result = lx.dispatch_syscall(LinuxSyscall::ClockGetres {
+            clockid: 42,
+            tp: 0,
+        });
+        assert_eq!(result, EINVAL);
+    }
+
+    #[test]
+    fn x86_64_clock_getres_mapping() {
+        let syscall = LinuxSyscall::from_x86_64(229, [1, 0x5000, 0, 0, 0, 0]);
+        assert!(matches!(
+            syscall,
+            LinuxSyscall::ClockGetres {
+                clockid: 1,
+                tp: 0x5000
+            }
+        ));
+    }
+
+    #[test]
+    fn aarch64_clock_getres_mapping() {
+        let syscall = LinuxSyscall::from_aarch64(114, [0, 0x6000, 0, 0, 0, 0]);
+        assert!(matches!(
+            syscall,
+            LinuxSyscall::ClockGetres {
+                clockid: 0,
+                tp: 0x6000
+            }
+        ));
     }
 }
