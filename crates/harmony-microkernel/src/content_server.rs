@@ -227,7 +227,7 @@ impl ContentServer {
                 // Uses algo 0 (Sha256Msb) as the default storage address.
                 let mut to_insert = Vec::new();
                 for (i, variants) in book.pages.iter().enumerate() {
-                    let addr = variants[0]; // algo 0 = Sha256Msb
+                    let addr = *variants.first().expect("Book: page must have variants");
                     let hb = addr.hash_bits();
                     let page_data = &page_bufs[i];
 
@@ -278,7 +278,7 @@ impl ContentServer {
     fn build_ingest_response(&self, cid: &[u8; 32], book: &Book) -> Result<Vec<u8>, IpcError> {
         let page_count =
             u32::try_from(book.page_count()).map_err(|_| IpcError::ResourceExhausted)?;
-        let blob_size = book.blob_size;
+        let blob_size: u32 = book.blob_size;
         let mut response = Vec::with_capacity(40);
         response.extend_from_slice(cid);
         response.extend_from_slice(&page_count.to_le_bytes());
@@ -296,7 +296,9 @@ impl ContentServer {
         let pages = &self.pages;
         let data = book
             .reassemble(|idx| {
-                let addr = book.pages[idx as usize][0]; // algo 0
+                let addr = *book.pages[idx as usize]
+                    .first()
+                    .expect("Book: page must have variants");
                 pages.get(&addr.hash_bits()).map(|(_, d)| d.clone())
             })
             .map_err(|_| IpcError::NotFound)?;
