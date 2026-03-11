@@ -2016,6 +2016,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return self.sys_fstat(dirfd, statbuf_ptr);
         }
 
+        if pathname_ptr == 0 {
+            return EFAULT;
+        }
         let path = unsafe { read_c_string(pathname_ptr) };
         if path.is_empty() {
             return EINVAL;
@@ -2154,6 +2157,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return EFAULT;
         }
         let path = unsafe { read_c_string(pathname_ptr) };
+        if path.is_empty() {
+            return ENOENT;
+        }
         let resolved = self.resolve_path(&path);
 
         let fid = self.alloc_fid();
@@ -3354,6 +3360,23 @@ mod tests {
         assert_eq!(ret, 0);
     }
 
+    #[test]
+    fn sys_newfstatat_null_pathname_without_at_empty_path() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        #[cfg(target_arch = "x86_64")]
+        let mut statbuf = [0u8; 144];
+        #[cfg(not(target_arch = "x86_64"))]
+        let mut statbuf = [0u8; 128];
+        let ret = lx.dispatch_syscall(LinuxSyscall::Newfstatat {
+            dirfd: -100,
+            pathname: 0, // NULL
+            statbuf: statbuf.as_mut_ptr() as u64,
+            flags: 0, // no AT_EMPTY_PATH
+        });
+        assert_eq!(ret, EFAULT);
+    }
+
     // ── sys_faccessat tests ────────────────────────────────────────────
 
     #[test]
@@ -4364,6 +4387,17 @@ mod integration_tests {
         });
         assert_eq!(ret, 11); // "/nix/store\0"
         assert_eq!(&buf[..11], b"/nix/store\0");
+    }
+
+    #[test]
+    fn sys_chdir_empty_path_returns_enoent() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let empty = b"\0";
+        let ret = lx.dispatch_syscall(LinuxSyscall::Chdir {
+            pathname: empty.as_ptr() as u64,
+        });
+        assert_eq!(ret, ENOENT);
     }
 
     // ── sys_fchdir tests ──────────────────────────────────────────
