@@ -257,37 +257,49 @@ unsafe fn step6_getpid() -> bool {
     pid > 0
 }
 
-/// Step 7: clock_gettime(CLOCK_MONOTONIC) — verify it returns a non-zero timestamp
+/// Step 7: clock_gettime(CLOCK_MONOTONIC) — two calls, verify monotonic increase
 unsafe fn step7_clock_gettime() -> bool {
-    // timespec: tv_sec (i64) + tv_nsec (i64) = 16 bytes
-    let mut ts: core::mem::MaybeUninit<[u8; 16]> = core::mem::MaybeUninit::uninit();
     let clock_monotonic: u64 = 1;
-    let ret = syscall2(SYS_CLOCK_GETTIME, clock_monotonic, ts.as_mut_ptr() as u64);
-    if ret != 0 {
+
+    // First call — may return (0,0) if this is the first clock_gettime
+    let mut ts1: core::mem::MaybeUninit<[u8; 16]> = core::mem::MaybeUninit::uninit();
+    let ret1 = syscall2(SYS_CLOCK_GETTIME, clock_monotonic, ts1.as_mut_ptr() as u64);
+    if ret1 != 0 {
         return false;
     }
-    let p = ts.as_ptr() as *const u8;
-    let tv_sec = i64::from_le_bytes([
-        *p,
-        *p.add(1),
-        *p.add(2),
-        *p.add(3),
-        *p.add(4),
-        *p.add(5),
-        *p.add(6),
-        *p.add(7),
+
+    // Second call — must return a strictly greater value
+    let mut ts2: core::mem::MaybeUninit<[u8; 16]> = core::mem::MaybeUninit::uninit();
+    let ret2 = syscall2(SYS_CLOCK_GETTIME, clock_monotonic, ts2.as_mut_ptr() as u64);
+    if ret2 != 0 {
+        return false;
+    }
+
+    // Read tv_nsec from both (at offset 8, 8 bytes LE)
+    let p1 = ts1.as_ptr() as *const u8;
+    let p2 = ts2.as_ptr() as *const u8;
+    let nsec1 = i64::from_le_bytes([
+        *p1.add(8),
+        *p1.add(9),
+        *p1.add(10),
+        *p1.add(11),
+        *p1.add(12),
+        *p1.add(13),
+        *p1.add(14),
+        *p1.add(15),
     ]);
-    let tv_nsec = i64::from_le_bytes([
-        *p.add(8),
-        *p.add(9),
-        *p.add(10),
-        *p.add(11),
-        *p.add(12),
-        *p.add(13),
-        *p.add(14),
-        *p.add(15),
+    let nsec2 = i64::from_le_bytes([
+        *p2.add(8),
+        *p2.add(9),
+        *p2.add(10),
+        *p2.add(11),
+        *p2.add(12),
+        *p2.add(13),
+        *p2.add(14),
+        *p2.add(15),
     ]);
-    tv_sec != 0 || tv_nsec != 0
+    // Second call must be strictly greater (monotonic counter advances 1ms per call)
+    nsec2 > nsec1
 }
 
 /// Step 8: uname — verify sysname starts with "Linux"
