@@ -44,6 +44,19 @@ unsafe fn syscall1(nr: u64, a0: u64) -> i64 {
 }
 
 #[inline(always)]
+unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64 {
+    let ret: i64;
+    core::arch::asm!(
+        "svc #0",
+        in("x8") nr,
+        inlateout("x0") a0 => ret,
+        in("x1") a1,
+        options(nostack),
+    );
+    ret
+}
+
+#[inline(always)]
 unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     let ret: i64;
     core::arch::asm!(
@@ -133,7 +146,7 @@ unsafe fn step2_mmap() -> bool {
     let ok = *ptr == 0xAA && *ptr.add(1) == 0x55 && *ptr.add(4095) == 0xBB;
 
     // munmap
-    let ret = syscall3(SYS_MUNMAP, addr as u64, size, 0);
+    let ret = syscall2(SYS_MUNMAP, addr as u64, size);
     ok && ret == 0
 }
 
@@ -182,11 +195,14 @@ unsafe fn step4_getrandom() -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     unsafe {
+        let mut all_ok = true;
+
         // Step 1: write
         if step1_write() {
             write_stdout(b"[LINUXULATOR] Step 1 (write): OK\n");
         } else {
             write_stdout(b"[LINUXULATOR] Step 1 (write): FAIL\n");
+            all_ok = false;
         }
 
         // Step 2: mmap + munmap
@@ -194,6 +210,7 @@ pub extern "C" fn _start() -> ! {
             write_stdout(b"[LINUXULATOR] Step 2 (mmap): OK\n");
         } else {
             write_stdout(b"[LINUXULATOR] Step 2 (mmap): FAIL\n");
+            all_ok = false;
         }
 
         // Step 3: brk
@@ -201,6 +218,7 @@ pub extern "C" fn _start() -> ! {
             write_stdout(b"[LINUXULATOR] Step 3 (brk): OK\n");
         } else {
             write_stdout(b"[LINUXULATOR] Step 3 (brk): FAIL\n");
+            all_ok = false;
         }
 
         // Step 4: getrandom
@@ -208,12 +226,16 @@ pub extern "C" fn _start() -> ! {
             write_stdout(b"[LINUXULATOR] Step 4 (getrandom): OK\n");
         } else {
             write_stdout(b"[LINUXULATOR] Step 4 (getrandom): FAIL\n");
+            all_ok = false;
         }
 
-        // All done
-        write_stdout(b"[LINUXULATOR] All tests passed\n");
-
-        exit_group(0);
+        if all_ok {
+            write_stdout(b"[LINUXULATOR] All tests passed\n");
+            exit_group(0);
+        } else {
+            write_stdout(b"[LINUXULATOR] Some tests FAILED\n");
+            exit_group(1);
+        }
     }
 }
 
