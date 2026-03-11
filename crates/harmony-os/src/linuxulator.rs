@@ -1992,6 +1992,30 @@ impl<B: SyscallBackend> Linuxulator<B> {
         buflen as i64
     }
 
+    /// Stat an fd or the cwd (when dirfd == AT_FDCWD).
+    /// Used by `sys_newfstatat` for the AT_EMPTY_PATH cases.
+    fn sys_stat_fd_or_cwd(&mut self, dirfd: i32, statbuf_ptr: usize) -> i64 {
+        const AT_FDCWD: i32 = -100;
+        if dirfd == AT_FDCWD {
+            let cwd = self.cwd.clone();
+            let fid = self.alloc_fid();
+            if let Err(e) = self.backend.walk(&cwd, fid) {
+                return ipc_err_to_errno(e);
+            }
+            let result = match self.backend.stat(fid) {
+                Ok(stat) => {
+                    write_linux_stat(statbuf_ptr, &stat, false);
+                    0
+                }
+                Err(e) => ipc_err_to_errno(e),
+            };
+            let _ = self.backend.clunk(fid);
+            result
+        } else {
+            self.sys_fstat(dirfd, statbuf_ptr)
+        }
+    }
+
     /// Linux newfstatat(2): stat a file by path or fd.
     ///
     /// Supports AT_FDCWD + absolute/relative paths, and AT_EMPTY_PATH
@@ -2009,37 +2033,17 @@ impl<B: SyscallBackend> Linuxulator<B> {
         const AT_FDCWD: i32 = -100;
         const AT_EMPTY_PATH: i32 = 0x1000;
 
+        // Handle null/empty pathname for AT_EMPTY_PATH, or return EFAULT/ENOENT.
         if pathname_ptr == 0 {
-            // AT_EMPTY_PATH with NULL pathname is valid (stat the fd)
             if flags & AT_EMPTY_PATH != 0 {
-                return self.sys_fstat(dirfd, statbuf_ptr);
+                return self.sys_stat_fd_or_cwd(dirfd, statbuf_ptr);
             }
             return EFAULT;
         }
         let path = unsafe { read_c_string(pathname_ptr) };
-
-        // AT_EMPTY_PATH only triggers fd-stat when pathname is actually empty.
-        // Non-empty pathname is resolved normally even with the flag set.
         if path.is_empty() {
             if flags & AT_EMPTY_PATH != 0 {
-                if dirfd == AT_FDCWD {
-                    // Stat the current working directory by path.
-                    let cwd = self.cwd.clone();
-                    let fid = self.alloc_fid();
-                    if let Err(e) = self.backend.walk(&cwd, fid) {
-                        return ipc_err_to_errno(e);
-                    }
-                    let result = match self.backend.stat(fid) {
-                        Ok(stat) => {
-                            write_linux_stat(statbuf_ptr, &stat, false);
-                            0
-                        }
-                        Err(e) => ipc_err_to_errno(e),
-                    };
-                    let _ = self.backend.clunk(fid);
-                    return result;
-                }
-                return self.sys_fstat(dirfd, statbuf_ptr);
+                return self.sys_stat_fd_or_cwd(dirfd, statbuf_ptr);
             }
             return ENOENT;
         }
@@ -2238,10 +2242,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
             None => return ENOSYS,
         };
 
-        // Walk a new fid for cwd (the fd's fid stays with the fd table)
+        // Walk a new fid for cwd (the fd's fid stays with the fd table).
+        // No clunk on walk failure — the fid was never established on the backend.
         let cwd_fid = self.alloc_fid();
         if let Err(e) = self.backend.walk(&path, cwd_fid) {
-            let _ = self.backend.clunk(cwd_fid);
             return ipc_err_to_errno(e);
         }
 
@@ -3432,6 +3436,28 @@ mod tests {
         });
         assert_eq!(ret, 0);
         // Should have walked the cwd path
+        assert_eq!(lx.backend().walks[0].0, "/nix/store");
+    }
+
+    #[test]
+    fn sys_newfstatat_null_pathname_at_empty_path_at_fdcwd_stats_cwd() {
+        let mut mock = MockBackend::new();
+        mock.directory_paths
+            .insert(alloc::string::String::from("/nix/store"));
+        let mut lx = Linuxulator::new(mock);
+        lx.cwd = alloc::string::String::from("/nix/store");
+        #[cfg(target_arch = "x86_64")]
+        let mut statbuf = [0u8; 144];
+        #[cfg(not(target_arch = "x86_64"))]
+        let mut statbuf = [0u8; 128];
+        let at_empty_path: i32 = 0x1000;
+        let ret = lx.dispatch_syscall(LinuxSyscall::Newfstatat {
+            dirfd: -100, // AT_FDCWD
+            pathname: 0, // NULL
+            statbuf: statbuf.as_mut_ptr() as u64,
+            flags: at_empty_path,
+        });
+        assert_eq!(ret, 0);
         assert_eq!(lx.backend().walks[0].0, "/nix/store");
     }
 
