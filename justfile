@@ -194,7 +194,9 @@ test-qemu-aarch64: build-test-elf build-aarch64
         -nographic \
         -bios target/aarch64-unknown-uefi/release/harmony-boot-aarch64.efi \
         2>/dev/null | tee "$LOG"
-    EXIT=${PIPESTATUS[0]}
+    # timeout exits 124 on timeout (expected — kernel enters idle loop).
+    # We check log content rather than exit code.
+    _EXIT=${PIPESTATUS[0]}
     echo ""
     if grep -q '\[LINUXULATOR\] All tests passed' "$LOG"; then
         echo "QEMU aarch64 boot test: PASSED"

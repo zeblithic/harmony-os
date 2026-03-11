@@ -15,6 +15,10 @@ IMG="$TARGET_DIR/harmony-rpi5.img"
 IMG_SIZE_MB=256
 
 # ── Firmware URLs ──
+# TODO(rpi5-hw): These firmware files are from the RPi4 (BCM2711) ecosystem.
+# The RPi5 (BCM2712) may need different GPU blobs and a BCM2712-compatible
+# EDK2 build.  The script works for QEMU testing; real RPi5 hardware boot
+# needs verification once we have a board.
 FIRMWARE_REPO="https://github.com/raspberrypi/firmware/raw/master/boot"
 EDK2_RELEASE="https://github.com/pftf/RPi4/releases/download/v1.38/RPi4_UEFI_Firmware_v1.38.zip"
 

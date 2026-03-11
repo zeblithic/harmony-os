@@ -14,6 +14,11 @@ compile_error!("Exactly one platform feature must be enabled: `qemu-virt` or `rp
 #[cfg(feature = "qemu-virt")]
 pub const PL011_BASE: usize = 0x0900_0000;
 
+/// PL011 UART base address for RPi5.
+///
+/// TODO(rpi5-hw): This is the BCM2711 (RPi4) legacy peripheral address.
+/// BCM2712 (RPi5) routes UART through the RP1 south-bridge — the correct
+/// post-ExitBootServices address needs verification on real hardware.
 #[cfg(feature = "rpi5")]
 pub const PL011_BASE: usize = 0xFE20_1000;
 
@@ -25,6 +30,7 @@ pub const UART_CLOCK_HZ: u32 = 24_000_000;
 pub const UART_CLOCK_HZ: u32 = 48_000_000;
 
 // RPi5-only peripherals (reserved for future network driver)
+// TODO(rpi5-hw): Verify GENET base address on BCM2712 hardware.
 #[cfg(feature = "rpi5")]
 #[allow(dead_code)]
 pub const GENET_BASE: usize = 0xFD58_0000;
