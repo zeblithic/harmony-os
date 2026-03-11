@@ -42,8 +42,10 @@ mkdir -p "$FIRMWARE_DIR"
 download_if_missing() {
     local url="$1" dest="$2"
     if [ ! -f "$dest" ]; then
+        local tmp="${dest}.tmp"
         echo "  Downloading $(basename "$dest")..."
-        curl -fSL "$url" -o "$dest"
+        curl -fSL "$url" -o "$tmp"
+        mv -f "$tmp" "$dest"
     else
         echo "  Cached: $(basename "$dest")"
     fi
@@ -55,7 +57,8 @@ download_if_missing "$FIRMWARE_REPO/bcm2712-rpi-5-b.dtb" "$FIRMWARE_DIR/bcm2712-
 
 if [ ! -f "$FIRMWARE_DIR/RPI_EFI.fd" ]; then
     echo "  Downloading EDK2 UEFI firmware..."
-    curl -fSL "$EDK2_RELEASE" -o "$FIRMWARE_DIR/edk2.zip"
+    curl -fSL "$EDK2_RELEASE" -o "$FIRMWARE_DIR/edk2.zip.tmp"
+    mv -f "$FIRMWARE_DIR/edk2.zip.tmp" "$FIRMWARE_DIR/edk2.zip"
     unzip -o -j "$FIRMWARE_DIR/edk2.zip" "RPI_EFI.fd" -d "$FIRMWARE_DIR/"
     rm -f "$FIRMWARE_DIR/edk2.zip"
 else
