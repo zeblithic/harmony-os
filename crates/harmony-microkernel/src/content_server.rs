@@ -16,7 +16,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use harmony_athenaeum::{sha256_hash, Book, PageAddr, BOOK_MAX_SIZE, PAGE_SIZE};
+use harmony_athenaeum::{sha256_hash, Book, PageAddr, BOOK_MAX_SIZE};
 
 use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
 
@@ -610,6 +610,7 @@ impl FileServer for ContentServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harmony_athenaeum::PAGE_SIZE;
 
     #[test]
     fn new_content_server_has_root_fid() {
