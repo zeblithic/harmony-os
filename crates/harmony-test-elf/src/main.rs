@@ -275,31 +275,27 @@ unsafe fn step7_clock_gettime() -> bool {
         return false;
     }
 
-    // Read tv_nsec from both (at offset 8, 8 bytes LE)
+    // Read (tv_sec, tv_nsec) from both timespecs
     let p1 = ts1.as_ptr() as *const u8;
     let p2 = ts2.as_ptr() as *const u8;
-    let nsec1 = i64::from_le_bytes([
-        *p1.add(8),
-        *p1.add(9),
-        *p1.add(10),
-        *p1.add(11),
-        *p1.add(12),
-        *p1.add(13),
-        *p1.add(14),
-        *p1.add(15),
+    let sec1 = u64::from_le_bytes([
+        *p1, *p1.add(1), *p1.add(2), *p1.add(3),
+        *p1.add(4), *p1.add(5), *p1.add(6), *p1.add(7),
     ]);
-    let nsec2 = i64::from_le_bytes([
-        *p2.add(8),
-        *p2.add(9),
-        *p2.add(10),
-        *p2.add(11),
-        *p2.add(12),
-        *p2.add(13),
-        *p2.add(14),
-        *p2.add(15),
+    let nsec1 = u64::from_le_bytes([
+        *p1.add(8), *p1.add(9), *p1.add(10), *p1.add(11),
+        *p1.add(12), *p1.add(13), *p1.add(14), *p1.add(15),
     ]);
-    // Second call must be strictly greater (monotonic counter advances 1ms per call)
-    nsec2 > nsec1
+    let sec2 = u64::from_le_bytes([
+        *p2, *p2.add(1), *p2.add(2), *p2.add(3),
+        *p2.add(4), *p2.add(5), *p2.add(6), *p2.add(7),
+    ]);
+    let nsec2 = u64::from_le_bytes([
+        *p2.add(8), *p2.add(9), *p2.add(10), *p2.add(11),
+        *p2.add(12), *p2.add(13), *p2.add(14), *p2.add(15),
+    ]);
+    // Second call must be strictly greater (handles second-boundary wrap)
+    (sec2, nsec2) > (sec1, nsec1)
 }
 
 /// Step 8: uname — verify sysname starts with "Linux"

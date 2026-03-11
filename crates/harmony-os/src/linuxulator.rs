@@ -1187,8 +1187,11 @@ pub struct Linuxulator<B: SyscallBackend> {
     /// Current working directory (absolute path).
     cwd: alloc::string::String,
     /// Monotonic clock counter in nanoseconds. Incremented by 1_000_000
-    /// (1 ms) on each `clock_gettime` call.
+    /// (1 ms) on each `clock_gettime(CLOCK_MONOTONIC)` call.
     monotonic_ns: u64,
+    /// Realtime clock counter in nanoseconds. Incremented by 1_000_000
+    /// (1 ms) on each `clock_gettime(CLOCK_REALTIME)` call.
+    realtime_ns: u64,
     /// Reference counts for 9P fids shared across multiple fd_table entries
     /// (via dup/dup2/dup3). A fid is only clunked when its refcount reaches 0.
     fid_refcount: BTreeMap<Fid, u32>,
@@ -1214,6 +1217,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             getrandom_counter: 0,
             cwd: alloc::string::String::from("/"),
             monotonic_ns: 0,
+            realtime_ns: 0,
             fid_refcount: BTreeMap::new(),
         }
     }
@@ -1639,6 +1643,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// If oldfd == newfd, just validates oldfd exists and returns it.
     /// If newfd is already open, silently closes it first (clunks fid).
     fn sys_dup2(&mut self, oldfd: i32, newfd: i32) -> i64 {
+        if newfd < 0 {
+            return EBADF;
+        }
         if !self.fd_table.contains_key(&oldfd) {
             return EBADF;
         }
@@ -1678,6 +1685,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// - Accepts O_CLOEXEC flag to set FD_CLOEXEC on the new fd
     /// - Returns EINVAL for any flags other than O_CLOEXEC
     fn sys_dup3(&mut self, oldfd: i32, newfd: i32, flags: i32) -> i64 {
+        if newfd < 0 {
+            return EBADF;
+        }
         if oldfd == newfd {
             return EINVAL;
         }
@@ -2806,24 +2816,29 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return EFAULT;
         }
 
-        match clockid {
-            CLOCK_REALTIME | CLOCK_MONOTONIC => {
-                // Increment the monotonic counter.
+        let ns = match clockid {
+            CLOCK_REALTIME => {
+                let ns = self.realtime_ns;
+                self.realtime_ns = ns.wrapping_add(1_000_000);
+                ns
+            }
+            CLOCK_MONOTONIC => {
                 let ns = self.monotonic_ns;
                 self.monotonic_ns = ns.wrapping_add(1_000_000);
-
-                let tv_sec = ns / 1_000_000_000;
-                let tv_nsec = ns % 1_000_000_000;
-
-                // struct timespec: 16 bytes (u64 tv_sec + u64 tv_nsec), LE
-                let buf = unsafe { core::slice::from_raw_parts_mut(tp_ptr as *mut u8, 16) };
-                buf[0..8].copy_from_slice(&tv_sec.to_le_bytes());
-                buf[8..16].copy_from_slice(&tv_nsec.to_le_bytes());
-
-                0
+                ns
             }
-            _ => EINVAL,
-        }
+            _ => return EINVAL,
+        };
+
+        let tv_sec = ns / 1_000_000_000;
+        let tv_nsec = ns % 1_000_000_000;
+
+        // struct timespec: 16 bytes (u64 tv_sec + u64 tv_nsec), LE
+        let buf = unsafe { core::slice::from_raw_parts_mut(tp_ptr as *mut u8, 16) };
+        buf[0..8].copy_from_slice(&tv_sec.to_le_bytes());
+        buf[8..16].copy_from_slice(&tv_nsec.to_le_bytes());
+
+        0
     }
 
     /// Linux clock_getres(2): write clock resolution as a `struct timespec`.
@@ -6324,6 +6339,57 @@ mod integration_tests {
         });
         let dup_fid = lx.fd_table.get(&10).unwrap().fid;
         assert_eq!(orig_fid, dup_fid);
+    }
+
+    #[test]
+    fn sys_dup2_negative_newfd_returns_ebadf() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        let result = lx.dispatch_syscall(LinuxSyscall::Dup2 {
+            oldfd: 1,
+            newfd: -1,
+        });
+        assert_eq!(result, EBADF);
+    }
+
+    #[test]
+    fn sys_dup3_negative_newfd_returns_ebadf() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        let result = lx.dispatch_syscall(LinuxSyscall::Dup3 {
+            oldfd: 1,
+            newfd: -1,
+            flags: 0,
+        });
+        assert_eq!(result, EBADF);
+    }
+
+    #[test]
+    fn sys_clock_gettime_realtime_independent_of_monotonic() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Advance monotonic clock 3 times
+        let mut ts = [0u8; 16];
+        for _ in 0..3 {
+            lx.dispatch_syscall(LinuxSyscall::ClockGettime {
+                clockid: 1, // CLOCK_MONOTONIC
+                tp: ts.as_mut_ptr() as u64,
+            });
+        }
+        let mono_nsec = u64::from_le_bytes(ts[8..16].try_into().unwrap());
+        assert_eq!(mono_nsec, 2_000_000); // 3rd call returns ns=2M
+
+        // First CLOCK_REALTIME call should start at 0, not 3M
+        let mut rts = [0u8; 16];
+        lx.dispatch_syscall(LinuxSyscall::ClockGettime {
+            clockid: 0, // CLOCK_REALTIME
+            tp: rts.as_mut_ptr() as u64,
+        });
+        let rt_sec = u64::from_le_bytes(rts[0..8].try_into().unwrap());
+        let rt_nsec = u64::from_le_bytes(rts[8..16].try_into().unwrap());
+        assert_eq!(rt_sec, 0);
+        assert_eq!(rt_nsec, 0); // independent counter, starts at 0
     }
 
     // ── Syscall number mapping tests for fd manipulation ────────────
