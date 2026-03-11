@@ -59,11 +59,16 @@ pub unsafe fn set_dispatch_fn(f: fn(LinuxSyscall) -> SyscallDispatchResult) {
 }
 
 /// Check if the process has exited.
+/// Currently unused — exit code is returned via the trampoline. Kept for
+/// future polling-based execution models.
+#[allow(dead_code)]
 pub fn process_exited() -> bool {
     unsafe { PROCESS_EXITED }
 }
 
 /// Get the exit code.
+/// Currently unused — exit code is returned via the trampoline.
+#[allow(dead_code)]
 pub fn exit_code() -> i32 {
     unsafe { EXIT_CODE }
 }

@@ -475,7 +475,12 @@ fn main() -> Status {
 
                 // Allocate an 8 KiB stack (2 pages) for the test binary.
                 let stack_base = bump.alloc_frame().expect("stack page 1 alloc failed").0;
-                let _ = bump.alloc_frame().expect("stack page 2 alloc failed");
+                let stack_page2 = bump.alloc_frame().expect("stack page 2 alloc failed").0;
+                assert_eq!(
+                    stack_page2,
+                    stack_base + 4096,
+                    "stack pages must be contiguous"
+                );
                 let stack_top = stack_base + 8192;
 
                 let _ = writeln!(
