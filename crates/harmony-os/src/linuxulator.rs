@@ -551,7 +551,7 @@ pub trait SyscallBackend {
 
     /// List directory entries for the given fid.
     ///
-    /// Default implementation returns `NotSupported` — backends that
+    /// Default implementation returns `IpcError::NotDirectory` — backends that
     /// expose a real filesystem override this.
     fn readdir(&mut self, _fid: Fid) -> Result<Vec<DirEntry>, IpcError> {
         Err(IpcError::NotDirectory)
@@ -1374,7 +1374,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Linux fstat(2): get file status.
     fn sys_fstat(&mut self, fd: i32, statbuf_ptr: usize) -> i64 {
         if statbuf_ptr == 0 {
-            return EINVAL;
+            return EFAULT;
         }
         let fid = match self.fd_table.get(&fd) {
             Some(e) => e.fid,
@@ -2006,7 +2006,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         flags: i32,
     ) -> i64 {
         if statbuf_ptr == 0 {
-            return EINVAL;
+            return EFAULT;
         }
         const AT_FDCWD: i32 = -100;
         const AT_EMPTY_PATH: i32 = 0x1000;
@@ -2658,12 +2658,12 @@ mod tests {
     }
 
     #[test]
-    fn sys_fstat_null_ptr_returns_einval() {
+    fn sys_fstat_null_ptr_returns_efault() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
         lx.init_stdio().unwrap();
         let result = lx.handle_syscall(5, [1, 0, 0, 0, 0, 0]);
-        assert_eq!(result, EINVAL);
+        assert_eq!(result, EFAULT);
     }
 
     // ── stub syscall tests ──────────────────────────────────────────
