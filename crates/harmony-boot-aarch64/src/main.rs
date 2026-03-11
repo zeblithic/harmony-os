@@ -496,10 +496,11 @@ fn main() -> Status {
                 // will be fetched via I-cache.  Without explicit cache maintenance,
                 // the I-cache may hold stale (zero) data from before the write.
                 unsafe {
-                    // Cover the full ELF load range (rodata + text).
-                    // Round to 128 KiB to be safe regardless of segment layout.
+                    // Use the ELF file size as the flush range — this is an upper
+                    // bound on the loaded data, so it always covers all segments
+                    // regardless of binary size or segment layout.
                     let start = load_result.entry_point & !0xFFFF; // page-align down
-                    let end = start + 0x20000; // 128 KiB
+                    let end = start + (TEST_ELF.len() as u64);
                     let mut addr = start;
                     while addr < end {
                         core::arch::asm!("dc cvau, {}", in(reg) addr);
@@ -517,6 +518,9 @@ fn main() -> Status {
                 let _ = writeln!(serial, "[ELF] Jumping to entry point...");
 
                 let code = unsafe { run_elf_binary(load_result.entry_point, stack_top) };
+                // Clear stale return context so a future exit_group doesn't
+                // redirect to an invalid stack frame.
+                unsafe { syscall::reset_return_context() };
                 test_exit_code = code;
 
                 let _ = writeln!(serial, "[ELF] Test binary exited with code {}", code,);

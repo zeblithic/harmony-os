@@ -28,7 +28,7 @@ echo "=== Building Harmony RPi5 SD card image ==="
 echo "[1/4] Cross-compiling test ELF..."
 (cd "$ROOT_DIR/crates/harmony-test-elf" && \
     cargo build --target aarch64-unknown-linux-musl --release)
-TEST_ELF="$TARGET_DIR/aarch64-unknown-linux-musl/release/harmony-test-elf"
+TEST_ELF="$ROOT_DIR/crates/harmony-test-elf/target/aarch64-unknown-linux-musl/release/harmony-test-elf"
 echo "  Test ELF: $(wc -c < "$TEST_ELF") bytes"
 
 # ── Step 2: Build kernel with rpi5 feature ──
@@ -36,7 +36,7 @@ echo "[2/4] Building Harmony kernel (aarch64-uefi, rpi5)..."
 (cd "$ROOT_DIR/crates/harmony-boot-aarch64" && \
     cargo build --target aarch64-unknown-uefi --release \
     --features rpi5 --no-default-features)
-KERNEL="$TARGET_DIR/aarch64-unknown-uefi/release/harmony-boot-aarch64.efi"
+KERNEL="$ROOT_DIR/crates/harmony-boot-aarch64/target/aarch64-unknown-uefi/release/harmony-boot-aarch64.efi"
 echo "  Kernel: $(wc -c < "$KERNEL") bytes"
 
 # ── Step 3: Download/cache firmware ──

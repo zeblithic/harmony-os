@@ -90,6 +90,22 @@ pub unsafe extern "C" fn set_return_context(addr: u64, sp: u64, lr: u64) {
     RETURN_LR = lr;
 }
 
+/// Clear the return context after an ELF process exits.
+///
+/// Prevents stale `RETURN_ADDR` / `RETURN_SP` / `RETURN_LR` from
+/// redirecting a subsequent `exit_group` to an invalid stack frame.
+///
+/// # Safety
+/// Must be called after the ELF binary has exited and before any
+/// new ELF binary is loaded.
+pub unsafe fn reset_return_context() {
+    RETURN_ADDR = 0;
+    RETURN_SP = 0;
+    RETURN_LR = 0;
+    PROCESS_EXITED = false;
+    EXIT_CODE = 0;
+}
+
 /// Rust SVC handler — called from the exception vector table asm.
 ///
 /// Reads the syscall number from X8 and arguments from X0-X5,

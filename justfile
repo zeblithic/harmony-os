@@ -192,7 +192,7 @@ test-qemu-aarch64: build-test-elf build-aarch64
         -cpu max \
         -m 256M \
         -nographic \
-        -bios target/aarch64-unknown-uefi/release/harmony-boot-aarch64.efi \
+        -bios crates/harmony-boot-aarch64/target/aarch64-unknown-uefi/release/harmony-boot-aarch64.efi \
         2>/dev/null | tee "$LOG"
     # timeout exits 124 on timeout (expected — kernel enters idle loop).
     # We check log content rather than exit code.
