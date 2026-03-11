@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! Graduated Linux syscall test binary for Linuxulator validation.
 //!
 //! Cross-compiled to `aarch64-unknown-linux-musl` (static, no_std, no_main).
@@ -126,7 +127,7 @@ unsafe fn step2_mmap() -> bool {
         size,                           // length
         PROT_READ | PROT_WRITE,         // prot
         MAP_PRIVATE | MAP_ANONYMOUS,    // flags
-        u64::MAX,                       // fd = -1 (as unsigned)
+        (-1i64) as u64,                 // fd = -1 (anonymous mapping)
         0,                              // offset
     );
 
