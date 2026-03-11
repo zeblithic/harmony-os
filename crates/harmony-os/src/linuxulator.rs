@@ -1619,6 +1619,13 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Creates a new fd pointing to the same fid as `oldfd`.
     /// The new fd gets the lowest available fd number and flags=0
     /// (CLOEXEC is not inherited per POSIX).
+    ///
+    /// **Known deviation:** POSIX requires dup'd fds to share the same open
+    /// file description (and thus the same offset). This implementation copies
+    /// the offset by value, so reads/seeks on one fd do not advance the other.
+    /// Sufficient for musl static init (fd setup), but programs relying on
+    /// shared-offset semantics after dup will need a `FileDescription`
+    /// indirection table (future work).
     fn sys_dup(&mut self, oldfd: i32) -> i64 {
         let entry = match self.fd_table.get(&oldfd) {
             Some(e) => e,
@@ -1642,6 +1649,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
     ///
     /// If oldfd == newfd, just validates oldfd exists and returns it.
     /// If newfd is already open, silently closes it first (clunks fid).
+    ///
+    /// See `sys_dup` for known offset-sharing deviation.
     fn sys_dup2(&mut self, oldfd: i32, newfd: i32) -> i64 {
         if newfd < 0 {
             return EBADF;
@@ -1684,6 +1693,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// - Returns EINVAL if oldfd == newfd (unlike dup2)
     /// - Accepts O_CLOEXEC flag to set FD_CLOEXEC on the new fd
     /// - Returns EINVAL for any flags other than O_CLOEXEC
+    ///
+    /// See `sys_dup` for known offset-sharing deviation.
     fn sys_dup3(&mut self, oldfd: i32, newfd: i32, flags: i32) -> i64 {
         if newfd < 0 {
             return EBADF;
@@ -2774,7 +2785,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
     ///
     /// Each of the 6 fields is a 65-byte null-terminated C string (390 bytes total).
     /// We report "Linux" as sysname for compatibility — programs check this.
-    fn sys_uname(&self, buf_ptr: usize) -> i64 {
+    fn sys_uname(&mut self, buf_ptr: usize) -> i64 {
         if buf_ptr == 0 {
             return EFAULT;
         }
@@ -2783,8 +2794,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         const FIELD_LEN: usize = 65;
         const UTSNAME_SIZE: usize = FIELD_LEN * 6;
 
-        let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, UTSNAME_SIZE) };
-        buf.fill(0);
+        let mut buf = [0u8; UTSNAME_SIZE];
 
         // Helper: copy a string into a 65-byte field (already zero-filled).
         fn write_field(buf: &mut [u8], offset: usize, value: &[u8]) {
@@ -2792,18 +2802,19 @@ impl<B: SyscallBackend> Linuxulator<B> {
             buf[offset..offset + len].copy_from_slice(&value[..len]);
         }
 
-        write_field(buf, 0, b"Linux"); // sysname
-        write_field(buf, FIELD_LEN, b"harmony"); // nodename
-        write_field(buf, FIELD_LEN * 2, b"6.1.0-harmony"); // release
-        write_field(buf, FIELD_LEN * 3, b"#1 SMP"); // version
+        write_field(&mut buf, 0, b"Linux"); // sysname
+        write_field(&mut buf, FIELD_LEN, b"harmony"); // nodename
+        write_field(&mut buf, FIELD_LEN * 2, b"6.1.0-harmony"); // release
+        write_field(&mut buf, FIELD_LEN * 3, b"#1 SMP"); // version
         #[cfg(target_arch = "x86_64")]
-        write_field(buf, FIELD_LEN * 4, b"x86_64"); // machine
+        write_field(&mut buf, FIELD_LEN * 4, b"x86_64"); // machine
         #[cfg(target_arch = "aarch64")]
-        write_field(buf, FIELD_LEN * 4, b"aarch64"); // machine
+        write_field(&mut buf, FIELD_LEN * 4, b"aarch64"); // machine
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        write_field(buf, FIELD_LEN * 4, b"unknown"); // machine
-        write_field(buf, FIELD_LEN * 5, b"(none)"); // domainname
+        write_field(&mut buf, FIELD_LEN * 4, b"unknown"); // machine
+        write_field(&mut buf, FIELD_LEN * 5, b"(none)"); // domainname
 
+        self.backend.vm_write_bytes(buf_ptr as u64, &buf);
         0
     }
 
@@ -2834,9 +2845,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
         let tv_nsec = ns % 1_000_000_000;
 
         // struct timespec: 16 bytes (u64 tv_sec + u64 tv_nsec), LE
-        let buf = unsafe { core::slice::from_raw_parts_mut(tp_ptr as *mut u8, 16) };
+        let mut buf = [0u8; 16];
         buf[0..8].copy_from_slice(&tv_sec.to_le_bytes());
         buf[8..16].copy_from_slice(&tv_nsec.to_le_bytes());
+        self.backend.vm_write_bytes(tp_ptr as u64, &buf);
 
         0
     }
@@ -2845,13 +2857,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
     ///
     /// Reports 1 ms resolution for CLOCK_REALTIME and CLOCK_MONOTONIC.
     /// A null `tp` is allowed — Linux uses this to validate the clock ID.
-    fn sys_clock_getres(&self, clockid: i32, tp_ptr: usize) -> i64 {
+    fn sys_clock_getres(&mut self, clockid: i32, tp_ptr: usize) -> i64 {
         match clockid {
             CLOCK_REALTIME | CLOCK_MONOTONIC => {
                 if tp_ptr != 0 {
-                    let buf = unsafe { core::slice::from_raw_parts_mut(tp_ptr as *mut u8, 16) };
+                    let mut buf = [0u8; 16];
                     buf[0..8].copy_from_slice(&0u64.to_le_bytes()); // tv_sec = 0
                     buf[8..16].copy_from_slice(&1_000_000u64.to_le_bytes()); // tv_nsec = 1ms
+                    self.backend.vm_write_bytes(tp_ptr as u64, &buf);
                 }
                 0
             }
