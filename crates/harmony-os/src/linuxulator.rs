@@ -2154,6 +2154,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         // Walk a new fid for cwd (the fd's fid stays with the fd table)
         let cwd_fid = self.alloc_fid();
         if let Err(e) = self.backend.walk(&path, cwd_fid) {
+            let _ = self.backend.clunk(cwd_fid);
             return ipc_err_to_errno(e);
         }
 
@@ -4245,7 +4246,7 @@ mod integration_tests {
         assert_eq!(ret, 0);
         // getcwd should reflect the change
         let mut buf = [0u8; 64];
-        let ret = lx.dispatch_syscall(LinuxSyscall::Getcwd {
+        let _ret = lx.dispatch_syscall(LinuxSyscall::Getcwd {
             buf: buf.as_mut_ptr() as u64,
             size: 64,
         });
