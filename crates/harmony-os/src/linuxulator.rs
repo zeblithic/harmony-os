@@ -1555,21 +1555,23 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
     }
 
+    /// Decrement the refcount for a fid and clunk it if no references remain.
+    fn release_fid(&mut self, fid: Fid) {
+        let rc = self.fid_refcount.get_mut(&fid).expect("refcount missing");
+        *rc -= 1;
+        if *rc == 0 {
+            self.fid_refcount.remove(&fid);
+            let _ = self.backend.clunk(fid);
+        }
+    }
+
     /// Linux close(2): close a file descriptor.
     fn sys_close(&mut self, fd: i32) -> i64 {
         let entry = match self.fd_table.remove(&fd) {
             Some(e) => e,
             None => return EBADF,
         };
-        let rc = self
-            .fid_refcount
-            .get_mut(&entry.fid)
-            .expect("refcount missing");
-        *rc -= 1;
-        if *rc == 0 {
-            self.fid_refcount.remove(&entry.fid);
-            let _ = self.backend.clunk(entry.fid);
-        }
+        self.release_fid(entry.fid);
         0
     }
 
@@ -1661,17 +1663,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if oldfd == newfd {
             return newfd as i64;
         }
-        // Close newfd if it's open (with refcount-aware clunk)
+        // Close newfd if it's open
         if let Some(existing) = self.fd_table.remove(&newfd) {
-            let rc = self
-                .fid_refcount
-                .get_mut(&existing.fid)
-                .expect("refcount missing");
-            *rc -= 1;
-            if *rc == 0 {
-                self.fid_refcount.remove(&existing.fid);
-                let _ = self.backend.clunk(existing.fid);
-            }
+            self.release_fid(existing.fid);
         }
         let entry = self.fd_table.get(&oldfd).unwrap();
         let new_entry = FdEntry {
@@ -1709,17 +1703,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if !self.fd_table.contains_key(&oldfd) {
             return EBADF;
         }
-        // Close newfd if it's open (with refcount-aware clunk)
+        // Close newfd if it's open
         if let Some(existing) = self.fd_table.remove(&newfd) {
-            let rc = self
-                .fid_refcount
-                .get_mut(&existing.fid)
-                .expect("refcount missing");
-            *rc -= 1;
-            if *rc == 0 {
-                self.fid_refcount.remove(&existing.fid);
-                let _ = self.backend.clunk(existing.fid);
-            }
+            self.release_fid(existing.fid);
         }
         let entry = self.fd_table.get(&oldfd).unwrap();
         let fd_flags = if flags & O_CLOEXEC != 0 {
@@ -1795,6 +1781,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
             Err(_) => FileType::Regular, // best-effort default
         };
 
+        let fd_flags = if flags & O_CLOEXEC != 0 {
+            FD_CLOEXEC
+        } else {
+            0
+        };
         let fd = self.alloc_fd();
         self.fd_table.insert(
             fd,
@@ -1803,7 +1794,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 offset: 0,
                 path: Some(path),
                 file_type,
-                flags: 0,
+                flags: fd_flags,
             },
         );
         self.fid_refcount.insert(fid, 1);
@@ -2741,10 +2732,13 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if cpusetsize < 8 {
             return EINVAL;
         }
-        // Single-CPU bitmask: only CPU 0.
-        let bitmask: [u8; 8] = [1, 0, 0, 0, 0, 0, 0, 0];
-        self.backend.vm_write_bytes(mask, &bitmask);
-        8
+        // Zero the full buffer first (Linux kernel does this), then set CPU 0.
+        // Cap at a reasonable maximum to avoid huge allocations from bad input.
+        let size = (cpusetsize as usize).min(1024);
+        let mut buf = vec![0u8; size];
+        buf[0] = 1; // CPU 0
+        self.backend.vm_write_bytes(mask, &buf);
+        size as i64
     }
 
     /// Linux getcwd(2): get current working directory.
@@ -5251,6 +5245,45 @@ mod integration_tests {
         assert_eq!(last_walk.0, "/nix/store/abc123-hello");
     }
 
+    #[test]
+    fn sys_openat_propagates_o_cloexec() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let path = b"/tmp/test\0";
+        let fd = lx.dispatch_syscall(LinuxSyscall::Openat {
+            dirfd: -100,
+            pathname: path.as_ptr() as u64,
+            flags: O_CLOEXEC,
+        });
+        assert!(fd >= 0);
+        // F_GETFD should return FD_CLOEXEC
+        let flags = lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: fd as i32,
+            cmd: 1, // F_GETFD
+            arg: 0,
+        });
+        assert_eq!(flags, FD_CLOEXEC as i64);
+    }
+
+    #[test]
+    fn sys_openat_without_cloexec_has_zero_flags() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let path = b"/tmp/test\0";
+        let fd = lx.dispatch_syscall(LinuxSyscall::Openat {
+            dirfd: -100,
+            pathname: path.as_ptr() as u64,
+            flags: 0,
+        });
+        assert!(fd >= 0);
+        let flags = lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: fd as i32,
+            cmd: 1, // F_GETFD
+            arg: 0,
+        });
+        assert_eq!(flags, 0);
+    }
+
     // ── process identity syscall tests ────────────────────────────
 
     #[test]
@@ -5494,11 +5527,11 @@ mod integration_tests {
             cpusetsize: 128,
             mask: buf.as_mut_ptr() as u64,
         });
-        // Still returns 8 (size of the written mask).
-        assert_eq!(result, 8);
-        // First 8 bytes overwritten with the bitmask.
+        // Returns cpusetsize (full buffer zeroed, like Linux kernel).
+        assert_eq!(result, 128);
+        // CPU 0 set, everything else zeroed.
         assert_eq!(buf[0], 1);
-        assert_eq!(buf[1..8], [0; 7]);
+        assert_eq!(buf[1..], [0; 127]);
     }
 
     #[test]
