@@ -234,6 +234,23 @@ pub enum LinuxSyscall {
         clockid: i32,
         tp: u64,
     },
+    Fcntl {
+        fd: i32,
+        cmd: i32,
+        arg: u64,
+    },
+    Dup {
+        oldfd: i32,
+    },
+    Dup2 {
+        oldfd: i32,
+        newfd: i32,
+    },
+    Dup3 {
+        oldfd: i32,
+        newfd: i32,
+        flags: i32,
+    },
     Unknown {
         nr: u64,
     },
@@ -297,11 +314,23 @@ impl LinuxSyscall {
                 len: args[1],
                 advice: args[2] as i32,
             },
+            32 => LinuxSyscall::Dup {
+                oldfd: args[0] as i32,
+            },
+            33 => LinuxSyscall::Dup2 {
+                oldfd: args[0] as i32,
+                newfd: args[1] as i32,
+            },
             39 => LinuxSyscall::Getpid,
             60 => LinuxSyscall::Exit {
                 code: args[0] as i32,
             },
             63 => LinuxSyscall::Uname { buf: args[0] },
+            72 => LinuxSyscall::Fcntl {
+                fd: args[0] as i32,
+                cmd: args[1] as i32,
+                arg: args[2],
+            },
             79 => LinuxSyscall::Getcwd {
                 buf: args[0],
                 size: args[1],
@@ -392,6 +421,11 @@ impl LinuxSyscall {
                 mode: args[2] as i32,
             },
             273 => LinuxSyscall::SetRobustList,
+            292 => LinuxSyscall::Dup3 {
+                oldfd: args[0] as i32,
+                newfd: args[1] as i32,
+                flags: args[2] as i32,
+            },
             302 => LinuxSyscall::Prlimit64 {
                 pid: args[0] as i32,
                 resource: args[1] as i32,
@@ -417,6 +451,19 @@ impl LinuxSyscall {
             17 => LinuxSyscall::Getcwd {
                 buf: args[0],
                 size: args[1],
+            },
+            23 => LinuxSyscall::Dup {
+                oldfd: args[0] as i32,
+            },
+            24 => LinuxSyscall::Dup3 {
+                oldfd: args[0] as i32,
+                newfd: args[1] as i32,
+                flags: args[2] as i32,
+            },
+            25 => LinuxSyscall::Fcntl {
+                fd: args[0] as i32,
+                cmd: args[1] as i32,
+                arg: args[2],
             },
             29 => LinuxSyscall::Ioctl {
                 fd: args[0] as i32,
@@ -1106,6 +1153,8 @@ struct FdEntry {
     path: Option<alloc::string::String>,
     /// Cached file type — avoids IPC stat on every lseek.
     file_type: FileType,
+    /// File descriptor flags (e.g. FD_CLOEXEC). Default 0.
+    flags: u32,
 }
 
 /// Linux syscall-to-9P translation engine.
@@ -1232,6 +1281,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 offset: 0,
                 path: None,
                 file_type: FileType::CharDev,
+                flags: 0,
             },
         );
 
@@ -1246,6 +1296,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 offset: 0,
                 path: None,
                 file_type: FileType::CharDev,
+                flags: 0,
             },
         );
 
@@ -1260,6 +1311,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 offset: 0,
                 path: None,
                 file_type: FileType::CharDev,
+                flags: 0,
             },
         );
 
@@ -1416,6 +1468,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
             LinuxSyscall::ClockGetres { clockid, tp } => {
                 self.sys_clock_getres(clockid, tp as usize)
             }
+            LinuxSyscall::Fcntl { fd, cmd, arg } => self.sys_fcntl(fd, cmd, arg),
+            LinuxSyscall::Dup { oldfd } => self.sys_dup(oldfd),
+            LinuxSyscall::Dup2 { oldfd, newfd } => self.sys_dup2(oldfd, newfd),
+            LinuxSyscall::Dup3 {
+                oldfd,
+                newfd,
+                flags,
+            } => self.sys_dup3(oldfd, newfd, flags),
             LinuxSyscall::Unknown { .. } => ENOSYS,
         }
     }
@@ -1490,6 +1550,137 @@ impl<B: SyscallBackend> Linuxulator<B> {
         0
     }
 
+    /// Linux fcntl(2): manipulate file descriptor flags.
+    ///
+    /// Supported commands:
+    /// - F_GETFD (1): return fd flags (bit 0 = FD_CLOEXEC)
+    /// - F_SETFD (2): set fd flags
+    /// - F_GETFL (3): return file status flags (stub: returns 0)
+    /// - F_SETFL (4): set file status flags (stub: no-op)
+    fn sys_fcntl(&mut self, fd: i32, cmd: i32, arg: u64) -> i64 {
+        const F_GETFD: i32 = 1;
+        const F_SETFD: i32 = 2;
+        const F_GETFL: i32 = 3;
+        const F_SETFL: i32 = 4;
+
+        match cmd {
+            F_GETFD => match self.fd_table.get(&fd) {
+                Some(entry) => entry.flags as i64,
+                None => EBADF,
+            },
+            F_SETFD => match self.fd_table.get_mut(&fd) {
+                Some(entry) => {
+                    entry.flags = arg as u32;
+                    0
+                }
+                None => EBADF,
+            },
+            F_GETFL => {
+                if !self.fd_table.contains_key(&fd) {
+                    return EBADF;
+                }
+                0 // stub — we don't track open mode flags yet
+            }
+            F_SETFL => {
+                if !self.fd_table.contains_key(&fd) {
+                    return EBADF;
+                }
+                0 // stub — no-op
+            }
+            _ => EINVAL,
+        }
+    }
+
+    /// Linux dup(2): duplicate a file descriptor.
+    ///
+    /// Creates a new fd pointing to the same fid as `oldfd`.
+    /// The new fd gets the lowest available fd number and flags=0
+    /// (CLOEXEC is not inherited per POSIX).
+    fn sys_dup(&mut self, oldfd: i32) -> i64 {
+        let entry = match self.fd_table.get(&oldfd) {
+            Some(e) => e,
+            None => return EBADF,
+        };
+        let new_entry = FdEntry {
+            fid: entry.fid,
+            offset: entry.offset,
+            path: entry.path.clone(),
+            file_type: entry.file_type,
+            flags: 0,
+        };
+        let newfd = self.alloc_fd();
+        self.fd_table.insert(newfd, new_entry);
+        newfd as i64
+    }
+
+    /// Linux dup2(2): duplicate a file descriptor to a specific fd.
+    ///
+    /// If oldfd == newfd, just validates oldfd exists and returns it.
+    /// If newfd is already open, silently closes it first (clunks fid).
+    fn sys_dup2(&mut self, oldfd: i32, newfd: i32) -> i64 {
+        if !self.fd_table.contains_key(&oldfd) {
+            return EBADF;
+        }
+        if oldfd == newfd {
+            return newfd as i64;
+        }
+        // Close newfd if it's open
+        if let Some(existing) = self.fd_table.remove(&newfd) {
+            let _ = self.backend.clunk(existing.fid);
+        }
+        let entry = self.fd_table.get(&oldfd).unwrap();
+        let new_entry = FdEntry {
+            fid: entry.fid,
+            offset: entry.offset,
+            path: entry.path.clone(),
+            file_type: entry.file_type,
+            flags: 0,
+        };
+        self.fd_table.insert(newfd, new_entry);
+        newfd as i64
+    }
+
+    /// Linux dup3(2): duplicate fd with flags.
+    ///
+    /// Like dup2, but:
+    /// - Returns EINVAL if oldfd == newfd (unlike dup2)
+    /// - Accepts O_CLOEXEC flag to set FD_CLOEXEC on the new fd
+    /// - Returns EINVAL for any flags other than O_CLOEXEC
+    fn sys_dup3(&mut self, oldfd: i32, newfd: i32, flags: i32) -> i64 {
+        const O_CLOEXEC: i32 = 0o2000000;
+        const FD_CLOEXEC: u32 = 1;
+
+        if oldfd == newfd {
+            return EINVAL;
+        }
+        // Only O_CLOEXEC is allowed; any other bits are invalid
+        if flags & !O_CLOEXEC != 0 {
+            return EINVAL;
+        }
+        if !self.fd_table.contains_key(&oldfd) {
+            return EBADF;
+        }
+        // Close newfd if it's open
+        if let Some(existing) = self.fd_table.remove(&newfd) {
+            let _ = self.backend.clunk(existing.fid);
+        }
+        let entry = self.fd_table.get(&oldfd).unwrap();
+        let fd_flags = if flags & O_CLOEXEC != 0 {
+            FD_CLOEXEC
+        } else {
+            0
+        };
+        let new_entry = FdEntry {
+            fid: entry.fid,
+            offset: entry.offset,
+            path: entry.path.clone(),
+            file_type: entry.file_type,
+            flags: fd_flags,
+        };
+        self.fd_table.insert(newfd, new_entry);
+        newfd as i64
+    }
+
     /// Linux fstat(2): get file status.
     fn sys_fstat(&mut self, fd: i32, statbuf_ptr: usize) -> i64 {
         if statbuf_ptr == 0 {
@@ -1553,6 +1744,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 offset: 0,
                 path: Some(path),
                 file_type,
+                flags: 0,
             },
         );
         fd as i64
@@ -2295,9 +2487,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
             // rec is already zeroed (NUL terminator included)
             let d_ino = (idx + 1) as u64; // non-zero placeholder; 0 means "deleted"
             rec[0..8].copy_from_slice(&d_ino.to_le_bytes()); // d_ino
-            // d_off: entry index used as seek position (Linuxulator-internal
-            // convention — not a byte offset, but consistent with how
-            // FdEntry.offset tracks pagination via lseek).
+                                                             // d_off: entry index used as seek position (Linuxulator-internal
+                                                             // convention — not a byte offset, but consistent with how
+                                                             // FdEntry.offset tracks pagination via lseek).
             let next_off = (idx + 1) as i64;
             rec[8..16].copy_from_slice(&next_off.to_le_bytes()); // d_off
             rec[16..18].copy_from_slice(&(reclen as u16).to_le_bytes()); // d_reclen
@@ -2599,7 +2791,6 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Reports 1 ms resolution for CLOCK_REALTIME and CLOCK_MONOTONIC.
     /// A null `tp` is allowed — Linux uses this to validate the clock ID.
     fn sys_clock_getres(&self, clockid: i32, tp_ptr: usize) -> i64 {
-
         match clockid {
             CLOCK_REALTIME | CLOCK_MONOTONIC => {
                 if tp_ptr != 0 {
@@ -4777,6 +4968,7 @@ mod integration_tests {
                 offset: 0,
                 path: Some(alloc::string::String::from("/test")),
                 file_type: FileType::Directory,
+                flags: 0,
             },
         );
 
@@ -4821,6 +5013,7 @@ mod integration_tests {
                 offset: 0,
                 path: Some(alloc::string::String::from("/empty")),
                 file_type: FileType::Directory,
+                flags: 0,
             },
         );
 
@@ -5629,6 +5822,435 @@ mod integration_tests {
             LinuxSyscall::ClockGetres {
                 clockid: 0,
                 tp: 0x6000
+            }
+        ));
+    }
+
+    // ── fcntl tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn sys_fcntl_getfd_default_zero() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        let result = lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: 1,
+            cmd: 1, // F_GETFD
+            arg: 0,
+        });
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn sys_fcntl_setfd_then_getfd() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        // Set FD_CLOEXEC
+        let result = lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: 1,
+            cmd: 2, // F_SETFD
+            arg: 1, // FD_CLOEXEC
+        });
+        assert_eq!(result, 0);
+        // Read it back
+        let result = lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: 1,
+            cmd: 1, // F_GETFD
+            arg: 0,
+        });
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn sys_fcntl_getfl_stub_returns_zero() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        let result = lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: 0,
+            cmd: 3, // F_GETFL
+            arg: 0,
+        });
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn sys_fcntl_setfl_stub_returns_zero() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        let result = lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: 0,
+            cmd: 4, // F_SETFL
+            arg: 0,
+        });
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn sys_fcntl_unknown_cmd_returns_einval() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        let result = lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: 0,
+            cmd: 99,
+            arg: 0,
+        });
+        assert_eq!(result, EINVAL);
+    }
+
+    #[test]
+    fn sys_fcntl_bad_fd_returns_ebadf() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        // F_GETFD on non-existent fd
+        assert_eq!(
+            lx.dispatch_syscall(LinuxSyscall::Fcntl {
+                fd: 42,
+                cmd: 1,
+                arg: 0,
+            }),
+            EBADF
+        );
+        // F_SETFD on non-existent fd
+        assert_eq!(
+            lx.dispatch_syscall(LinuxSyscall::Fcntl {
+                fd: 42,
+                cmd: 2,
+                arg: 1,
+            }),
+            EBADF
+        );
+        // F_GETFL on non-existent fd
+        assert_eq!(
+            lx.dispatch_syscall(LinuxSyscall::Fcntl {
+                fd: 42,
+                cmd: 3,
+                arg: 0,
+            }),
+            EBADF
+        );
+        // F_SETFL on non-existent fd
+        assert_eq!(
+            lx.dispatch_syscall(LinuxSyscall::Fcntl {
+                fd: 42,
+                cmd: 4,
+                arg: 0,
+            }),
+            EBADF
+        );
+    }
+
+    // ── dup tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn sys_dup_returns_lowest_free_fd() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        // fds 0, 1, 2 are in use; dup should return 3
+        let result = lx.dispatch_syscall(LinuxSyscall::Dup { oldfd: 1 });
+        assert_eq!(result, 3);
+        assert!(lx.has_fd(3));
+    }
+
+    #[test]
+    fn sys_dup_shares_fid() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        let original_fid = lx.fd_table.get(&1).unwrap().fid;
+        let newfd = lx.dispatch_syscall(LinuxSyscall::Dup { oldfd: 1 });
+        assert!(newfd >= 0);
+        let new_fid = lx.fd_table.get(&(newfd as i32)).unwrap().fid;
+        assert_eq!(original_fid, new_fid, "dup should share the same fid");
+    }
+
+    #[test]
+    fn sys_dup_does_not_inherit_cloexec() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        // Set CLOEXEC on fd 1
+        lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: 1,
+            cmd: 2, // F_SETFD
+            arg: 1, // FD_CLOEXEC
+        });
+        let newfd = lx.dispatch_syscall(LinuxSyscall::Dup { oldfd: 1 }) as i32;
+        let new_flags = lx.fd_table.get(&newfd).unwrap().flags;
+        assert_eq!(new_flags, 0, "dup should not inherit FD_CLOEXEC");
+    }
+
+    #[test]
+    fn sys_dup_bad_fd_returns_ebadf() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        let result = lx.dispatch_syscall(LinuxSyscall::Dup { oldfd: 99 });
+        assert_eq!(result, EBADF);
+    }
+
+    #[test]
+    fn sys_dup_fills_gap() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        // Close fd 1 to create a gap
+        lx.dispatch_syscall(LinuxSyscall::Close { fd: 1 });
+        // dup should reuse fd 1 (lowest available)
+        let result = lx.dispatch_syscall(LinuxSyscall::Dup { oldfd: 0 });
+        assert_eq!(result, 1);
+    }
+
+    // ── dup2 tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn sys_dup2_to_specific_fd() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        let result = lx.dispatch_syscall(LinuxSyscall::Dup2 {
+            oldfd: 1,
+            newfd: 10,
+        });
+        assert_eq!(result, 10);
+        assert!(lx.has_fd(10));
+        let orig_fid = lx.fd_table.get(&1).unwrap().fid;
+        let dup_fid = lx.fd_table.get(&10).unwrap().fid;
+        assert_eq!(orig_fid, dup_fid);
+    }
+
+    #[test]
+    fn sys_dup2_same_fd_returns_fd() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        let result = lx.dispatch_syscall(LinuxSyscall::Dup2 { oldfd: 1, newfd: 1 });
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn sys_dup2_same_fd_bad_oldfd_returns_ebadf() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        let result = lx.dispatch_syscall(LinuxSyscall::Dup2 {
+            oldfd: 99,
+            newfd: 99,
+        });
+        assert_eq!(result, EBADF);
+    }
+
+    #[test]
+    fn sys_dup2_closes_existing_newfd() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        // fd 2 (stderr) is open. dup2(0, 2) should close stderr first.
+        let stderr_fid = lx.fd_table.get(&2).unwrap().fid;
+        let result = lx.dispatch_syscall(LinuxSyscall::Dup2 { oldfd: 0, newfd: 2 });
+        assert_eq!(result, 2);
+        // The old stderr fid should have been clunked
+        assert!(
+            lx.backend().clunks.contains(&stderr_fid),
+            "dup2 should clunk the old fd's fid"
+        );
+        // fd 2 now shares fd 0's fid
+        let stdin_fid = lx.fd_table.get(&0).unwrap().fid;
+        let new_fd2_fid = lx.fd_table.get(&2).unwrap().fid;
+        assert_eq!(stdin_fid, new_fd2_fid);
+    }
+
+    #[test]
+    fn sys_dup2_bad_oldfd_returns_ebadf() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        let result = lx.dispatch_syscall(LinuxSyscall::Dup2 {
+            oldfd: 99,
+            newfd: 10,
+        });
+        assert_eq!(result, EBADF);
+    }
+
+    #[test]
+    fn sys_dup2_flags_not_inherited() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        // Set CLOEXEC on fd 0
+        lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: 0,
+            cmd: 2,
+            arg: 1,
+        });
+        let result = lx.dispatch_syscall(LinuxSyscall::Dup2 {
+            oldfd: 0,
+            newfd: 10,
+        });
+        assert_eq!(result, 10);
+        assert_eq!(lx.fd_table.get(&10).unwrap().flags, 0);
+    }
+
+    // ── dup3 tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn sys_dup3_basic() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        let result = lx.dispatch_syscall(LinuxSyscall::Dup3 {
+            oldfd: 1,
+            newfd: 10,
+            flags: 0,
+        });
+        assert_eq!(result, 10);
+        assert!(lx.has_fd(10));
+        assert_eq!(lx.fd_table.get(&10).unwrap().flags, 0);
+    }
+
+    #[test]
+    fn sys_dup3_with_cloexec() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        let o_cloexec: i32 = 0o2000000;
+        let result = lx.dispatch_syscall(LinuxSyscall::Dup3 {
+            oldfd: 1,
+            newfd: 10,
+            flags: o_cloexec,
+        });
+        assert_eq!(result, 10);
+        assert_eq!(
+            lx.fd_table.get(&10).unwrap().flags,
+            1,
+            "dup3 with O_CLOEXEC should set FD_CLOEXEC"
+        );
+    }
+
+    #[test]
+    fn sys_dup3_same_fd_returns_einval() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        let result = lx.dispatch_syscall(LinuxSyscall::Dup3 {
+            oldfd: 1,
+            newfd: 1,
+            flags: 0,
+        });
+        assert_eq!(result, EINVAL);
+    }
+
+    #[test]
+    fn sys_dup3_invalid_flags_returns_einval() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        let result = lx.dispatch_syscall(LinuxSyscall::Dup3 {
+            oldfd: 1,
+            newfd: 10,
+            flags: 0x42, // not O_CLOEXEC
+        });
+        assert_eq!(result, EINVAL);
+    }
+
+    #[test]
+    fn sys_dup3_bad_oldfd_returns_ebadf() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        let result = lx.dispatch_syscall(LinuxSyscall::Dup3 {
+            oldfd: 99,
+            newfd: 10,
+            flags: 0,
+        });
+        assert_eq!(result, EBADF);
+    }
+
+    #[test]
+    fn sys_dup3_closes_existing_newfd() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        let stderr_fid = lx.fd_table.get(&2).unwrap().fid;
+        let result = lx.dispatch_syscall(LinuxSyscall::Dup3 {
+            oldfd: 0,
+            newfd: 2,
+            flags: 0,
+        });
+        assert_eq!(result, 2);
+        assert!(
+            lx.backend().clunks.contains(&stderr_fid),
+            "dup3 should clunk the old fd's fid"
+        );
+    }
+
+    #[test]
+    fn sys_dup3_shares_fid() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        let orig_fid = lx.fd_table.get(&1).unwrap().fid;
+        lx.dispatch_syscall(LinuxSyscall::Dup3 {
+            oldfd: 1,
+            newfd: 10,
+            flags: 0,
+        });
+        let dup_fid = lx.fd_table.get(&10).unwrap().fid;
+        assert_eq!(orig_fid, dup_fid);
+    }
+
+    // ── Syscall number mapping tests for fd manipulation ────────────
+
+    #[test]
+    fn from_x86_64_dup() {
+        let syscall = LinuxSyscall::from_x86_64(32, [5, 0, 0, 0, 0, 0]);
+        assert!(matches!(syscall, LinuxSyscall::Dup { oldfd: 5 }));
+    }
+
+    #[test]
+    fn from_x86_64_dup2() {
+        let syscall = LinuxSyscall::from_x86_64(33, [1, 10, 0, 0, 0, 0]);
+        assert!(matches!(
+            syscall,
+            LinuxSyscall::Dup2 {
+                oldfd: 1,
+                newfd: 10
+            }
+        ));
+    }
+
+    #[test]
+    fn from_x86_64_fcntl() {
+        let syscall = LinuxSyscall::from_x86_64(72, [3, 1, 0, 0, 0, 0]);
+        assert!(matches!(
+            syscall,
+            LinuxSyscall::Fcntl {
+                fd: 3,
+                cmd: 1,
+                arg: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn from_x86_64_dup3() {
+        let o_cloexec = 0o2000000u64;
+        let syscall = LinuxSyscall::from_x86_64(292, [1, 10, o_cloexec, 0, 0, 0]);
+        assert!(matches!(
+            syscall,
+            LinuxSyscall::Dup3 {
+                oldfd: 1,
+                newfd: 10,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn from_aarch64_dup() {
+        let syscall = LinuxSyscall::from_aarch64(23, [5, 0, 0, 0, 0, 0]);
+        assert!(matches!(syscall, LinuxSyscall::Dup { oldfd: 5 }));
+    }
+
+    #[test]
+    fn from_aarch64_dup3() {
+        let o_cloexec = 0o2000000u64;
+        let syscall = LinuxSyscall::from_aarch64(24, [1, 10, o_cloexec, 0, 0, 0]);
+        assert!(matches!(
+            syscall,
+            LinuxSyscall::Dup3 {
+                oldfd: 1,
+                newfd: 10,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn from_aarch64_fcntl() {
+        let syscall = LinuxSyscall::from_aarch64(25, [3, 2, 1, 0, 0, 0]);
+        assert!(matches!(
+            syscall,
+            LinuxSyscall::Fcntl {
+                fd: 3,
+                cmd: 2,
+                arg: 1
             }
         ));
     }
