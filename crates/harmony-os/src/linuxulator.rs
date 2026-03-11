@@ -1628,28 +1628,35 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// The new fd gets the lowest available fd number and flags=0
     /// (CLOEXEC is not inherited per POSIX).
     ///
+    /// Clone an fd entry from `oldfd` into `newfd` with the given flags,
+    /// and bump the fid refcount. Caller must ensure `oldfd` exists.
+    ///
     /// **Known deviation:** POSIX requires dup'd fds to share the same open
     /// file description (and thus the same offset). This implementation copies
     /// the offset by value, so reads/seeks on one fd do not advance the other.
     /// Sufficient for musl static init (fd setup), but programs relying on
     /// shared-offset semantics after dup will need a `FileDescription`
     /// indirection table (future work).
-    fn sys_dup(&mut self, oldfd: i32) -> i64 {
-        let entry = match self.fd_table.get(&oldfd) {
-            Some(e) => e,
-            None => return EBADF,
-        };
+    fn dup_fd_to(&mut self, oldfd: i32, newfd: i32, fd_flags: u32) {
+        let entry = self.fd_table.get(&oldfd).unwrap();
         let new_entry = FdEntry {
             fid: entry.fid,
             offset: entry.offset,
             path: entry.path.clone(),
             file_type: entry.file_type,
-            flags: 0,
+            flags: fd_flags,
         };
         let fid = new_entry.fid;
-        let newfd = self.alloc_fd();
         self.fd_table.insert(newfd, new_entry);
         *self.fid_refcount.get_mut(&fid).expect("refcount missing") += 1;
+    }
+
+    fn sys_dup(&mut self, oldfd: i32) -> i64 {
+        if !self.fd_table.contains_key(&oldfd) {
+            return EBADF;
+        }
+        let newfd = self.alloc_fd();
+        self.dup_fd_to(oldfd, newfd, 0);
         newfd as i64
     }
 
@@ -1658,7 +1665,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// If oldfd == newfd, just validates oldfd exists and returns it.
     /// If newfd is already open, silently closes it first (clunks fid).
     ///
-    /// See `sys_dup` for known offset-sharing deviation.
+    /// See `dup_fd_to` for known offset-sharing deviation.
     fn sys_dup2(&mut self, oldfd: i32, newfd: i32) -> i64 {
         if newfd < 0 {
             return EBADF;
@@ -1673,17 +1680,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if let Some(existing) = self.fd_table.remove(&newfd) {
             self.release_fid(existing.fid);
         }
-        let entry = self.fd_table.get(&oldfd).unwrap();
-        let new_entry = FdEntry {
-            fid: entry.fid,
-            offset: entry.offset,
-            path: entry.path.clone(),
-            file_type: entry.file_type,
-            flags: 0,
-        };
-        let fid = new_entry.fid;
-        self.fd_table.insert(newfd, new_entry);
-        *self.fid_refcount.get_mut(&fid).expect("refcount missing") += 1;
+        self.dup_fd_to(oldfd, newfd, 0);
         newfd as i64
     }
 
@@ -1694,7 +1691,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// - Accepts O_CLOEXEC flag to set FD_CLOEXEC on the new fd
     /// - Returns EINVAL for any flags other than O_CLOEXEC
     ///
-    /// See `sys_dup` for known offset-sharing deviation.
+    /// See `dup_fd_to` for known offset-sharing deviation.
     fn sys_dup3(&mut self, oldfd: i32, newfd: i32, flags: i32) -> i64 {
         if newfd < 0 {
             return EBADF;
@@ -1713,22 +1710,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if let Some(existing) = self.fd_table.remove(&newfd) {
             self.release_fid(existing.fid);
         }
-        let entry = self.fd_table.get(&oldfd).unwrap();
         let fd_flags = if flags & O_CLOEXEC != 0 {
             FD_CLOEXEC
         } else {
             0
         };
-        let new_entry = FdEntry {
-            fid: entry.fid,
-            offset: entry.offset,
-            path: entry.path.clone(),
-            file_type: entry.file_type,
-            flags: fd_flags,
-        };
-        let fid = new_entry.fid;
-        self.fd_table.insert(newfd, new_entry);
-        *self.fid_refcount.get_mut(&fid).expect("refcount missing") += 1;
+        self.dup_fd_to(oldfd, newfd, fd_flags);
         newfd as i64
     }
 
