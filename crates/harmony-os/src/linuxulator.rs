@@ -1036,6 +1036,20 @@ impl<B: SyscallBackend> Linuxulator<B> {
         fd
     }
 
+    /// Resolve a path relative to `self.cwd`.
+    ///
+    /// Absolute paths (starting with `/`) pass through unchanged.
+    /// Relative paths get `self.cwd` prepended.
+    fn resolve_path(&self, path: &str) -> alloc::string::String {
+        if path.starts_with('/') {
+            alloc::string::String::from(path)
+        } else if self.cwd == "/" {
+            alloc::format!("/{}", path)
+        } else {
+            alloc::format!("{}/{}", self.cwd, path)
+        }
+    }
+
     /// Pre-populate fd 0 (stdin), 1 (stdout), 2 (stderr) by walking
     /// to the serial server and opening the log file.
     ///
@@ -1972,11 +1986,16 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if buf_ptr == 0 {
             return EFAULT;
         }
-        if size < 2 {
-            return ERANGE; // buffer too small for "/\0"
+        let cwd_bytes = self.cwd.as_bytes();
+        let needed = cwd_bytes.len() + 1; // +1 for NUL terminator
+        if size < needed {
+            return ERANGE;
         }
-        self.backend.vm_write_bytes(buf_ptr as u64, b"/\0");
-        2 // bytes written: '/' + '\0'
+        let mut out = Vec::with_capacity(needed);
+        out.extend_from_slice(cwd_bytes);
+        out.push(0);
+        self.backend.vm_write_bytes(buf_ptr as u64, &out);
+        needed as i64
     }
 
     /// Linux readlink(2): read the value of a symbolic link.
@@ -2940,6 +2959,46 @@ mod tests {
         let mut buf = [0u8; 1];
         let result = lx.handle_syscall(79, [buf.as_mut_ptr() as u64, 1, 0, 0, 0, 0]);
         assert_eq!(result, ERANGE);
+    }
+
+    // ── resolve_path tests ──────────────────────────────────────────
+
+    #[test]
+    fn resolve_path_absolute() {
+        let mock = MockBackend::new();
+        let lx = Linuxulator::new(mock);
+        assert_eq!(lx.resolve_path("/foo/bar"), "/foo/bar");
+    }
+
+    #[test]
+    fn resolve_path_relative_from_root() {
+        let mock = MockBackend::new();
+        let lx = Linuxulator::new(mock);
+        assert_eq!(lx.resolve_path("bar"), "/bar");
+    }
+
+    #[test]
+    fn resolve_path_relative_from_subdir() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.cwd = alloc::string::String::from("/foo");
+        assert_eq!(lx.resolve_path("bar"), "/foo/bar");
+    }
+
+    // ── sys_getcwd upgraded tests ─────────────────────────────────────
+
+    #[test]
+    fn sys_getcwd_tracks_cwd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.cwd = alloc::string::String::from("/nix/store");
+        let mut buf = [0u8; 64];
+        let ret = lx.dispatch_syscall(LinuxSyscall::Getcwd {
+            buf: buf.as_mut_ptr() as u64,
+            size: 64,
+        });
+        assert_eq!(ret, 11); // "/nix/store\0" = 11 bytes
+        assert_eq!(&buf[..11], b"/nix/store\0");
     }
 
     // ── sys_readlink tests ─────────────────────────────────────────
