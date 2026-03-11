@@ -1,0 +1,18 @@
+[package]
+name = "harmony-test-elf"
+description = "Graduated Linux syscall test binary for Linuxulator validation"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/zeblithic/harmony-os"
+
+# Cross-compiled to aarch64-unknown-linux-musl, excluded from workspace.
+# Empty [workspace] table prevents Cargo from searching parent directories
+# for a workspace root (needed when building from git worktrees).
+[workspace]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
