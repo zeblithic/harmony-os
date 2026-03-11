@@ -1358,16 +1358,19 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux openat(2): open a file relative to a directory fd.
     fn sys_openat(&mut self, dirfd: i32, pathname_ptr: usize, flags: i32) -> i64 {
-        let path = unsafe { read_c_string(pathname_ptr) };
+        let raw_path = unsafe { read_c_string(pathname_ptr) };
 
-        let at_fdcwd: i32 = -100;
-        // TODO: relative-path resolution relative to dirfd is not yet implemented.
-        // All current callers use AT_FDCWD or absolute paths, so this is fine for
-        // the MVP. A future implementation should resolve path components starting
-        // from the fid mapped to dirfd.
-        if dirfd != at_fdcwd && !self.fd_table.contains_key(&dirfd) {
+        const AT_FDCWD: i32 = -100;
+        if dirfd != AT_FDCWD && !self.fd_table.contains_key(&dirfd) {
             return EBADF;
         }
+
+        let path = if dirfd == AT_FDCWD || raw_path.starts_with('/') {
+            self.resolve_path(&raw_path)
+        } else {
+            // dirfd-relative: not yet supported
+            return ENOSYS;
+        };
 
         let fid = self.alloc_fid();
         let mode = flags_to_open_mode(flags);
@@ -4282,5 +4285,32 @@ mod integration_tests {
             mode: 0o755,
         });
         assert_eq!(ret, -30); // EROFS
+    }
+
+    // ── openat resolve_path tests ────────────────────────────────
+
+    #[test]
+    fn sys_openat_relative_path_uses_cwd() {
+        let mut mock = MockBackend::new();
+        mock.directory_paths
+            .insert(alloc::string::String::from("/nix/store"));
+        let mut lx = Linuxulator::new(mock);
+        // chdir to /nix/store
+        let dir = b"/nix/store\0";
+        lx.dispatch_syscall(LinuxSyscall::Chdir {
+            pathname: dir.as_ptr() as u64,
+        });
+        // openat with relative path
+        let file = b"abc123-hello\0";
+        let fd = lx.dispatch_syscall(LinuxSyscall::Openat {
+            dirfd: -100,
+            pathname: file.as_ptr() as u64,
+            flags: 0,
+        });
+        assert!(fd >= 0);
+        // Verify the walk used the resolved path
+        let walks = &lx.backend().walks;
+        let last_walk = &walks[walks.len() - 1];
+        assert_eq!(last_walk.0, "/nix/store/abc123-hello");
     }
 }
