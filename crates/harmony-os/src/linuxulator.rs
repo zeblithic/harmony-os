@@ -561,6 +561,8 @@ pub struct MockBackend {
     /// File content keyed by fid. Populated via `set_file_content` so that
     /// `read()` returns real data instead of an empty Vec.
     file_content: BTreeMap<Fid, Vec<u8>>,
+    /// Directory entries keyed by fid, for readdir testing.
+    pub readdir_entries: BTreeMap<Fid, Vec<DirEntry>>,
 }
 
 #[cfg(test)]
@@ -574,6 +576,7 @@ impl MockBackend {
             clunks: Vec::new(),
             stats: Vec::new(),
             file_content: BTreeMap::new(),
+            readdir_entries: BTreeMap::new(),
         }
     }
 
@@ -682,6 +685,13 @@ impl SyscallBackend for MockBackend {
             size: 0,
             file_type: FileType::Regular,
         })
+    }
+
+    fn readdir(&mut self, fid: Fid) -> Result<Vec<DirEntry>, IpcError> {
+        self.readdir_entries
+            .get(&fid)
+            .cloned()
+            .ok_or(IpcError::NotSupported)
     }
 }
 
@@ -1034,6 +1044,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
             fd += 1;
         }
         fd
+    }
+
+    /// Mutable access to the fd table (test-only).
+    #[cfg(test)]
+    fn fd_table_mut(&mut self) -> &mut BTreeMap<i32, FdEntry> {
+        &mut self.fd_table
     }
 
     /// Resolve a path relative to `self.cwd`.
@@ -1995,9 +2011,74 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux getdents64(2): read directory entries.
     ///
-    /// Stub — returns ENOSYS until readdir is implemented.
-    fn sys_getdents64(&mut self, _fd: i32, _dirp: usize, _count: usize) -> i64 {
-        ENOSYS
+    /// Calls `backend.readdir(fid)` to get all entries, then packs
+    /// `linux_dirent64` structs into the user buffer starting from
+    /// the entry index stored in `FdEntry.offset`.
+    fn sys_getdents64(&mut self, fd: i32, dirp: usize, count: usize) -> i64 {
+        if dirp == 0 {
+            return EINVAL;
+        }
+        let entry = match self.fd_table.get(&fd) {
+            Some(e) => e.clone(),
+            None => return EBADF,
+        };
+        let start_idx = entry.offset as usize;
+
+        let entries = match self.backend.readdir(entry.fid) {
+            Ok(e) => e,
+            Err(e) => return ipc_err_to_errno(e),
+        };
+
+        if start_idx >= entries.len() {
+            return 0; // End of directory
+        }
+
+        let mut bytes_written: usize = 0;
+        let mut idx = start_idx;
+
+        while idx < entries.len() {
+            let e = &entries[idx];
+            let name_bytes = e.name.as_bytes();
+            // d_ino(8) + d_off(8) + d_reclen(2) + d_type(1) + name + NUL
+            let reclen_unaligned = 8 + 8 + 2 + 1 + name_bytes.len() + 1;
+            let reclen = (reclen_unaligned + 7) & !7; // 8-byte align
+
+            if bytes_written + reclen > count {
+                break; // Buffer full
+            }
+
+            let d_type: u8 = match e.file_type {
+                FileType::Regular => 8,   // DT_REG
+                FileType::Directory => 4, // DT_DIR
+            };
+
+            // Pack the entry into the buffer.
+            let base = dirp + bytes_written;
+            let mut rec = vec![0u8; reclen];
+            rec[0..8].copy_from_slice(&0u64.to_le_bytes()); // d_ino (placeholder)
+            let next_off = (idx + 1) as i64;
+            rec[8..16].copy_from_slice(&next_off.to_le_bytes()); // d_off
+            rec[16..18].copy_from_slice(&(reclen as u16).to_le_bytes()); // d_reclen
+            rec[18] = d_type; // d_type
+            rec[19..19 + name_bytes.len()].copy_from_slice(name_bytes); // d_name
+            // NUL terminator already 0 from vec![0u8; reclen]
+
+            self.backend.vm_write_bytes(base as u64, &rec);
+
+            bytes_written += reclen;
+            idx += 1;
+        }
+
+        if bytes_written == 0 && idx < entries.len() {
+            return EINVAL; // Buffer too small for even one entry
+        }
+
+        // Update the offset to track position.
+        if let Some(entry) = self.fd_table.get_mut(&fd) {
+            entry.offset = idx as u64;
+        }
+
+        bytes_written as i64
     }
 
     /// Linux chdir(2): change working directory.
@@ -3969,5 +4050,85 @@ mod integration_tests {
             2,
             "Process should have exactly 2 regions (text + data)"
         );
+    }
+
+    #[test]
+    fn sys_getdents64_packs_entries() {
+        let mut mock = MockBackend::new();
+        let dir_fid: Fid = 200;
+        mock.readdir_entries.insert(
+            dir_fid,
+            vec![
+                DirEntry {
+                    name: alloc::string::String::from("hello.txt"),
+                    file_type: FileType::Regular,
+                },
+                DirEntry {
+                    name: alloc::string::String::from("subdir"),
+                    file_type: FileType::Directory,
+                },
+            ],
+        );
+        let mut lx = Linuxulator::new(mock);
+        // Manually insert a directory fd.
+        lx.fd_table_mut().insert(
+            3,
+            FdEntry {
+                fid: dir_fid,
+                offset: 0,
+                path: Some(alloc::string::String::from("/test")),
+            },
+        );
+
+        let mut buf = [0u8; 512];
+        let ret = lx.dispatch_syscall(LinuxSyscall::Getdents64 {
+            fd: 3,
+            dirp: buf.as_mut_ptr() as u64,
+            count: 512,
+        });
+        assert!(ret > 0, "should have written some bytes, got {ret}");
+
+        // Verify first entry header: d_reclen at offset 16..18
+        let reclen1 = u16::from_le_bytes([buf[16], buf[17]]) as usize;
+        // d_type at offset 18
+        assert_eq!(buf[18], 8, "first entry should be DT_REG");
+        // d_name starts at offset 19
+        assert_eq!(&buf[19..28], b"hello.txt");
+
+        // Verify second entry starts at reclen1
+        assert_eq!(buf[reclen1 + 18], 4, "second entry should be DT_DIR");
+        assert_eq!(&buf[reclen1 + 19..reclen1 + 25], b"subdir");
+
+        // Calling again should return 0 (end of directory).
+        let ret2 = lx.dispatch_syscall(LinuxSyscall::Getdents64 {
+            fd: 3,
+            dirp: buf.as_mut_ptr() as u64,
+            count: 512,
+        });
+        assert_eq!(ret2, 0, "second call should return 0 (end of dir)");
+    }
+
+    #[test]
+    fn sys_getdents64_empty_dir() {
+        let mut mock = MockBackend::new();
+        let dir_fid: Fid = 200;
+        mock.readdir_entries.insert(dir_fid, vec![]);
+        let mut lx = Linuxulator::new(mock);
+        lx.fd_table_mut().insert(
+            3,
+            FdEntry {
+                fid: dir_fid,
+                offset: 0,
+                path: Some(alloc::string::String::from("/empty")),
+            },
+        );
+
+        let mut buf = [0u8; 512];
+        let ret = lx.dispatch_syscall(LinuxSyscall::Getdents64 {
+            fd: 3,
+            dirp: buf.as_mut_ptr() as u64,
+            count: 512,
+        });
+        assert_eq!(ret, 0, "empty directory should return 0");
     }
 }
