@@ -16,6 +16,7 @@ const SYS_EXIT_GROUP: u64 = 94;
 const SYS_BRK: u64 = 214;
 const SYS_MUNMAP: u64 = 215;
 const SYS_MMAP: u64 = 222;
+const SYS_NEWFSTATAT: u64 = 79;
 const SYS_GETRANDOM: u64 = 278;
 
 // mmap constants
@@ -66,6 +67,21 @@ unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
         inlateout("x0") a0 => ret,
         in("x1") a1,
         in("x2") a2,
+        options(nostack),
+    );
+    ret
+}
+
+#[inline(always)]
+unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    let ret: i64;
+    core::arch::asm!(
+        "svc #0",
+        in("x8") nr,
+        inlateout("x0") a0 => ret,
+        in("x1") a1,
+        in("x2") a2,
+        in("x3") a3,
         options(nostack),
     );
     ret
@@ -189,6 +205,37 @@ unsafe fn step4_getrandom() -> bool {
     !all_zero
 }
 
+/// Step 5: newfstatat(stdout, "", &statbuf, AT_EMPTY_PATH)
+/// Verifies stat-by-fd works through the SVC handler.
+unsafe fn step5_newfstatat() -> bool {
+    // Use MaybeUninit to avoid a memset/memcpy call (no libc in no_std).
+    // The kernel fills the buffer on success; we read via raw pointer.
+    let mut statbuf: core::mem::MaybeUninit<[u8; 128]> = core::mem::MaybeUninit::uninit();
+    let empty = b"\0";
+    let at_empty_path: u64 = 0x1000;
+    let ret = syscall4(
+        SYS_NEWFSTATAT,
+        1, // fd = stdout
+        empty.as_ptr() as u64,
+        statbuf.as_mut_ptr() as u64,
+        at_empty_path,
+    );
+    // Should succeed (return 0) and write something to statbuf
+    if ret != 0 {
+        return false;
+    }
+    // st_mode at offset 16 should be S_IFCHR|0o666 = 0o020666 = 0x21B6
+    // Read bytes via pointer to avoid memcpy from assume_init().
+    let p = statbuf.as_ptr() as *const u8;
+    let mode = u32::from_le_bytes([
+        *p.add(16),
+        *p.add(17),
+        *p.add(18),
+        *p.add(19),
+    ]);
+    mode == 0o020666
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -227,6 +274,14 @@ pub extern "C" fn _start() -> ! {
             write_stdout(b"[LINUXULATOR] Step 4 (getrandom): OK\n");
         } else {
             write_stdout(b"[LINUXULATOR] Step 4 (getrandom): FAIL\n");
+            all_ok = false;
+        }
+
+        // Step 5: newfstatat
+        if step5_newfstatat() {
+            write_stdout(b"[LINUXULATOR] Step 5 (newfstatat): OK\n");
+        } else {
+            write_stdout(b"[LINUXULATOR] Step 5 (newfstatat): FAIL\n");
             all_ok = false;
         }
 
