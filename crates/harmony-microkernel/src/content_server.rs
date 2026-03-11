@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 
 use harmony_athenaeum::{sha256_hash, Book, PageAddr, BOOK_MAX_SIZE};
 
+use crate::fid_tracker::FidTracker;
 use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
 
 /// Maximum concurrent ingest sessions. Each session can buffer up to
@@ -53,17 +54,6 @@ enum NodeKind {
     Page(PageAddr),
 }
 
-// ── Per-fid state ───────────────────────────────────────────────────
-
-/// Tracks every fid's position in the namespace tree plus open state.
-#[derive(Debug, Clone)]
-struct FidState {
-    qpath: QPath,
-    node: NodeKind,
-    is_open: bool,
-    mode: Option<OpenMode>,
-}
-
 // ── Ingest pipeline ─────────────────────────────────────────────────
 
 /// Tracks the state of an in-progress blob ingest via the `/ingest` file.
@@ -94,7 +84,7 @@ pub struct ContentServer {
     /// Blob manifests indexed by 256-bit CID.
     blobs: BTreeMap<[u8; 32], Book>,
     /// Active fid → state mapping.
-    fids: BTreeMap<Fid, FidState>,
+    tracker: FidTracker<NodeKind>,
     /// Per-fid ingest buffers for the `/ingest` pseudo-file.
     ingest_buffers: BTreeMap<Fid, IngestState>,
 }
@@ -102,20 +92,10 @@ pub struct ContentServer {
 impl ContentServer {
     /// Create a new, empty ContentServer with fid 0 attached to the root.
     pub fn new() -> Self {
-        let mut fids = BTreeMap::new();
-        fids.insert(
-            0,
-            FidState {
-                qpath: ROOT,
-                node: NodeKind::Root,
-                is_open: false,
-                mode: None,
-            },
-        );
         Self {
             pages: BTreeMap::new(),
             blobs: BTreeMap::new(),
-            fids,
+            tracker: FidTracker::new(ROOT, NodeKind::Root),
             ingest_buffers: BTreeMap::new(),
         }
     }
@@ -386,12 +366,8 @@ pub(crate) fn format_addr_hex(addr: &PageAddr) -> alloc::string::String {
 
 impl FileServer for ContentServer {
     fn walk(&mut self, fid: Fid, new_fid: Fid, name: &str) -> Result<QPath, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        let parent_node = state.node.clone();
-
-        if self.fids.contains_key(&new_fid) {
-            return Err(IpcError::InvalidFid);
-        }
+        let entry = self.tracker.get(fid)?;
+        let parent_node = entry.payload.clone();
 
         let (qpath, node) = match &parent_node {
             NodeKind::Root => match name {
@@ -427,24 +403,13 @@ impl FileServer for ContentServer {
             }
         };
 
-        self.fids.insert(
-            new_fid,
-            FidState {
-                qpath,
-                node,
-                is_open: false,
-                mode: None,
-            },
-        );
+        self.tracker.insert(new_fid, qpath, node)?;
         Ok(qpath)
     }
 
     fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
-        let state = self.fids.get_mut(&fid).ok_or(IpcError::InvalidFid)?;
-        if state.is_open {
-            return Err(IpcError::PermissionDenied);
-        }
-        match &state.node {
+        let entry = self.tracker.begin_open(fid)?;
+        match &entry.payload {
             NodeKind::Root | NodeKind::BlobsDir | NodeKind::PagesDir => {
                 if matches!(mode, OpenMode::Write | OpenMode::ReadWrite) {
                     return Err(IpcError::IsDirectory);
@@ -466,24 +431,26 @@ impl FileServer for ContentServer {
                 }
                 self.ingest_buffers
                     .insert(fid, IngestState::Writing(Vec::new()));
+                // Re-borrow after ingest_buffers insert
+                let entry = self.tracker.get_mut(fid).unwrap();
+                entry.mark_open(mode);
+                return Ok(());
             }
         }
-        // Re-borrow mutably after the match (ingest_buffers insert released the borrow).
-        let state = self.fids.get_mut(&fid).unwrap();
-        state.is_open = true;
-        state.mode = Some(mode);
+        entry.mark_open(mode);
         Ok(())
     }
 
     fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        if !state.is_open {
+        let entry = self.tracker.get(fid)?;
+        if !entry.is_open {
             return Err(IpcError::NotOpen);
         }
-        if matches!(state.mode, Some(OpenMode::Write)) {
+        if matches!(entry.mode, Some(OpenMode::Write)) {
             return Err(IpcError::PermissionDenied);
         }
-        match &state.node {
+        let node = entry.payload.clone();
+        match &node {
             NodeKind::Root | NodeKind::BlobsDir | NodeKind::PagesDir => {
                 Err(IpcError::IsDirectory)
             }
@@ -491,14 +458,8 @@ impl FileServer for ContentServer {
                 let response = self.finalize_ingest(fid)?;
                 Ok(slice_data(&response, offset, count))
             }
-            NodeKind::Blob(cid) => {
-                let cid = *cid;
-                self.read_blob(&cid, offset, count)
-            }
-            NodeKind::Page(addr) => {
-                let addr = *addr;
-                self.read_page_data(&addr, offset, count)
-            }
+            NodeKind::Blob(cid) => self.read_blob(cid, offset, count),
+            NodeKind::Page(addr) => self.read_page_data(addr, offset, count),
         }
     }
 
@@ -506,14 +467,15 @@ impl FileServer for ContentServer {
     // Writes are always appended to the accumulation buffer regardless of
     // the requested offset, matching Plan 9 ctl-file conventions.
     fn write(&mut self, fid: Fid, _offset: u64, data: &[u8]) -> Result<u32, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        if !state.is_open {
+        let entry = self.tracker.get(fid)?;
+        if !entry.is_open {
             return Err(IpcError::NotOpen);
         }
-        if matches!(state.mode, Some(OpenMode::Read)) {
+        if matches!(entry.mode, Some(OpenMode::Read)) {
             return Err(IpcError::PermissionDenied);
         }
-        match &state.node {
+        let node = entry.payload.clone();
+        match &node {
             NodeKind::Root | NodeKind::BlobsDir | NodeKind::PagesDir => {
                 Err(IpcError::IsDirectory)
             }
@@ -540,17 +502,15 @@ impl FileServer for ContentServer {
     }
 
     fn clunk(&mut self, fid: Fid) -> Result<(), IpcError> {
-        if fid == 0 {
-            return Err(IpcError::PermissionDenied);
-        }
-        self.fids.remove(&fid).ok_or(IpcError::InvalidFid)?;
+        self.tracker.clunk(fid)?;
         self.ingest_buffers.remove(&fid);
         Ok(())
     }
 
     fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        match &state.node {
+        let entry = self.tracker.get(fid)?;
+        let node = entry.payload.clone();
+        match &node {
             NodeKind::Root => Ok(FileStat {
                 qpath: ROOT,
                 name: Arc::from("store"),
@@ -600,22 +560,7 @@ impl FileServer for ContentServer {
     }
 
     fn clone_fid(&mut self, fid: Fid, new_fid: Fid) -> Result<QPath, IpcError> {
-        if self.fids.contains_key(&new_fid) {
-            return Err(IpcError::InvalidFid);
-        }
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        let qpath = state.qpath;
-        let node = state.node.clone();
-        self.fids.insert(
-            new_fid,
-            FidState {
-                qpath,
-                node,
-                is_open: false,
-                mode: None,
-            },
-        );
-        Ok(qpath)
+        self.tracker.clone_fid(fid, new_fid)
     }
 }
 
@@ -627,9 +572,9 @@ mod tests {
     #[test]
     fn new_content_server_has_root_fid() {
         let server = ContentServer::new();
-        let state = server.fids.get(&0).unwrap();
-        assert_eq!(state.qpath, ROOT);
-        assert!(!state.is_open);
+        let entry = server.tracker.get(0).unwrap();
+        assert_eq!(entry.qpath, ROOT);
+        assert!(!entry.is_open);
     }
 
     #[test]
@@ -645,7 +590,7 @@ mod tests {
         let server = ContentServer::default();
         assert_eq!(server.blob_count(), 0);
         assert_eq!(server.page_count(), 0);
-        assert!(server.fids.contains_key(&0));
+        assert!(server.tracker.contains(0));
     }
 
     #[test]
