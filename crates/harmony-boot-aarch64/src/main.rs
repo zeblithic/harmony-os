@@ -527,12 +527,17 @@ core::arch::global_asm!(
     ".global run_elf_binary",
     "run_elf_binary:",
     // x0 = entry_point, x1 = stack_top
-    // Save entry and stack_top in callee-saved regs
+    // AAPCS64 prologue: save callee-saved regs + LR
+    "stp x19, x20, [sp, #-32]!",
+    "stp x29, x30, [sp, #16]",
+    "mov x29, sp",
+    // Save args in callee-saved regs
     "mov x19, x0", // x19 = entry_point
     "mov x20, x1", // x20 = stack_top
-    // Compute return context
+    // Register return context for the SVC handler's exit_group path.
+    // SP is captured AFTER the prologue push so .Lelf_return can pop.
     "adr x0, .Lelf_return", // arg0 = return address
-    "mov x1, sp",           // arg1 = kernel SP
+    "mov x1, sp",           // arg1 = kernel SP (post-prologue)
     "mov x2, x30",          // arg2 = kernel LR
     "bl set_return_context",
     // Switch to binary stack and jump to entry
@@ -541,12 +546,14 @@ core::arch::global_asm!(
     // Landing pad — SVC handler sets ELR here on exit_group.
     // Register state is fully controlled by the TrapFrame restore:
     //   x0 = exit code
-    //   x1 = saved kernel SP
+    //   x1 = saved kernel SP (post-prologue)
     //   x2 = saved kernel LR
     ".Lelf_return:",
-    "mov sp, x1",  // restore kernel SP
-    "mov x30, x2", // restore kernel LR
-    "ret",         // return to Rust caller
+    "mov sp, x1",  // restore kernel SP (post-prologue)
+    // AAPCS64 epilogue: restore callee-saved regs + LR
+    "ldp x29, x30, [sp, #16]",
+    "ldp x19, x20, [sp], #32",
+    "ret",         // return to Rust caller with exit code in x0
 );
 
 #[cfg(target_arch = "aarch64")]
