@@ -6,7 +6,7 @@
 //! ```text
 //! /
 //! ├── blobs/       — one file per stored blob, named by hex CID
-//! ├── chunks/      — one file per stored chunk, named by hex hash_bits
+//! ├── pages/       — one file per stored page, named by hex hash_bits
 //! └── ingest       — ctl-file; write blob bytes, read to finalize (returns CID + metadata)
 //! ```
 
@@ -16,30 +16,29 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use harmony_athenaeum::{sha256_hash, Athenaeum, ChunkAddr, MAX_BLOB_SIZE};
+use harmony_athenaeum::{sha256_hash, Book, PageAddr, BOOK_MAX_SIZE};
 
 use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
 
-/// Raw chunk size used by Athenaeum for blob chunking (4 KiB).
-/// Must match `harmony_athenaeum::CHUNK_SIZE` (which is `pub(crate)`).
-const CHUNK_SIZE: usize = 4096;
-
 /// Maximum concurrent ingest sessions. Each session can buffer up to
-/// `MAX_BLOB_SIZE` (1 MB), so this caps ingest memory at 4 MB.
+/// `BOOK_MAX_SIZE` (1 MB), so steady-state ingest memory is capped at
+/// 4 MB. During finalization, `page_data_from_blob` allocates an
+/// additional page-buffer of the same size, so the transient peak can
+/// reach ~8 MB if all sessions finalize simultaneously.
 const MAX_CONCURRENT_INGESTS: usize = 4;
 
 // ── QPath constants ─────────────────────────────────────────────────
 
 const ROOT: QPath = 0;
 const BLOBS_DIR: QPath = 1;
-const CHUNKS_DIR: QPath = 2;
+const PAGES_DIR: QPath = 2;
 const INGEST: QPath = 3;
 /// Blob QPaths: `BLOB_QPATH_BASE | u64_from_cid[0..8] & 0x7FFF_FFFF_FFFF_FFFF`.
 /// Bit 32 is always set (via OR), so minimum blob QPath is `0x1_0000_0000`.
-/// Chunk QPaths: `0x100_0000 + hash_bits` (hash_bits is 21 bits, max 0x1F_FFFF).
-/// These ranges are disjoint: chunks top out at 0x11F_FFFF, blobs start at 0x1_0000_0000.
+/// Page QPaths: `0x1000_0000 + hash_bits` (hash_bits is 28 bits, max 0x0FFF_FFFF).
+/// These ranges are disjoint: pages top out at 0x1FFF_FFFF, blobs start at 0x1_0000_0000.
 const BLOB_QPATH_BASE: QPath = 0x1_0000_0000;
-const CHUNK_QPATH_BASE: QPath = 0x100_0000;
+const PAGE_QPATH_BASE: QPath = 0x1000_0000;
 
 // ── Node taxonomy ───────────────────────────────────────────────────
 
@@ -48,10 +47,10 @@ const CHUNK_QPATH_BASE: QPath = 0x100_0000;
 enum NodeKind {
     Root,
     BlobsDir,
-    ChunksDir,
+    PagesDir,
     Ingest,
     Blob([u8; 32]),
-    Chunk(ChunkAddr),
+    Page(PageAddr),
 }
 
 // ── Per-fid state ───────────────────────────────────────────────────
@@ -80,20 +79,20 @@ enum IngestState {
 
 // ── ContentServer ───────────────────────────────────────────────────
 
-/// A content-addressed 9P file server backed by Athenaeum.
+/// A content-addressed 9P file server backed by Book/PageAddr.
 ///
 /// Stores blobs (identified by 256-bit CID) and their constituent
-/// chunks (identified by `ChunkAddr`). New content enters via the
+/// pages (identified by `PageAddr`). New content enters via the
 /// `/ingest` pseudo-file: write the raw blob bytes, then **read** to
-/// finalize. The server chunks the data, computes the CID, and stores
-/// both the blob manifest and individual chunk data. Clunking the
+/// finalize. The server pages the data, computes the CID, and stores
+/// both the blob manifest and individual page data. Clunking the
 /// ingest fid without reading first silently discards the buffer.
 pub struct ContentServer {
-    /// Chunk data keyed by `hash_bits` (21-bit address).
+    /// Page data keyed by `hash_bits` (28-bit address).
     /// O(log n) lookups instead of linear scan through a Vec.
-    chunks: BTreeMap<u32, (ChunkAddr, Vec<u8>)>,
+    pages: BTreeMap<u32, (PageAddr, Vec<u8>)>,
     /// Blob manifests indexed by 256-bit CID.
-    blobs: BTreeMap<[u8; 32], Athenaeum>,
+    blobs: BTreeMap<[u8; 32], Book>,
     /// Active fid → state mapping.
     fids: BTreeMap<Fid, FidState>,
     /// Per-fid ingest buffers for the `/ingest` pseudo-file.
@@ -114,7 +113,7 @@ impl ContentServer {
             },
         );
         Self {
-            chunks: BTreeMap::new(),
+            pages: BTreeMap::new(),
             blobs: BTreeMap::new(),
             fids,
             ingest_buffers: BTreeMap::new(),
@@ -130,9 +129,9 @@ impl ContentServer {
         BLOB_QPATH_BASE | (bits & 0x7FFF_FFFF_FFFF_FFFF)
     }
 
-    /// Compute the QPath for a chunk given its address.
-    fn chunk_qpath(addr: &ChunkAddr) -> QPath {
-        CHUNK_QPATH_BASE + addr.hash_bits() as u64
+    /// Compute the QPath for a page given its address.
+    fn page_qpath(addr: &PageAddr) -> QPath {
+        PAGE_QPATH_BASE + addr.hash_bits() as u64
     }
 
     /// Number of blobs currently stored.
@@ -140,31 +139,31 @@ impl ContentServer {
         self.blobs.len()
     }
 
-    /// Number of chunks currently stored.
-    pub fn chunk_count(&self) -> usize {
-        self.chunks.len()
+    /// Number of pages currently stored.
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
     }
 
-    /// Find a chunk by its `hash_bits` value.
+    /// Find a page by its `hash_bits` value.
     ///
-    /// Returns the first chunk whose 21-bit `hash_bits` matches. Within a
-    /// single `Athenaeum`, addresses are unique by construction (collision
+    /// Returns the first page whose 28-bit `hash_bits` matches. Within a
+    /// single `Book`, addresses are unique by construction (collision
     /// resolution). Across independently ingested blobs a hash_bits collision
     /// is theoretically possible; in that case the first stored match wins.
-    /// The `/chunks/<addr>` namespace inherits this: two chunks sharing
+    /// The `/pages/<addr>` namespace inherits this: two pages sharing
     /// hash_bits would map to the same filename and only the first is reachable.
-    fn find_chunk(&self, hash_bits: u32) -> Option<&ChunkAddr> {
-        self.chunks.get(&hash_bits).map(|(addr, _)| addr)
+    fn find_page(&self, hash_bits: u32) -> Option<&PageAddr> {
+        self.pages.get(&hash_bits).map(|(addr, _)| addr)
     }
 
-    /// Finalize an ingest: chunk the blob, store chunks + metadata, return 40-byte response.
+    /// Finalize an ingest: page the blob, store pages + metadata, return 40-byte response.
     fn finalize_ingest(&mut self, fid: Fid) -> Result<Vec<u8>, IpcError> {
         let buf = self
             .ingest_buffers
             .get_mut(&fid)
             .ok_or(IpcError::InvalidArgument)?;
         // Peek before transitioning — errors must not poison the fid.
-        // Note: MAX_BLOB_SIZE is enforced in write(), so no size check needed here.
+        // Note: BOOK_MAX_SIZE is enforced in write(), so no size check needed here.
         match buf {
             IngestState::Writing(v) if v.is_empty() => {
                 return Err(IpcError::InvalidArgument); // read before write
@@ -182,12 +181,12 @@ impl ContentServer {
                     // Drop blob data early — only the CID is needed from here.
                     // Avoids holding up to 1 MB during the response build.
                     drop(data);
-                    let ath = &self.blobs[&cid];
-                    let response = match self.build_ingest_response(&cid, ath) {
+                    let book = &self.blobs[&cid];
+                    let response = match self.build_ingest_response(&cid, book) {
                         Ok(r) => r,
                         Err(e) => {
                             // Restore with empty buffer. In practice unreachable:
-                            // the Athenaeum was valid when first stored.
+                            // the Book was valid when first stored.
                             *self.ingest_buffers.get_mut(&fid).unwrap() =
                                 IngestState::Writing(Vec::new());
                             return Err(e);
@@ -198,51 +197,58 @@ impl ContentServer {
                     return Ok(response);
                 }
 
-                // from_blob can fail with CollisionError::AllAlgorithmsCollide
-                // (32-bit address space exhaustion). Size is enforced in write(),
+                // from_blob can fail with BookError::AllAlgorithmsCollide
+                // (28-bit address space exhaustion). Size is enforced in write(),
                 // so ResourceExhausted maps to the remaining failure mode.
-                let ath = match Athenaeum::from_blob(cid, &data) {
-                    Ok(ath) => ath,
+                let book = match Book::from_blob(cid, &data) {
+                    Ok(book) => book,
                     Err(_) => {
                         // Restore buffer so the fid isn't poisoned.
-                        *self.ingest_buffers.get_mut(&fid).unwrap() = IngestState::Writing(data);
+                        *self.ingest_buffers.get_mut(&fid).unwrap() =
+                            IngestState::Writing(data);
                         return Err(IpcError::ResourceExhausted);
                     }
                 };
 
-                // Build response before committing chunks — if this fails,
+                // Build response before committing pages — if this fails,
                 // no side effects have occurred and we can restore the buffer.
-                let response = match self.build_ingest_response(&cid, &ath) {
+                let response = match self.build_ingest_response(&cid, &book) {
                     Ok(r) => r,
                     Err(e) => {
-                        *self.ingest_buffers.get_mut(&fid).unwrap() = IngestState::Writing(data);
+                        *self.ingest_buffers.get_mut(&fid).unwrap() =
+                            IngestState::Writing(data);
                         return Err(e);
                     }
                 };
 
-                // Two-pass chunk commit: validate first, then insert.
-                // Detects cross-blob hash_bits collisions (different data at the
-                // same 21-bit address) that would corrupt blob reassembly.
-                let mut to_insert = Vec::new();
-                for (i, addr) in ath.chunks.iter().enumerate() {
-                    let hb = addr.hash_bits();
-                    let chunk_start = i * CHUNK_SIZE;
-                    let chunk_end = (chunk_start + CHUNK_SIZE).min(data.len());
-                    let raw = &data[chunk_start..chunk_end];
-                    let padded_size = addr.size_bytes();
-                    let mut padded = alloc::vec![0u8; padded_size];
-                    padded[..raw.len()].copy_from_slice(raw);
+                // Split blob into 4KB page buffers (zero-padded).
+                let page_bufs = book.page_data_from_blob(&data);
+                debug_assert_eq!(
+                    page_bufs.len(),
+                    book.pages.len(),
+                    "page_data_from_blob must return exactly one buffer per page"
+                );
 
-                    if let Some((_, existing)) = self.chunks.get(&hb) {
-                        if *existing != padded {
+                // Two-pass page commit: validate first, then insert.
+                // Detects cross-blob hash_bits collisions (different data at the
+                // same 28-bit address) that would corrupt blob reassembly.
+                // Uses algo 0 (Sha256Msb) as the default storage address.
+                let mut to_insert = Vec::new();
+                for (i, variants) in book.pages.iter().enumerate() {
+                    let addr = *variants.first().expect("Book: page must have variants");
+                    let hb = addr.hash_bits();
+                    let page_data = &page_bufs[i];
+
+                    if let Some((_, existing)) = self.pages.get(&hb) {
+                        if *existing != *page_data {
                             // Cross-blob collision: same hash_bits, different content.
                             // Storing would silently corrupt reassembly for this blob.
                             // Conflict (not ResourceExhausted) distinguishes this from
                             // capacity errors — callers know the data is valid but clashes
-                            // with existing chunk state.
+                            // with existing page state.
                             //
                             // This is permanent for this blob on this server instance:
-                            // the colliding chunk at `hb` won't change. Retrying the
+                            // the colliding page at `hb` won't change. Retrying the
                             // same blob data will always fail. The fid is restored to
                             // Writing so the caller can re-open for different data.
                             *self.ingest_buffers.get_mut(&fid).unwrap() =
@@ -251,18 +257,19 @@ impl ContentServer {
                         }
                         // Same content at same address — cross-blob dedup, skip.
                     } else {
-                        to_insert.push((hb, *addr, padded));
+                        to_insert.push((hb, addr, page_data.clone()));
                     }
                 }
 
-                // All validated — commit chunks and blob (infallible from here).
-                for (hb, addr, padded) in to_insert {
-                    self.chunks.insert(hb, (addr, padded));
+                // All validated — commit pages and blob (infallible from here).
+                for (hb, addr, page_data) in to_insert {
+                    self.pages.insert(hb, (addr, page_data));
                 }
 
-                self.blobs.insert(cid, ath);
+                self.blobs.insert(cid, book);
                 // Cache response so partial/multiple reads work.
-                *self.ingest_buffers.get_mut(&fid).unwrap() = IngestState::Done(response.clone());
+                *self.ingest_buffers.get_mut(&fid).unwrap() =
+                    IngestState::Done(response.clone());
                 Ok(response)
             }
             IngestState::Done(_) => unreachable!(), // handled by peek above
@@ -273,43 +280,50 @@ impl ContentServer {
     ///
     /// ```text
     /// [0..32]  — 256-bit CID (raw bytes)
-    /// [32..36] — chunk_count as u32 little-endian
+    /// [32..36] — page_count  as u32 little-endian
     /// [36..40] — blob_size   as u32 little-endian
     /// ```
-    fn build_ingest_response(&self, cid: &[u8; 32], ath: &Athenaeum) -> Result<Vec<u8>, IpcError> {
-        let chunk_count =
-            u32::try_from(ath.chunks.len()).map_err(|_| IpcError::ResourceExhausted)?;
-        let blob_size = u32::try_from(ath.blob_size).map_err(|_| IpcError::ResourceExhausted)?;
+    fn build_ingest_response(&self, cid: &[u8; 32], book: &Book) -> Result<Vec<u8>, IpcError> {
+        let page_count =
+            u32::try_from(book.page_count()).map_err(|_| IpcError::ResourceExhausted)?;
+        let blob_size: u32 = book.blob_size;
         let mut response = Vec::with_capacity(40);
         response.extend_from_slice(cid);
-        response.extend_from_slice(&chunk_count.to_le_bytes());
+        response.extend_from_slice(&page_count.to_le_bytes());
         response.extend_from_slice(&blob_size.to_le_bytes());
         Ok(response)
     }
 
-    /// Read blob data by reassembling from stored chunks.
+    /// Read blob data by reassembling from stored pages.
     ///
-    /// Note: reassembles the full blob on every call (O(N) chunk lookups,
+    /// Note: reassembles the full blob on every call (O(N) page lookups,
     /// O(blob_size) allocation). Callers reading large blobs in small
-    /// chunks should prefer a single large read or cache locally.
+    /// pieces should prefer a single large read or cache locally.
     fn read_blob(&self, cid: &[u8; 32], offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
-        let ath = self.blobs.get(cid).ok_or(IpcError::NotFound)?;
-        let chunks = &self.chunks;
-        let data = ath
-            .reassemble(|addr| chunks.get(&addr.hash_bits()).map(|(_, d)| d.clone()))
+        let book = self.blobs.get(cid).ok_or(IpcError::NotFound)?;
+        let pages = &self.pages;
+        let data = book
+            .reassemble(|idx| {
+                let addr = book
+                    .pages
+                    .get(idx as usize)
+                    .and_then(|v| v.first())
+                    .copied()?;
+                pages.get(&addr.hash_bits()).map(|(_, d)| d.clone())
+            })
             .map_err(|_| IpcError::NotFound)?;
         Ok(slice_data(&data, offset, count))
     }
 
-    /// Read raw chunk data.
-    fn read_chunk_data(
+    /// Read raw page data.
+    fn read_page_data(
         &self,
-        addr: &ChunkAddr,
+        addr: &PageAddr,
         offset: u64,
         count: u32,
     ) -> Result<Vec<u8>, IpcError> {
         let (_, data) = self
-            .chunks
+            .pages
             .get(&addr.hash_bits())
             .ok_or(IpcError::NotFound)?;
         Ok(slice_data(data, offset, count))
@@ -357,11 +371,11 @@ pub(crate) fn format_cid_hex(cid: &[u8; 32]) -> alloc::string::String {
     s
 }
 
-/// Format a `ChunkAddr`'s `hash_bits` as an 8-character zero-padded lowercase hex string.
+/// Format a `PageAddr`'s `hash_bits` as an 8-character zero-padded lowercase hex string.
 ///
-/// This is the canonical filename used under `/chunks/` — e.g. `hash_bits = 0x1FFFFF`
-/// → `"001fffff"`. Clients must use this exact 8-character format when walking.
-pub(crate) fn format_addr_hex(addr: &ChunkAddr) -> alloc::string::String {
+/// This is the canonical filename used under `/pages/` — e.g. `hash_bits = 0x0FFFFFFF`
+/// → `"0fffffff"`. Clients must use this exact 8-character format when walking.
+pub(crate) fn format_addr_hex(addr: &PageAddr) -> alloc::string::String {
     use core::fmt::Write;
     let mut s = alloc::string::String::with_capacity(8);
     write!(s, "{:08x}", addr.hash_bits()).unwrap();
@@ -382,7 +396,7 @@ impl FileServer for ContentServer {
         let (qpath, node) = match &parent_node {
             NodeKind::Root => match name {
                 "blobs" => (BLOBS_DIR, NodeKind::BlobsDir),
-                "chunks" => (CHUNKS_DIR, NodeKind::ChunksDir),
+                "pages" => (PAGES_DIR, NodeKind::PagesDir),
                 "ingest" => (INGEST, NodeKind::Ingest),
                 _ => return Err(IpcError::NotFound),
             },
@@ -393,21 +407,22 @@ impl FileServer for ContentServer {
                 }
                 (Self::blob_qpath(&cid), NodeKind::Blob(cid))
             }
-            NodeKind::ChunksDir => {
+            NodeKind::PagesDir => {
                 if name.len() != 8 {
                     return Err(IpcError::NotFound);
                 }
                 // Enforce lowercase hex to match the canonical format produced
-                // by format_addr_hex (e.g. "001fffff", not "001FFFFF").
+                // by format_addr_hex (e.g. "0fffffff", not "0FFFFFFF").
                 if name.bytes().any(|b| b.is_ascii_uppercase()) {
                     return Err(IpcError::NotFound);
                 }
-                let hash_bits = u32::from_str_radix(name, 16).map_err(|_| IpcError::NotFound)?;
-                let addr = *self.find_chunk(hash_bits).ok_or(IpcError::NotFound)?;
-                (Self::chunk_qpath(&addr), NodeKind::Chunk(addr))
+                let hash_bits =
+                    u32::from_str_radix(name, 16).map_err(|_| IpcError::NotFound)?;
+                let addr = *self.find_page(hash_bits).ok_or(IpcError::NotFound)?;
+                (Self::page_qpath(&addr), NodeKind::Page(addr))
             }
             // Leaf nodes are not directories — cannot walk into them.
-            NodeKind::Blob(_) | NodeKind::Chunk(_) | NodeKind::Ingest => {
+            NodeKind::Blob(_) | NodeKind::Page(_) | NodeKind::Ingest => {
                 return Err(IpcError::NotDirectory);
             }
         };
@@ -430,12 +445,12 @@ impl FileServer for ContentServer {
             return Err(IpcError::PermissionDenied);
         }
         match &state.node {
-            NodeKind::Root | NodeKind::BlobsDir | NodeKind::ChunksDir => {
+            NodeKind::Root | NodeKind::BlobsDir | NodeKind::PagesDir => {
                 if matches!(mode, OpenMode::Write | OpenMode::ReadWrite) {
                     return Err(IpcError::IsDirectory);
                 }
             }
-            NodeKind::Blob(_) | NodeKind::Chunk(_) => {
+            NodeKind::Blob(_) | NodeKind::Page(_) => {
                 if matches!(mode, OpenMode::Write | OpenMode::ReadWrite) {
                     return Err(IpcError::ReadOnly);
                 }
@@ -469,7 +484,9 @@ impl FileServer for ContentServer {
             return Err(IpcError::PermissionDenied);
         }
         match &state.node {
-            NodeKind::Root | NodeKind::BlobsDir | NodeKind::ChunksDir => Err(IpcError::IsDirectory),
+            NodeKind::Root | NodeKind::BlobsDir | NodeKind::PagesDir => {
+                Err(IpcError::IsDirectory)
+            }
             NodeKind::Ingest => {
                 let response = self.finalize_ingest(fid)?;
                 Ok(slice_data(&response, offset, count))
@@ -478,9 +495,9 @@ impl FileServer for ContentServer {
                 let cid = *cid;
                 self.read_blob(&cid, offset, count)
             }
-            NodeKind::Chunk(addr) => {
+            NodeKind::Page(addr) => {
                 let addr = *addr;
-                self.read_chunk_data(&addr, offset, count)
+                self.read_page_data(&addr, offset, count)
             }
         }
     }
@@ -497,8 +514,10 @@ impl FileServer for ContentServer {
             return Err(IpcError::PermissionDenied);
         }
         match &state.node {
-            NodeKind::Root | NodeKind::BlobsDir | NodeKind::ChunksDir => Err(IpcError::IsDirectory),
-            NodeKind::Blob(_) | NodeKind::Chunk(_) => Err(IpcError::ReadOnly),
+            NodeKind::Root | NodeKind::BlobsDir | NodeKind::PagesDir => {
+                Err(IpcError::IsDirectory)
+            }
+            NodeKind::Blob(_) | NodeKind::Page(_) => Err(IpcError::ReadOnly),
             NodeKind::Ingest => {
                 let buf = self
                     .ingest_buffers
@@ -508,7 +527,7 @@ impl FileServer for ContentServer {
                     IngestState::Writing(ref mut v) => {
                         let written =
                             u32::try_from(data.len()).map_err(|_| IpcError::ResourceExhausted)?;
-                        if v.len().saturating_add(data.len()) > MAX_BLOB_SIZE {
+                        if v.len().saturating_add(data.len()) > BOOK_MAX_SIZE {
                             return Err(IpcError::ResourceExhausted);
                         }
                         v.extend_from_slice(data);
@@ -544,9 +563,9 @@ impl FileServer for ContentServer {
                 size: 0,
                 file_type: FileType::Directory,
             }),
-            NodeKind::ChunksDir => Ok(FileStat {
-                qpath: CHUNKS_DIR,
-                name: Arc::from("chunks"),
+            NodeKind::PagesDir => Ok(FileStat {
+                qpath: PAGES_DIR,
+                name: Arc::from("pages"),
                 size: 0,
                 file_type: FileType::Directory,
             }),
@@ -557,21 +576,21 @@ impl FileServer for ContentServer {
                 file_type: FileType::Regular,
             }),
             NodeKind::Blob(cid) => {
-                let ath = self.blobs.get(cid).ok_or(IpcError::NotFound)?;
+                let book = self.blobs.get(cid).ok_or(IpcError::NotFound)?;
                 Ok(FileStat {
                     qpath: Self::blob_qpath(cid),
                     name: Arc::from(format_cid_hex(cid).as_str()),
-                    size: ath.blob_size as u64,
+                    size: book.blob_size as u64,
                     file_type: FileType::Regular,
                 })
             }
-            NodeKind::Chunk(addr) => {
+            NodeKind::Page(addr) => {
                 let (_, data) = self
-                    .chunks
+                    .pages
                     .get(&addr.hash_bits())
                     .ok_or(IpcError::NotFound)?;
                 Ok(FileStat {
-                    qpath: Self::chunk_qpath(addr),
+                    qpath: Self::page_qpath(addr),
                     name: Arc::from(format_addr_hex(addr).as_str()),
                     size: data.len() as u64,
                     file_type: FileType::Regular,
@@ -603,6 +622,7 @@ impl FileServer for ContentServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harmony_athenaeum::PAGE_SIZE;
 
     #[test]
     fn new_content_server_has_root_fid() {
@@ -616,7 +636,7 @@ mod tests {
     fn new_content_server_is_empty() {
         let server = ContentServer::new();
         assert_eq!(server.blob_count(), 0);
-        assert_eq!(server.chunk_count(), 0);
+        assert_eq!(server.page_count(), 0);
         assert!(server.ingest_buffers.is_empty());
     }
 
@@ -624,7 +644,7 @@ mod tests {
     fn default_matches_new() {
         let server = ContentServer::default();
         assert_eq!(server.blob_count(), 0);
-        assert_eq!(server.chunk_count(), 0);
+        assert_eq!(server.page_count(), 0);
         assert!(server.fids.contains_key(&0));
     }
 
@@ -638,20 +658,20 @@ mod tests {
     }
 
     #[test]
-    fn chunk_qpath_above_base() {
-        use harmony_athenaeum::{ChunkAddr, Depth};
-        let addr = ChunkAddr::from_data(b"test chunk data for qpath", Depth::Blob, 0);
-        let q = ContentServer::chunk_qpath(&addr);
-        assert!(q >= CHUNK_QPATH_BASE);
+    fn page_qpath_above_base() {
+        let data = [0u8; PAGE_SIZE];
+        let addr = PageAddr::from_data(&data, harmony_athenaeum::Algorithm::Sha256Msb);
+        let q = ContentServer::page_qpath(&addr);
+        assert!(q >= PAGE_QPATH_BASE);
     }
 
     #[test]
     fn qpath_ranges_are_disjoint() {
-        // Maximum chunk QPath assuming 21-bit hash_bits (max 0x1F_FFFF).
-        let max_chunk_qpath = CHUNK_QPATH_BASE + 0x1F_FFFF;
+        // Maximum page QPath assuming 28-bit hash_bits (max 0x0FFF_FFFF).
+        let max_page_qpath = PAGE_QPATH_BASE + 0x0FFF_FFFF;
         assert!(
-            max_chunk_qpath < BLOB_QPATH_BASE,
-            "chunk and blob QPath ranges overlap"
+            max_page_qpath < BLOB_QPATH_BASE,
+            "page and blob QPath ranges overlap"
         );
     }
 
@@ -665,10 +685,10 @@ mod tests {
     }
 
     #[test]
-    fn walk_root_to_chunks() {
+    fn walk_root_to_pages() {
         let mut server = ContentServer::new();
-        let qpath = server.walk(0, 1, "chunks").unwrap();
-        assert_eq!(qpath, CHUNKS_DIR);
+        let qpath = server.walk(0, 1, "pages").unwrap();
+        assert_eq!(qpath, PAGES_DIR);
     }
 
     #[test]
@@ -685,6 +705,13 @@ mod tests {
     }
 
     #[test]
+    fn walk_root_chunks_not_found() {
+        // Old "chunks" path no longer exists — must use "pages".
+        let mut server = ContentServer::new();
+        assert_eq!(server.walk(0, 1, "chunks"), Err(IpcError::NotFound));
+    }
+
+    #[test]
     fn walk_invalid_source_fid() {
         let mut server = ContentServer::new();
         assert_eq!(server.walk(99, 1, "blobs"), Err(IpcError::InvalidFid));
@@ -694,7 +721,7 @@ mod tests {
     fn walk_duplicate_new_fid() {
         let mut server = ContentServer::new();
         server.walk(0, 1, "blobs").unwrap();
-        assert_eq!(server.walk(0, 1, "chunks"), Err(IpcError::InvalidFid));
+        assert_eq!(server.walk(0, 1, "pages"), Err(IpcError::InvalidFid));
     }
 
     #[test]
@@ -814,6 +841,15 @@ mod tests {
         assert_eq!(&*stat.name, "blobs");
     }
 
+    #[test]
+    fn stat_pages_dir() {
+        let mut server = ContentServer::new();
+        server.walk(0, 1, "pages").unwrap();
+        let stat = server.stat(1).unwrap();
+        assert_eq!(stat.file_type, FileType::Directory);
+        assert_eq!(&*stat.name, "pages");
+    }
+
     // ── write() tests ─────────────────────────────────────────────────
 
     #[test]
@@ -850,21 +886,21 @@ mod tests {
         let mut server = ContentServer::new();
         server.walk(0, 1, "ingest").unwrap();
         server.open(1, OpenMode::ReadWrite).unwrap();
-        let blob_data = alloc::vec![0xABu8; 4096];
+        let blob_data = alloc::vec![0xABu8; PAGE_SIZE];
         server.write(1, 0, &blob_data).unwrap();
 
         let response = server.read(1, 0, 256).unwrap();
         assert_eq!(response.len(), 40);
 
         let cid: [u8; 32] = response[..32].try_into().unwrap();
-        let chunk_count = u32::from_le_bytes(response[32..36].try_into().unwrap());
+        let page_count = u32::from_le_bytes(response[32..36].try_into().unwrap());
         let blob_size = u32::from_le_bytes(response[36..40].try_into().unwrap());
 
         assert_eq!(cid, harmony_athenaeum::sha256_hash(&blob_data));
-        assert_eq!(chunk_count, 1);
-        assert_eq!(blob_size, 4096);
+        assert_eq!(page_count, 1);
+        assert_eq!(blob_size, PAGE_SIZE as u32);
         assert_eq!(server.blob_count(), 1);
-        assert_eq!(server.chunk_count(), 1);
+        assert_eq!(server.page_count(), 1);
     }
 
     #[test]
@@ -896,7 +932,7 @@ mod tests {
         // Read before write — should fail but NOT poison the fid.
         assert_eq!(server.read(1, 0, 256), Err(IpcError::InvalidArgument));
         // Fid should still be usable: write then read to finalize.
-        let blob_data = alloc::vec![0xBBu8; 4096];
+        let blob_data = alloc::vec![0xBBu8; PAGE_SIZE];
         server.write(1, 0, &blob_data).unwrap();
         let response = server.read(1, 0, 256).unwrap();
         assert_eq!(response.len(), 40);
@@ -907,15 +943,15 @@ mod tests {
         let mut server = ContentServer::new();
         server.walk(0, 1, "ingest").unwrap();
         server.open(1, OpenMode::ReadWrite).unwrap();
-        let blob_data = alloc::vec![0xCCu8; 4096];
+        let blob_data = alloc::vec![0xCCu8; PAGE_SIZE];
         server.write(1, 0, &blob_data).unwrap();
-        // Read only bytes 32..40 (chunk_count + blob_size portion of response)
+        // Read only bytes 32..40 (page_count + blob_size portion of response)
         let slice = server.read(1, 32, 8).unwrap();
         assert_eq!(slice.len(), 8);
-        let chunk_count = u32::from_le_bytes(slice[0..4].try_into().unwrap());
+        let page_count = u32::from_le_bytes(slice[0..4].try_into().unwrap());
         let blob_size = u32::from_le_bytes(slice[4..8].try_into().unwrap());
-        assert_eq!(chunk_count, 1);
-        assert_eq!(blob_size, 4096);
+        assert_eq!(page_count, 1);
+        assert_eq!(blob_size, PAGE_SIZE as u32);
     }
 
     #[test]
@@ -923,7 +959,7 @@ mod tests {
         let mut server = ContentServer::new();
         server.walk(0, 1, "ingest").unwrap();
         server.open(1, OpenMode::ReadWrite).unwrap();
-        let blob_data = alloc::vec![0xDDu8; 4096];
+        let blob_data = alloc::vec![0xDDu8; PAGE_SIZE];
         server.write(1, 0, &blob_data).unwrap();
         // First read: CID only (first 32 bytes)
         let cid_bytes = server.read(1, 0, 32).unwrap();
@@ -932,10 +968,10 @@ mod tests {
         let meta = server.read(1, 32, 8).unwrap();
         assert_eq!(meta.len(), 8);
         // Verify metadata is consistent
-        let chunk_count = u32::from_le_bytes(meta[0..4].try_into().unwrap());
+        let page_count = u32::from_le_bytes(meta[0..4].try_into().unwrap());
         let blob_size = u32::from_le_bytes(meta[4..8].try_into().unwrap());
-        assert_eq!(chunk_count, 1);
-        assert_eq!(blob_size, 4096);
+        assert_eq!(page_count, 1);
+        assert_eq!(blob_size, PAGE_SIZE as u32);
     }
 
     #[test]
@@ -959,7 +995,7 @@ mod tests {
     #[test]
     fn read_blob_with_offset() {
         let mut server = ContentServer::new();
-        let blob_data = alloc::vec![0xEFu8; 4096];
+        let blob_data = alloc::vec![0xEFu8; PAGE_SIZE];
         server.walk(0, 1, "ingest").unwrap();
         server.open(1, OpenMode::ReadWrite).unwrap();
         server.write(1, 0, &blob_data).unwrap();
@@ -986,21 +1022,21 @@ mod tests {
     #[test]
     fn ingest_dedup_same_blob() {
         let mut server = ContentServer::new();
-        let blob_data = alloc::vec![0xAAu8; 4096];
+        let blob_data = alloc::vec![0xAAu8; PAGE_SIZE];
 
         server.walk(0, 1, "ingest").unwrap();
         server.open(1, OpenMode::ReadWrite).unwrap();
         server.write(1, 0, &blob_data).unwrap();
         server.read(1, 0, 256).unwrap();
         server.clunk(1).unwrap();
-        assert_eq!(server.chunk_count(), 1);
+        assert_eq!(server.page_count(), 1);
 
         server.walk(0, 2, "ingest").unwrap();
         server.open(2, OpenMode::ReadWrite).unwrap();
         server.write(2, 0, &blob_data).unwrap();
         server.read(2, 0, 256).unwrap();
         server.clunk(2).unwrap();
-        assert_eq!(server.chunk_count(), 1); // No new chunks
+        assert_eq!(server.page_count(), 1); // No new pages
         assert_eq!(server.blob_count(), 1); // No new blob
     }
 
@@ -1030,8 +1066,8 @@ mod tests {
         let mut server = ContentServer::new();
         server.walk(0, 1, "ingest").unwrap();
         server.open(1, OpenMode::ReadWrite).unwrap();
-        // Write up to exactly MAX_BLOB_SIZE — should succeed.
-        let max = alloc::vec![0u8; harmony_athenaeum::MAX_BLOB_SIZE];
+        // Write up to exactly BOOK_MAX_SIZE — should succeed.
+        let max = alloc::vec![0u8; BOOK_MAX_SIZE];
         server.write(1, 0, &max).unwrap();
         // One more byte exceeds the limit — rejected eagerly at write time.
         assert_eq!(
@@ -1045,8 +1081,8 @@ mod tests {
         let mut server = ContentServer::new();
         server.walk(0, 1, "ingest").unwrap();
         server.open(1, OpenMode::ReadWrite).unwrap();
-        // Fill to exactly MAX_BLOB_SIZE.
-        let max = alloc::vec![0u8; harmony_athenaeum::MAX_BLOB_SIZE];
+        // Fill to exactly BOOK_MAX_SIZE.
+        let max = alloc::vec![0u8; BOOK_MAX_SIZE];
         server.write(1, 0, &max).unwrap();
         // Exceed limit — rejected at write time.
         assert_eq!(
@@ -1054,24 +1090,25 @@ mod tests {
             Err(IpcError::ResourceExhausted)
         );
         // Fid is NOT poisoned — the valid data is still in the buffer.
-        // Reading should finalize successfully with the MAX_BLOB_SIZE data.
+        // Reading should finalize successfully with the BOOK_MAX_SIZE data.
         let response = server.read(1, 0, 256).unwrap();
         assert_eq!(response.len(), 40);
     }
 
     #[test]
-    fn ingest_detects_cross_blob_chunk_collision() {
+    fn ingest_detects_cross_blob_page_collision() {
         let mut server = ContentServer::new();
 
-        // Determine what hash_bits a known blob's chunk would get.
-        let blob_data = alloc::vec![0xFFu8; 4096];
+        // Determine what hash_bits a known blob's page would get.
+        let blob_data = alloc::vec![0xFFu8; PAGE_SIZE];
         let cid = sha256_hash(&blob_data);
-        let ath = Athenaeum::from_blob(cid, &blob_data).unwrap();
-        let target_hb = ath.chunks[0].hash_bits();
+        let book = Book::from_blob(cid, &blob_data).unwrap();
+        let addr = book.pages[0][0]; // algo 0
+        let target_hb = addr.hash_bits();
 
-        // Plant a conflicting chunk at that address with different data.
-        let conflict = alloc::vec![0x00u8; ath.chunks[0].size_bytes()];
-        server.chunks.insert(target_hb, (ath.chunks[0], conflict));
+        // Plant a conflicting page at that address with different data.
+        let conflict = alloc::vec![0x00u8; PAGE_SIZE];
+        server.pages.insert(target_hb, (addr, conflict));
 
         // Ingest the blob — should detect the collision and reject.
         server.walk(0, 1, "ingest").unwrap();
@@ -1084,48 +1121,49 @@ mod tests {
     }
 
     #[test]
-    fn chunk_size_matches_athenaeum() {
-        // Validate that our local CHUNK_SIZE matches Athenaeum's behavior:
-        // a blob of exactly CHUNK_SIZE bytes should produce exactly 1 chunk.
-        let data = alloc::vec![0xAAu8; CHUNK_SIZE];
+    fn page_size_matches_book() {
+        // Validate that PAGE_SIZE matches Book's behavior:
+        // a blob of exactly PAGE_SIZE bytes should produce exactly 1 page.
+        let data = alloc::vec![0xAAu8; PAGE_SIZE];
         let cid = harmony_athenaeum::sha256_hash(&data);
-        let ath = harmony_athenaeum::Athenaeum::from_blob(cid, &data).unwrap();
-        assert_eq!(ath.chunks.len(), 1);
-        // A blob of CHUNK_SIZE + 1 should produce exactly 2 chunks.
-        let data2 = alloc::vec![0xBBu8; CHUNK_SIZE + 1];
+        let book = harmony_athenaeum::Book::from_blob(cid, &data).unwrap();
+        assert_eq!(book.page_count(), 1);
+        // A blob of PAGE_SIZE + 1 should produce exactly 2 pages.
+        let data2 = alloc::vec![0xBBu8; PAGE_SIZE + 1];
         let cid2 = harmony_athenaeum::sha256_hash(&data2);
-        let ath2 = harmony_athenaeum::Athenaeum::from_blob(cid2, &data2).unwrap();
-        assert_eq!(ath2.chunks.len(), 2);
+        let book2 = harmony_athenaeum::Book::from_blob(cid2, &data2).unwrap();
+        assert_eq!(book2.page_count(), 2);
     }
 
     #[test]
-    fn read_chunk_by_address() {
+    fn read_page_by_address() {
         let mut server = ContentServer::new();
-        let blob_data = alloc::vec![0x77u8; 4096]; // single chunk
+        let blob_data = alloc::vec![0x77u8; PAGE_SIZE]; // single page
         server.walk(0, 1, "ingest").unwrap();
         server.open(1, OpenMode::ReadWrite).unwrap();
         server.write(1, 0, &blob_data).unwrap();
         server.read(1, 0, 256).unwrap();
         server.clunk(1).unwrap();
 
-        // Get the chunk address from storage
-        assert_eq!(server.chunk_count(), 1);
-        let (addr, _) = server.chunks.values().next().unwrap();
+        // Get the page address from storage
+        assert_eq!(server.page_count(), 1);
+        let (addr, _) = server.pages.values().next().unwrap();
         let addr_hex = format_addr_hex(addr);
 
-        // Walk to the chunk and read it
-        server.walk(0, 2, "chunks").unwrap();
+        // Walk to the page and read it
+        server.walk(0, 2, "pages").unwrap();
         server.walk(2, 3, &addr_hex).unwrap();
         server.open(3, OpenMode::Read).unwrap();
-        let chunk_data = server.read(3, 0, 8192).unwrap();
-        // Chunk is padded to size_bytes(); first 4096 bytes should match blob data
-        assert_eq!(&chunk_data[..blob_data.len()], &blob_data[..]);
+        let page_data = server.read(3, 0, 8192).unwrap();
+        // All pages are exactly PAGE_SIZE (4KB), zero-padded
+        assert_eq!(page_data.len(), PAGE_SIZE);
+        assert_eq!(&page_data[..blob_data.len()], &blob_data[..]);
     }
 
     #[test]
     fn stat_blob_after_ingest() {
         let mut server = ContentServer::new();
-        let blob_data = alloc::vec![0x55u8; 4096];
+        let blob_data = alloc::vec![0x55u8; PAGE_SIZE];
         server.walk(0, 1, "ingest").unwrap();
         server.open(1, OpenMode::ReadWrite).unwrap();
         server.write(1, 0, &blob_data).unwrap();
@@ -1137,25 +1175,25 @@ mod tests {
         server.walk(2, 3, &cid_hex).unwrap();
         let stat = server.stat(3).unwrap();
         assert_eq!(stat.file_type, FileType::Regular);
-        assert_eq!(stat.size, 4096);
+        assert_eq!(stat.size, PAGE_SIZE as u64);
         assert_eq!(&*stat.name, &*cid_hex);
     }
 
     #[test]
-    fn stat_chunk_after_ingest() {
+    fn stat_page_after_ingest() {
         let mut server = ContentServer::new();
-        let blob_data = alloc::vec![0x33u8; 4096];
+        let blob_data = alloc::vec![0x33u8; PAGE_SIZE];
         server.walk(0, 1, "ingest").unwrap();
         server.open(1, OpenMode::ReadWrite).unwrap();
         server.write(1, 0, &blob_data).unwrap();
         server.read(1, 0, 256).unwrap();
         server.clunk(1).unwrap();
 
-        let (addr, chunk_data) = server.chunks.values().next().unwrap();
+        let (addr, page_data) = server.pages.values().next().unwrap();
         let addr_hex = format_addr_hex(addr);
-        let expected_size = chunk_data.len() as u64;
+        let expected_size = page_data.len() as u64;
 
-        server.walk(0, 2, "chunks").unwrap();
+        server.walk(0, 2, "pages").unwrap();
         server.walk(2, 3, &addr_hex).unwrap();
         let stat = server.stat(3).unwrap();
         assert_eq!(stat.file_type, FileType::Regular);
