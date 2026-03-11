@@ -4,7 +4,7 @@
 #
 # Output: target/harmony-rpi5.img (256 MB FAT32)
 #
-# Requirements: mtools, curl, sha256sum, cargo, aarch64-unknown-linux-musl target
+# Requirements: mtools, curl, unzip, cargo, aarch64-unknown-linux-musl target
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -78,6 +78,7 @@ mcopy -i "$IMG" "$FIRMWARE_DIR/RPI_EFI.fd" ::
 
 # Create config.txt
 CONFIG=$(mktemp)
+trap 'rm -f "$CONFIG"' EXIT
 cat > "$CONFIG" <<'CONFIGEOF'
 arm_64bit=1
 enable_uart=1
