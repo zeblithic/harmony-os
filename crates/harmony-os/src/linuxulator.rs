@@ -2128,6 +2128,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return 0; // End of directory
         }
 
+        // Single allocation for the output buffer — avoids per-entry heap alloc.
+        let mut buf = vec![0u8; count];
         let mut bytes_written: usize = 0;
         let mut idx = start_idx;
 
@@ -2138,6 +2140,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
             let reclen_unaligned = 8 + 8 + 2 + 1 + name_bytes.len() + 1;
             let reclen = (reclen_unaligned + 7) & !7; // 8-byte align
 
+            // Guard against filenames exceeding d_reclen's u16 range.
+            if reclen > u16::MAX as usize {
+                return EINVAL;
+            }
+
             if bytes_written + reclen > count {
                 break; // Buffer full
             }
@@ -2147,22 +2154,28 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 FileType::Directory => 4, // DT_DIR
             };
 
-            // Pack the entry into the buffer.
-            let base = dirp + bytes_written;
-            let mut rec = vec![0u8; reclen];
+            // Pack the entry into the pre-allocated buffer.
+            let rec = &mut buf[bytes_written..bytes_written + reclen];
+            // rec is already zeroed (NUL terminator included)
             let d_ino = (idx + 1) as u64; // non-zero placeholder; 0 means "deleted"
             rec[0..8].copy_from_slice(&d_ino.to_le_bytes()); // d_ino
+            // d_off: entry index used as seek position (Linuxulator-internal
+            // convention — not a byte offset, but consistent with how
+            // FdEntry.offset tracks pagination via lseek).
             let next_off = (idx + 1) as i64;
             rec[8..16].copy_from_slice(&next_off.to_le_bytes()); // d_off
             rec[16..18].copy_from_slice(&(reclen as u16).to_le_bytes()); // d_reclen
             rec[18] = d_type; // d_type
             rec[19..19 + name_bytes.len()].copy_from_slice(name_bytes); // d_name
-            // NUL terminator already 0 from vec![0u8; reclen]
-
-            self.backend.vm_write_bytes(base as u64, &rec);
 
             bytes_written += reclen;
             idx += 1;
+        }
+
+        // Single write for all packed entries.
+        if bytes_written > 0 {
+            self.backend
+                .vm_write_bytes(dirp as u64, &buf[..bytes_written]);
         }
 
         if bytes_written == 0 && idx < entries.len() {
