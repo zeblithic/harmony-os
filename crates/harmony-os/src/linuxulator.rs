@@ -1905,11 +1905,15 @@ impl<B: SyscallBackend> Linuxulator<B> {
             None => return EBADF,
         };
 
+        // Single stat call: checks chardev and provides size for SEEK_END.
+        let stat = match self.backend.stat(entry_fid) {
+            Ok(s) => s,
+            Err(e) => return ipc_err_to_errno(e),
+        };
+
         // Character devices (stdin/stdout/stderr) are not seekable.
-        if let Ok(stat) = self.backend.stat(entry_fid) {
-            if stat.file_type == FileType::CharDev {
-                return ESPIPE;
-            }
+        if stat.file_type == FileType::CharDev {
+            return ESPIPE;
         }
 
         let new_offset = match whence {
@@ -1919,10 +1923,6 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 None => return EOVERFLOW,
             },
             SEEK_END => {
-                let stat = match self.backend.stat(entry_fid) {
-                    Ok(s) => s,
-                    Err(e) => return ipc_err_to_errno(e),
-                };
                 // Guard against files larger than i64::MAX — the
                 // `as i64` cast would wrap to negative.
                 if stat.size > i64::MAX as u64 {
@@ -1999,6 +1999,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
         const AT_FDCWD: i32 = -100;
         if dirfd == AT_FDCWD {
             let cwd = self.cwd.clone();
+            // Note: alloc_fid() advances the monotonic counter even if walk
+            // fails. This is acceptable — the u32 counter won't wrap in
+            // practice, and clunking a never-walked fid is a 9P violation.
             let fid = self.alloc_fid();
             if let Err(e) = self.backend.walk(&cwd, fid) {
                 return ipc_err_to_errno(e);
@@ -2076,7 +2079,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Linux faccessat(2): check file accessibility.
     ///
     /// Walks the path and stats to check existence. Permission bits always
-    /// pass (single-user, no capability enforcement yet).
+    /// pass (single-user, no capability enforcement yet). Note: `W_OK`
+    /// succeeds even though the filesystem is read-only; callers that use
+    /// `faccessat(W_OK)` for writability detection will be misled.
     fn sys_faccessat(&mut self, dirfd: i32, pathname_ptr: usize, _mode: i32) -> i64 {
         if pathname_ptr == 0 {
             return EFAULT;
@@ -2245,10 +2250,13 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         let path = match &entry.path {
             Some(p) => p.clone(),
-            // fd is confirmed directory but has no tracked path — implementation
-            // limitation (all current directory fds have paths, so this is
-            // effectively unreachable).
-            None => return ENOSYS,
+            None => {
+                // fd is confirmed directory but has no tracked path —
+                // implementation limitation. All current directory fds have
+                // paths, so this is effectively unreachable.
+                debug_assert!(false, "directory fd {} has no tracked path", fd);
+                return EINVAL;
+            }
         };
 
         self.cwd = path;
