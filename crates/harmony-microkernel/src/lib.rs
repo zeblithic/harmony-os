@@ -55,6 +55,7 @@ pub enum OpenMode {
 pub enum FileType {
     Regular,
     Directory,
+    CharDev,
 }
 
 /// Errors returned by IPC operations.

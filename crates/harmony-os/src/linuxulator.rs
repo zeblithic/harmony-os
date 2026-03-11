@@ -582,11 +582,19 @@ pub struct MockBackend {
     pub directory_paths: alloc::collections::BTreeSet<alloc::string::String>,
     /// Fids that represent directories.
     pub directory_fids: alloc::collections::BTreeSet<Fid>,
+    /// Paths that are character devices (for stat to return FileType::CharDev).
+    pub chardev_paths: alloc::collections::BTreeSet<alloc::string::String>,
+    /// Fids that represent character devices.
+    chardev_fids: alloc::collections::BTreeSet<Fid>,
 }
 
 #[cfg(test)]
 impl MockBackend {
     pub fn new() -> Self {
+        let mut chardev_paths = alloc::collections::BTreeSet::new();
+        // init_stdio walks /dev/serial/log — register as chardev so stat
+        // reports FileType::CharDev for stdio fids.
+        chardev_paths.insert(alloc::string::String::from("/dev/serial/log"));
         Self {
             walks: Vec::new(),
             opens: Vec::new(),
@@ -598,6 +606,8 @@ impl MockBackend {
             readdir_entries: BTreeMap::new(),
             directory_paths: alloc::collections::BTreeSet::new(),
             directory_fids: alloc::collections::BTreeSet::new(),
+            chardev_paths,
+            chardev_fids: alloc::collections::BTreeSet::new(),
         }
     }
 
@@ -671,6 +681,9 @@ impl SyscallBackend for MockBackend {
         if self.directory_paths.contains(path) {
             self.directory_fids.insert(new_fid);
         }
+        if self.chardev_paths.contains(path) {
+            self.chardev_fids.insert(new_fid);
+        }
         Ok(0)
     }
 
@@ -705,6 +718,8 @@ impl SyscallBackend for MockBackend {
         self.stats.push(fid);
         let file_type = if self.directory_fids.contains(&fid) {
             FileType::Directory
+        } else if self.chardev_fids.contains(&fid) {
+            FileType::CharDev
         } else {
             FileType::Regular
         };
@@ -934,14 +949,11 @@ fn flags_to_open_mode(flags: i32) -> OpenMode {
 ///   60      4     __pad2
 ///   64      8     st_blocks
 ///   72-128        timestamps (zeroed for MVP)
-fn write_linux_stat(buf_ptr: usize, stat: &FileStat, is_chardev: bool) {
-    let mode: u32 = if is_chardev {
-        0o020000 | 0o666 // S_IFCHR | rw-rw-rw-
-    } else {
-        match stat.file_type {
-            FileType::Regular => 0o100000 | 0o644,   // S_IFREG | rw-r--r--
-            FileType::Directory => 0o040000 | 0o755, // S_IFDIR | rwxr-xr-x
-        }
+fn write_linux_stat(buf_ptr: usize, stat: &FileStat) {
+    let mode: u32 = match stat.file_type {
+        FileType::Regular => 0o100000 | 0o644,   // S_IFREG | rw-r--r--
+        FileType::Directory => 0o040000 | 0o755, // S_IFDIR | rwxr-xr-x
+        FileType::CharDev => 0o020000 | 0o666,   // S_IFCHR | rw-rw-rw-
     };
 
     #[cfg(target_arch = "x86_64")]
@@ -1019,9 +1031,6 @@ pub struct Linuxulator<B: SyscallBackend> {
     arena: MemoryArena,
     /// FS segment base register (TLS pointer for arch_prctl).
     fs_base: u64,
-    /// Fids that represent character devices (stdio).
-    /// Used by fstat to report S_IFCHR instead of S_IFREG.
-    chardev_fids: Vec<Fid>,
     /// VM-backed brk: base address of the heap (0 = not yet established).
     vm_brk_base: u64,
     /// VM-backed brk: current program break.
@@ -1031,8 +1040,6 @@ pub struct Linuxulator<B: SyscallBackend> {
     getrandom_counter: u64,
     /// Current working directory (absolute path).
     cwd: alloc::string::String,
-    /// 9P fid for the cwd, if one has been walked.
-    cwd_fid: Option<Fid>,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -1050,12 +1057,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
             exit_code: None,
             arena: MemoryArena::new(arena_size),
             fs_base: 0,
-            chardev_fids: Vec::new(),
             vm_brk_base: 0,
             vm_brk_current: 0,
             getrandom_counter: 0,
             cwd: alloc::string::String::from("/"),
-            cwd_fid: None,
         }
     }
 
@@ -1157,10 +1162,6 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 path: None,
             },
         );
-
-        // Track stdio fids as character devices for fstat.
-        self.chardev_fids
-            .extend_from_slice(&[stdin_fid, stdout_fid, stderr_fid]);
 
         Ok(())
     }
@@ -1366,7 +1367,6 @@ impl<B: SyscallBackend> Linuxulator<B> {
             Some(e) => e,
             None => return EBADF,
         };
-        self.chardev_fids.retain(|&f| f != entry.fid);
         let _ = self.backend.clunk(entry.fid);
         0
     }
@@ -1380,10 +1380,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
             Some(e) => e.fid,
             None => return EBADF,
         };
-        let is_chardev = self.chardev_fids.contains(&fid);
         match self.backend.stat(fid) {
             Ok(stat) => {
-                write_linux_stat(statbuf_ptr, &stat, is_chardev);
+                write_linux_stat(statbuf_ptr, &stat);
                 0
             }
             Err(e) => ipc_err_to_errno(e),
@@ -1907,8 +1906,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
         };
 
         // Character devices (stdin/stdout/stderr) are not seekable.
-        if self.chardev_fids.contains(&entry_fid) {
-            return ESPIPE;
+        if let Ok(stat) = self.backend.stat(entry_fid) {
+            if stat.file_type == FileType::CharDev {
+                return ESPIPE;
+            }
         }
 
         let new_offset = match whence {
@@ -2004,7 +2005,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             }
             let result = match self.backend.stat(fid) {
                 Ok(stat) => {
-                    write_linux_stat(statbuf_ptr, &stat, false);
+                    write_linux_stat(statbuf_ptr, &stat);
                     0
                 }
                 Err(e) => ipc_err_to_errno(e),
@@ -2063,7 +2064,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
         let result = match self.backend.stat(fid) {
             Ok(stat) => {
-                write_linux_stat(statbuf_ptr, &stat, false);
+                write_linux_stat(statbuf_ptr, &stat);
                 0
             }
             Err(e) => ipc_err_to_errno(e),
@@ -2128,8 +2129,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return 0; // End of directory
         }
 
-        // Single allocation for the output buffer — avoids per-entry heap alloc.
-        let mut buf = vec![0u8; count];
+        // Cap the kernel-side allocation to avoid OOM from user-controlled count.
+        // 256 KiB matches a common glibc getdents64 buffer size.
+        const GETDENTS_BUF_MAX: usize = 256 * 1024;
+        let capped_count = count.min(GETDENTS_BUF_MAX);
+        let mut buf = vec![0u8; capped_count];
         let mut bytes_written: usize = 0;
         let mut idx = start_idx;
 
@@ -2145,13 +2149,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 return EINVAL;
             }
 
-            if bytes_written + reclen > count {
+            if bytes_written + reclen > capped_count {
                 break; // Buffer full
             }
 
             let d_type: u8 = match e.file_type {
                 FileType::Regular => 8,   // DT_REG
                 FileType::Directory => 4, // DT_DIR
+                FileType::CharDev => 2,   // DT_CHR
             };
 
             // Pack the entry into the pre-allocated buffer.
@@ -2193,7 +2198,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Linux chdir(2): change working directory.
     ///
     /// Walks the path, verifies it's a directory via stat, then
-    /// updates `self.cwd`. Clunks the old cwd fid if set.
+    /// updates `self.cwd`. The walked fid is transient — clunked
+    /// immediately after verification.
     fn sys_chdir(&mut self, pathname_ptr: usize) -> i64 {
         if pathname_ptr == 0 {
             return EFAULT;
@@ -2209,27 +2215,17 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return ipc_err_to_errno(e);
         }
 
-        // Verify it's a directory
-        match self.backend.stat(fid) {
-            Ok(stat) if stat.file_type == FileType::Directory => {}
-            Ok(_) => {
-                let _ = self.backend.clunk(fid);
-                return ENOTDIR;
+        // Verify it's a directory, then clunk the transient fid
+        let result = match self.backend.stat(fid) {
+            Ok(stat) if stat.file_type == FileType::Directory => {
+                self.cwd = resolved;
+                0
             }
-            Err(e) => {
-                let _ = self.backend.clunk(fid);
-                return ipc_err_to_errno(e);
-            }
-        }
-
-        // Clunk old cwd fid
-        if let Some(old_fid) = self.cwd_fid {
-            let _ = self.backend.clunk(old_fid);
-        }
-
-        self.cwd = resolved;
-        self.cwd_fid = Some(fid);
-        0
+            Ok(_) => ENOTDIR,
+            Err(e) => ipc_err_to_errno(e),
+        };
+        let _ = self.backend.clunk(fid);
+        result
     }
 
     /// Linux fchdir(2): change working directory to an open fd.
@@ -2255,19 +2251,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             None => return ENOSYS,
         };
 
-        // Walk a new fid for cwd (the fd's fid stays with the fd table).
-        // No clunk on walk failure — the fid was never established on the backend.
-        let cwd_fid = self.alloc_fid();
-        if let Err(e) = self.backend.walk(&path, cwd_fid) {
-            return ipc_err_to_errno(e);
-        }
-
-        if let Some(old_fid) = self.cwd_fid {
-            let _ = self.backend.clunk(old_fid);
-        }
-
         self.cwd = path;
-        self.cwd_fid = Some(cwd_fid);
         0
     }
 
@@ -2615,15 +2599,14 @@ mod tests {
     }
 
     #[test]
-    fn sys_close_cleans_chardev_fids() {
+    fn sys_close_clunks_chardev_fd() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
         lx.init_stdio().unwrap();
-        // Closing stdout should remove its fid from chardev_fids
-        let stdout_fid = lx.fid_for_fd(1).unwrap();
-        assert!(lx.chardev_fids.contains(&stdout_fid));
+        // Closing stdout should clunk the fid and remove the fd
+        assert!(lx.has_fd(1));
         lx.handle_syscall(3, [1, 0, 0, 0, 0, 0]);
-        assert!(!lx.chardev_fids.contains(&stdout_fid));
+        assert!(!lx.has_fd(1));
     }
 
     // ── sys_openat tests ──────────────────────────────────────────────
@@ -3142,8 +3125,8 @@ mod tests {
         let mut lx = Linuxulator::new(mock);
         lx.init_stdio().unwrap();
 
-        // Open a file via openat to get fd 3
-        let path = b"/dev/serial/log\0";
+        // Open a regular file (not chardev) via openat to get fd 3
+        let path = b"/data/file.txt\0";
         let at_fdcwd = (-100i32) as u64;
         let fd = lx.handle_syscall(257, [at_fdcwd, path.as_ptr() as u64, 0, 0, 0, 0]);
         assert!(fd >= 0);
@@ -3160,7 +3143,7 @@ mod tests {
         let mut lx = Linuxulator::new(mock);
         lx.init_stdio().unwrap();
 
-        let path = b"/dev/serial/log\0";
+        let path = b"/data/file.txt\0";
         let at_fdcwd = (-100i32) as u64;
         let fd = lx.handle_syscall(257, [at_fdcwd, path.as_ptr() as u64, 0, 0, 0, 0]);
         assert!(fd >= 0);
@@ -3189,8 +3172,8 @@ mod tests {
         let mut lx = Linuxulator::new(mock);
         lx.init_stdio().unwrap();
 
-        // Open a file to get a seekable fd
-        let path = b"/dev/serial/log\0";
+        // Open a regular file to get a seekable fd
+        let path = b"/data/file.txt\0";
         let at_fdcwd = (-100i32) as u64;
         let fd = lx.handle_syscall(257, [at_fdcwd, path.as_ptr() as u64, 0, 0, 0, 0]);
         assert!(fd >= 0);
@@ -3384,6 +3367,15 @@ mod tests {
         assert_eq!(ret, 0);
         // Verify walk was called with the path
         assert_eq!(lx.backend().walks[0].0, "/dev/serial/log");
+        // /dev/serial/log is a chardev — st_mode should be S_IFCHR | 0o666
+        #[cfg(target_arch = "x86_64")]
+        const ST_MODE_OFFSET: usize = 24;
+        #[cfg(not(target_arch = "x86_64"))]
+        const ST_MODE_OFFSET: usize = 16;
+        let o = ST_MODE_OFFSET;
+        let st_mode =
+            u32::from_le_bytes([statbuf[o], statbuf[o + 1], statbuf[o + 2], statbuf[o + 3]]);
+        assert_eq!(st_mode, 0o020666, "path-based stat on chardev should report S_IFCHR");
     }
 
     #[test]
