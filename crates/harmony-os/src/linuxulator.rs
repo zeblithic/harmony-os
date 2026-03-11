@@ -311,8 +311,8 @@ impl LinuxSyscall {
             // Only AT_FDCWD is supported; explicit dirfds return ENOSYS
             // via the Unknown fallback.
             267 => {
-                const AT_FDCWD: i64 = -100;
-                if args[0] as i64 != AT_FDCWD {
+                const AT_FDCWD: i32 = -100;
+                if args[0] as i32 != AT_FDCWD {
                     LinuxSyscall::Unknown { nr: 267 }
                 } else {
                     LinuxSyscall::Readlink {
@@ -415,8 +415,8 @@ impl LinuxSyscall {
             // is supported; explicit dirfds return ENOSYS until a full
             // implementation is added.
             78 => {
-                const AT_FDCWD: i64 = -100;
-                if args[0] as i64 != AT_FDCWD {
+                const AT_FDCWD: i32 = -100;
+                if args[0] as i32 != AT_FDCWD {
                     LinuxSyscall::Unknown { nr: 78 }
                 } else {
                     LinuxSyscall::Readlink {
@@ -2029,6 +2029,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return ENOENT;
         }
 
+        if dirfd != AT_FDCWD && !self.fd_table.contains_key(&dirfd) {
+            return EBADF;
+        }
         let resolved = if dirfd == AT_FDCWD || path.starts_with('/') {
             self.resolve_path(&path)
         } else {
@@ -2065,9 +2068,13 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return ENOENT;
         }
 
+        if dirfd != AT_FDCWD && !self.fd_table.contains_key(&dirfd) {
+            return EBADF;
+        }
         let resolved = if dirfd == AT_FDCWD || path.starts_with('/') {
             self.resolve_path(&path)
         } else {
+            // dirfd-relative paths: not yet supported
             return ENOSYS;
         };
 
@@ -2087,7 +2094,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// the entry index stored in `FdEntry.offset`.
     fn sys_getdents64(&mut self, fd: i32, dirp: usize, count: usize) -> i64 {
         if dirp == 0 {
-            return EINVAL;
+            return EFAULT;
         }
         let entry = match self.fd_table.get(&fd) {
             Some(e) => e.clone(),
@@ -2212,7 +2219,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         let path = match &entry.path {
             Some(p) => p.clone(),
-            None => return EBADF, // fd is a directory but has no tracked path
+            // fd is confirmed directory but has no tracked path — implementation
+            // limitation (all current directory fds have paths, so this is
+            // effectively unreachable).
+            None => return ENOSYS,
         };
 
         // Walk a new fid for cwd (the fd's fid stays with the fd table)
@@ -3518,6 +3528,17 @@ mod tests {
                 assert_eq!(bufsiz, 128);
             }
             other => panic!("expected Readlink, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_x86_64_readlinkat_at_fdcwd_zero_extended() {
+        // Simulate 32-bit AT_FDCWD (-100 = 0xFFFFFF9C) zero-extended to 64 bits
+        let at_fdcwd_zext: u64 = 0x00000000FFFFFF9C;
+        let syscall = LinuxSyscall::from_x86_64(267, [at_fdcwd_zext, 0x1000, 0x2000, 128, 0, 0]);
+        match syscall {
+            LinuxSyscall::Readlink { .. } => {} // should match via i32 truncation
+            other => panic!("expected Readlink for zero-extended AT_FDCWD, got {:?}", other),
         }
     }
 
