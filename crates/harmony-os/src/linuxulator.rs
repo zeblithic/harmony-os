@@ -16,13 +16,16 @@ use harmony_microkernel::{Fid, FileStat, FileType, IpcError, OpenMode, QPath};
 // ── Linux errno constants ───────────────────────────────────────────
 
 const EPERM: i64 = -1;
+const ENOENT: i64 = -2;
 const ESRCH: i64 = -3;
 const EBADF: i64 = -9;
 const EFAULT: i64 = -14;
 const ENOMEM: i64 = -12;
+const ENOTDIR: i64 = -20;
 const EINVAL: i64 = -22;
 const ENOTTY: i64 = -25;
 const ESPIPE: i64 = -29;
+const EROFS: i64 = -30;
 const ERANGE: i64 = -34;
 const ENOSYS: i64 = -38;
 const EOVERFLOW: i64 = -75;
@@ -162,6 +165,38 @@ pub enum LinuxSyscall {
         buf: u64,
         bufsiz: u64,
     },
+    Newfstatat {
+        dirfd: i32,
+        pathname: u64,
+        statbuf: u64,
+        flags: i32,
+    },
+    Faccessat {
+        dirfd: i32,
+        pathname: u64,
+        mode: i32,
+    },
+    Getdents64 {
+        fd: i32,
+        dirp: u64,
+        count: u64,
+    },
+    Chdir {
+        pathname: u64,
+    },
+    Fchdir {
+        fd: i32,
+    },
+    Mkdirat {
+        dirfd: i32,
+        pathname: u64,
+        mode: u32,
+    },
+    Unlinkat {
+        dirfd: i32,
+        pathname: u64,
+        flags: i32,
+    },
     Unknown {
         nr: u64,
     },
@@ -227,6 +262,12 @@ impl LinuxSyscall {
                 buf: args[0],
                 size: args[1],
             },
+            80 => LinuxSyscall::Chdir {
+                pathname: args[0],
+            },
+            81 => LinuxSyscall::Fchdir {
+                fd: args[0] as i32,
+            },
             89 => LinuxSyscall::Readlink {
                 pathname: args[0],
                 buf: args[1],
@@ -236,6 +277,11 @@ impl LinuxSyscall {
                 code: args[0] as i32,
                 addr: args[1],
             },
+            217 => LinuxSyscall::Getdents64 {
+                fd: args[0] as i32,
+                dirp: args[1],
+                count: args[2],
+            },
             218 => LinuxSyscall::SetTidAddress,
             231 => LinuxSyscall::ExitGroup {
                 code: args[0] as i32,
@@ -244,6 +290,27 @@ impl LinuxSyscall {
                 dirfd: args[0] as i32,
                 pathname: args[1],
                 flags: args[2] as i32,
+            },
+            258 => LinuxSyscall::Mkdirat {
+                dirfd: args[0] as i32,
+                pathname: args[1],
+                mode: args[2] as u32,
+            },
+            262 => LinuxSyscall::Newfstatat {
+                dirfd: args[0] as i32,
+                pathname: args[1],
+                statbuf: args[2],
+                flags: args[3] as i32,
+            },
+            263 => LinuxSyscall::Unlinkat {
+                dirfd: args[0] as i32,
+                pathname: args[1],
+                flags: args[2] as i32,
+            },
+            269 => LinuxSyscall::Faccessat {
+                dirfd: args[0] as i32,
+                pathname: args[1],
+                mode: args[2] as i32,
             },
             273 => LinuxSyscall::SetRobustList,
             302 => LinuxSyscall::Prlimit64 {
@@ -276,12 +343,38 @@ impl LinuxSyscall {
                 fd: args[0] as i32,
                 request: args[1],
             },
+            34 => LinuxSyscall::Mkdirat {
+                dirfd: args[0] as i32,
+                pathname: args[1],
+                mode: args[2] as u32,
+            },
+            35 => LinuxSyscall::Unlinkat {
+                dirfd: args[0] as i32,
+                pathname: args[1],
+                flags: args[2] as i32,
+            },
+            48 => LinuxSyscall::Faccessat {
+                dirfd: args[0] as i32,
+                pathname: args[1],
+                mode: args[2] as i32,
+            },
+            49 => LinuxSyscall::Chdir {
+                pathname: args[0],
+            },
+            50 => LinuxSyscall::Fchdir {
+                fd: args[0] as i32,
+            },
             56 => LinuxSyscall::Openat {
                 dirfd: args[0] as i32,
                 pathname: args[1],
                 flags: args[2] as i32,
             },
             57 => LinuxSyscall::Close { fd: args[0] as i32 },
+            61 => LinuxSyscall::Getdents64 {
+                fd: args[0] as i32,
+                dirp: args[1],
+                count: args[2],
+            },
             62 => LinuxSyscall::Lseek {
                 fd: args[0] as i32,
                 offset: args[1] as i64,
@@ -318,6 +411,12 @@ impl LinuxSyscall {
                     }
                 }
             }
+            79 => LinuxSyscall::Newfstatat {
+                dirfd: args[0] as i32,
+                pathname: args[1],
+                statbuf: args[2],
+                flags: args[3] as i32,
+            },
             80 => LinuxSyscall::Fstat {
                 fd: args[0] as i32,
                 buf: args[1],
@@ -1101,6 +1200,24 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 buf,
                 bufsiz,
             } => self.sys_readlink(pathname, buf, bufsiz),
+            LinuxSyscall::Newfstatat {
+                dirfd,
+                pathname,
+                statbuf,
+                flags,
+            } => self.sys_newfstatat(dirfd, pathname as usize, statbuf as usize, flags),
+            LinuxSyscall::Faccessat {
+                dirfd,
+                pathname,
+                mode,
+            } => self.sys_faccessat(dirfd, pathname as usize, mode),
+            LinuxSyscall::Getdents64 { fd, dirp, count } => {
+                self.sys_getdents64(fd, dirp as usize, count as usize)
+            }
+            LinuxSyscall::Chdir { pathname } => self.sys_chdir(pathname as usize),
+            LinuxSyscall::Fchdir { fd } => self.sys_fchdir(fd),
+            LinuxSyscall::Mkdirat { .. } => self.sys_mkdirat(),
+            LinuxSyscall::Unlinkat { .. } => self.sys_unlinkat(),
             LinuxSyscall::Unknown { .. } => ENOSYS,
         }
     }
@@ -1788,6 +1905,61 @@ impl<B: SyscallBackend> Linuxulator<B> {
             written += n;
         }
         buflen as i64
+    }
+
+    /// Linux newfstatat(2): stat a file relative to a directory fd.
+    ///
+    /// Stub — returns ENOSYS until path resolution is implemented.
+    fn sys_newfstatat(
+        &mut self,
+        _dirfd: i32,
+        _pathname_ptr: usize,
+        _statbuf_ptr: usize,
+        _flags: i32,
+    ) -> i64 {
+        ENOSYS
+    }
+
+    /// Linux faccessat(2): check file permissions relative to a directory fd.
+    ///
+    /// Stub — returns ENOSYS until path resolution is implemented.
+    fn sys_faccessat(&mut self, _dirfd: i32, _pathname_ptr: usize, _mode: i32) -> i64 {
+        ENOSYS
+    }
+
+    /// Linux getdents64(2): read directory entries.
+    ///
+    /// Stub — returns ENOSYS until readdir is implemented.
+    fn sys_getdents64(&mut self, _fd: i32, _dirp: usize, _count: usize) -> i64 {
+        ENOSYS
+    }
+
+    /// Linux chdir(2): change working directory.
+    ///
+    /// Stub — returns ENOSYS until path resolution is implemented.
+    fn sys_chdir(&mut self, _pathname_ptr: usize) -> i64 {
+        ENOSYS
+    }
+
+    /// Linux fchdir(2): change working directory via fd.
+    ///
+    /// Stub — returns ENOSYS until cwd tracking is implemented.
+    fn sys_fchdir(&mut self, _fd: i32) -> i64 {
+        ENOSYS
+    }
+
+    /// Linux mkdirat(2): create a directory relative to a directory fd.
+    ///
+    /// Returns EROFS — the Linuxulator filesystem is read-only.
+    fn sys_mkdirat(&mut self) -> i64 {
+        EROFS
+    }
+
+    /// Linux unlinkat(2): remove a file relative to a directory fd.
+    ///
+    /// Returns EROFS — the Linuxulator filesystem is read-only.
+    fn sys_unlinkat(&mut self) -> i64 {
+        EROFS
     }
 
     /// Linux getcwd(2): get current working directory.
