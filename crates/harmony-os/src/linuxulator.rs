@@ -2055,7 +2055,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
             // Pack the entry into the buffer.
             let base = dirp + bytes_written;
             let mut rec = vec![0u8; reclen];
-            rec[0..8].copy_from_slice(&0u64.to_le_bytes()); // d_ino (placeholder)
+            let d_ino = (idx + 1) as u64; // non-zero placeholder; 0 means "deleted"
+            rec[0..8].copy_from_slice(&d_ino.to_le_bytes()); // d_ino
             let next_off = (idx + 1) as i64;
             rec[8..16].copy_from_slice(&next_off.to_le_bytes()); // d_off
             rec[16..18].copy_from_slice(&(reclen as u16).to_le_bytes()); // d_reclen
