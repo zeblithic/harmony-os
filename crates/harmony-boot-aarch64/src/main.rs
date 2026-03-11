@@ -383,7 +383,7 @@ fn main() -> Status {
 
         // Bare-metal identity-map backend for the ELF loader.
         //
-        // On QEMU virt with MMU identity mapping, all RAM is directly
+        // With the MMU identity map active, all RAM is directly
         // accessible at its physical address.  vm_mmap just returns the
         // requested address (no page table manipulation needed — the
         // identity map already covers it).  vm_write_bytes uses the

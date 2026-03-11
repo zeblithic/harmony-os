@@ -46,7 +46,9 @@ static mut EXIT_CODE: i32 = 0;
 static mut RETURN_ADDR: u64 = 0;
 /// Saved kernel stack pointer to restore on ELF exit.
 static mut RETURN_SP: u64 = 0;
-/// Saved kernel link register to restore on ELF exit.
+/// Saved kernel link register — passed through TrapFrame x2 on exit.
+/// Currently vestigial: the asm epilogue restores LR from the stack
+/// rather than from x2.  Kept for defensive completeness.
 static mut RETURN_LR: u64 = 0;
 
 /// Install the syscall dispatch function.

@@ -24,8 +24,9 @@ pub const UART_CLOCK_HZ: u32 = 24_000_000;
 #[cfg(feature = "rpi5")]
 pub const UART_CLOCK_HZ: u32 = 48_000_000;
 
-// RPi5-only peripherals
+// RPi5-only peripherals (reserved for future network driver)
 #[cfg(feature = "rpi5")]
+#[allow(dead_code)]
 pub const GENET_BASE: usize = 0xFD58_0000;
 
 #[cfg(test)]
