@@ -1,18 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! PL011 UART driver for QEMU `virt` machine (TX-only).
+//! PL011 UART driver (TX-only).
 //!
-//! The PL011 is mapped at physical address `0x0900_0000` on the QEMU aarch64
-//! `virt` platform. This driver initialises the UART at 115200 baud, 8N1, with
-//! FIFO enabled and provides a blocking `write_byte` function suitable for
-//! early boot serial output after ExitBootServices.
+//! This driver initialises the PL011 UART at 115200 baud, 8N1, with FIFO
+//! enabled and provides a blocking `write_byte` function suitable for early
+//! boot serial output after ExitBootServices. The base address and reference
+//! clock frequency are sourced from [`crate::platform`].
 
 // Register constants and flag bits are only referenced by the hardware access
 // functions, which are gated behind `cfg(target_arch = "aarch64")`.  Suppress
 // dead-code warnings on hosts where those functions are compiled out.
 #![cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 
-/// PL011 base address on QEMU aarch64 `virt`.
-const PL011_BASE: usize = 0x0900_0000;
+use crate::platform;
 
 // ── Register offsets ──────────────────────────────────────────────────
 const UARTDR: usize = 0x000; // Data register
@@ -34,30 +33,30 @@ pub use harmony_unikernel::drivers::pl011::baud_divisors;
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn write_reg(offset: usize, val: u32) {
-    let addr = (PL011_BASE + offset) as *mut u32;
+    let addr = (platform::PL011_BASE + offset) as *mut u32;
     core::ptr::write_volatile(addr, val);
 }
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn read_reg(offset: usize) -> u32 {
-    let addr = (PL011_BASE + offset) as *const u32;
+    let addr = (platform::PL011_BASE + offset) as *const u32;
     core::ptr::read_volatile(addr)
 }
 
 /// Initialise PL011 UART: 115200 baud, 8N1, FIFO enabled.
 ///
-/// Assumes a 24 MHz reference clock (QEMU `virt` default).
+/// The reference clock frequency is taken from [`platform::UART_CLOCK_HZ`].
 ///
 /// # Safety
 /// Must only be called after ExitBootServices on a platform with PL011
-/// mapped at `PL011_BASE`.
+/// mapped at [`platform::PL011_BASE`].
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn init() {
     // 1. Disable UART
     write_reg(UARTCR, 0);
 
-    // 2. Baud-rate divisors for 115200 at 24 MHz
-    let (ibrd, fbrd) = baud_divisors(24_000_000, 115_200);
+    // 2. Baud-rate divisors for 115200 baud
+    let (ibrd, fbrd) = baud_divisors(platform::UART_CLOCK_HZ, 115_200);
     write_reg(UARTIBRD, ibrd as u32);
     write_reg(UARTFBRD, fbrd as u32);
 
@@ -72,7 +71,7 @@ pub unsafe fn init() {
 ///
 /// # Safety
 /// Must only be called after [`init`] on a platform with PL011 mapped at
-/// `PL011_BASE`.
+/// [`platform::PL011_BASE`].
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn write_byte(byte: u8) {
     // Spin while TX FIFO is full

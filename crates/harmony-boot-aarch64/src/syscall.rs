@@ -41,6 +41,16 @@ static mut PROCESS_EXITED: bool = false;
 /// Exit code from the process.
 static mut EXIT_CODE: i32 = 0;
 
+/// Return address for the boot code after the ELF process exits.
+/// Set before jumping to the ELF entry point.
+static mut RETURN_ADDR: u64 = 0;
+/// Saved kernel stack pointer to restore on ELF exit.
+static mut RETURN_SP: u64 = 0;
+/// Saved kernel link register — passed through TrapFrame x2 on exit.
+/// Currently vestigial: the asm epilogue restores LR from the stack
+/// rather than from x2.  Kept for defensive completeness.
+static mut RETURN_LR: u64 = 0;
+
 /// Install the syscall dispatch function.
 ///
 /// # Safety
@@ -51,17 +61,49 @@ pub unsafe fn set_dispatch_fn(f: fn(LinuxSyscall) -> SyscallDispatchResult) {
 }
 
 /// Check if the process has exited.
-/// Used when loading and running ELF binaries (future bead).
+/// Currently unused — exit code is returned via the trampoline. Kept for
+/// future polling-based execution models.
 #[allow(dead_code)]
 pub fn process_exited() -> bool {
     unsafe { PROCESS_EXITED }
 }
 
 /// Get the exit code.
-/// Used when loading and running ELF binaries (future bead).
+/// Currently unused — exit code is returned via the trampoline.
 #[allow(dead_code)]
 pub fn exit_code() -> i32 {
     unsafe { EXIT_CODE }
+}
+
+/// Set the return context for process exit.
+///
+/// When exit_group fires, the SVC handler redirects ELR to `addr`,
+/// restores SP from `sp`, and LR from `lr` via the TrapFrame.
+///
+/// # Safety
+/// Must be called before the ELF entry point is invoked. `addr` must
+/// point to valid executable code, and `sp` must be a valid stack pointer.
+#[no_mangle]
+pub unsafe extern "C" fn set_return_context(addr: u64, sp: u64, lr: u64) {
+    RETURN_ADDR = addr;
+    RETURN_SP = sp;
+    RETURN_LR = lr;
+}
+
+/// Clear the return context after an ELF process exits.
+///
+/// Prevents stale `RETURN_ADDR` / `RETURN_SP` / `RETURN_LR` from
+/// redirecting a subsequent `exit_group` to an invalid stack frame.
+///
+/// # Safety
+/// Must be called after the ELF binary has exited and before any
+/// new ELF binary is loaded.
+pub unsafe fn reset_return_context() {
+    RETURN_ADDR = 0;
+    RETURN_SP = 0;
+    RETURN_LR = 0;
+    PROCESS_EXITED = false;
+    EXIT_CODE = 0;
 }
 
 /// Rust SVC handler — called from the exception vector table asm.
@@ -74,8 +116,7 @@ pub fn exit_code() -> i32 {
 pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
     let nr = frame.x[8];
     let args = [
-        frame.x[0], frame.x[1], frame.x[2],
-        frame.x[3], frame.x[4], frame.x[5],
+        frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
     ];
 
     let syscall = LinuxSyscall::from_aarch64(nr, args);
@@ -85,7 +126,17 @@ pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
         if result.exited {
             PROCESS_EXITED = true;
             EXIT_CODE = result.exit_code;
-            // Halt — do not return to the binary.
+            if RETURN_ADDR != 0 {
+                // Redirect eret to the boot code's return point.
+                // The vector table restore sequence loads these from the
+                // TrapFrame before eret, so the binary never resumes.
+                frame.elr = RETURN_ADDR;
+                frame.x[0] = result.exit_code as u64;
+                frame.x[1] = RETURN_SP;
+                frame.x[2] = RETURN_LR;
+                return;
+            }
+            // Fallback: halt if no return address was set.
             loop {
                 core::arch::asm!("wfe");
             }

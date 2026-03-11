@@ -51,6 +51,7 @@ pub unsafe fn init() {
 core::arch::global_asm!(
     // ── Vector table ────────────────────────────────────────────
     ".balign 2048",
+    ".globl vector_table",
     "vector_table:",
 
     // 0x000 — Current EL, SP_EL0, Synchronous (unused)
