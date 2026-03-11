@@ -13,6 +13,8 @@ mod pl011;
 mod rndr;
 mod timer;
 
+mod platform;
+
 mod syscall;
 mod vectors;
 
