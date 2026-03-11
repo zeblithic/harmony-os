@@ -563,6 +563,10 @@ pub struct MockBackend {
     file_content: BTreeMap<Fid, Vec<u8>>,
     /// Directory entries keyed by fid, for readdir testing.
     pub readdir_entries: BTreeMap<Fid, Vec<DirEntry>>,
+    /// Paths that are directories (for stat to return FileType::Directory).
+    pub directory_paths: alloc::collections::BTreeSet<alloc::string::String>,
+    /// Fids that represent directories.
+    pub directory_fids: alloc::collections::BTreeSet<Fid>,
 }
 
 #[cfg(test)]
@@ -577,6 +581,8 @@ impl MockBackend {
             stats: Vec::new(),
             file_content: BTreeMap::new(),
             readdir_entries: BTreeMap::new(),
+            directory_paths: alloc::collections::BTreeSet::new(),
+            directory_fids: alloc::collections::BTreeSet::new(),
         }
     }
 
@@ -647,6 +653,9 @@ impl SyscallBackend for MockBackend {
     fn walk(&mut self, path: &str, new_fid: Fid) -> Result<QPath, IpcError> {
         self.walks
             .push((alloc::string::String::from(path), new_fid));
+        if self.directory_paths.contains(path) {
+            self.directory_fids.insert(new_fid);
+        }
         Ok(0)
     }
 
@@ -679,11 +688,16 @@ impl SyscallBackend for MockBackend {
 
     fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
         self.stats.push(fid);
+        let file_type = if self.directory_fids.contains(&fid) {
+            FileType::Directory
+        } else {
+            FileType::Regular
+        };
         Ok(FileStat {
             qpath: 0,
             name: alloc::sync::Arc::from("mock"),
             size: 0,
-            file_type: FileType::Regular,
+            file_type,
         })
     }
 
@@ -2084,16 +2098,72 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux chdir(2): change working directory.
     ///
-    /// Stub — returns ENOSYS until path resolution is implemented.
-    fn sys_chdir(&mut self, _pathname_ptr: usize) -> i64 {
-        ENOSYS
+    /// Walks the path, verifies it's a directory via stat, then
+    /// updates `self.cwd`. Clunks the old cwd fid if set.
+    fn sys_chdir(&mut self, pathname_ptr: usize) -> i64 {
+        let path = unsafe { read_c_string(pathname_ptr) };
+        let resolved = self.resolve_path(&path);
+
+        let fid = self.alloc_fid();
+        if let Err(e) = self.backend.walk(&resolved, fid) {
+            return ipc_err_to_errno(e);
+        }
+
+        // Verify it's a directory
+        match self.backend.stat(fid) {
+            Ok(stat) if stat.file_type == FileType::Directory => {}
+            Ok(_) => {
+                let _ = self.backend.clunk(fid);
+                return ENOTDIR;
+            }
+            Err(e) => {
+                let _ = self.backend.clunk(fid);
+                return ipc_err_to_errno(e);
+            }
+        }
+
+        // Clunk old cwd fid
+        if let Some(old_fid) = self.cwd_fid {
+            let _ = self.backend.clunk(old_fid);
+        }
+
+        self.cwd = resolved;
+        self.cwd_fid = Some(fid);
+        0
     }
 
-    /// Linux fchdir(2): change working directory via fd.
-    ///
-    /// Stub — returns ENOSYS until cwd tracking is implemented.
-    fn sys_fchdir(&mut self, _fd: i32) -> i64 {
-        ENOSYS
+    /// Linux fchdir(2): change working directory to an open fd.
+    fn sys_fchdir(&mut self, fd: i32) -> i64 {
+        let entry = match self.fd_table.get(&fd) {
+            Some(e) => e.clone(),
+            None => return EBADF,
+        };
+
+        let path = match &entry.path {
+            Some(p) => p.clone(),
+            None => return EBADF, // stdio fds have no path
+        };
+
+        // Verify it's a directory
+        match self.backend.stat(entry.fid) {
+            Ok(stat) if stat.file_type == FileType::Directory => {}
+            Ok(_) => return ENOTDIR,
+            Err(e) => return ipc_err_to_errno(e),
+        }
+
+        // Walk a new fid for cwd (the fd's fid stays with the fd table)
+        let cwd_fid = self.alloc_fid();
+        if let Err(e) = self.backend.walk(&path, cwd_fid) {
+            return ipc_err_to_errno(e);
+        }
+
+        if let Some(old_fid) = self.cwd_fid {
+            let _ = self.backend.clunk(old_fid);
+        }
+
+        self.cwd = path;
+        self.cwd_fid = Some(cwd_fid);
+        0
     }
 
     /// Linux mkdirat(2): create a directory relative to a directory fd.
@@ -2134,10 +2204,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux readlink(2): read the value of a symbolic link.
     ///
-    /// Returns ENOSYS — ld-musl has fallbacks for /proc/self/exe and
-    /// similar paths.
+    /// Returns EINVAL — no symlinks in the 9P namespace.
     fn sys_readlink(&self, _pathname: u64, _buf: u64, _bufsiz: u64) -> i64 {
-        ENOSYS
+        EINVAL // No symlinks in the 9P namespace
     }
 }
 
@@ -3139,7 +3208,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn sys_readlink_returns_enosys() {
+    fn sys_readlink_returns_einval() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
 
@@ -3150,7 +3219,7 @@ mod tests {
             89,
             [path.as_ptr() as u64, buf.as_mut_ptr() as u64, 128, 0, 0, 0],
         );
-        assert_eq!(result, ENOSYS);
+        assert_eq!(result, EINVAL);
     }
 
     // ── sys_newfstatat tests ─────────────────────────────────────────
@@ -4131,5 +4200,86 @@ mod integration_tests {
             count: 512,
         });
         assert_eq!(ret, 0, "empty directory should return 0");
+    }
+
+    // ── sys_chdir tests ───────────────────────────────────────────
+
+    #[test]
+    fn sys_chdir_updates_cwd() {
+        let mut mock = MockBackend::new();
+        mock.directory_paths
+            .insert(alloc::string::String::from("/nix/store"));
+        let mut lx = Linuxulator::new(mock);
+        let path = b"/nix/store\0";
+        let ret = lx.dispatch_syscall(LinuxSyscall::Chdir {
+            pathname: path.as_ptr() as u64,
+        });
+        assert_eq!(ret, 0);
+        // Verify getcwd returns updated path
+        let mut buf = [0u8; 64];
+        let ret = lx.dispatch_syscall(LinuxSyscall::Getcwd {
+            buf: buf.as_mut_ptr() as u64,
+            size: 64,
+        });
+        assert_eq!(ret, 11); // "/nix/store\0"
+        assert_eq!(&buf[..11], b"/nix/store\0");
+    }
+
+    // ── sys_fchdir tests ──────────────────────────────────────────
+
+    #[test]
+    fn sys_fchdir_from_open_fd() {
+        let mut mock = MockBackend::new();
+        mock.directory_paths
+            .insert(alloc::string::String::from("/nix/store"));
+        let mut lx = Linuxulator::new(mock);
+        // Open a directory
+        let path = b"/nix/store\0";
+        let fd = lx.dispatch_syscall(LinuxSyscall::Openat {
+            dirfd: -100,
+            pathname: path.as_ptr() as u64,
+            flags: 0,
+        });
+        assert!(fd >= 0);
+        let ret = lx.dispatch_syscall(LinuxSyscall::Fchdir { fd: fd as i32 });
+        assert_eq!(ret, 0);
+        // getcwd should reflect the change
+        let mut buf = [0u8; 64];
+        let ret = lx.dispatch_syscall(LinuxSyscall::Getcwd {
+            buf: buf.as_mut_ptr() as u64,
+            size: 64,
+        });
+        assert_eq!(&buf[..11], b"/nix/store\0");
+    }
+
+    // ── sys_readlinkat tests (dispatch_syscall) ───────────────────
+
+    #[test]
+    fn sys_readlinkat_returns_einval() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let path = b"/some/link\0";
+        let mut buf = [0u8; 64];
+        let ret = lx.dispatch_syscall(LinuxSyscall::Readlink {
+            pathname: path.as_ptr() as u64,
+            buf: buf.as_mut_ptr() as u64,
+            bufsiz: 64,
+        });
+        assert_eq!(ret, -22); // EINVAL
+    }
+
+    // ── sys_mkdirat tests ─────────────────────────────────────────
+
+    #[test]
+    fn sys_mkdirat_returns_erofs() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let path = b"/tmp/newdir\0";
+        let ret = lx.dispatch_syscall(LinuxSyscall::Mkdirat {
+            dirfd: -100,
+            pathname: path.as_ptr() as u64,
+            mode: 0o755,
+        });
+        assert_eq!(ret, -30); // EROFS
     }
 }
