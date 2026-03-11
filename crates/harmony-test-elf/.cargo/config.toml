@@ -3,4 +3,4 @@
 # -C link-self-contained=no: skip musl's crt1.o (we provide our own _start).
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"
-rustflags = ["-C", "linker-flavor=ld.lld", "-C", "link-self-contained=no"]
+rustflags = ["-C", "linker-flavor=ld.lld", "-C", "link-self-contained=no", "-C", "link-arg=--image-base=0x4A000000"]

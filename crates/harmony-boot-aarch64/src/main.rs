@@ -24,6 +24,8 @@ use linked_list_allocator::LockedHeap;
 #[cfg(target_os = "uefi")]
 use core::fmt::Write;
 #[cfg(target_os = "uefi")]
+use uefi::mem::memory_map::MemoryMap as _;
+#[cfg(target_os = "uefi")]
 use uefi::prelude::*;
 
 #[cfg(not(test))]
@@ -304,7 +306,7 @@ fn main() -> Status {
             }
             fn write(
                 &mut self,
-                fid: harmony_microkernel::Fid,
+                _fid: harmony_microkernel::Fid,
                 _offset: u64,
                 data: &[u8],
             ) -> Result<u32, harmony_microkernel::IpcError> {
@@ -488,6 +490,29 @@ fn main() -> Status {
                     "[ELF] Stack: base={:#x} top={:#x}",
                     stack_base, stack_top,
                 );
+
+                // Flush instruction cache for the loaded ELF text segment.
+                // The ELF data was written via store instructions (D-cache) but
+                // will be fetched via I-cache.  Without explicit cache maintenance,
+                // the I-cache may hold stale (zero) data from before the write.
+                unsafe {
+                    // Cover the full ELF load range (rodata + text).
+                    // Round to 128 KiB to be safe regardless of segment layout.
+                    let start = load_result.entry_point & !0xFFFF; // page-align down
+                    let end = start + 0x20000; // 128 KiB
+                    let mut addr = start;
+                    while addr < end {
+                        core::arch::asm!("dc cvau, {}", in(reg) addr);
+                        addr += 64;
+                    }
+                    core::arch::asm!("dsb ish");
+                    addr = start;
+                    while addr < end {
+                        core::arch::asm!("ic ivau, {}", in(reg) addr);
+                        addr += 64;
+                    }
+                    core::arch::asm!("dsb ish", "isb");
+                }
 
                 let _ = writeln!(serial, "[ELF] Jumping to entry point...");
 

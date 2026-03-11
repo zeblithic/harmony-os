@@ -9,6 +9,9 @@ repository = "https://github.com/zeblithic/harmony-os"
 
 # Excluded from workspace — bare-metal target requires independent feature resolution
 # to avoid std feature unification with host-target workspace members.
+# Empty [workspace] table prevents Cargo from searching parent directories
+# for a workspace root (needed when building from git worktrees).
+[workspace]
 
 [dependencies]
 linked_list_allocator = "0.10"
