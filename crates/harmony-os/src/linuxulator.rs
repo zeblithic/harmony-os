@@ -34,6 +34,10 @@ const EOVERFLOW: i64 = -75;
 const CLOCK_REALTIME: i32 = 0;
 const CLOCK_MONOTONIC: i32 = 1;
 
+// File descriptor flags
+const FD_CLOEXEC: u32 = 1;
+const O_CLOEXEC: i32 = 0o2000000;
+
 fn ipc_err_to_errno(e: IpcError) -> i64 {
     match e {
         IpcError::NotFound => ENOENT,
@@ -1185,6 +1189,9 @@ pub struct Linuxulator<B: SyscallBackend> {
     /// Monotonic clock counter in nanoseconds. Incremented by 1_000_000
     /// (1 ms) on each `clock_gettime` call.
     monotonic_ns: u64,
+    /// Reference counts for 9P fids shared across multiple fd_table entries
+    /// (via dup/dup2/dup3). A fid is only clunked when its refcount reaches 0.
+    fid_refcount: BTreeMap<Fid, u32>,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -1207,6 +1214,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             getrandom_counter: 0,
             cwd: alloc::string::String::from("/"),
             monotonic_ns: 0,
+            fid_refcount: BTreeMap::new(),
         }
     }
 
@@ -1284,6 +1292,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 flags: 0,
             },
         );
+        self.fid_refcount.insert(stdin_fid, 1);
 
         // stdout (fd 1) — write mode
         let stdout_fid = self.alloc_fid();
@@ -1299,6 +1308,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 flags: 0,
             },
         );
+        self.fid_refcount.insert(stdout_fid, 1);
 
         // stderr (fd 2) — write mode
         let stderr_fid = self.alloc_fid();
@@ -1314,6 +1324,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 flags: 0,
             },
         );
+        self.fid_refcount.insert(stderr_fid, 1);
 
         Ok(())
     }
@@ -1546,7 +1557,15 @@ impl<B: SyscallBackend> Linuxulator<B> {
             Some(e) => e,
             None => return EBADF,
         };
-        let _ = self.backend.clunk(entry.fid);
+        let rc = self
+            .fid_refcount
+            .get_mut(&entry.fid)
+            .expect("refcount missing");
+        *rc -= 1;
+        if *rc == 0 {
+            self.fid_refcount.remove(&entry.fid);
+            let _ = self.backend.clunk(entry.fid);
+        }
         0
     }
 
@@ -1570,7 +1589,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             },
             F_SETFD => match self.fd_table.get_mut(&fd) {
                 Some(entry) => {
-                    entry.flags = arg as u32;
+                    entry.flags = (arg as u32) & FD_CLOEXEC;
                     0
                 }
                 None => EBADF,
@@ -1608,8 +1627,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
             file_type: entry.file_type,
             flags: 0,
         };
+        let fid = new_entry.fid;
         let newfd = self.alloc_fd();
         self.fd_table.insert(newfd, new_entry);
+        *self.fid_refcount.get_mut(&fid).expect("refcount missing") += 1;
         newfd as i64
     }
 
@@ -1624,9 +1645,17 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if oldfd == newfd {
             return newfd as i64;
         }
-        // Close newfd if it's open
+        // Close newfd if it's open (with refcount-aware clunk)
         if let Some(existing) = self.fd_table.remove(&newfd) {
-            let _ = self.backend.clunk(existing.fid);
+            let rc = self
+                .fid_refcount
+                .get_mut(&existing.fid)
+                .expect("refcount missing");
+            *rc -= 1;
+            if *rc == 0 {
+                self.fid_refcount.remove(&existing.fid);
+                let _ = self.backend.clunk(existing.fid);
+            }
         }
         let entry = self.fd_table.get(&oldfd).unwrap();
         let new_entry = FdEntry {
@@ -1636,7 +1665,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
             file_type: entry.file_type,
             flags: 0,
         };
+        let fid = new_entry.fid;
         self.fd_table.insert(newfd, new_entry);
+        *self.fid_refcount.get_mut(&fid).expect("refcount missing") += 1;
         newfd as i64
     }
 
@@ -1647,9 +1678,6 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// - Accepts O_CLOEXEC flag to set FD_CLOEXEC on the new fd
     /// - Returns EINVAL for any flags other than O_CLOEXEC
     fn sys_dup3(&mut self, oldfd: i32, newfd: i32, flags: i32) -> i64 {
-        const O_CLOEXEC: i32 = 0o2000000;
-        const FD_CLOEXEC: u32 = 1;
-
         if oldfd == newfd {
             return EINVAL;
         }
@@ -1660,9 +1688,17 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if !self.fd_table.contains_key(&oldfd) {
             return EBADF;
         }
-        // Close newfd if it's open
+        // Close newfd if it's open (with refcount-aware clunk)
         if let Some(existing) = self.fd_table.remove(&newfd) {
-            let _ = self.backend.clunk(existing.fid);
+            let rc = self
+                .fid_refcount
+                .get_mut(&existing.fid)
+                .expect("refcount missing");
+            *rc -= 1;
+            if *rc == 0 {
+                self.fid_refcount.remove(&existing.fid);
+                let _ = self.backend.clunk(existing.fid);
+            }
         }
         let entry = self.fd_table.get(&oldfd).unwrap();
         let fd_flags = if flags & O_CLOEXEC != 0 {
@@ -1677,7 +1713,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
             file_type: entry.file_type,
             flags: fd_flags,
         };
+        let fid = new_entry.fid;
         self.fd_table.insert(newfd, new_entry);
+        *self.fid_refcount.get_mut(&fid).expect("refcount missing") += 1;
         newfd as i64
     }
 
@@ -1747,6 +1785,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 flags: 0,
             },
         );
+        self.fid_refcount.insert(fid, 1);
         fd as i64
     }
 
@@ -2487,9 +2526,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
             // rec is already zeroed (NUL terminator included)
             let d_ino = (idx + 1) as u64; // non-zero placeholder; 0 means "deleted"
             rec[0..8].copy_from_slice(&d_ino.to_le_bytes()); // d_ino
-                                                             // d_off: entry index used as seek position (Linuxulator-internal
-                                                             // convention — not a byte offset, but consistent with how
-                                                             // FdEntry.offset tracks pagination via lseek).
+
+            // d_off: entry index used as seek position (Linuxulator-internal
+            // convention — not a byte offset, but consistent with how
+            // FdEntry.offset tracks pagination via lseek).
             let next_off = (idx + 1) as i64;
             rec[8..16].copy_from_slice(&next_off.to_le_bytes()); // d_off
             rec[16..18].copy_from_slice(&(reclen as u16).to_le_bytes()); // d_reclen
@@ -5991,6 +6031,117 @@ mod integration_tests {
         // dup should reuse fd 1 (lowest available)
         let result = lx.dispatch_syscall(LinuxSyscall::Dup { oldfd: 0 });
         assert_eq!(result, 1);
+    }
+
+    // ── dup refcount tests ───────────────────────────────────────────
+
+    #[test]
+    fn sys_dup_close_original_does_not_clunk() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        // Open a file to get fd 3 with a unique fid
+        let path = b"/dev/serial/log\0";
+        let fd = lx.dispatch_syscall(LinuxSyscall::Openat {
+            dirfd: -100,
+            pathname: path.as_ptr() as u64,
+            flags: 0,
+        }) as i32;
+        assert_eq!(fd, 3);
+        let fid = lx.fd_table.get(&fd).unwrap().fid;
+
+        // dup fd 3 → fd 4
+        let dup_fd = lx.dispatch_syscall(LinuxSyscall::Dup { oldfd: fd });
+        assert_eq!(dup_fd, 4);
+
+        // Close the original fd 3
+        lx.dispatch_syscall(LinuxSyscall::Close { fd });
+
+        // The fid should NOT have been clunked — the dup still holds it
+        assert!(
+            !lx.backend().clunks.contains(&fid),
+            "closing original fd should not clunk fid when dup still holds it"
+        );
+    }
+
+    #[test]
+    fn sys_dup_close_both_clunks_once() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        // Open a file to get fd 3
+        let path = b"/dev/serial/log\0";
+        let fd = lx.dispatch_syscall(LinuxSyscall::Openat {
+            dirfd: -100,
+            pathname: path.as_ptr() as u64,
+            flags: 0,
+        }) as i32;
+        assert_eq!(fd, 3);
+        let fid = lx.fd_table.get(&fd).unwrap().fid;
+
+        // dup fd 3 → fd 4
+        let dup_fd = lx.dispatch_syscall(LinuxSyscall::Dup { oldfd: fd }) as i32;
+        assert_eq!(dup_fd, 4);
+
+        // Close the dup first
+        lx.dispatch_syscall(LinuxSyscall::Close { fd: dup_fd });
+        assert!(
+            !lx.backend().clunks.contains(&fid),
+            "closing first copy should not clunk yet"
+        );
+
+        // Close the original
+        lx.dispatch_syscall(LinuxSyscall::Close { fd });
+        // Now the fid should be clunked exactly once
+        let clunk_count = lx.backend().clunks.iter().filter(|&&f| f == fid).count();
+        assert_eq!(
+            clunk_count, 1,
+            "fid should be clunked exactly once after both fds are closed"
+        );
+    }
+
+    #[test]
+    fn sys_dup2_replace_decrements_refcount() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.init_stdio().unwrap();
+        // Open a file to get fd 3 with fid_a
+        let path = b"/dev/serial/log\0";
+        let fd = lx.dispatch_syscall(LinuxSyscall::Openat {
+            dirfd: -100,
+            pathname: path.as_ptr() as u64,
+            flags: 0,
+        }) as i32;
+        assert_eq!(fd, 3);
+        let fid_a = lx.fd_table.get(&fd).unwrap().fid;
+
+        // dup fd 3 → fd 10 (fid_a refcount: 1 → 2)
+        lx.dispatch_syscall(LinuxSyscall::Dup2 {
+            oldfd: fd,
+            newfd: 10,
+        });
+        assert_eq!(lx.fd_table.get(&10).unwrap().fid, fid_a);
+
+        // dup2 fd 3 → fd 10 again (replaces the previous dup)
+        // The replaced fd 10's fid_a refcount should decrement (2 → 1)
+        // then re-increment for the new share (1 → 2). Net: still 2.
+        lx.dispatch_syscall(LinuxSyscall::Dup2 {
+            oldfd: fd,
+            newfd: 10,
+        });
+
+        // fid_a should NOT have been clunked (refcount never hit 0)
+        assert!(
+            !lx.backend().clunks.contains(&fid_a),
+            "replacing a dup with same fid should not clunk"
+        );
+
+        // Close fd 10, then fd 3 — fid_a should be clunked exactly once
+        lx.dispatch_syscall(LinuxSyscall::Close { fd: 10 });
+        assert!(
+            !lx.backend().clunks.contains(&fid_a),
+            "one reference still open"
+        );
+        lx.dispatch_syscall(LinuxSyscall::Close { fd });
+        let clunk_count = lx.backend().clunks.iter().filter(|&&f| f == fid_a).count();
+        assert_eq!(clunk_count, 1, "fid_a clunked exactly once");
     }
 
     // ── dup2 tests ──────────────────────────────────────────────────
