@@ -5,6 +5,8 @@
 //! All drivers use the [`RegisterBank`] trait for MMIO access,
 //! enabling full unit testing without hardware.
 
+pub mod dwc_usb;
+pub mod genet;
 pub mod gpio;
 pub mod pl011;
 pub mod register_bank;
