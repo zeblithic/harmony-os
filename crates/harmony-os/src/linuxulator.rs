@@ -554,7 +554,7 @@ pub trait SyscallBackend {
     /// Default implementation returns `NotSupported` — backends that
     /// expose a real filesystem override this.
     fn readdir(&mut self, _fid: Fid) -> Result<Vec<DirEntry>, IpcError> {
-        Err(IpcError::NotSupported)
+        Err(IpcError::NotDirectory)
     }
 }
 
@@ -720,7 +720,7 @@ impl SyscallBackend for MockBackend {
         self.readdir_entries
             .get(&fid)
             .cloned()
-            .ok_or(IpcError::NotSupported)
+            .ok_or(IpcError::NotDirectory)
     }
 }
 
@@ -2011,17 +2011,22 @@ impl<B: SyscallBackend> Linuxulator<B> {
         const AT_FDCWD: i32 = -100;
         const AT_EMPTY_PATH: i32 = 0x1000;
 
-        // AT_EMPTY_PATH: stat the fd itself (like fstat)
-        if flags & AT_EMPTY_PATH != 0 {
-            return self.sys_fstat(dirfd, statbuf_ptr);
-        }
-
         if pathname_ptr == 0 {
+            // AT_EMPTY_PATH with NULL pathname is valid (stat the fd)
+            if flags & AT_EMPTY_PATH != 0 {
+                return self.sys_fstat(dirfd, statbuf_ptr);
+            }
             return EFAULT;
         }
         let path = unsafe { read_c_string(pathname_ptr) };
+
+        // AT_EMPTY_PATH only triggers fd-stat when pathname is actually empty.
+        // Non-empty pathname is resolved normally even with the flag set.
         if path.is_empty() {
-            return EINVAL;
+            if flags & AT_EMPTY_PATH != 0 {
+                return self.sys_fstat(dirfd, statbuf_ptr);
+            }
+            return ENOENT;
         }
 
         let resolved = if dirfd == AT_FDCWD || path.starts_with('/') {
@@ -2197,17 +2202,18 @@ impl<B: SyscallBackend> Linuxulator<B> {
             None => return EBADF,
         };
 
-        let path = match &entry.path {
-            Some(p) => p.clone(),
-            None => return EBADF, // stdio fds have no path
-        };
-
-        // Verify it's a directory
+        // Verify it's a directory before checking path — a valid non-directory
+        // fd (e.g. stdio) should return ENOTDIR, not EBADF.
         match self.backend.stat(entry.fid) {
             Ok(stat) if stat.file_type == FileType::Directory => {}
             Ok(_) => return ENOTDIR,
             Err(e) => return ipc_err_to_errno(e),
         }
+
+        let path = match &entry.path {
+            Some(p) => p.clone(),
+            None => return EBADF, // fd is a directory but has no tracked path
+        };
 
         // Walk a new fid for cwd (the fd's fid stays with the fd table)
         let cwd_fid = self.alloc_fid();
@@ -3361,6 +3367,28 @@ mod tests {
     }
 
     #[test]
+    fn sys_newfstatat_at_empty_path_with_nonempty_pathname_resolves_path() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        #[cfg(target_arch = "x86_64")]
+        let mut statbuf = [0u8; 144];
+        #[cfg(not(target_arch = "x86_64"))]
+        let mut statbuf = [0u8; 128];
+        let path = b"/dev/serial/log\0";
+        let at_empty_path: i32 = 0x1000;
+        // AT_EMPTY_PATH with a non-empty path should resolve the path normally
+        let ret = lx.dispatch_syscall(LinuxSyscall::Newfstatat {
+            dirfd: -100,
+            pathname: path.as_ptr() as u64,
+            statbuf: statbuf.as_mut_ptr() as u64,
+            flags: at_empty_path,
+        });
+        assert_eq!(ret, 0);
+        // Verify the walk was called with the path (not an fstat on dirfd)
+        assert_eq!(lx.backend().walks[0].0, "/dev/serial/log");
+    }
+
+    #[test]
     fn sys_newfstatat_null_pathname_without_at_empty_path() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
@@ -4366,6 +4394,21 @@ mod integration_tests {
         assert_eq!(ret, 0, "empty directory should return 0");
     }
 
+    #[test]
+    fn sys_getdents64_non_directory_returns_enotdir() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+        // getdents64 on stdout (fd 1) — a regular file, not a directory
+        let mut buf = [0u8; 256];
+        let ret = lx.dispatch_syscall(LinuxSyscall::Getdents64 {
+            fd: 1,
+            dirp: buf.as_mut_ptr() as u64,
+            count: 256,
+        });
+        assert_eq!(ret, ENOTDIR);
+    }
+
     // ── sys_chdir tests ───────────────────────────────────────────
 
     #[test]
@@ -4425,6 +4468,16 @@ mod integration_tests {
             size: 64,
         });
         assert_eq!(&buf[..11], b"/nix/store\0");
+    }
+
+    #[test]
+    fn sys_fchdir_stdio_returns_enotdir() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+        // fchdir(1) on stdout — valid fd but not a directory
+        let ret = lx.dispatch_syscall(LinuxSyscall::Fchdir { fd: 1 });
+        assert_eq!(ret, ENOTDIR);
     }
 
     // ── sys_readlinkat tests (dispatch_syscall) ───────────────────
