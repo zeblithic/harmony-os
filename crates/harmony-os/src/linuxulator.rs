@@ -1013,6 +1013,8 @@ struct FdEntry {
     fid: Fid,
     offset: u64,
     path: Option<alloc::string::String>,
+    /// Cached file type — avoids IPC stat on every lseek.
+    file_type: FileType,
 }
 
 /// Linux syscall-to-9P translation engine.
@@ -1134,6 +1136,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 fid: stdin_fid,
                 offset: 0,
                 path: None,
+                file_type: FileType::CharDev,
             },
         );
 
@@ -1147,6 +1150,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 fid: stdout_fid,
                 offset: 0,
                 path: None,
+                file_type: FileType::CharDev,
             },
         );
 
@@ -1160,6 +1164,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 fid: stderr_fid,
                 offset: 0,
                 path: None,
+                file_type: FileType::CharDev,
             },
         );
 
@@ -1420,6 +1425,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return ipc_err_to_errno(e);
         }
 
+        // Cache file type at open time to avoid IPC on every lseek.
+        let file_type = match self.backend.stat(fid) {
+            Ok(s) => s.file_type,
+            Err(_) => FileType::Regular, // best-effort default
+        };
+
         let fd = self.alloc_fd();
         self.fd_table.insert(
             fd,
@@ -1427,6 +1438,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 fid,
                 offset: 0,
                 path: Some(path),
+                file_type,
             },
         );
         fd as i64
@@ -1900,19 +1912,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
         const SEEK_CUR: i32 = 1;
         const SEEK_END: i32 = 2;
 
-        let (entry_fid, entry_offset) = match self.fd_table.get(&fd) {
-            Some(e) => (e.fid, e.offset),
+        let (entry_fid, entry_offset, entry_file_type) = match self.fd_table.get(&fd) {
+            Some(e) => (e.fid, e.offset, e.file_type),
             None => return EBADF,
         };
 
-        // Single stat call: checks chardev and provides size for SEEK_END.
-        let stat = match self.backend.stat(entry_fid) {
-            Ok(s) => s,
-            Err(e) => return ipc_err_to_errno(e),
-        };
-
         // Character devices (stdin/stdout/stderr) are not seekable.
-        if stat.file_type == FileType::CharDev {
+        // Uses cached file_type from FdEntry — no IPC needed.
+        if entry_file_type == FileType::CharDev {
             return ESPIPE;
         }
 
@@ -1923,6 +1930,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 None => return EOVERFLOW,
             },
             SEEK_END => {
+                // SEEK_END needs the current file size — stat required.
+                let stat = match self.backend.stat(entry_fid) {
+                    Ok(s) => s,
+                    Err(e) => return ipc_err_to_errno(e),
+                };
                 // Guard against files larger than i64::MAX — the
                 // `as i64` cast would wrap to negative.
                 if stat.size > i64::MAX as u64 {
@@ -4468,6 +4480,7 @@ mod integration_tests {
                 fid: dir_fid,
                 offset: 0,
                 path: Some(alloc::string::String::from("/test")),
+                file_type: FileType::Directory,
             },
         );
 
@@ -4511,6 +4524,7 @@ mod integration_tests {
                 fid: dir_fid,
                 offset: 0,
                 path: Some(alloc::string::String::from("/empty")),
+                file_type: FileType::Directory,
             },
         );
 
