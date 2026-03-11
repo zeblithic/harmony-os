@@ -58,6 +58,13 @@ fn vm_err_to_errno(e: VmError) -> i64 {
     }
 }
 
+/// Directory entry returned by [`SyscallBackend::readdir`].
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    pub name: alloc::string::String,
+    pub file_type: FileType,
+}
+
 // ── LinuxSyscall — CPU-agnostic syscall representation ──────────
 
 /// CPU-agnostic Linux syscall. Each architecture maps its native
@@ -426,6 +433,14 @@ pub trait SyscallBackend {
                 core::ptr::copy_nonoverlapping(data.as_ptr(), addr as usize as *mut u8, data.len());
             }
         }
+    }
+
+    /// List directory entries for the given fid.
+    ///
+    /// Default implementation returns `NotSupported` — backends that
+    /// expose a real filesystem override this.
+    fn readdir(&mut self, _fid: Fid) -> Result<Vec<DirEntry>, IpcError> {
+        Err(IpcError::NotSupported)
     }
 }
 
