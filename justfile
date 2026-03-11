@@ -156,10 +156,60 @@ test-mesh: build
 clippy:
     cargo clippy --workspace
     cd crates/harmony-boot && cargo clippy --target x86_64-unknown-none
+    cd crates/harmony-boot-aarch64 && cargo clippy --target aarch64-unknown-uefi --features qemu-virt --no-default-features
 
 # Format check
 fmt-check:
     cargo fmt --all -- --check
+
+# ── aarch64 recipes ──────────────────────────────────────────────
+
+# Build aarch64 kernel for QEMU virt (default feature)
+build-aarch64:
+    cd crates/harmony-boot-aarch64 && cargo build --target aarch64-unknown-uefi --release
+
+# Build aarch64 kernel for RPi5
+build-rpi5:
+    cd crates/harmony-boot-aarch64 && cargo build --target aarch64-unknown-uefi --release --features rpi5 --no-default-features
+
+# Cross-compile test ELF for Linuxulator validation
+build-test-elf:
+    cd crates/harmony-test-elf && cargo build --target aarch64-unknown-linux-musl --release
+
+# Build complete RPi5 SD card image (firmware + kernel + test ELF)
+build-rpi5-image: build-test-elf
+    bash scripts/build-rpi5-image.sh
+
+# QEMU aarch64 boot test — verifies Phase 1-3 output
+test-qemu-aarch64: build-test-elf build-aarch64
+    #!/usr/bin/env bash
+    set -uo pipefail
+    echo "Booting QEMU aarch64 and checking for Linuxulator output..."
+    LOG=$(mktemp)
+    trap "rm -f $LOG" EXIT
+    timeout 15 qemu-system-aarch64 \
+        -machine virt \
+        -cpu max \
+        -m 256M \
+        -nographic \
+        -bios target/aarch64-unknown-uefi/release/harmony-boot-aarch64.efi \
+        2>/dev/null | tee "$LOG"
+    EXIT=${PIPESTATUS[0]}
+    echo ""
+    if grep -q '\[LINUXULATOR\] All tests passed' "$LOG"; then
+        echo "QEMU aarch64 boot test: PASSED"
+        exit 0
+    fi
+    if grep -q '\[Identity\]' "$LOG"; then
+        echo "QEMU aarch64 boot test: PARTIAL (identity OK, Linuxulator incomplete)"
+        exit 1
+    fi
+    echo "QEMU aarch64 boot test: FAILED (no expected output)"
+    exit 1
+
+# Lint aarch64 crates (in addition to workspace)
+clippy-aarch64:
+    cd crates/harmony-boot-aarch64 && cargo clippy --target aarch64-unknown-uefi --features qemu-virt --no-default-features
 
 # Full quality gate (host-side only, no QEMU)
 check: test clippy fmt-check
