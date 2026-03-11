@@ -30,6 +30,10 @@ const ERANGE: i64 = -34;
 const ENOSYS: i64 = -38;
 const EOVERFLOW: i64 = -75;
 
+// Clock IDs (shared by clock_gettime and clock_getres)
+const CLOCK_REALTIME: i32 = 0;
+const CLOCK_MONOTONIC: i32 = 1;
+
 fn ipc_err_to_errno(e: IpcError) -> i64 {
     match e {
         IpcError::NotFound => ENOENT,
@@ -302,12 +306,8 @@ impl LinuxSyscall {
                 buf: args[0],
                 size: args[1],
             },
-            80 => LinuxSyscall::Chdir {
-                pathname: args[0],
-            },
-            81 => LinuxSyscall::Fchdir {
-                fd: args[0] as i32,
-            },
+            80 => LinuxSyscall::Chdir { pathname: args[0] },
+            81 => LinuxSyscall::Fchdir { fd: args[0] as i32 },
             89 => LinuxSyscall::Readlink {
                 pathname: args[0],
                 buf: args[1],
@@ -437,12 +437,8 @@ impl LinuxSyscall {
                 pathname: args[1],
                 mode: args[2] as i32,
             },
-            49 => LinuxSyscall::Chdir {
-                pathname: args[0],
-            },
-            50 => LinuxSyscall::Fchdir {
-                fd: args[0] as i32,
-            },
+            49 => LinuxSyscall::Chdir { pathname: args[0] },
+            50 => LinuxSyscall::Fchdir { fd: args[0] as i32 },
             56 => LinuxSyscall::Openat {
                 dirfd: args[0] as i32,
                 pathname: args[1],
@@ -2554,17 +2550,17 @@ impl<B: SyscallBackend> Linuxulator<B> {
             buf[offset..offset + len].copy_from_slice(&value[..len]);
         }
 
-        write_field(buf, 0, b"Linux");                              // sysname
-        write_field(buf, FIELD_LEN, b"harmony");                   // nodename
-        write_field(buf, FIELD_LEN * 2, b"6.1.0-harmony");        // release
-        write_field(buf, FIELD_LEN * 3, b"#1 SMP");               // version
+        write_field(buf, 0, b"Linux"); // sysname
+        write_field(buf, FIELD_LEN, b"harmony"); // nodename
+        write_field(buf, FIELD_LEN * 2, b"6.1.0-harmony"); // release
+        write_field(buf, FIELD_LEN * 3, b"#1 SMP"); // version
         #[cfg(target_arch = "x86_64")]
-        write_field(buf, FIELD_LEN * 4, b"x86_64");               // machine
+        write_field(buf, FIELD_LEN * 4, b"x86_64"); // machine
         #[cfg(target_arch = "aarch64")]
-        write_field(buf, FIELD_LEN * 4, b"aarch64");              // machine
+        write_field(buf, FIELD_LEN * 4, b"aarch64"); // machine
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        write_field(buf, FIELD_LEN * 4, b"unknown");              // machine
-        write_field(buf, FIELD_LEN * 5, b"(none)");               // domainname
+        write_field(buf, FIELD_LEN * 4, b"unknown"); // machine
+        write_field(buf, FIELD_LEN * 5, b"(none)"); // domainname
 
         0
     }
@@ -2578,9 +2574,6 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return EFAULT;
         }
 
-        const CLOCK_REALTIME: i32 = 0;
-        const CLOCK_MONOTONIC: i32 = 1;
-
         match clockid {
             CLOCK_REALTIME | CLOCK_MONOTONIC => {
                 // Increment the monotonic counter.
@@ -2591,8 +2584,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 let tv_nsec = ns % 1_000_000_000;
 
                 // struct timespec: 16 bytes (u64 tv_sec + u64 tv_nsec), LE
-                let buf =
-                    unsafe { core::slice::from_raw_parts_mut(tp_ptr as *mut u8, 16) };
+                let buf = unsafe { core::slice::from_raw_parts_mut(tp_ptr as *mut u8, 16) };
                 buf[0..8].copy_from_slice(&tv_sec.to_le_bytes());
                 buf[8..16].copy_from_slice(&tv_nsec.to_le_bytes());
 
@@ -2607,14 +2599,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Reports 1 ms resolution for CLOCK_REALTIME and CLOCK_MONOTONIC.
     /// A null `tp` is allowed — Linux uses this to validate the clock ID.
     fn sys_clock_getres(&self, clockid: i32, tp_ptr: usize) -> i64 {
-        const CLOCK_REALTIME: i32 = 0;
-        const CLOCK_MONOTONIC: i32 = 1;
 
         match clockid {
             CLOCK_REALTIME | CLOCK_MONOTONIC => {
                 if tp_ptr != 0 {
-                    let buf =
-                        unsafe { core::slice::from_raw_parts_mut(tp_ptr as *mut u8, 16) };
+                    let buf = unsafe { core::slice::from_raw_parts_mut(tp_ptr as *mut u8, 16) };
                     buf[0..8].copy_from_slice(&0u64.to_le_bytes()); // tv_sec = 0
                     buf[8..16].copy_from_slice(&1_000_000u64.to_le_bytes()); // tv_nsec = 1ms
                 }
@@ -3696,7 +3685,10 @@ mod tests {
         let o = ST_MODE_OFFSET;
         let st_mode =
             u32::from_le_bytes([statbuf[o], statbuf[o + 1], statbuf[o + 2], statbuf[o + 3]]);
-        assert_eq!(st_mode, 0o020666, "path-based stat on chardev should report S_IFCHR");
+        assert_eq!(
+            st_mode, 0o020666,
+            "path-based stat on chardev should report S_IFCHR"
+        );
     }
 
     #[test]
@@ -3959,7 +3951,10 @@ mod tests {
         let syscall = LinuxSyscall::from_x86_64(267, [at_fdcwd_zext, 0x1000, 0x2000, 128, 0, 0]);
         match syscall {
             LinuxSyscall::Readlink { .. } => {} // should match via i32 truncation
-            other => panic!("expected Readlink for zero-extended AT_FDCWD, got {:?}", other),
+            other => panic!(
+                "expected Readlink for zero-extended AT_FDCWD, got {:?}",
+                other
+            ),
         }
     }
 
@@ -5277,10 +5272,7 @@ mod integration_tests {
         let mut lx = Linuxulator::new(mock);
         let mut buf = [0u8; 8];
         // x86_64 nr 204: sched_getaffinity(pid, cpusetsize, mask)
-        let result = lx.handle_syscall(
-            204,
-            [0, 8, buf.as_mut_ptr() as u64, 0, 0, 0],
-        );
+        let result = lx.handle_syscall(204, [0, 8, buf.as_mut_ptr() as u64, 0, 0, 0]);
         assert_eq!(result, 8);
         assert_eq!(buf[0], 1);
     }
@@ -5404,11 +5396,7 @@ mod integration_tests {
             let field_start = i * 65;
             let field = &buf[field_start..field_start + 65];
             // Find the string content, then verify there's a NUL in the field
-            assert!(
-                field.contains(&0),
-                "field {} is not null-terminated",
-                i
-            );
+            assert!(field.contains(&0), "field {} is not null-terminated", i);
         }
     }
 
@@ -5543,10 +5531,7 @@ mod integration_tests {
     fn sys_clock_gettime_null_pointer_returns_efault() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
-        let result = lx.dispatch_syscall(LinuxSyscall::ClockGettime {
-            clockid: 0,
-            tp: 0,
-        });
+        let result = lx.dispatch_syscall(LinuxSyscall::ClockGettime { clockid: 0, tp: 0 });
         assert_eq!(result, EFAULT);
     }
 
@@ -5609,16 +5594,10 @@ mod integration_tests {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
         // Linux allows null tp — just validates the clock ID
-        let result = lx.dispatch_syscall(LinuxSyscall::ClockGetres {
-            clockid: 0,
-            tp: 0,
-        });
+        let result = lx.dispatch_syscall(LinuxSyscall::ClockGetres { clockid: 0, tp: 0 });
         assert_eq!(result, 0);
 
-        let result2 = lx.dispatch_syscall(LinuxSyscall::ClockGetres {
-            clockid: 1,
-            tp: 0,
-        });
+        let result2 = lx.dispatch_syscall(LinuxSyscall::ClockGetres { clockid: 1, tp: 0 });
         assert_eq!(result2, 0);
     }
 
@@ -5626,10 +5605,7 @@ mod integration_tests {
     fn sys_clock_getres_invalid_clock_returns_einval() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
-        let result = lx.dispatch_syscall(LinuxSyscall::ClockGetres {
-            clockid: 42,
-            tp: 0,
-        });
+        let result = lx.dispatch_syscall(LinuxSyscall::ClockGetres { clockid: 42, tp: 0 });
         assert_eq!(result, EINVAL);
     }
 
