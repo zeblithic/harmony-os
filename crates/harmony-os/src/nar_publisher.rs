@@ -57,15 +57,7 @@ impl<A: ContentAnnouncer> NarPublisher<A> {
         store_path_name: &str,
         nar_bytes: &[u8],
     ) -> Result<ContentId, String> {
-        // Ingest into the DAG.
-        let root_cid = dag::ingest(nar_bytes, &self.chunker_config, &mut self.blob_store)
-            .map_err(|e| format!("ingest failed: {e}"))?;
-
-        // Record the mapping.
-        self.published_paths
-            .insert(store_path_name.to_string(), root_cid);
-
-        // Validate store path format: must be >= 33 chars with a hyphen at position 32.
+        // Validate store path format FIRST — before any mutation.
         if store_path_name.len() < 33 || store_path_name.as_bytes()[32] != b'-' {
             return Err(format!(
                 "store path name does not have expected '<32-char-hash>-<name>' format: {:?}",
@@ -73,6 +65,14 @@ impl<A: ContentAnnouncer> NarPublisher<A> {
             ));
         }
         let store_hash = &store_path_name[..32];
+
+        // Ingest into the DAG.
+        let root_cid = dag::ingest(nar_bytes, &self.chunker_config, &mut self.blob_store)
+            .map_err(|e| format!("ingest failed: {e}"))?;
+
+        // Record the mapping.
+        self.published_paths
+            .insert(store_path_name.to_string(), root_cid);
 
         // Announce store path mapping: key = harmony/nix/store/{store_hash},
         // payload = root CID as hex.
@@ -320,5 +320,22 @@ mod tests {
         // Exactly 32 chars (missing hyphen + name).
         let result = publisher.publish("abc12345678901234567890123456789", &nar);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn publish_validation_failure_does_not_leak_state() {
+        let (announcer, log) = MockAnnouncer::new();
+        let mut publisher = NarPublisher::new(announcer);
+        let nar = build_test_nar(b"should not leak");
+
+        // Attempt to publish with a malformed store path.
+        let result = publisher.publish("short", &nar);
+        assert!(result.is_err());
+
+        // No mappings should exist — validation failed before mutation.
+        assert!(publisher.published_paths().is_empty());
+
+        // No announcements should have been made.
+        assert!(log.borrow().is_empty());
     }
 }

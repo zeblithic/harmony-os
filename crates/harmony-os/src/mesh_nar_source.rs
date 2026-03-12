@@ -50,6 +50,21 @@ pub trait MeshNarFetch {
 /// Given a Nix store path name (e.g. `abc...xyz-hello-2.12.1`), queries
 /// the mesh for the root CID mapping, fetches all DAG nodes, and
 /// reassembles the original NAR bytes.
+///
+/// # Trust model
+///
+/// Every fetched blob is content-verified by its CID (the CID *is* the
+/// hash of the data). However, the store-path → root-CID mapping is
+/// currently unauthenticated: a malicious peer could announce a
+/// different root CID for a given store hash. This is acceptable for
+/// now because:
+///
+/// - `NixStoreFetcher` falls back to HTTP (with narinfo hash
+///   verification) if mesh-sourced import fails
+/// - Future work will add UCAN-signed announcements (separate bead)
+///
+/// Do **not** trust mesh-sourced NARs in security-critical contexts
+/// without additional verification.
 pub struct MeshNarSource<Q: ContentQuerier> {
     querier: Q,
 }

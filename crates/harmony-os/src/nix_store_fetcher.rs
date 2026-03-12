@@ -201,11 +201,13 @@ impl NixStoreFetcher {
                 continue;
             }
 
-            // Try mesh first (if available).
+            // Try mesh first (if available), tracking data source.
             let mut nar_bytes = None;
+            let mut from_mesh = false;
             if let Some(ref mesh) = self.mesh {
                 if let Some(mesh_nar) = mesh.fetch_nar(&name_str) {
                     nar_bytes = Some(mesh_nar);
+                    from_mesh = true;
                 }
             }
 
@@ -233,8 +235,9 @@ impl NixStoreFetcher {
                     // Already present — skip re-publishing.
                 }
                 Err(e) => {
-                    // If mesh data failed import, try HTTP before blacklisting.
-                    if self.mesh.is_some() {
+                    // Only fall back to HTTP if data actually came from mesh.
+                    // If data was already from HTTP, re-fetching is redundant.
+                    if from_mesh {
                         eprintln!(
                             "[nix-fetcher] mesh import failed for {}, trying HTTP: {}",
                             name_str, e
@@ -258,6 +261,10 @@ impl NixStoreFetcher {
                                     "[nix-fetcher] HTTP fallback fetch failed for {}: {:?}",
                                     name_str, e2
                                 );
+                                // Respect transient-error policy in fallback path too.
+                                if matches!(e2, FetchError::Network(_)) {
+                                    continue;
+                                }
                             }
                         }
                     } else {
