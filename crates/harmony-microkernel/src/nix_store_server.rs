@@ -565,4 +565,150 @@ mod tests {
         let listing = core::str::from_utf8(&data).unwrap();
         assert_eq!(listing, "aaa-first\nzzz-last\n");
     }
+
+    // ── Kernel integration tests ─────────────────────────────────────
+
+    mod kernel_integration {
+        use super::*;
+        use crate::echo::EchoServer;
+        use crate::kernel::Kernel;
+        use crate::vm::buddy::BuddyAllocator;
+        use crate::vm::manager::AddressSpaceManager;
+        use crate::vm::mock::MockPageTable;
+        use crate::vm::PhysAddr;
+        use harmony_identity::PrivateIdentity;
+        use harmony_unikernel::KernelEntropy;
+
+        fn make_test_entropy() -> KernelEntropy<impl FnMut(&mut [u8])> {
+            let mut seed = 42u64;
+            KernelEntropy::new(move |buf: &mut [u8]| {
+                for b in buf.iter_mut() {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    *b = (seed >> 33) as u8;
+                }
+            })
+        }
+
+        fn make_test_vm() -> AddressSpaceManager<MockPageTable> {
+            let buddy = BuddyAllocator::new(PhysAddr(0x10_0000), 64).unwrap();
+            AddressSpaceManager::new(buddy)
+        }
+
+        /// Create a kernel with a NixStoreServer mounted at `/nix/store`
+        /// and a client process that can access it.
+        fn setup_kernel_with_nix_store() -> (Kernel<MockPageTable>, u32, u32) {
+            let mut entropy = make_test_entropy();
+            let kernel_id = PrivateIdentity::generate(&mut entropy);
+            let mut kernel = Kernel::new(kernel_id, make_test_vm());
+
+            // Build and populate the nix store server.
+            let mut nix = NixStoreServer::new();
+            nix.import_nar("abc123-hello", nar_directory_with_files())
+                .unwrap();
+
+            // pid 0 = nix store server
+            let server_pid = kernel
+                .spawn_process("nix-store", Box::new(nix), &[], None)
+                .unwrap();
+
+            // pid 1 = client with /nix/store mounted to the nix server
+            let client_pid = kernel
+                .spawn_process(
+                    "client",
+                    Box::new(EchoServer::new()),
+                    &[("/nix/store", server_pid, 0)],
+                    None,
+                )
+                .unwrap();
+
+            // Grant client access to the nix store server.
+            kernel
+                .grant_endpoint_cap(&mut entropy, client_pid, server_pid, 0)
+                .unwrap();
+
+            (kernel, client_pid, server_pid)
+        }
+
+        #[test]
+        fn walk_open_read_through_kernel() {
+            let (mut kernel, client, _server) = setup_kernel_with_nix_store();
+
+            // Walk the full path in one call — kernel splits into components:
+            // /nix/store → (namespace resolve) → abc123-hello → bin → hello
+            kernel
+                .walk(client, "/nix/store/abc123-hello/bin/hello", 0, 1, 0)
+                .unwrap();
+
+            // Open the file for reading.
+            kernel.open(client, 1, OpenMode::Read).unwrap();
+
+            // Read the file contents and verify.
+            let data = kernel.read(client, 1, 0, 256).unwrap();
+            assert_eq!(data, b"#!/bin/sh\necho hello\n");
+        }
+
+        #[test]
+        fn stat_file_through_kernel() {
+            let (mut kernel, client, _server) = setup_kernel_with_nix_store();
+
+            kernel
+                .walk(client, "/nix/store/abc123-hello/bin/hello", 0, 1, 0)
+                .unwrap();
+
+            let stat = kernel.stat(client, 1).unwrap();
+            assert_eq!(&*stat.name, "hello");
+            assert_eq!(stat.file_type, FileType::Regular);
+            assert_eq!(stat.size, b"#!/bin/sh\necho hello\n".len() as u64);
+        }
+
+        #[test]
+        fn walk_to_store_path_root_through_kernel() {
+            let (mut kernel, client, _server) = setup_kernel_with_nix_store();
+
+            // Walk to a store path root (directory).
+            kernel
+                .walk(client, "/nix/store/abc123-hello", 0, 1, 0)
+                .unwrap();
+
+            let stat = kernel.stat(client, 1).unwrap();
+            assert_eq!(&*stat.name, "abc123-hello");
+            assert_eq!(stat.file_type, FileType::Directory);
+        }
+
+        #[test]
+        fn read_readme_through_kernel() {
+            let (mut kernel, client, _server) = setup_kernel_with_nix_store();
+
+            // Walk to README (two components after namespace: abc123-hello, README).
+            kernel
+                .walk(client, "/nix/store/abc123-hello/README", 0, 1, 0)
+                .unwrap();
+
+            kernel.open(client, 1, OpenMode::Read).unwrap();
+
+            let data = kernel.read(client, 1, 0, 256).unwrap();
+            assert_eq!(data, b"Hello, world!\n");
+        }
+
+        #[test]
+        fn walk_nonexistent_path_through_kernel() {
+            let (mut kernel, client, _server) = setup_kernel_with_nix_store();
+
+            let result = kernel.walk(client, "/nix/store/nonexistent-pkg/bin/foo", 0, 1, 0);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn walk_to_mount_root_through_kernel() {
+            let (mut kernel, client, _server) = setup_kernel_with_nix_store();
+
+            // Walk to the mount root itself (/nix/store with no further path).
+            kernel.walk(client, "/nix/store", 0, 1, 0).unwrap();
+
+            let stat = kernel.stat(client, 1).unwrap();
+            assert_eq!(&*stat.name, "store");
+            assert_eq!(stat.file_type, FileType::Directory);
+            assert_eq!(stat.size, 1); // one imported store path
+        }
+    }
 }
