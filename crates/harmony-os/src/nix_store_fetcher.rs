@@ -7,6 +7,7 @@
 //! HTTP is injectable via the [`HttpClient`] trait for testability.
 
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use harmony_microkernel::nix_store_server::NixStoreServer;
 use sha2::{Digest, Sha256};
@@ -63,12 +64,14 @@ impl Default for UreqHttpClient {
 
 impl HttpClient for UreqHttpClient {
     fn get(&self, url: &str) -> Result<Vec<u8>, FetchError> {
-        let response = ureq::get(url).call().map_err(|e| match e {
+        let mut response = ureq::get(url).call().map_err(|e| match e {
             ureq::Error::StatusCode(404) => FetchError::NotFound,
             other => FetchError::Network(other.to_string()),
         })?;
         response
-            .into_body()
+            .body_mut()
+            .with_config()
+            .limit(256 * 1024 * 1024) // 256 MB — NAR files can be large
             .read_to_vec()
             .map_err(|e| FetchError::Network(e.to_string()))
     }
@@ -104,9 +107,14 @@ impl NixStoreFetcher {
     /// Process all pending misses: drain, deduplicate, fetch, import.
     pub fn process_misses(&mut self, server: &mut NixStoreServer) {
         let misses = server.drain_misses();
+        self.fetch_and_import_misses(misses, server);
+    }
 
-        // Deduplicate — a store path may have been walked multiple times
-        // before the fetcher runs.
+    /// Process misses from a shared (Arc<Mutex>) server, releasing the lock
+    /// during HTTP I/O so the kernel thread isn't blocked.
+    pub fn process_misses_shared(&mut self, server: &Arc<Mutex<NixStoreServer>>) {
+        let misses = server.lock().unwrap().drain_misses();
+
         let mut seen = HashSet::new();
         for name in &misses {
             let name_str = name.to_string();
@@ -116,18 +124,54 @@ impl NixStoreFetcher {
             if !seen.insert(name_str.clone()) {
                 continue;
             }
-            if let Err(_e) = self.fetch_and_import(&name_str, server) {
-                self.failed.insert(name_str);
+            // Fetch with NO lock held.
+            match self.fetch_nar(&name_str) {
+                Ok(nar_bytes) => {
+                    // Re-acquire lock only for import.
+                    if server
+                        .lock()
+                        .unwrap()
+                        .import_nar(&name_str, nar_bytes)
+                        .is_err()
+                    {
+                        self.failed.insert(name_str);
+                    }
+                }
+                Err(_) => {
+                    self.failed.insert(name_str);
+                }
             }
         }
     }
 
-    /// Fetch a single store path: narinfo -> NAR -> decompress -> verify -> import.
-    fn fetch_and_import(
-        &self,
-        store_path_name: &str,
-        server: &mut NixStoreServer,
-    ) -> Result<(), FetchError> {
+    /// Drain + deduplicate + fetch + import (non-shared path).
+    fn fetch_and_import_misses(&mut self, misses: Vec<Arc<str>>, server: &mut NixStoreServer) {
+        let mut seen = HashSet::new();
+        for name in &misses {
+            let name_str = name.to_string();
+            if self.failed.contains(&name_str) {
+                continue;
+            }
+            if !seen.insert(name_str.clone()) {
+                continue;
+            }
+            match self.fetch_nar(&name_str) {
+                Ok(nar_bytes) => {
+                    if server.import_nar(&name_str, nar_bytes).is_err() {
+                        self.failed.insert(name_str);
+                    }
+                }
+                Err(_) => {
+                    self.failed.insert(name_str);
+                }
+            }
+        }
+    }
+
+    /// Fetch a single store path: narinfo -> NAR -> decompress -> verify.
+    ///
+    /// Returns the decompressed, verified NAR bytes on success.
+    fn fetch_nar(&self, store_path_name: &str) -> Result<Vec<u8>, FetchError> {
         // 1. Extract store hash (first 32 chars of store path name).
         if store_path_name.len() < 32 {
             return Err(FetchError::NarInfo(
@@ -144,22 +188,34 @@ impl NixStoreFetcher {
         let narinfo =
             NarInfo::parse(&narinfo_text).map_err(|e| FetchError::NarInfo(format!("{:?}", e)))?;
 
-        // 3. Fetch NAR.
+        // 3. Check compression — we only support xz.
+        if narinfo.compression != "xz" {
+            return Err(FetchError::Decompress(format!(
+                "unsupported compression: {}",
+                narinfo.compression
+            )));
+        }
+
+        // 4. Fetch NAR.
         let nar_url = format!("{}/{}", self.cache_url, narinfo.url);
         let compressed_nar = self.http.get(&nar_url)?;
 
-        // 4. Decompress xz.
+        // 5. Decompress xz.
         let nar_bytes = decompress_xz(&compressed_nar)?;
 
-        // 5. Verify SHA-256 hash.
+        // 6. Validate decompressed size against NarSize.
+        if nar_bytes.len() as u64 != narinfo.nar_size {
+            return Err(FetchError::Decompress(format!(
+                "decompressed size {} != expected NarSize {}",
+                nar_bytes.len(),
+                narinfo.nar_size
+            )));
+        }
+
+        // 7. Verify SHA-256 hash.
         verify_nar_hash(&nar_bytes, &narinfo.nar_hash)?;
 
-        // 6. Import into server.
-        server
-            .import_nar(store_path_name, nar_bytes)
-            .map_err(|e| FetchError::Import(format!("{:?}", e)))?;
-
-        Ok(())
+        Ok(nar_bytes)
     }
 }
 
@@ -417,12 +473,10 @@ mod tests {
     #[test]
     fn shared_server_fetch_and_walk() {
         use harmony_microkernel::nix_store_server::SharedNixStoreServer;
-        use std::sync::{Arc, Mutex};
 
         // Build test NAR + responses (reuse existing helpers from this test module).
         let nar = build_test_nar(b"shared test data");
         let hash = sha2::Sha256::digest(&nar);
-        let _hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
         let nix_b32 = encode_nix_base32(&hash);
         let store_hash = "abc12345678901234567890123456789";
         let store_path_name = format!("{store_hash}-shared-test");
@@ -449,14 +503,8 @@ mod tests {
         );
         let http = MockHttp { responses };
 
-        // Set up shared server.
-        let server = NixStoreServer::new();
-        let shared = Arc::new(Mutex::new(server));
-
-        // Wrap for FileServer use (simulating kernel).
-        let mut wrapper = SharedNixStoreServer {
-            inner: Arc::clone(&shared),
-        };
+        // Set up shared server via constructor (inner is private).
+        let (mut wrapper, shared) = SharedNixStoreServer::new(NixStoreServer::new());
 
         // Walk miss through wrapper — records the miss.
         use harmony_microkernel::FileServer;
@@ -465,12 +513,10 @@ mod tests {
             Err(harmony_microkernel::IpcError::NotFound)
         );
 
-        // Fetcher processes misses through the Arc<Mutex>.
+        // Fetcher processes misses via process_misses_shared — lock is NOT
+        // held during HTTP I/O.
         let mut fetcher = NixStoreFetcher::new(Box::new(http));
-        {
-            let mut srv = shared.lock().unwrap();
-            fetcher.process_misses(&mut srv);
-        }
+        fetcher.process_misses_shared(&shared);
 
         // Now walk through the wrapper should succeed.
         let qp = wrapper.walk(0, 2, &store_path_name).unwrap();

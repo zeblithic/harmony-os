@@ -10,6 +10,8 @@
 pub struct NarInfo {
     /// Relative URL to the NAR file (e.g. `nar/1234abcd.nar.xz`).
     pub url: String,
+    /// Compression type (e.g. `"xz"`, `"bzip2"`, `"none"`).
+    pub compression: String,
     /// Hash of the decompressed NAR (e.g. `sha256:<nix-base32>`).
     pub nar_hash: String,
     /// Size of the decompressed NAR in bytes.
@@ -29,12 +31,15 @@ impl NarInfo {
     /// Parse a NARInfo response body.
     pub fn parse(input: &str) -> Result<Self, NarInfoError> {
         let mut url = None;
+        let mut compression = None;
         let mut nar_hash = None;
         let mut nar_size = None;
 
         for line in input.lines() {
             if let Some(val) = line.strip_prefix("URL: ") {
                 url = Some(val.to_string());
+            } else if let Some(val) = line.strip_prefix("Compression: ") {
+                compression = Some(val.to_string());
             } else if let Some(val) = line.strip_prefix("NarHash: ") {
                 nar_hash = Some(val.to_string());
             } else if let Some(val) = line.strip_prefix("NarSize: ") {
@@ -47,6 +52,7 @@ impl NarInfo {
 
         Ok(NarInfo {
             url: url.ok_or(NarInfoError::MissingField("URL"))?,
+            compression: compression.unwrap_or_else(|| "xz".to_string()),
             nar_hash: nar_hash.ok_or(NarInfoError::MissingField("NarHash"))?,
             nar_size: nar_size.ok_or(NarInfoError::MissingField("NarSize"))?,
         })
@@ -73,6 +79,7 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
     fn parse_valid_narinfo() {
         let info = NarInfo::parse(SAMPLE_NARINFO).unwrap();
         assert_eq!(info.url, "nar/1234abcd.nar.xz");
+        assert_eq!(info.compression, "xz");
         assert_eq!(
             info.nar_hash,
             "sha256:1b8m03r63zqhnjf7l5wnldhh7c134p5vpj0850gk224669lcr3yq"
@@ -120,5 +127,13 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
         assert_eq!(info.url, "nar/bar.nar.xz");
         assert_eq!(info.nar_hash, "sha256:xyz");
         assert_eq!(info.nar_size, 42);
+        assert_eq!(info.compression, "xz"); // default when absent
+    }
+
+    #[test]
+    fn explicit_compression_field() {
+        let input = "URL: nar/a.nar.zst\nCompression: zstd\nNarHash: sha256:abc\nNarSize: 10\n";
+        let info = NarInfo::parse(input).unwrap();
+        assert_eq!(info.compression, "zstd");
     }
 }

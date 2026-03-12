@@ -400,7 +400,23 @@ impl FileServer for NixStoreServer {
 /// `drain_misses()` and `import_nar()` calls.
 #[cfg(feature = "std")]
 pub struct SharedNixStoreServer {
-    pub inner: Arc<Mutex<NixStoreServer>>,
+    inner: Arc<Mutex<NixStoreServer>>,
+}
+
+#[cfg(feature = "std")]
+impl SharedNixStoreServer {
+    /// Create a new shared server, returning the wrapper (for the kernel)
+    /// and a clone of the inner `Arc<Mutex<NixStoreServer>>` (for the
+    /// fetcher thread).
+    pub fn new(server: NixStoreServer) -> (Self, Arc<Mutex<NixStoreServer>>) {
+        let inner = Arc::new(Mutex::new(server));
+        (
+            Self {
+                inner: Arc::clone(&inner),
+            },
+            inner,
+        )
+    }
 }
 
 #[cfg(feature = "std")]
@@ -440,7 +456,6 @@ impl FileServer for SharedNixStoreServer {
 mod tests {
     use super::*;
     use crate::nar::tests::{nar_directory_with_files, nar_regular_file, nar_symlink};
-    use std::sync::Mutex;
 
     /// Helper: create a NixStoreServer with one directory store path.
     fn test_server() -> NixStoreServer {
@@ -728,19 +743,12 @@ mod tests {
 
     #[test]
     fn shared_wrapper_delegates_walk_and_stat() {
-        use alloc::sync::Arc;
-
-        let inner = NixStoreServer::new();
-        let shared_inner = Arc::new(Mutex::new(inner));
-        shared_inner
-            .lock()
-            .unwrap()
+        let mut server = NixStoreServer::new();
+        server
             .import_nar("abc123-hello", nar_directory_with_files())
             .unwrap();
 
-        let mut wrapper = SharedNixStoreServer {
-            inner: Arc::clone(&shared_inner),
-        };
+        let (mut wrapper, shared_inner) = SharedNixStoreServer::new(server);
 
         // Walk and stat through the wrapper.
         let qp = wrapper.walk(0, 1, "abc123-hello").unwrap();
