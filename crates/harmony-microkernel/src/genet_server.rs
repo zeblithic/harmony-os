@@ -11,7 +11,6 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -19,6 +18,7 @@ use alloc::vec::Vec;
 use harmony_unikernel::drivers::genet::{GenetDriver, GenetError};
 use harmony_unikernel::drivers::RegisterBank;
 
+use crate::fid_tracker::FidTracker;
 use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
 
 // QPath assignments
@@ -30,12 +30,6 @@ const QPATH_MTU: QPath = 4;
 const QPATH_STATS: QPath = 5;
 const QPATH_LINK: QPath = 6;
 
-struct FidState {
-    qpath: QPath,
-    is_open: bool,
-    mode: Option<OpenMode>,
-}
-
 /// A 9P file server wrapping a [`GenetDriver`] and [`RegisterBank`].
 ///
 /// Walk to `"genet0"` to enter the device directory, then walk to
@@ -43,7 +37,7 @@ struct FidState {
 pub struct GenetServer<B: RegisterBank, const RX: usize, const TX: usize> {
     driver: GenetDriver<RX, TX>,
     bank: B,
-    fids: BTreeMap<Fid, FidState>,
+    tracker: FidTracker<()>,
     /// MDIO poll count for link status reads.
     mdio_polls: u32,
 }
@@ -51,19 +45,10 @@ pub struct GenetServer<B: RegisterBank, const RX: usize, const TX: usize> {
 impl<B: RegisterBank, const RX: usize, const TX: usize> GenetServer<B, RX, TX> {
     /// Create a new GenetServer with an already-initialized driver.
     pub fn new(driver: GenetDriver<RX, TX>, bank: B) -> Self {
-        let mut fids = BTreeMap::new();
-        fids.insert(
-            0,
-            FidState {
-                qpath: QPATH_ROOT,
-                is_open: false,
-                mode: None,
-            },
-        );
         Self {
             driver,
             bank,
-            fids,
+            tracker: FidTracker::new(QPATH_ROOT, ()),
             mdio_polls: 100,
         }
     }
@@ -112,60 +97,55 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> GenetServer<B, RX, TX> {
 
 impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServer<B, RX, TX> {
     fn walk(&mut self, fid: Fid, new_fid: Fid, name: &str) -> Result<QPath, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        if state.is_open {
+        let entry = self.tracker.get(fid)?;
+        if entry.is_open() {
             return Err(IpcError::PermissionDenied); // 9P: cannot walk from an open fid
         }
-        if !Self::is_directory(state.qpath) {
+        if !Self::is_directory(entry.qpath) {
             return Err(IpcError::NotDirectory);
         }
+        let parent_qpath = entry.qpath; // Copy before mutating tracker
+        let qpath = Self::child_qpath(parent_qpath, name)?;
         // 9P2000: new_fid may equal fid (in-place walk replaces the binding)
-        if new_fid != fid && self.fids.contains_key(&new_fid) {
-            return Err(IpcError::InvalidFid);
+        if new_fid == fid {
+            // In-place walk: replace existing entry
+            let entry = self.tracker.get_mut(fid)?;
+            entry.qpath = qpath;
+            entry.reset_open_state();
+        } else {
+            self.tracker.insert(new_fid, qpath, ())?;
         }
-        let qpath = Self::child_qpath(state.qpath, name)?;
-        self.fids.insert(
-            new_fid,
-            FidState {
-                qpath,
-                is_open: false,
-                mode: None,
-            },
-        );
         Ok(qpath)
     }
 
     fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
-        let state = self.fids.get_mut(&fid).ok_or(IpcError::InvalidFid)?;
-        if state.is_open {
-            return Err(IpcError::PermissionDenied);
-        }
-        if Self::is_directory(state.qpath) {
+        let entry = self.tracker.begin_open(fid)?;
+        if Self::is_directory(entry.qpath) {
             return Err(IpcError::IsDirectory);
         }
-        if Self::is_read_only(state.qpath) && matches!(mode, OpenMode::Write | OpenMode::ReadWrite)
+        if Self::is_read_only(entry.qpath) && matches!(mode, OpenMode::Write | OpenMode::ReadWrite)
         {
             return Err(IpcError::ReadOnly);
         }
-        state.is_open = true;
-        state.mode = Some(mode);
+        entry.mark_open(mode);
         Ok(())
     }
 
     fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        if !state.is_open {
+        let entry = self.tracker.get(fid)?;
+        if !entry.is_open() {
             return Err(IpcError::NotOpen);
         }
-        if Self::is_directory(state.qpath) {
+        if Self::is_directory(entry.qpath) {
             return Err(IpcError::IsDirectory);
         }
-        if matches!(state.mode, Some(OpenMode::Write)) {
+        if matches!(entry.mode(), Some(OpenMode::Write)) {
             return Err(IpcError::PermissionDenied);
         }
 
+        let qpath = entry.qpath; // Copy before match to avoid borrow conflict
         let max = count as usize;
-        match state.qpath {
+        match qpath {
             QPATH_DATA => {
                 // Streaming semantics: offset is ignored, each read returns
                 // the next pending frame (or empty if none available).
@@ -228,18 +208,19 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
     }
 
     fn write(&mut self, fid: Fid, _offset: u64, data: &[u8]) -> Result<u32, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        if !state.is_open {
+        let entry = self.tracker.get(fid)?;
+        if !entry.is_open() {
             return Err(IpcError::NotOpen);
         }
-        if Self::is_directory(state.qpath) {
+        if Self::is_directory(entry.qpath) {
             return Err(IpcError::IsDirectory);
         }
-        if matches!(state.mode, Some(OpenMode::Read)) {
+        if matches!(entry.mode(), Some(OpenMode::Read)) {
             return Err(IpcError::PermissionDenied);
         }
 
-        match state.qpath {
+        let qpath = entry.qpath; // Copy before match to avoid borrow conflict
+        match qpath {
             QPATH_DATA => {
                 self.driver.send(&mut self.bank, data).map_err(|e| match e {
                     GenetError::TxRingFull => IpcError::ResourceExhausted,
@@ -252,25 +233,21 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
     }
 
     fn clunk(&mut self, fid: Fid) -> Result<(), IpcError> {
-        if fid == 0 {
-            return Err(IpcError::PermissionDenied);
-        }
-        self.fids.remove(&fid).ok_or(IpcError::InvalidFid)?;
-        Ok(())
+        self.tracker.clunk(fid)
     }
 
     fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        let name = Self::qpath_name(state.qpath);
-        let file_type = if Self::is_directory(state.qpath) {
+        let qpath = self.tracker.get(fid)?.qpath;
+        let name = Self::qpath_name(qpath);
+        let file_type = if Self::is_directory(qpath) {
             FileType::Directory
         } else {
             FileType::Regular
         };
         Ok(FileStat {
-            qpath: state.qpath,
+            qpath,
             name: Arc::from(name),
-            size: match state.qpath {
+            size: match qpath {
                 QPATH_MAC => 18, // "aa:bb:cc:dd:ee:ff\n"
                 QPATH_MTU => 5,  // "1500\n"
                 _ => 0,          // stream or dynamic content
@@ -280,20 +257,7 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
     }
 
     fn clone_fid(&mut self, fid: Fid, new_fid: Fid) -> Result<QPath, IpcError> {
-        if self.fids.contains_key(&new_fid) {
-            return Err(IpcError::InvalidFid);
-        }
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        let qpath = state.qpath;
-        self.fids.insert(
-            new_fid,
-            FidState {
-                qpath,
-                is_open: false,
-                mode: None,
-            },
-        );
-        Ok(qpath)
+        self.tracker.clone_fid(fid, new_fid)
     }
 }
 

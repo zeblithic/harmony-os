@@ -9,7 +9,6 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -17,6 +16,7 @@ use harmony_unikernel::drivers::gpio::{
     GpioController, GpioError, PinDirection, PinFunction, Pull,
 };
 
+use crate::fid_tracker::FidTracker;
 use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
 
 const QPATH_ROOT: QPath = 0;
@@ -43,12 +43,6 @@ fn map_gpio_err(e: GpioError) -> IpcError {
     }
 }
 
-struct FidState {
-    qpath: QPath,
-    is_open: bool,
-    mode: Option<OpenMode>,
-}
-
 /// A 9P file server wrapping a [`GpioController`].
 ///
 /// Walk to a pin number (`"0"` through `"27"`) to get a file handle.
@@ -56,75 +50,56 @@ struct FidState {
 /// Write accepts value or configuration commands.
 pub struct GpioServer<G: GpioController> {
     pub(crate) gpio: G,
-    fids: BTreeMap<Fid, FidState>,
+    tracker: FidTracker<()>,
 }
 
 impl<G: GpioController> GpioServer<G> {
     /// Create a new `GpioServer` wrapping the given GPIO controller.
     pub fn new(gpio: G) -> Self {
-        let mut fids = BTreeMap::new();
-        fids.insert(
-            0,
-            FidState {
-                qpath: QPATH_ROOT,
-                is_open: false,
-                mode: None,
-            },
-        );
-        Self { gpio, fids }
+        Self {
+            gpio,
+            tracker: FidTracker::new(QPATH_ROOT, ()),
+        }
     }
 }
 
 impl<G: GpioController> FileServer for GpioServer<G> {
     fn walk(&mut self, fid: Fid, new_fid: Fid, name: &str) -> Result<QPath, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        if state.qpath != QPATH_ROOT {
+        let entry = self.tracker.get(fid)?;
+        if entry.qpath != QPATH_ROOT {
             return Err(IpcError::NotDirectory);
-        }
-        if self.fids.contains_key(&new_fid) {
-            return Err(IpcError::InvalidFid);
         }
         let pin: u8 = name.parse().map_err(|_| IpcError::NotFound)?;
         if pin >= NUM_PINS {
             return Err(IpcError::NotFound);
         }
         let qpath = pin_qpath(pin);
-        self.fids.insert(
-            new_fid,
-            FidState {
-                qpath,
-                is_open: false,
-                mode: None,
-            },
-        );
+        self.tracker.insert(new_fid, qpath, ())?;
         Ok(qpath)
     }
 
     fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
-        let state = self.fids.get_mut(&fid).ok_or(IpcError::InvalidFid)?;
-        if state.is_open {
-            return Err(IpcError::PermissionDenied);
-        }
-        if state.qpath == QPATH_ROOT && matches!(mode, OpenMode::Write | OpenMode::ReadWrite) {
+        let entry = self.tracker.begin_open(fid)?;
+        if entry.qpath == QPATH_ROOT && matches!(mode, OpenMode::Write | OpenMode::ReadWrite) {
             return Err(IpcError::IsDirectory);
         }
-        state.is_open = true;
-        state.mode = Some(mode);
+        entry.mark_open(mode);
         Ok(())
     }
 
     fn read(&mut self, fid: Fid, _offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        if !state.is_open {
+        let entry = self.tracker.get(fid)?;
+        if !entry.is_open() {
             return Err(IpcError::NotOpen);
         }
-        if state.qpath == QPATH_ROOT {
+        if entry.qpath == QPATH_ROOT {
             return Err(IpcError::IsDirectory);
         }
-        if matches!(state.mode, Some(OpenMode::Write)) {
+        if matches!(entry.mode(), Some(OpenMode::Write)) {
             return Err(IpcError::PermissionDenied);
         }
-        let pin = qpath_to_pin(state.qpath).ok_or(IpcError::NotFound)?;
+        let qpath = entry.qpath; // Copy before match to avoid borrow conflict
+        let pin = qpath_to_pin(qpath).ok_or(IpcError::NotFound)?;
         let value = self.gpio.read_pin(pin).map_err(|_| IpcError::NotFound)?;
         let full: &[u8] = if value { b"1\n" } else { b"0\n" };
         let n = (count as usize).min(full.len());
@@ -132,17 +107,18 @@ impl<G: GpioController> FileServer for GpioServer<G> {
     }
 
     fn write(&mut self, fid: Fid, _offset: u64, data: &[u8]) -> Result<u32, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        if !state.is_open {
+        let entry = self.tracker.get(fid)?;
+        if !entry.is_open() {
             return Err(IpcError::NotOpen);
         }
-        if state.qpath == QPATH_ROOT {
+        if entry.qpath == QPATH_ROOT {
             return Err(IpcError::IsDirectory);
         }
-        if matches!(state.mode, Some(OpenMode::Read)) {
+        if matches!(entry.mode(), Some(OpenMode::Read)) {
             return Err(IpcError::PermissionDenied);
         }
-        let pin = qpath_to_pin(state.qpath).ok_or(IpcError::NotFound)?;
+        let qpath = entry.qpath; // Copy before match to avoid borrow conflict
+        let pin = qpath_to_pin(qpath).ok_or(IpcError::NotFound)?;
         let cmd = core::str::from_utf8(data)
             .map_err(|_| IpcError::InvalidArgument)?
             .trim();
@@ -214,16 +190,12 @@ impl<G: GpioController> FileServer for GpioServer<G> {
     }
 
     fn clunk(&mut self, fid: Fid) -> Result<(), IpcError> {
-        if fid == 0 {
-            return Err(IpcError::PermissionDenied); // Root fid is permanent.
-        }
-        self.fids.remove(&fid).ok_or(IpcError::InvalidFid)?;
-        Ok(())
+        self.tracker.clunk(fid)
     }
 
     fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        match state.qpath {
+        let qpath = self.tracker.get(fid)?.qpath;
+        match qpath {
             QPATH_ROOT => Ok(FileStat {
                 qpath: QPATH_ROOT,
                 name: Arc::from("/"),
@@ -245,20 +217,7 @@ impl<G: GpioController> FileServer for GpioServer<G> {
     }
 
     fn clone_fid(&mut self, fid: Fid, new_fid: Fid) -> Result<QPath, IpcError> {
-        if self.fids.contains_key(&new_fid) {
-            return Err(IpcError::InvalidFid);
-        }
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        let qpath = state.qpath;
-        self.fids.insert(
-            new_fid,
-            FidState {
-                qpath,
-                is_open: false,
-                mode: None,
-            },
-        );
-        Ok(qpath)
+        self.tracker.clone_fid(fid, new_fid)
     }
 }
 
