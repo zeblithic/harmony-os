@@ -2718,20 +2718,21 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// returns 8 (size of the mask in bytes). Returns EINVAL if the
     /// buffer is too small.
     fn sys_sched_getaffinity(&mut self, cpusetsize: u64, mask: u64) -> i64 {
+        // Kernel cpumask size: 8 bytes supports up to 64 CPUs.
+        // The raw syscall returns this fixed size, not the user buffer size.
+        const CPUMASK_SIZE: usize = 8;
+
         if mask == 0 {
             return EFAULT;
         }
-        // Linux requires at least 8 bytes for the cpu_set_t.
-        if cpusetsize < 8 {
+        if (cpusetsize as usize) < CPUMASK_SIZE {
             return EINVAL;
         }
-        // Zero the full buffer first (Linux kernel does this), then set CPU 0.
-        // Cap at a reasonable maximum to avoid huge allocations from bad input.
-        let size = (cpusetsize as usize).min(1024);
-        let mut buf = vec![0u8; size];
+        // Write the kernel cpumask: CPU 0 set, remaining bits zero.
+        let mut buf = [0u8; CPUMASK_SIZE];
         buf[0] = 1; // CPU 0
         self.backend.vm_write_bytes(mask, &buf);
-        size as i64
+        CPUMASK_SIZE as i64
     }
 
     /// Linux getcwd(2): get current working directory.
@@ -5520,11 +5521,13 @@ mod integration_tests {
             cpusetsize: 128,
             mask: buf.as_mut_ptr() as u64,
         });
-        // Returns cpusetsize (full buffer zeroed, like Linux kernel).
-        assert_eq!(result, 128);
-        // CPU 0 set, everything else zeroed.
+        // Returns kernel cpumask size (8), not user buffer size.
+        assert_eq!(result, 8);
+        // First 8 bytes: CPU 0 set, rest of cpumask zero.
         assert_eq!(buf[0], 1);
-        assert_eq!(buf[1..], [0; 127]);
+        assert_eq!(buf[1..8], [0; 7]);
+        // Bytes beyond cpumask are untouched.
+        assert_eq!(buf[8..], [0xFF; 120]);
     }
 
     #[test]
