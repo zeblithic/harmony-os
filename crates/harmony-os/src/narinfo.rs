@@ -83,7 +83,10 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
     #[test]
     fn reject_missing_url() {
         let input = "NarHash: sha256:abc\nNarSize: 100\n";
-        assert_eq!(NarInfo::parse(input), Err(NarInfoError::MissingField("URL")));
+        assert_eq!(
+            NarInfo::parse(input),
+            Err(NarInfoError::MissingField("URL"))
+        );
     }
 
     #[test]

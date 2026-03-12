@@ -139,8 +139,8 @@ impl NixStoreFetcher {
         // 2. Fetch narinfo.
         let narinfo_url = format!("{}/{}.narinfo", self.cache_url, store_hash);
         let narinfo_bytes = self.http.get(&narinfo_url)?;
-        let narinfo_text = String::from_utf8(narinfo_bytes)
-            .map_err(|e| FetchError::NarInfo(e.to_string()))?;
+        let narinfo_text =
+            String::from_utf8(narinfo_bytes).map_err(|e| FetchError::NarInfo(e.to_string()))?;
         let narinfo =
             NarInfo::parse(&narinfo_text).map_err(|e| FetchError::NarInfo(format!("{:?}", e)))?;
 
@@ -477,7 +477,9 @@ mod tests {
         assert_ne!(qp, 0);
 
         // Read the file through the wrapper.
-        wrapper.open(2, harmony_microkernel::OpenMode::Read).unwrap();
+        wrapper
+            .open(2, harmony_microkernel::OpenMode::Read)
+            .unwrap();
         let data = wrapper.read(2, 0, 1024).unwrap();
         assert_eq!(data, b"shared test data");
     }

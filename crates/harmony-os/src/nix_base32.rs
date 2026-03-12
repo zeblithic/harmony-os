@@ -79,7 +79,7 @@ mod tests {
     fn reject_wrong_length_for_sha256() {
         // SHA-256 needs exactly 52 Nix base32 chars.
         assert!(decode_nix_base32("abc").is_ok()); // short decode is allowed
-        // but the caller validates length -- decoder just decodes what it gets
+                                                   // but the caller validates length -- decoder just decodes what it gets
     }
 
     #[test]
