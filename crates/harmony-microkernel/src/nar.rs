@@ -72,7 +72,7 @@ pub enum NarEntry {
 /// - 0-padding to the next 8-byte boundary
 ///
 /// Returns `(data_slice, new_position)`.
-pub fn read_string(data: &[u8], pos: usize) -> Result<(&[u8], usize), NarError> {
+fn read_string(data: &[u8], pos: usize) -> Result<(&[u8], usize), NarError> {
     // Need at least 8 bytes for the length field.
     if pos.checked_add(8).ok_or(NarError::OffsetOverflow)? > data.len() {
         return Err(NarError::TooShort);
@@ -81,19 +81,30 @@ pub fn read_string(data: &[u8], pos: usize) -> Result<(&[u8], usize), NarError> 
     let len_bytes: [u8; 8] = data[pos..pos + 8]
         .try_into()
         .map_err(|_| NarError::TooShort)?;
-    let len = u64::from_le_bytes(len_bytes) as usize;
+    let len: usize = u64::from_le_bytes(len_bytes)
+        .try_into()
+        .map_err(|_| NarError::OffsetOverflow)?;
 
     // Padding: round up to next 8-byte boundary.
     let padded_len = (len + 7) & !7;
 
     let data_start = pos.checked_add(8).ok_or(NarError::OffsetOverflow)?;
-    let data_end = data_start.checked_add(len).ok_or(NarError::OffsetOverflow)?;
+    let data_end = data_start
+        .checked_add(len)
+        .ok_or(NarError::OffsetOverflow)?;
     let total_end = data_start
         .checked_add(padded_len)
         .ok_or(NarError::OffsetOverflow)?;
 
     if data_end > data.len() || total_end > data.len() {
         return Err(NarError::TooShort);
+    }
+
+    // Validate that all padding bytes are zero.
+    for &b in &data[data_end..total_end] {
+        if b != 0 {
+            return Err(NarError::InvalidString);
+        }
     }
 
     let string_data = &data[data_start..data_end];
@@ -103,7 +114,7 @@ pub fn read_string(data: &[u8], pos: usize) -> Result<(&[u8], usize), NarError> 
 /// Read a NAR string at `pos` and verify it matches `expected`.
 ///
 /// Returns the new position after the string.
-pub fn expect_string(data: &[u8], pos: usize, expected: &[u8]) -> Result<usize, NarError> {
+fn expect_string(data: &[u8], pos: usize, expected: &[u8]) -> Result<usize, NarError> {
     let (found, new_pos) = read_string(data, pos)?;
     if found != expected {
         return Err(NarError::UnexpectedToken);
@@ -159,7 +170,9 @@ fn parse_regular(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarError>
     let len_bytes: [u8; 8] = data[pos..pos + 8]
         .try_into()
         .map_err(|_| NarError::TooShort)?;
-    let contents_len = u64::from_le_bytes(len_bytes) as usize;
+    let contents_len: usize = u64::from_le_bytes(len_bytes)
+        .try_into()
+        .map_err(|_| NarError::OffsetOverflow)?;
     let padded_len = (contents_len + 7) & !7;
 
     let contents_offset = pos.checked_add(8).ok_or(NarError::OffsetOverflow)?;
@@ -197,8 +210,7 @@ fn parse_symlink(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarError>
     let (target_bytes, pos) = read_string(data, pos)?;
 
     // Convert target to a string. NAR targets should be valid UTF-8 paths.
-    let target_str =
-        core::str::from_utf8(target_bytes).map_err(|_| NarError::InvalidString)?;
+    let target_str = core::str::from_utf8(target_bytes).map_err(|_| NarError::InvalidString)?;
 
     let pos = expect_string(data, pos, b")")?;
 
@@ -241,8 +253,7 @@ fn parse_directory(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarErro
         // Read the entry name.
         let (name_bytes, new_pos) = read_string(data, pos)?;
         pos = new_pos;
-        let name_str =
-            core::str::from_utf8(name_bytes).map_err(|_| NarError::InvalidString)?;
+        let name_str = core::str::from_utf8(name_bytes).map_err(|_| NarError::InvalidString)?;
         let name: Arc<str> = Arc::from(name_str);
 
         // Expect "node".
@@ -496,6 +507,17 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn read_string_nonzero_padding() {
+        // "hello" is 5 bytes → 3 padding bytes to reach 8-byte boundary.
+        // Build manually with non-zero padding.
+        let mut data = Vec::new();
+        data.extend_from_slice(&5u64.to_le_bytes()); // length = 5
+        data.extend_from_slice(b"hello"); // 5 bytes of content
+        data.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // 3 non-zero padding bytes
+        assert_eq!(read_string(&data, 0), Err(NarError::InvalidString));
+    }
+
+    #[test]
     fn expect_string_matches() {
         let data = nar_string(b"(");
         let pos = expect_string(&data, 0, b"(").unwrap();
@@ -603,7 +625,9 @@ pub(crate) mod tests {
 
                 // Check bin directory.
                 match entries.get("bin").unwrap() {
-                    NarEntry::Directory { entries: bin_entries } => {
+                    NarEntry::Directory {
+                        entries: bin_entries,
+                    } => {
                         assert_eq!(bin_entries.len(), 1);
                         match bin_entries.get("hello").unwrap() {
                             NarEntry::Regular {
@@ -667,9 +691,7 @@ pub(crate) mod tests {
         // README at top level.
         let readme = archive.lookup("README").unwrap();
         match readme {
-            NarEntry::Regular {
-                contents_len, ..
-            } => {
+            NarEntry::Regular { contents_len, .. } => {
                 assert_eq!(*contents_len, b"Hello, world!\n".len());
             }
             other => panic!("Expected Regular README, got {:?}", other),
@@ -683,6 +705,9 @@ pub(crate) mod tests {
             }
             other => panic!("Expected Regular hello, got {:?}", other),
         }
+
+        // Walk through a file (not a directory).
+        assert!(archive.lookup("README/foo").is_none());
 
         // Nonexistent path.
         assert!(archive.lookup("nonexistent").is_none());

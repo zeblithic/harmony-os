@@ -21,8 +21,8 @@ pub mod gpio_server;
 pub mod kernel;
 #[cfg(feature = "kernel")]
 pub mod library_server;
-pub mod nar;
 pub mod namespace;
+pub mod nar;
 pub mod sd_server;
 pub mod serial_server;
 pub mod uart_server;
