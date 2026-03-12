@@ -184,6 +184,18 @@ mod tests {
         data: HashMap<String, Vec<u8>>,
     }
 
+    impl MockQuerier {
+        fn new() -> Self {
+            Self {
+                data: HashMap::new(),
+            }
+        }
+
+        fn insert(&mut self, key: &str, value: Vec<u8>) {
+            self.data.insert(key.to_string(), value);
+        }
+    }
+
     impl ContentQuerier for MockQuerier {
         fn query(&self, key_expr: &str) -> Result<Option<Vec<u8>>, String> {
             Ok(self.data.get(key_expr).cloned())
@@ -372,5 +384,55 @@ mod tests {
         // MeshNarFetch::fetch_nar should return None (not panic) on error.
         let result = source.fetch_nar(store_path_name);
         assert_eq!(result, None);
+    }
+
+    /// End-to-end: publish via NarPublisher, then fetch via MeshNarSource.
+    #[test]
+    fn end_to_end_publish_then_fetch() {
+        use crate::nar_publisher::{ContentAnnouncer, NarPublisher};
+
+        struct NoopAnnouncer;
+        impl ContentAnnouncer for NoopAnnouncer {
+            fn announce(&self, _key: &str, _payload: &[u8]) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let nar = build_test_nar(b"end-to-end mesh test data");
+        let store_path = "abc12345678901234567890123456789-e2e-test";
+
+        let mut publisher = NarPublisher::new(NoopAnnouncer);
+        let root_cid = publisher.publish(store_path, &nar).unwrap();
+
+        // Populate mock querier with publisher's blob store data.
+        let mut querier = MockQuerier::new();
+        let store_hash = &store_path[..32];
+        let root_cid_hex = hex::encode(root_cid.to_bytes());
+
+        // Store path → root CID mapping.
+        querier.insert(
+            &format!("harmony/nix/store/{store_hash}"),
+            root_cid_hex.as_bytes().to_vec(),
+        );
+
+        // Root blob/bundle.
+        let root_fetch_key = content::fetch_key(&root_cid_hex);
+        querier.insert(
+            &root_fetch_key,
+            publisher.get_blob(&root_cid).unwrap().to_vec(),
+        );
+
+        // All leaf blobs via dag::walk on publisher's blob store.
+        let blob_cids = dag::walk(&root_cid, publisher.blob_store()).unwrap();
+        for cid in &blob_cids {
+            let cid_hex = hex::encode(cid.to_bytes());
+            let fetch_key = content::fetch_key(&cid_hex);
+            querier.insert(&fetch_key, publisher.get_blob(cid).unwrap().to_vec());
+        }
+
+        // Fetch side.
+        let source = MeshNarSource::new(querier);
+        let fetched = source.fetch_nar(store_path);
+        assert_eq!(fetched, Some(nar));
     }
 }
