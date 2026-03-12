@@ -37,7 +37,14 @@ pub enum NarError {
     OutOfOrder,
     /// The archive has trailing bytes after the root node.
     TrailingData,
+    /// Directory nesting exceeds the maximum allowed depth.
+    NestingTooDeep,
 }
+
+/// Maximum directory nesting depth. Prevents stack overflow from crafted
+/// archives with deeply nested directories. 256 levels is generous for
+/// real Nix store paths (typical depth is < 20).
+const MAX_NESTING_DEPTH: usize = 256;
 
 // ── Entry types ─────────────────────────────────────────────────────
 
@@ -137,6 +144,15 @@ fn expect_string(data: &[u8], pos: usize, expected: &[u8]) -> Result<usize, NarE
 ///
 /// Returns `(entry, new_position)`.
 pub fn parse_node(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarError> {
+    parse_node_depth(data, pos, 0)
+}
+
+/// Internal depth-tracking version of [`parse_node`].
+fn parse_node_depth(data: &[u8], pos: usize, depth: usize) -> Result<(NarEntry, usize), NarError> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(NarError::NestingTooDeep);
+    }
+
     let pos = expect_string(data, pos, b"(")?;
     let pos = expect_string(data, pos, b"type")?;
 
@@ -145,7 +161,7 @@ pub fn parse_node(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarError
     match type_str {
         b"regular" => parse_regular(data, pos),
         b"symlink" => parse_symlink(data, pos),
-        b"directory" => parse_directory(data, pos),
+        b"directory" => parse_directory(data, pos, depth),
         _ => Err(NarError::InvalidType),
     }
 }
@@ -257,7 +273,7 @@ fn parse_symlink(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarError>
 /// At entry, `pos` points just after the `type directory` tokens.
 /// Expects zero or more `entry ( name <n> node <recurse> )` sequences,
 /// then `)`.
-fn parse_directory(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarError> {
+fn parse_directory(data: &[u8], pos: usize, depth: usize) -> Result<(NarEntry, usize), NarError> {
     let mut entries = BTreeMap::new();
     let mut last_name: Option<Arc<str>> = None;
     let mut pos = pos;
@@ -316,8 +332,8 @@ fn parse_directory(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarErro
         // Expect "node".
         pos = expect_string(data, pos, b"node")?;
 
-        // Recurse into the node.
-        let (child_entry, new_pos) = parse_node(data, pos)?;
+        // Recurse into the node (depth + 1 for nesting limit).
+        let (child_entry, new_pos) = parse_node_depth(data, pos, depth + 1)?;
         pos = new_pos;
 
         // Expect ")" to close the entry.
@@ -377,6 +393,9 @@ impl NarArchive {
 
         let mut current = &self.root;
         for component in path.split('/') {
+            // Empty components (from double-slashes or leading/trailing slashes)
+            // are intentionally skipped. Paths produced by `walk` always use a
+            // single `/` separator, so this case should not arise in practice.
             if component.is_empty() {
                 continue;
             }
@@ -987,5 +1006,36 @@ pub(crate) mod tests {
                 contents_len: 0,
             }
         );
+    }
+
+    #[test]
+    fn rejects_deeply_nested_directories() {
+        // Build a NAR with MAX_NESTING_DEPTH + 2 levels of nesting.
+        let depth = MAX_NESTING_DEPTH + 2;
+        let mut buf = Vec::new();
+        buf.extend(nar_string(b"nix-archive-1"));
+        for i in 0..depth {
+            buf.extend(nar_string(b"("));
+            buf.extend(nar_string(b"type"));
+            buf.extend(nar_string(b"directory"));
+            buf.extend(nar_string(b"entry"));
+            buf.extend(nar_string(b"("));
+            buf.extend(nar_string(b"name"));
+            // Use a unique, ascending name at each level.
+            let name = alloc::format!("d{i}");
+            buf.extend(nar_string(name.as_bytes()));
+            buf.extend(nar_string(b"node"));
+        }
+        // Innermost node: a regular file.
+        buf.extend(nar_string(b"("));
+        buf.extend(nar_string(b"type"));
+        buf.extend(nar_string(b"regular"));
+        buf.extend(nar_string(b")"));
+        // Close all the entry/directory pairs.
+        for _ in 0..depth {
+            buf.extend(nar_string(b")"));
+            buf.extend(nar_string(b")"));
+        }
+        assert_eq!(NarArchive::parse(&buf), Err(NarError::NestingTooDeep));
     }
 }

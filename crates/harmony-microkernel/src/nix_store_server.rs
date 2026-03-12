@@ -114,6 +114,13 @@ impl NixStoreServer {
     ///
     /// `name` is the store path name (e.g. `"abc123-hello"`).
     /// `nar_bytes` is the raw NAR blob.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NarError::InvalidString` if `name` is malformed (empty,
+    /// contains `/`, `\0`, `\n`, `\r`, or is `.`/`..`).
+    /// Returns `NarError::DuplicateEntry` if `name` is already imported.
+    /// All other `NarError` variants come from parsing the NAR blob itself.
     pub fn import_nar(&mut self, name: &str, nar_bytes: Vec<u8>) -> Result<(), NarError> {
         // Validate store-path name — same constraints as NAR entry names.
         // Listings use '\n' as separator, so newlines would create ambiguous output.
