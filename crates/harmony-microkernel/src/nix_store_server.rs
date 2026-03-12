@@ -155,6 +155,11 @@ impl NixStoreServer {
         Ok(())
     }
 
+    /// Check whether a store path has already been imported.
+    pub fn has_store_path(&self, name: &str) -> bool {
+        self.store_paths.contains_key(name)
+    }
+
     /// Drain all recorded miss events (store path names that were walked
     /// but not found). The fetcher calls this periodically to discover
     /// which store paths need fetching. Misses are deduplicated at source.
@@ -422,31 +427,52 @@ impl SharedNixStoreServer {
 #[cfg(feature = "std")]
 impl FileServer for SharedNixStoreServer {
     fn walk(&mut self, fid: Fid, new_fid: Fid, name: &str) -> Result<QPath, IpcError> {
-        self.inner.lock().unwrap().walk(fid, new_fid, name)
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .walk(fid, new_fid, name)
     }
 
     fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
-        self.inner.lock().unwrap().open(fid, mode)
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .open(fid, mode)
     }
 
     fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
-        self.inner.lock().unwrap().read(fid, offset, count)
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .read(fid, offset, count)
     }
 
     fn write(&mut self, fid: Fid, offset: u64, data: &[u8]) -> Result<u32, IpcError> {
-        self.inner.lock().unwrap().write(fid, offset, data)
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .write(fid, offset, data)
     }
 
     fn clunk(&mut self, fid: Fid) -> Result<(), IpcError> {
-        self.inner.lock().unwrap().clunk(fid)
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clunk(fid)
     }
 
     fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
-        self.inner.lock().unwrap().stat(fid)
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stat(fid)
     }
 
     fn clone_fid(&mut self, fid: Fid, new_fid: Fid) -> Result<QPath, IpcError> {
-        self.inner.lock().unwrap().clone_fid(fid, new_fid)
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone_fid(fid, new_fid)
     }
 }
 

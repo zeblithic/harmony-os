@@ -122,16 +122,30 @@ impl NixStoreFetcher {
     pub fn process_misses(&mut self, server: &mut NixStoreServer) {
         let misses = server.drain_misses();
         self.process_miss_list(misses, |name, nar| {
-            import_or_dup_ok(server.import_nar(name, nar))
+            // Skip if already imported (race: kernel re-recorded a miss
+            // for a path imported in a previous cycle).
+            if server.has_store_path(name) {
+                return Ok(());
+            }
+            server.import_nar(name, nar).map_err(|e| format!("{:?}", e))
         });
     }
 
     /// Process misses from a shared (Arc<Mutex>) server, releasing the lock
     /// during HTTP I/O so the kernel thread isn't blocked.
     pub fn process_misses_shared(&mut self, server: &Arc<Mutex<NixStoreServer>>) {
-        let misses = server.lock().unwrap().drain_misses();
+        let misses = server
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain_misses();
         self.process_miss_list(misses, |name, nar| {
-            import_or_dup_ok(server.lock().unwrap().import_nar(name, nar))
+            let mut guard = server.lock().unwrap_or_else(|e| e.into_inner());
+            // Skip if already imported (race: kernel re-recorded a miss
+            // for a path imported in a previous cycle).
+            if guard.has_store_path(name) {
+                return Ok(());
+            }
+            guard.import_nar(name, nar).map_err(|e| format!("{:?}", e))
         });
     }
 
@@ -194,7 +208,14 @@ impl NixStoreFetcher {
             )));
         }
 
-        // 4. Fetch NAR.
+        // 4. Fetch NAR — validate URL is a safe relative path.
+        if narinfo.url.contains("://") || narinfo.url.starts_with('/') || narinfo.url.contains("..")
+        {
+            return Err(FetchError::NarInfo(format!(
+                "narinfo URL is not a safe relative path: {:?}",
+                narinfo.url
+            )));
+        }
         let nar_url = format!("{}/{}", self.cache_url, narinfo.url);
         let compressed_nar = self.http.get(&nar_url)?;
 
@@ -218,17 +239,6 @@ impl NixStoreFetcher {
 }
 
 // ── Helper functions ─────────────────────────────────────────────────
-
-/// Treat `DuplicateEntry` from `import_nar` as success. This can happen
-/// when the kernel re-records a miss for a path that the fetcher is
-/// concurrently importing (race between drain and import cycles).
-fn import_or_dup_ok(result: Result<(), harmony_microkernel::nar::NarError>) -> Result<(), String> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(harmony_microkernel::nar::NarError::DuplicateEntry) => Ok(()),
-        Err(e) => Err(format!("{:?}", e)),
-    }
-}
 
 /// Decompress xz-compressed data, reading at most `nar_size + 1` bytes
 /// to prevent decompression bombs from exhausting memory.
