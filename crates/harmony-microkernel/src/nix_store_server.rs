@@ -161,7 +161,7 @@ impl NixStoreServer {
                 contents_len,
                 ..
             } => {
-                let off = offset as usize;
+                let off = usize::try_from(offset).unwrap_or(usize::MAX);
                 if off >= *contents_len {
                     return Vec::new();
                 }
@@ -173,7 +173,7 @@ impl NixStoreServer {
             }
             NarEntry::Symlink { target } => {
                 let bytes = target.as_bytes();
-                let off = offset as usize;
+                let off = usize::try_from(offset).unwrap_or(usize::MAX);
                 if off >= bytes.len() {
                     return Vec::new();
                 }
@@ -187,7 +187,7 @@ impl NixStoreServer {
                     listing.push('\n');
                 }
                 let bytes = listing.as_bytes();
-                let off = offset as usize;
+                let off = usize::try_from(offset).unwrap_or(usize::MAX);
                 if off >= bytes.len() {
                     return Vec::new();
                 }
@@ -282,7 +282,7 @@ impl FileServer for NixStoreServer {
                     listing.push('\n');
                 }
                 let bytes = listing.as_bytes();
-                let off = offset as usize;
+                let off = usize::try_from(offset).unwrap_or(usize::MAX);
                 if off >= bytes.len() {
                     return Ok(Vec::new());
                 }

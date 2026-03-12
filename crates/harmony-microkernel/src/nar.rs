@@ -271,6 +271,15 @@ fn parse_directory(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarErro
         let (name_bytes, new_pos) = read_string(data, pos)?;
         pos = new_pos;
         let name_str = core::str::from_utf8(name_bytes).map_err(|_| NarError::InvalidString)?;
+        // NAR spec: entry names must not be empty, contain '/' or '\0', or be "." / "..".
+        if name_str.is_empty()
+            || name_str.contains('/')
+            || name_str.contains('\0')
+            || name_str == "."
+            || name_str == ".."
+        {
+            return Err(NarError::InvalidString);
+        }
         let name: Arc<str> = Arc::from(name_str);
 
         // NAR spec requires entries in strictly ascending lexicographic order.
@@ -844,5 +853,60 @@ pub(crate) mod tests {
         buf.extend_from_slice(&[0, 0, 0, 0, 0, 0xFF]);
         buf.extend(nar_string(b")"));
         assert_eq!(NarArchive::parse(&buf), Err(NarError::InvalidString));
+    }
+
+    /// Helper: build a directory NAR with a single entry of the given name.
+    fn nar_dir_with_name(name: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend(nar_string(b"nix-archive-1"));
+        buf.extend(nar_string(b"("));
+        buf.extend(nar_string(b"type"));
+        buf.extend(nar_string(b"directory"));
+        buf.extend(nar_string(b"entry"));
+        buf.extend(nar_string(b"("));
+        buf.extend(nar_string(b"name"));
+        buf.extend(nar_string(name));
+        buf.extend(nar_string(b"node"));
+        buf.extend(nar_string(b"("));
+        buf.extend(nar_string(b"type"));
+        buf.extend(nar_string(b"regular"));
+        buf.extend(nar_string(b"contents"));
+        buf.extend(nar_string(b"x"));
+        buf.extend(nar_string(b")"));
+        buf.extend(nar_string(b")"));
+        buf.extend(nar_string(b")"));
+        buf
+    }
+
+    #[test]
+    fn rejects_entry_name_with_slash() {
+        assert_eq!(
+            NarArchive::parse(&nar_dir_with_name(b"a/b")),
+            Err(NarError::InvalidString)
+        );
+    }
+
+    #[test]
+    fn rejects_entry_name_dot() {
+        assert_eq!(
+            NarArchive::parse(&nar_dir_with_name(b".")),
+            Err(NarError::InvalidString)
+        );
+    }
+
+    #[test]
+    fn rejects_entry_name_dotdot() {
+        assert_eq!(
+            NarArchive::parse(&nar_dir_with_name(b"..")),
+            Err(NarError::InvalidString)
+        );
+    }
+
+    #[test]
+    fn rejects_empty_entry_name() {
+        assert_eq!(
+            NarArchive::parse(&nar_dir_with_name(b"")),
+            Err(NarError::InvalidString)
+        );
     }
 }
