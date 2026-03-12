@@ -50,6 +50,7 @@ enum NixFidPayload {
 pub struct NixStoreServer {
     store_paths: BTreeMap<Arc<str>, StorePath>,
     tracker: FidTracker<NixFidPayload>,
+    misses: Vec<Arc<str>>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
@@ -107,6 +108,7 @@ impl NixStoreServer {
         Self {
             store_paths: BTreeMap::new(),
             tracker: FidTracker::new(0, NixFidPayload::Root),
+            misses: Vec::new(),
         }
     }
 
@@ -148,6 +150,13 @@ impl NixStoreServer {
             },
         );
         Ok(())
+    }
+
+    /// Drain all recorded miss events (store path names that were walked
+    /// but not found). The fetcher calls this periodically to discover
+    /// which store paths need fetching.
+    pub fn drain_misses(&mut self) -> Vec<Arc<str>> {
+        core::mem::take(&mut self.misses)
     }
 
     /// Build the full path string for qpath computation from a payload.
@@ -231,6 +240,7 @@ impl FileServer for NixStoreServer {
                 // Walk from root to a store path.
                 let key: Arc<str> = Arc::from(name);
                 if !self.store_paths.contains_key(&key) {
+                    self.misses.push(Arc::clone(&key));
                     return Err(IpcError::NotFound);
                 }
                 NixFidPayload::StorePathRoot { name: key }
@@ -627,6 +637,56 @@ mod tests {
         let data = srv.read(0, 0, 4096).unwrap();
         let listing = core::str::from_utf8(&data).unwrap();
         assert_eq!(listing, "aaa-first\nzzz-last\n");
+    }
+
+    #[test]
+    fn walk_miss_is_recorded() {
+        let mut srv = NixStoreServer::new();
+        // Walk to a non-existent store path.
+        assert_eq!(srv.walk(0, 1, "nonexistent-pkg"), Err(IpcError::NotFound));
+        // The miss should be recorded.
+        let misses = srv.drain_misses();
+        assert_eq!(misses.len(), 1);
+        assert_eq!(&*misses[0], "nonexistent-pkg");
+    }
+
+    #[test]
+    fn drain_misses_clears_list() {
+        let mut srv = NixStoreServer::new();
+        assert_eq!(srv.walk(0, 1, "miss-one"), Err(IpcError::NotFound));
+        assert_eq!(srv.walk(0, 2, "miss-two"), Err(IpcError::NotFound));
+        // First drain returns both.
+        let misses = srv.drain_misses();
+        assert_eq!(misses.len(), 2);
+        // Second drain returns empty.
+        let misses2 = srv.drain_misses();
+        assert!(misses2.is_empty());
+    }
+
+    #[test]
+    fn drain_misses_on_empty_server() {
+        let mut srv = NixStoreServer::new();
+        let misses = srv.drain_misses();
+        assert!(misses.is_empty());
+    }
+
+    #[test]
+    fn duplicate_misses_are_recorded() {
+        let mut srv = NixStoreServer::new();
+        assert_eq!(srv.walk(0, 1, "same-pkg"), Err(IpcError::NotFound));
+        assert_eq!(srv.walk(0, 2, "same-pkg"), Err(IpcError::NotFound));
+        let misses = srv.drain_misses();
+        assert_eq!(misses.len(), 2);
+        assert_eq!(&*misses[0], "same-pkg");
+        assert_eq!(&*misses[1], "same-pkg");
+    }
+
+    #[test]
+    fn existing_store_path_walk_does_not_record_miss() {
+        let mut srv = test_server(); // has "abc123-hello"
+        srv.walk(0, 1, "abc123-hello").unwrap();
+        let misses = srv.drain_misses();
+        assert!(misses.is_empty());
     }
 
     // ── Kernel integration tests ─────────────────────────────────────
