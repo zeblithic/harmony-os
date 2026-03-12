@@ -488,12 +488,13 @@ pub fn build_initial_stack(
     stack_base + pos as u64
 }
 
-/// Allocate a stack region, build the Linux-standard initial stack
-/// layout (argc/argv/envp/auxv), write it into the process's VM,
-/// and return the initial SP.
+/// Build the Linux-standard initial stack layout (argc/argv/envp/auxv)
+/// and write it into an already-mapped stack region in the process's VM.
+/// Returns the initial SP.
 ///
-/// `stack_top` is the virtual address of the stack region's base
-/// (lowest address). The stack grows downward from
+/// The caller must ensure the stack region at `stack_top` is already
+/// mapped (e.g. via `vm_mmap`). `stack_top` is the lowest virtual
+/// address of the region. The stack grows downward from
 /// `stack_top + stack_size`.
 pub fn prepare_process_stack(
     backend: &mut dyn SyscallBackend,
@@ -1583,6 +1584,125 @@ mod tests {
             let sp = build_initial_stack(&mut stack, stack_base, args, &[], &test_auxv, &random);
             assert_eq!(sp % 16, 0, "SP must be 16-byte aligned for argv {:?}", args);
         }
+    }
+
+    /// Build a static ET_EXEC ELF with PT_LOAD + PT_TLS.
+    fn build_static_elf_with_tls(code: &[u8], tls_memsz: u64) -> Vec<u8> {
+        let phdr_size = 56usize;
+        let phnum = 2usize; // PT_LOAD + PT_TLS
+        let code_offset = 64 + phnum * phdr_size;
+        let tls_data = [0u8; 8]; // 8 bytes of .tdata
+        let tls_offset = code_offset + code.len();
+        let total = tls_offset + tls_data.len();
+        let mut elf = vec![0u8; total];
+
+        // ELF header
+        elf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        #[cfg(target_arch = "x86_64")]
+        elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
+        #[cfg(target_arch = "aarch64")]
+        elf[18..20].copy_from_slice(&0xB7u16.to_le_bytes());
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf[24..32].copy_from_slice(&0x401000u64.to_le_bytes()); // entry
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // phoff
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&(phnum as u16).to_le_bytes());
+
+        // PT_LOAD: p_offset = 0, vaddr = 0x400000, filesz = entire file
+        // This is how real ELFs work — the first LOAD segment starts at file
+        // offset 0 and covers the ELF header + phdrs, so they're mapped.
+        let ph = &mut elf[64..64 + phdr_size];
+        ph[0..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        ph[4..8].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
+        ph[8..16].copy_from_slice(&0u64.to_le_bytes()); // p_offset = 0
+        ph[16..24].copy_from_slice(&0x400000u64.to_le_bytes()); // vaddr
+        ph[24..32].copy_from_slice(&0x400000u64.to_le_bytes());
+        ph[32..40].copy_from_slice(&(total as u64).to_le_bytes()); // filesz = entire file
+        ph[40..48].copy_from_slice(&(total as u64).to_le_bytes()); // memsz
+        ph[48..56].copy_from_slice(&0x1000u64.to_le_bytes());
+
+        // PT_TLS
+        let tph = &mut elf[64 + phdr_size..64 + 2 * phdr_size];
+        tph[0..4].copy_from_slice(&7u32.to_le_bytes()); // PT_TLS
+        tph[4..8].copy_from_slice(&4u32.to_le_bytes()); // PF_R
+        tph[8..16].copy_from_slice(&(tls_offset as u64).to_le_bytes());
+        tph[16..24].copy_from_slice(&0x403000u64.to_le_bytes()); // vaddr
+        tph[24..32].copy_from_slice(&0x403000u64.to_le_bytes());
+        tph[32..40].copy_from_slice(&(tls_data.len() as u64).to_le_bytes());
+        tph[40..48].copy_from_slice(&tls_memsz.to_le_bytes());
+        tph[48..56].copy_from_slice(&16u64.to_le_bytes()); // align
+
+        elf[tls_offset..tls_offset + tls_data.len()].copy_from_slice(&tls_data);
+
+        elf
+    }
+
+    #[test]
+    fn boot_elf_with_tls_has_pt_tls_in_mapped_phdrs() {
+        use crate::elf::parse_elf;
+
+        let elf_bytes = build_static_elf_with_tls(&[0xCC; 16], 32);
+        let parsed = parse_elf(&elf_bytes).unwrap();
+
+        // Verify PT_TLS was parsed.
+        assert!(parsed.tls.is_some(), "ParsedElf should contain TLS info");
+        let tls = parsed.tls.unwrap();
+        assert_eq!(tls.memsz, 32);
+
+        // Verify phdr count includes PT_TLS.
+        assert_eq!(parsed.phdr_count, 2, "should have PT_LOAD + PT_TLS");
+
+        // Load via InterpreterLoader to verify no errors.
+        let mut backend = LoaderMockBackend::new();
+        let mut loader = InterpreterLoader::default();
+        let result = loader.load(&elf_bytes, &mut backend);
+        assert!(result.is_ok(), "loading ELF with PT_TLS should succeed");
+
+        // Verify AT_PHDR is in the auxv and points within the mapped region.
+        let load_result = result.unwrap();
+        let at_phdr = load_result
+            .auxv
+            .iter()
+            .find(|(k, _)| *k == auxv::AT_PHDR)
+            .map(|(_, v)| *v)
+            .expect("AT_PHDR should be in auxv");
+
+        // AT_PHDR should point within the mapped region (0x400000...).
+        assert!(
+            at_phdr >= 0x400000,
+            "AT_PHDR ({:#x}) should be within mapped region",
+            at_phdr
+        );
+
+        // Verify the mapped memory at AT_PHDR contains the raw phdr bytes.
+        // Use rfind because the loader zero-fills the region first, then
+        // overwrites with the actual segment data — we want the latter.
+        let phdr_write = backend.written.iter().rev().find(|(addr, data)| {
+            let end = *addr + data.len() as u64;
+            at_phdr >= *addr && at_phdr + 56 * 2 <= end
+        });
+        assert!(
+            phdr_write.is_some(),
+            "program headers should be written to VM memory"
+        );
+
+        // Read the second phdr (PT_TLS) from the mapped data.
+        let (base, data) = phdr_write.unwrap();
+        let phdr_off = (at_phdr - base) as usize;
+        let second_phdr_off = phdr_off + 56;
+        let p_type = u32::from_le_bytes(
+            data[second_phdr_off..second_phdr_off + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(p_type, 7, "second phdr should be PT_TLS (type 7)");
     }
 
     #[test]
