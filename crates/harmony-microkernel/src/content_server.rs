@@ -429,9 +429,13 @@ impl FileServer for ContentServer {
                 if self.ingest_buffers.len() >= MAX_CONCURRENT_INGESTS {
                     return Err(IpcError::ResourceExhausted);
                 }
+                // NLL ends the `entry` borrow here (last use was in the
+                // match discriminant above), allowing us to mutably borrow
+                // `self.ingest_buffers`. After the insert, we re-borrow the
+                // tracker to call mark_open — the unwrap is safe because
+                // begin_open already validated the fid.
                 self.ingest_buffers
                     .insert(fid, IngestState::Writing(Vec::new()));
-                // Re-borrow after ingest_buffers insert
                 let entry = self.tracker.get_mut(fid).unwrap();
                 entry.mark_open(mode);
                 return Ok(());
@@ -443,10 +447,10 @@ impl FileServer for ContentServer {
 
     fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
         let entry = self.tracker.get(fid)?;
-        if !entry.is_open {
+        if !entry.is_open() {
             return Err(IpcError::NotOpen);
         }
-        if matches!(entry.mode, Some(OpenMode::Write)) {
+        if matches!(entry.mode(), Some(OpenMode::Write)) {
             return Err(IpcError::PermissionDenied);
         }
         let node = entry.payload.clone();
@@ -468,10 +472,10 @@ impl FileServer for ContentServer {
     // the requested offset, matching Plan 9 ctl-file conventions.
     fn write(&mut self, fid: Fid, _offset: u64, data: &[u8]) -> Result<u32, IpcError> {
         let entry = self.tracker.get(fid)?;
-        if !entry.is_open {
+        if !entry.is_open() {
             return Err(IpcError::NotOpen);
         }
-        if matches!(entry.mode, Some(OpenMode::Read)) {
+        if matches!(entry.mode(), Some(OpenMode::Read)) {
             return Err(IpcError::PermissionDenied);
         }
         let node = entry.payload.clone();
@@ -574,7 +578,7 @@ mod tests {
         let server = ContentServer::new();
         let entry = server.tracker.get(0).unwrap();
         assert_eq!(entry.qpath, ROOT);
-        assert!(!entry.is_open);
+        assert!(!entry.is_open());
     }
 
     #[test]

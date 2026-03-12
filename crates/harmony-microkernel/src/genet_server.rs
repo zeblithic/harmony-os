@@ -98,7 +98,7 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> GenetServer<B, RX, TX> {
 impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServer<B, RX, TX> {
     fn walk(&mut self, fid: Fid, new_fid: Fid, name: &str) -> Result<QPath, IpcError> {
         let entry = self.tracker.get(fid)?;
-        if entry.is_open {
+        if entry.is_open() {
             return Err(IpcError::PermissionDenied); // 9P: cannot walk from an open fid
         }
         if !Self::is_directory(entry.qpath) {
@@ -111,8 +111,7 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
             // In-place walk: replace existing entry
             let entry = self.tracker.get_mut(fid)?;
             entry.qpath = qpath;
-            entry.is_open = false;
-            entry.mode = None;
+            entry.reset_open_state();
         } else {
             self.tracker.insert(new_fid, qpath, ())?;
         }
@@ -134,13 +133,13 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
 
     fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
         let entry = self.tracker.get(fid)?;
-        if !entry.is_open {
+        if !entry.is_open() {
             return Err(IpcError::NotOpen);
         }
         if Self::is_directory(entry.qpath) {
             return Err(IpcError::IsDirectory);
         }
-        if matches!(entry.mode, Some(OpenMode::Write)) {
+        if matches!(entry.mode(), Some(OpenMode::Write)) {
             return Err(IpcError::PermissionDenied);
         }
 
@@ -210,13 +209,13 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
 
     fn write(&mut self, fid: Fid, _offset: u64, data: &[u8]) -> Result<u32, IpcError> {
         let entry = self.tracker.get(fid)?;
-        if !entry.is_open {
+        if !entry.is_open() {
             return Err(IpcError::NotOpen);
         }
         if Self::is_directory(entry.qpath) {
             return Err(IpcError::IsDirectory);
         }
-        if matches!(entry.mode, Some(OpenMode::Read)) {
+        if matches!(entry.mode(), Some(OpenMode::Read)) {
             return Err(IpcError::PermissionDenied);
         }
 

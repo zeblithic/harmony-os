@@ -68,13 +68,13 @@ impl<B: RegisterBank, const N: usize> FileServer for UartServer<B, N> {
 
     fn read(&mut self, fid: Fid, _offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
         let entry = self.tracker.get(fid)?;
-        if !entry.is_open {
+        if !entry.is_open() {
             return Err(IpcError::NotOpen);
         }
         if entry.qpath == QPATH_ROOT {
             return Err(IpcError::IsDirectory);
         }
-        if matches!(entry.mode, Some(OpenMode::Write)) {
+        if matches!(entry.mode(), Some(OpenMode::Write)) {
             return Err(IpcError::PermissionDenied);
         }
         // Poll hardware, then drain ring buffer.
@@ -87,13 +87,13 @@ impl<B: RegisterBank, const N: usize> FileServer for UartServer<B, N> {
 
     fn write(&mut self, fid: Fid, _offset: u64, data: &[u8]) -> Result<u32, IpcError> {
         let entry = self.tracker.get(fid)?;
-        if !entry.is_open {
+        if !entry.is_open() {
             return Err(IpcError::NotOpen);
         }
         if entry.qpath == QPATH_ROOT {
             return Err(IpcError::IsDirectory);
         }
-        if matches!(entry.mode, Some(OpenMode::Read)) {
+        if matches!(entry.mode(), Some(OpenMode::Read)) {
             return Err(IpcError::PermissionDenied);
         }
         let len = u32::try_from(data.len()).map_err(|_| IpcError::ResourceExhausted)?;

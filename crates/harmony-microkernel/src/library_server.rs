@@ -77,17 +77,17 @@ impl FileServer for LibraryServer {
     }
 
     fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
+        let entry = self.tracker.begin_open(fid)?;
         if mode != OpenMode::Read {
             return Err(IpcError::ReadOnly);
         }
-        let entry = self.tracker.begin_open(fid)?;
         entry.mark_open(mode);
         Ok(())
     }
 
     fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
         let entry = self.tracker.get(fid)?;
-        if !entry.is_open {
+        if !entry.is_open() {
             return Err(IpcError::NotOpen);
         }
         // Root fid is a directory — reading it is not supported.

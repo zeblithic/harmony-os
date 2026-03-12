@@ -16,19 +16,40 @@ use crate::{Fid, IpcError, OpenMode, QPath};
 
 /// State tracked for each fid: its qpath, open status, and an
 /// arbitrary server-specific payload of type `T`.
+///
+/// `is_open` and `mode` are encapsulated — mutate only through
+/// `mark_open` and `reset_open_state` to maintain lifecycle invariants.
 #[derive(Debug, Clone)]
 pub struct FidEntry<T: Clone> {
     pub qpath: QPath,
-    pub is_open: bool,
-    pub mode: Option<OpenMode>,
+    is_open: bool,
+    mode: Option<OpenMode>,
     pub payload: T,
 }
 
 impl<T: Clone> FidEntry<T> {
+    /// Whether this fid has been opened.
+    pub fn is_open(&self) -> bool {
+        self.is_open
+    }
+
+    /// The mode this fid was opened with, if any.
+    pub fn mode(&self) -> Option<OpenMode> {
+        self.mode
+    }
+
     /// Mark this fid as open with the given mode.
     pub fn mark_open(&mut self, mode: OpenMode) {
         self.is_open = true;
         self.mode = Some(mode);
+    }
+
+    /// Reset open state to closed. Used by in-place walk (9P2000:
+    /// `new_fid == fid` replaces the binding, resetting the fid to
+    /// a walked-but-not-opened state).
+    pub fn reset_open_state(&mut self) {
+        self.is_open = false;
+        self.mode = None;
     }
 }
 
@@ -69,6 +90,7 @@ impl<T: Clone> FidTracker<T> {
     }
 
     /// Returns `true` if the tracker contains `fid`.
+    #[cfg(test)]
     pub fn contains(&self, fid: Fid) -> bool {
         self.fids.contains_key(&fid)
     }
@@ -149,8 +171,8 @@ mod tests {
 
         let entry = tracker.get(0).expect("fid 0 should exist");
         assert_eq!(entry.qpath, 42);
-        assert!(!entry.is_open);
-        assert_eq!(entry.mode, None);
+        assert!(!entry.is_open());
+        assert_eq!(entry.mode(), None);
     }
 
     #[test]
@@ -159,7 +181,7 @@ mod tests {
         tracker.insert(1, 42, ()).unwrap();
         let entry = tracker.get(1).unwrap();
         assert_eq!(entry.qpath, 42);
-        assert!(!entry.is_open);
+        assert!(!entry.is_open());
     }
 
     #[test]
@@ -250,8 +272,21 @@ mod tests {
         let entry = tracker.begin_open(1).unwrap();
         entry.mark_open(OpenMode::ReadWrite);
         let entry = tracker.get(1).unwrap();
-        assert!(entry.is_open);
-        assert_eq!(entry.mode, Some(OpenMode::ReadWrite));
+        assert!(entry.is_open());
+        assert_eq!(entry.mode(), Some(OpenMode::ReadWrite));
+    }
+
+    #[test]
+    fn reset_open_state_clears_open_and_mode() {
+        let mut tracker: FidTracker<()> = FidTracker::new(0, ());
+        tracker.insert(1, 42, ()).unwrap();
+        let entry = tracker.begin_open(1).unwrap();
+        entry.mark_open(OpenMode::ReadWrite);
+        // Now reset (used by in-place walk)
+        let entry = tracker.get_mut(1).unwrap();
+        entry.reset_open_state();
+        assert!(!entry.is_open());
+        assert_eq!(entry.mode(), None);
     }
 
     #[test]
