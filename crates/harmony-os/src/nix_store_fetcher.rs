@@ -226,21 +226,14 @@ impl NixStoreFetcher {
             }
 
             let nar_bytes = nar_bytes.unwrap();
-            match import_fn(&name_str, nar_bytes.clone()) {
-                Ok(true) => {
-                    // Newly imported — only publish if data came from HTTP
-                    // (mesh-sourced NARs are already on the mesh).
-                    if !from_mesh {
-                        imported.push((name_str, nar_bytes));
-                    }
-                }
-                Ok(false) => {
-                    // Already present — skip re-publishing.
-                }
-                Err(e) => {
-                    // Only fall back to HTTP if data actually came from mesh.
-                    // If data was already from HTTP, re-fetching is redundant.
-                    if from_mesh {
+
+            if from_mesh {
+                // Mesh-sourced: no clone needed — we never return these
+                // for re-publishing (they're already on the mesh).
+                match import_fn(&name_str, nar_bytes) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        // Mesh data failed import — try HTTP before blacklisting.
                         eprintln!(
                             "[nix-fetcher] mesh import failed for {}, trying HTTP: {}",
                             name_str, e
@@ -270,10 +263,23 @@ impl NixStoreFetcher {
                                 }
                             }
                         }
-                    } else {
-                        eprintln!("[nix-fetcher] import failed for {}: {}", name_str, e);
+                        self.failed.insert(name_str);
                     }
-                    self.failed.insert(name_str);
+                }
+            } else {
+                // HTTP-sourced: clone needed — import_fn consumes the Vec,
+                // but we need the original for the return value.
+                match import_fn(&name_str, nar_bytes.clone()) {
+                    Ok(true) => {
+                        imported.push((name_str, nar_bytes));
+                    }
+                    Ok(false) => {
+                        // Already present — skip re-publishing.
+                    }
+                    Err(e) => {
+                        eprintln!("[nix-fetcher] import failed for {}: {}", name_str, e);
+                        self.failed.insert(name_str);
+                    }
                 }
             }
         }
