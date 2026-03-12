@@ -11,6 +11,7 @@ extern crate alloc;
 pub mod elf;
 pub mod elf_loader;
 pub mod linuxulator;
+pub mod nix_base32;
 
 #[cfg(test)]
 mod tests {
