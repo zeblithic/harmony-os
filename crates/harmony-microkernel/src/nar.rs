@@ -153,9 +153,10 @@ pub fn parse_node(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarError
 /// Parse a regular file node.
 ///
 /// At entry, `pos` points just after the `type regular` tokens.
-/// Expects optional `executable ""`, then `contents <data>`, then `)`.
+/// NAR grammar: `"regular" ["executable" ""] ["contents" <data>] ")"`.
+/// The `contents` field is optional — Nix omits it for empty files.
 fn parse_regular(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarError> {
-    // Peek at the next token to see if it's "executable" or "contents".
+    // Peek at the next token to see if it's "executable", "contents", or ")".
     let (token, next_pos) = read_string(data, pos)?;
 
     let (executable, pos) = if token == b"executable" {
@@ -166,8 +167,23 @@ fn parse_regular(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarError>
         (false, pos)
     };
 
-    // Now expect "contents".
-    let pos = expect_string(data, pos, b"contents")?;
+    // Peek again — "contents" or ")" (empty file).
+    let (token, next_pos) = read_string(data, pos)?;
+
+    if token == b")" {
+        // Empty regular file — no contents field.
+        let entry = NarEntry::Regular {
+            executable,
+            contents_offset: 0,
+            contents_len: 0,
+        };
+        return Ok((entry, next_pos));
+    }
+
+    if token != b"contents" {
+        return Err(NarError::UnexpectedToken);
+    }
+    let pos = next_pos;
 
     // Read the contents length (8-byte LE).
     if pos.checked_add(8).ok_or(NarError::OffsetOverflow)? > data.len() {
@@ -284,7 +300,10 @@ fn parse_directory(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarErro
 
         // NAR spec requires entries in strictly ascending lexicographic order.
         if let Some(ref prev) = last_name {
-            if *name <= **prev {
+            if *name == **prev {
+                return Err(NarError::DuplicateEntry);
+            }
+            if *name < **prev {
                 return Err(NarError::OutOfOrder);
             }
         }
@@ -300,9 +319,7 @@ fn parse_directory(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarErro
         // Expect ")" to close the entry.
         pos = expect_string(data, pos, b")")?;
 
-        if entries.insert(name, child_entry).is_some() {
-            return Err(NarError::DuplicateEntry);
-        }
+        entries.insert(name, child_entry);
     }
 }
 
@@ -795,8 +812,7 @@ pub(crate) mod tests {
         buf.extend(nar_string(b")"));
         buf.extend(nar_string(b")"));
         buf.extend(nar_string(b")"));
-        // Equal names are caught by the sort-order check (<=) before the duplicate check.
-        assert_eq!(NarArchive::parse(&buf), Err(NarError::OutOfOrder));
+        assert_eq!(NarArchive::parse(&buf), Err(NarError::DuplicateEntry));
     }
 
     #[test]
@@ -907,6 +923,49 @@ pub(crate) mod tests {
         assert_eq!(
             NarArchive::parse(&nar_dir_with_name(b"")),
             Err(NarError::InvalidString)
+        );
+    }
+
+    #[test]
+    fn empty_regular_file_without_contents() {
+        // NAR spec: contents field is optional for empty files.
+        let mut buf = Vec::new();
+        buf.extend(nar_string(b"nix-archive-1"));
+        buf.extend(nar_string(b"("));
+        buf.extend(nar_string(b"type"));
+        buf.extend(nar_string(b"regular"));
+        // No "contents" — just close immediately.
+        buf.extend(nar_string(b")"));
+        let archive = NarArchive::parse(&buf).unwrap();
+        assert_eq!(
+            archive.root,
+            NarEntry::Regular {
+                executable: false,
+                contents_offset: 0,
+                contents_len: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn empty_executable_file_without_contents() {
+        let mut buf = Vec::new();
+        buf.extend(nar_string(b"nix-archive-1"));
+        buf.extend(nar_string(b"("));
+        buf.extend(nar_string(b"type"));
+        buf.extend(nar_string(b"regular"));
+        buf.extend(nar_string(b"executable"));
+        buf.extend(nar_string(b""));
+        // No "contents" — just close.
+        buf.extend(nar_string(b")"));
+        let archive = NarArchive::parse(&buf).unwrap();
+        assert_eq!(
+            archive.root,
+            NarEntry::Regular {
+                executable: true,
+                contents_offset: 0,
+                contents_len: 0,
+            }
         );
     }
 }

@@ -117,6 +117,9 @@ impl NixStoreServer {
     pub fn import_nar(&mut self, name: &str, nar_bytes: Vec<u8>) -> Result<(), NarError> {
         let archive = NarArchive::parse(&nar_bytes)?;
         let key: Arc<str> = Arc::from(name);
+        if self.store_paths.contains_key(&*key) {
+            return Err(NarError::DuplicateEntry);
+        }
         self.store_paths.insert(
             key,
             StorePath {
@@ -547,6 +550,18 @@ mod tests {
         srv.open(2, OpenMode::Read).unwrap();
         let data = srv.read(2, 0, 1024).unwrap();
         assert_eq!(data, b"world content");
+    }
+
+    #[test]
+    fn import_duplicate_store_path_rejected() {
+        let mut srv = NixStoreServer::new();
+        srv.import_nar("abc123-hello", nar_directory_with_files())
+            .unwrap();
+        // Second import of the same name is rejected.
+        assert_eq!(
+            srv.import_nar("abc123-hello", nar_regular_file(b"other", false)),
+            Err(NarError::DuplicateEntry)
+        );
     }
 
     #[test]
