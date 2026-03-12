@@ -292,6 +292,9 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, ElfError> {
                 let p_filesz = u64_le(ph, 32);
                 let p_memsz = u64_le(ph, 40);
                 let p_align = u64_le(ph, 48);
+                if p_memsz < p_filesz {
+                    return Err(ElfError::SegmentOutOfBounds);
+                }
                 tls = Some(TlsInfo {
                     vaddr: p_vaddr,
                     filesz: p_filesz,
@@ -710,5 +713,12 @@ mod tests {
         let elf = build_test_elf(&code);
         let parsed = parse_elf(&elf).unwrap();
         assert!(parsed.tls.is_none());
+    }
+
+    #[test]
+    fn pt_tls_rejects_filesz_greater_than_memsz() {
+        // filesz=16 > memsz=8 is invalid per ELF spec.
+        let elf = build_test_elf_with_tls(&[0xCC; 16], &[0x42; 16], 8, 16);
+        assert_eq!(parse_elf(&elf), Err(ElfError::SegmentOutOfBounds));
     }
 }

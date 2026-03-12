@@ -517,7 +517,12 @@ pub fn prepare_process_stack(
     sp
 }
 
-/// Parse, load, and set up the initial stack for a static ELF binary.
+/// Parse, load, and set up the initial stack for a statically-linked
+/// ELF binary (no PT_INTERP / dynamic linker).
+///
+/// Accepts both ET_EXEC and ET_DYN (static PIE) binaries — the
+/// underlying `InterpreterLoader` handles load-bias relocation for
+/// either type.
 ///
 /// Returns `(entry_point, initial_sp)` — everything needed to start
 /// execution. The caller sets PC and SP to these values.
