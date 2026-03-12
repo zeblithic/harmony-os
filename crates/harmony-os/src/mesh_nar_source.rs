@@ -114,9 +114,11 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
                 if !store.contains(cid) {
                     let cid_hex = hex::encode(cid.to_bytes());
                     let key = content::fetch_key(&cid_hex);
-                    if let Some(data) = self.querier.query(&key)? {
-                        store.store(*cid, data);
-                    }
+                    let data = self
+                        .querier
+                        .query(&key)?
+                        .ok_or_else(|| format!("mesh missing blob {cid_hex}"))?;
+                    store.store(*cid, data);
                 }
             }
             CidType::Bundle(_) => {
@@ -135,9 +137,11 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
                     if !store.contains(child) {
                         let child_hex = hex::encode(child.to_bytes());
                         let key = content::fetch_key(&child_hex);
-                        if let Some(data) = self.querier.query(&key)? {
-                            store.store(*child, data);
-                        }
+                        let data = self
+                            .querier
+                            .query(&key)?
+                            .ok_or_else(|| format!("mesh missing {child_hex}"))?;
+                        store.store(*child, data);
                     }
                     self.fetch_children(child, store)?;
                 }
