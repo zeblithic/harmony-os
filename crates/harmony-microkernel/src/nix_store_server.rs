@@ -134,11 +134,12 @@ impl NixStoreServer {
         {
             return Err(NarError::InvalidString);
         }
-        let archive = NarArchive::parse(&nar_bytes)?;
-        let key: Arc<str> = Arc::from(name);
-        if self.store_paths.contains_key(&*key) {
+        // Check for duplicates before the expensive parse.
+        if self.store_paths.contains_key(name) {
             return Err(NarError::DuplicateEntry);
         }
+        let archive = NarArchive::parse(&nar_bytes)?;
+        let key: Arc<str> = Arc::from(name);
         self.store_paths.insert(
             key,
             StorePath {

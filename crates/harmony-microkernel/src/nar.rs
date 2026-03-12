@@ -143,7 +143,7 @@ fn expect_string(data: &[u8], pos: usize, expected: &[u8]) -> Result<usize, NarE
 /// Dispatches to the appropriate type-specific parser.
 ///
 /// Returns `(entry, new_position)`.
-pub fn parse_node(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarError> {
+pub(crate) fn parse_node(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarError> {
     parse_node_depth(data, pos, 0)
 }
 
