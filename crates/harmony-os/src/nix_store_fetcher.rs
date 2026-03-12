@@ -139,18 +139,15 @@ impl NixStoreFetcher {
         });
     }
 
-    /// Shared loop: deduplicate, fetch, import via caller-provided closure.
+    /// Fetch and import each miss via caller-provided closure.
+    /// Misses are already deduplicated by `drain_misses()` (BTreeSet).
     fn process_miss_list<F>(&mut self, misses: Vec<Arc<str>>, mut import_fn: F)
     where
         F: FnMut(&str, Vec<u8>) -> Result<(), String>,
     {
-        let mut seen = HashSet::new();
         for name in &misses {
             let name_str = name.to_string();
             if self.failed.contains(&name_str) {
-                continue;
-            }
-            if !seen.insert(name_str.clone()) {
                 continue;
             }
             match self.fetch_nar(&name_str) {
@@ -230,7 +227,7 @@ fn decompress_xz(data: &[u8], nar_size: u64) -> Result<Vec<u8>, FetchError> {
     // Read at most nar_size + 1 bytes so oversized streams are caught
     // by the size check in fetch_nar rather than exhausting memory.
     decoder
-        .take(nar_size + 1)
+        .take(nar_size.saturating_add(1))
         .read_to_end(&mut buf)
         .map_err(|e| FetchError::Decompress(e.to_string()))?;
     Ok(buf)
@@ -246,6 +243,13 @@ fn verify_nar_hash(nar_bytes: &[u8], expected: &str) -> Result<(), FetchError> {
 
     let expected_bytes =
         decode_nix_base32(hash_str).map_err(|e| FetchError::Base32(format!("{:?}", e)))?;
+
+    if expected_bytes.len() != 32 {
+        return Err(FetchError::NarInfo(format!(
+            "NarHash decoded to {} bytes, expected 32 (SHA-256)",
+            expected_bytes.len()
+        )));
+    }
 
     let actual = Sha256::digest(nar_bytes);
 

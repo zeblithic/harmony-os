@@ -25,6 +25,9 @@ pub fn decode_nix_base32(input: &str) -> Result<Vec<u8>, NixBase32Error> {
     let mut out = vec![0u8; hash_size];
 
     for (i, c) in input.chars().enumerate() {
+        if !c.is_ascii() {
+            return Err(NixBase32Error::InvalidChar(c));
+        }
         let digit = NIX_BASE32_CHARS
             .iter()
             .position(|&ch| ch == c as u8)
