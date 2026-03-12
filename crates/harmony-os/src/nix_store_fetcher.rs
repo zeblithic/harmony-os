@@ -122,7 +122,7 @@ impl NixStoreFetcher {
     pub fn process_misses(&mut self, server: &mut NixStoreServer) {
         let misses = server.drain_misses();
         self.process_miss_list(misses, |name, nar| {
-            server.import_nar(name, nar).map_err(|e| format!("{:?}", e))
+            import_or_dup_ok(server.import_nar(name, nar))
         });
     }
 
@@ -131,11 +131,7 @@ impl NixStoreFetcher {
     pub fn process_misses_shared(&mut self, server: &Arc<Mutex<NixStoreServer>>) {
         let misses = server.lock().unwrap().drain_misses();
         self.process_miss_list(misses, |name, nar| {
-            server
-                .lock()
-                .unwrap()
-                .import_nar(name, nar)
-                .map_err(|e| format!("{:?}", e))
+            import_or_dup_ok(server.lock().unwrap().import_nar(name, nar))
         });
     }
 
@@ -159,7 +155,12 @@ impl NixStoreFetcher {
                 }
                 Err(e) => {
                     eprintln!("[nix-fetcher] fetch failed for {}: {:?}", name_str, e);
-                    self.failed.insert(name_str);
+                    // Only blacklist permanent failures. Transient network
+                    // errors (DNS, timeout, connection reset) should be
+                    // retried on the next drain cycle.
+                    if !matches!(e, FetchError::Network(_)) {
+                        self.failed.insert(name_str);
+                    }
                 }
             }
         }
@@ -169,10 +170,10 @@ impl NixStoreFetcher {
     ///
     /// Returns the decompressed, verified NAR bytes on success.
     fn fetch_nar(&self, store_path_name: &str) -> Result<Vec<u8>, FetchError> {
-        // 1. Extract store hash (first 32 chars of store path name).
-        if store_path_name.len() < 32 {
+        // 1. Extract store hash (first 32 chars, followed by `-`).
+        if store_path_name.len() < 33 || store_path_name.as_bytes()[32] != b'-' {
             return Err(FetchError::NarInfo(
-                "store path name too short for hash extraction".into(),
+                "store path name does not have expected '<32-char-hash>-<name>' format".into(),
             ));
         }
         let store_hash = &store_path_name[..32];
@@ -187,7 +188,7 @@ impl NixStoreFetcher {
 
         // 3. Check compression — we only support xz.
         if narinfo.compression != "xz" {
-            return Err(FetchError::Decompress(format!(
+            return Err(FetchError::NarInfo(format!(
                 "unsupported compression: {}",
                 narinfo.compression
             )));
@@ -217,6 +218,17 @@ impl NixStoreFetcher {
 }
 
 // ── Helper functions ─────────────────────────────────────────────────
+
+/// Treat `DuplicateEntry` from `import_nar` as success. This can happen
+/// when the kernel re-records a miss for a path that the fetcher is
+/// concurrently importing (race between drain and import cycles).
+fn import_or_dup_ok(result: Result<(), harmony_microkernel::nar::NarError>) -> Result<(), String> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(harmony_microkernel::nar::NarError::DuplicateEntry) => Ok(()),
+        Err(e) => Err(format!("{:?}", e)),
+    }
+}
 
 /// Decompress xz-compressed data, reading at most `nar_size + 1` bytes
 /// to prevent decompression bombs from exhausting memory.
