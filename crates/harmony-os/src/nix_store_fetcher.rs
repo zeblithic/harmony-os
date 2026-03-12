@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use harmony_microkernel::nix_store_server::NixStoreServer;
 use sha2::{Digest, Sha256};
@@ -47,12 +48,20 @@ pub trait HttpClient {
 
 // ── UreqHttpClient ──────────────────────────────────────────────────
 
-/// Production HTTP client using `ureq`.
-pub struct UreqHttpClient;
+/// Production HTTP client using `ureq` with timeouts and body size limits.
+pub struct UreqHttpClient {
+    agent: ureq::Agent,
+}
 
 impl UreqHttpClient {
     pub fn new() -> Self {
-        Self
+        let config = ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_global(Some(Duration::from_secs(120)))
+            .build();
+        Self {
+            agent: ureq::Agent::new_with_config(config),
+        }
     }
 }
 
@@ -64,7 +73,7 @@ impl Default for UreqHttpClient {
 
 impl HttpClient for UreqHttpClient {
     fn get(&self, url: &str) -> Result<Vec<u8>, FetchError> {
-        let mut response = ureq::get(url).call().map_err(|e| match e {
+        let mut response = self.agent.get(url).call().map_err(|e| match e {
             ureq::Error::StatusCode(404) => FetchError::NotFound,
             other => FetchError::Network(other.to_string()),
         })?;
@@ -89,7 +98,7 @@ pub struct NixStoreFetcher {
     cache_url: String,
     /// Store path names that have already failed to fetch. Prevents
     /// repeated fetch attempts for the same path.
-    pub failed: HashSet<String>,
+    failed: HashSet<String>,
 }
 
 impl NixStoreFetcher {
@@ -104,48 +113,37 @@ impl NixStoreFetcher {
         }
     }
 
+    /// Read-only view of paths that have permanently failed to fetch.
+    pub fn failed_paths(&self) -> &HashSet<String> {
+        &self.failed
+    }
+
     /// Process all pending misses: drain, deduplicate, fetch, import.
     pub fn process_misses(&mut self, server: &mut NixStoreServer) {
         let misses = server.drain_misses();
-        self.fetch_and_import_misses(misses, server);
+        self.process_miss_list(misses, |name, nar| {
+            server.import_nar(name, nar).map_err(|e| format!("{:?}", e))
+        });
     }
 
     /// Process misses from a shared (Arc<Mutex>) server, releasing the lock
     /// during HTTP I/O so the kernel thread isn't blocked.
     pub fn process_misses_shared(&mut self, server: &Arc<Mutex<NixStoreServer>>) {
         let misses = server.lock().unwrap().drain_misses();
-
-        let mut seen = HashSet::new();
-        for name in &misses {
-            let name_str = name.to_string();
-            if self.failed.contains(&name_str) {
-                continue;
-            }
-            if !seen.insert(name_str.clone()) {
-                continue;
-            }
-            // Fetch with NO lock held.
-            match self.fetch_nar(&name_str) {
-                Ok(nar_bytes) => {
-                    // Re-acquire lock only for import.
-                    if server
-                        .lock()
-                        .unwrap()
-                        .import_nar(&name_str, nar_bytes)
-                        .is_err()
-                    {
-                        self.failed.insert(name_str);
-                    }
-                }
-                Err(_) => {
-                    self.failed.insert(name_str);
-                }
-            }
-        }
+        self.process_miss_list(misses, |name, nar| {
+            server
+                .lock()
+                .unwrap()
+                .import_nar(name, nar)
+                .map_err(|e| format!("{:?}", e))
+        });
     }
 
-    /// Drain + deduplicate + fetch + import (non-shared path).
-    fn fetch_and_import_misses(&mut self, misses: Vec<Arc<str>>, server: &mut NixStoreServer) {
+    /// Shared loop: deduplicate, fetch, import via caller-provided closure.
+    fn process_miss_list<F>(&mut self, misses: Vec<Arc<str>>, mut import_fn: F)
+    where
+        F: FnMut(&str, Vec<u8>) -> Result<(), String>,
+    {
         let mut seen = HashSet::new();
         for name in &misses {
             let name_str = name.to_string();
@@ -157,11 +155,13 @@ impl NixStoreFetcher {
             }
             match self.fetch_nar(&name_str) {
                 Ok(nar_bytes) => {
-                    if server.import_nar(&name_str, nar_bytes).is_err() {
+                    if let Err(e) = import_fn(&name_str, nar_bytes) {
+                        eprintln!("[nix-fetcher] import failed for {}: {}", name_str, e);
                         self.failed.insert(name_str);
                     }
                 }
-                Err(_) => {
+                Err(e) => {
+                    eprintln!("[nix-fetcher] fetch failed for {}: {:?}", name_str, e);
                     self.failed.insert(name_str);
                 }
             }
@@ -200,8 +200,8 @@ impl NixStoreFetcher {
         let nar_url = format!("{}/{}", self.cache_url, narinfo.url);
         let compressed_nar = self.http.get(&nar_url)?;
 
-        // 5. Decompress xz.
-        let nar_bytes = decompress_xz(&compressed_nar)?;
+        // 5. Decompress xz (bounded to nar_size + 1 to prevent decompression bombs).
+        let nar_bytes = decompress_xz(&compressed_nar, narinfo.nar_size)?;
 
         // 6. Validate decompressed size against NarSize.
         if nar_bytes.len() as u64 != narinfo.nar_size {
@@ -221,12 +221,16 @@ impl NixStoreFetcher {
 
 // ── Helper functions ─────────────────────────────────────────────────
 
-/// Decompress xz-compressed data.
-fn decompress_xz(data: &[u8]) -> Result<Vec<u8>, FetchError> {
+/// Decompress xz-compressed data, reading at most `nar_size + 1` bytes
+/// to prevent decompression bombs from exhausting memory.
+fn decompress_xz(data: &[u8], nar_size: u64) -> Result<Vec<u8>, FetchError> {
     use std::io::Read;
-    let mut decoder = XzDecoder::new(data);
+    let decoder = XzDecoder::new(data);
     let mut buf = Vec::new();
+    // Read at most nar_size + 1 bytes so oversized streams are caught
+    // by the size check in fetch_nar rather than exhausting memory.
     decoder
+        .take(nar_size + 1)
         .read_to_end(&mut buf)
         .map_err(|e| FetchError::Decompress(e.to_string()))?;
     Ok(buf)
@@ -385,8 +389,8 @@ mod tests {
         let data = server.read(2, 0, 1024).unwrap();
         assert_eq!(data, b"hello from nix");
 
-        // Verify failed set is empty (success case).
-        assert!(fetcher.failed.is_empty());
+        // Verify no failures recorded.
+        assert!(fetcher.failed_paths().is_empty());
     }
 
     // ── Test: 404 records failure ────────────────────────────────────
@@ -411,7 +415,7 @@ mod tests {
         fetcher.process_misses(&mut server);
 
         // Verify the name is in the failed set.
-        assert!(fetcher.failed.contains(store_path_name));
+        assert!(fetcher.failed_paths().contains(store_path_name));
     }
 
     // ── Test: hash mismatch records failure ──────────────────────────
@@ -465,7 +469,7 @@ mod tests {
         );
 
         // Verify name is in the failed set.
-        assert!(fetcher.failed.contains(store_path_name.as_str()));
+        assert!(fetcher.failed_paths().contains(store_path_name.as_str()));
     }
 
     // ── Test: SharedNixStoreServer + NixStoreFetcher integration ────
@@ -534,7 +538,7 @@ mod tests {
 
     #[test]
     fn ureq_client_exists() {
-        // Smoke test: UreqHttpClient can be constructed.
+        // Smoke test: UreqHttpClient can be constructed with timeouts.
         let _client = UreqHttpClient::new();
     }
 }

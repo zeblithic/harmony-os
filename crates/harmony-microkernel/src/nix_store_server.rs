@@ -11,7 +11,7 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -53,7 +53,7 @@ enum NixFidPayload {
 pub struct NixStoreServer {
     store_paths: BTreeMap<Arc<str>, StorePath>,
     tracker: FidTracker<NixFidPayload>,
-    misses: Vec<Arc<str>>,
+    misses: BTreeSet<Arc<str>>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
@@ -111,7 +111,7 @@ impl NixStoreServer {
         Self {
             store_paths: BTreeMap::new(),
             tracker: FidTracker::new(0, NixFidPayload::Root),
-            misses: Vec::new(),
+            misses: BTreeSet::new(),
         }
     }
 
@@ -157,9 +157,9 @@ impl NixStoreServer {
 
     /// Drain all recorded miss events (store path names that were walked
     /// but not found). The fetcher calls this periodically to discover
-    /// which store paths need fetching.
+    /// which store paths need fetching. Misses are deduplicated at source.
     pub fn drain_misses(&mut self) -> Vec<Arc<str>> {
-        core::mem::take(&mut self.misses)
+        core::mem::take(&mut self.misses).into_iter().collect()
     }
 
     /// Build the full path string for qpath computation from a payload.
@@ -243,7 +243,7 @@ impl FileServer for NixStoreServer {
                 // Walk from root to a store path.
                 let key: Arc<str> = Arc::from(name);
                 if !self.store_paths.contains_key(&key) {
-                    self.misses.push(Arc::clone(&key));
+                    self.misses.insert(Arc::clone(&key));
                     return Err(IpcError::NotFound);
                 }
                 NixFidPayload::StorePathRoot { name: key }
@@ -731,14 +731,14 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_misses_are_recorded() {
+    fn duplicate_misses_are_deduplicated() {
         let mut srv = NixStoreServer::new();
         assert_eq!(srv.walk(0, 1, "same-pkg"), Err(IpcError::NotFound));
         assert_eq!(srv.walk(0, 2, "same-pkg"), Err(IpcError::NotFound));
         let misses = srv.drain_misses();
-        assert_eq!(misses.len(), 2);
+        // BTreeSet deduplicates at source.
+        assert_eq!(misses.len(), 1);
         assert_eq!(&*misses[0], "same-pkg");
-        assert_eq!(&*misses[1], "same-pkg");
     }
 
     #[test]
