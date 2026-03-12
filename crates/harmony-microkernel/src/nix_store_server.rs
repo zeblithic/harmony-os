@@ -83,7 +83,8 @@ fn size_of(entry: &NarEntry) -> u64 {
     match entry {
         NarEntry::Regular { contents_len, .. } => *contents_len as u64,
         NarEntry::Symlink { target } => target.len() as u64,
-        NarEntry::Directory { entries } => entries.len() as u64,
+        // Convention: directories report size 0 (matches LibraryServer, ContentServer).
+        NarEntry::Directory { .. } => 0,
     }
 }
 
@@ -320,7 +321,7 @@ impl FileServer for NixStoreServer {
             NixFidPayload::Root => Ok(FileStat {
                 qpath: 0,
                 name: Arc::from("store"),
-                size: self.store_paths.len() as u64,
+                size: 0, // directories report size 0 (codebase convention)
                 file_type: FileType::Directory,
             }),
             NixFidPayload::StorePathRoot { name } => {
@@ -377,7 +378,7 @@ mod tests {
         let st = srv.stat(0).unwrap();
         assert_eq!(&*st.name, "store");
         assert_eq!(st.file_type, FileType::Directory);
-        assert_eq!(st.size, 1);
+        assert_eq!(st.size, 0); // directories report size 0 (codebase convention)
         assert_eq!(st.qpath, 0);
     }
 
@@ -529,7 +530,7 @@ mod tests {
 
         // Verify root stat reflects both.
         let st = srv.stat(0).unwrap();
-        assert_eq!(st.size, 2);
+        assert_eq!(st.size, 0); // directories report size 0
 
         // Walk to first store path.
         srv.walk(0, 1, "abc123-hello").unwrap();
@@ -716,7 +717,7 @@ mod tests {
             let stat = kernel.stat(client, 1).unwrap();
             assert_eq!(&*stat.name, "store");
             assert_eq!(stat.file_type, FileType::Directory);
-            assert_eq!(stat.size, 1); // one imported store path
+            assert_eq!(stat.size, 0); // directories report size 0
         }
     }
 }

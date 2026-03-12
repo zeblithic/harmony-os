@@ -90,7 +90,7 @@ fn read_string(data: &[u8], pos: usize) -> Result<(&[u8], usize), NarError> {
         .map_err(|_| NarError::OffsetOverflow)?;
 
     // Padding: round up to next 8-byte boundary.
-    let padded_len = (len + 7) & !7;
+    let padded_len = len.checked_add(7).ok_or(NarError::OffsetOverflow)? & !7;
 
     let data_start = pos.checked_add(8).ok_or(NarError::OffsetOverflow)?;
     let data_end = data_start
@@ -177,7 +177,10 @@ fn parse_regular(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarError>
     let contents_len: usize = u64::from_le_bytes(len_bytes)
         .try_into()
         .map_err(|_| NarError::OffsetOverflow)?;
-    let padded_len = (contents_len + 7) & !7;
+    let padded_len = contents_len
+        .checked_add(7)
+        .ok_or(NarError::OffsetOverflow)?
+        & !7;
 
     let contents_offset = pos.checked_add(8).ok_or(NarError::OffsetOverflow)?;
     let contents_end = contents_offset
