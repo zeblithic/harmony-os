@@ -23,6 +23,8 @@ pub mod kernel;
 pub mod library_server;
 pub mod namespace;
 pub mod nar;
+#[cfg(feature = "kernel")]
+pub mod nix_store_server;
 pub mod sd_server;
 pub mod serial_server;
 pub mod uart_server;
