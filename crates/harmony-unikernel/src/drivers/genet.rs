@@ -237,10 +237,7 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         mac: [u8; 6],
         poll_count: u32,
     ) -> Result<Self, GenetError> {
-        assert!(
-            RX_RING > 0 && TX_RING > 0,
-            "ring sizes must be non-zero"
-        );
+        assert!(RX_RING > 0 && TX_RING > 0, "ring sizes must be non-zero");
 
         // 1. Software reset
         bank.write(UMAC_CMD, CMD_SW_RESET);

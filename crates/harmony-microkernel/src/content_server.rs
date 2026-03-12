@@ -184,8 +184,7 @@ impl ContentServer {
                     Ok(book) => book,
                     Err(_) => {
                         // Restore buffer so the fid isn't poisoned.
-                        *self.ingest_buffers.get_mut(&fid).unwrap() =
-                            IngestState::Writing(data);
+                        *self.ingest_buffers.get_mut(&fid).unwrap() = IngestState::Writing(data);
                         return Err(IpcError::ResourceExhausted);
                     }
                 };
@@ -195,8 +194,7 @@ impl ContentServer {
                 let response = match self.build_ingest_response(&cid, &book) {
                     Ok(r) => r,
                     Err(e) => {
-                        *self.ingest_buffers.get_mut(&fid).unwrap() =
-                            IngestState::Writing(data);
+                        *self.ingest_buffers.get_mut(&fid).unwrap() = IngestState::Writing(data);
                         return Err(e);
                     }
                 };
@@ -248,8 +246,7 @@ impl ContentServer {
 
                 self.blobs.insert(cid, book);
                 // Cache response so partial/multiple reads work.
-                *self.ingest_buffers.get_mut(&fid).unwrap() =
-                    IngestState::Done(response.clone());
+                *self.ingest_buffers.get_mut(&fid).unwrap() = IngestState::Done(response.clone());
                 Ok(response)
             }
             IngestState::Done(_) => unreachable!(), // handled by peek above
@@ -392,8 +389,7 @@ impl FileServer for ContentServer {
                 if name.bytes().any(|b| b.is_ascii_uppercase()) {
                     return Err(IpcError::NotFound);
                 }
-                let hash_bits =
-                    u32::from_str_radix(name, 16).map_err(|_| IpcError::NotFound)?;
+                let hash_bits = u32::from_str_radix(name, 16).map_err(|_| IpcError::NotFound)?;
                 let addr = *self.find_page(hash_bits).ok_or(IpcError::NotFound)?;
                 (Self::page_qpath(&addr), NodeKind::Page(addr))
             }

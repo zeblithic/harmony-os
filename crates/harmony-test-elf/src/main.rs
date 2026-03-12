@@ -17,6 +17,9 @@ const SYS_BRK: u64 = 214;
 const SYS_MUNMAP: u64 = 215;
 const SYS_MMAP: u64 = 222;
 const SYS_NEWFSTATAT: u64 = 79;
+const SYS_CLOCK_GETTIME: u64 = 113;
+const SYS_UNAME: u64 = 160;
+const SYS_GETPID: u64 = 172;
 const SYS_GETRANDOM: u64 = 278;
 
 // mmap constants
@@ -32,6 +35,18 @@ const STDERR: u64 = 2;
 // ---------------------------------------------------------------------------
 // Raw syscall wrappers (aarch64: svc #0, nr in x8, args in x0-x5, ret in x0)
 // ---------------------------------------------------------------------------
+
+#[inline(always)]
+unsafe fn syscall0(nr: u64) -> i64 {
+    let ret: i64;
+    core::arch::asm!(
+        "svc #0",
+        in("x8") nr,
+        lateout("x0") ret,
+        options(nostack),
+    );
+    ret
+}
 
 #[inline(always)]
 unsafe fn syscall1(nr: u64, a0: u64) -> i64 {
@@ -236,6 +251,66 @@ unsafe fn step5_newfstatat() -> bool {
     mode == 0o020666
 }
 
+/// Step 6: getpid — verify we get a positive pid (Linuxulator returns 1)
+unsafe fn step6_getpid() -> bool {
+    let pid = syscall0(SYS_GETPID);
+    pid > 0
+}
+
+/// Step 7: clock_gettime(CLOCK_MONOTONIC) — two calls, verify monotonic increase
+unsafe fn step7_clock_gettime() -> bool {
+    let clock_monotonic: u64 = 1;
+
+    // First call — may return (0,0) if this is the first clock_gettime
+    let mut ts1: core::mem::MaybeUninit<[u8; 16]> = core::mem::MaybeUninit::uninit();
+    let ret1 = syscall2(SYS_CLOCK_GETTIME, clock_monotonic, ts1.as_mut_ptr() as u64);
+    if ret1 != 0 {
+        return false;
+    }
+
+    // Second call — must return a strictly greater value
+    let mut ts2: core::mem::MaybeUninit<[u8; 16]> = core::mem::MaybeUninit::uninit();
+    let ret2 = syscall2(SYS_CLOCK_GETTIME, clock_monotonic, ts2.as_mut_ptr() as u64);
+    if ret2 != 0 {
+        return false;
+    }
+
+    // Read (tv_sec, tv_nsec) from both timespecs
+    let p1 = ts1.as_ptr() as *const u8;
+    let p2 = ts2.as_ptr() as *const u8;
+    let sec1 = u64::from_le_bytes([
+        *p1, *p1.add(1), *p1.add(2), *p1.add(3),
+        *p1.add(4), *p1.add(5), *p1.add(6), *p1.add(7),
+    ]);
+    let nsec1 = u64::from_le_bytes([
+        *p1.add(8), *p1.add(9), *p1.add(10), *p1.add(11),
+        *p1.add(12), *p1.add(13), *p1.add(14), *p1.add(15),
+    ]);
+    let sec2 = u64::from_le_bytes([
+        *p2, *p2.add(1), *p2.add(2), *p2.add(3),
+        *p2.add(4), *p2.add(5), *p2.add(6), *p2.add(7),
+    ]);
+    let nsec2 = u64::from_le_bytes([
+        *p2.add(8), *p2.add(9), *p2.add(10), *p2.add(11),
+        *p2.add(12), *p2.add(13), *p2.add(14), *p2.add(15),
+    ]);
+    // Second call must be strictly greater (handles second-boundary wrap)
+    (sec2, nsec2) > (sec1, nsec1)
+}
+
+/// Step 8: uname — verify sysname starts with "Linux"
+unsafe fn step8_uname() -> bool {
+    // struct utsname is 390 bytes (5 × 65-byte fields + 1 × 65-byte domainname)
+    let mut buf: core::mem::MaybeUninit<[u8; 390]> = core::mem::MaybeUninit::uninit();
+    let ret = syscall1(SYS_UNAME, buf.as_mut_ptr() as u64);
+    if ret != 0 {
+        return false;
+    }
+    // sysname is the first field — check it starts with "Linux"
+    let p = buf.as_ptr() as *const u8;
+    *p == b'L' && *p.add(1) == b'i' && *p.add(2) == b'n' && *p.add(3) == b'u' && *p.add(4) == b'x'
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -282,6 +357,30 @@ pub extern "C" fn _start() -> ! {
             write_stdout(b"[LINUXULATOR] Step 5 (newfstatat): OK\n");
         } else {
             write_stdout(b"[LINUXULATOR] Step 5 (newfstatat): FAIL\n");
+            all_ok = false;
+        }
+
+        // Step 6: getpid
+        if step6_getpid() {
+            write_stdout(b"[LINUXULATOR] Step 6 (getpid): OK\n");
+        } else {
+            write_stdout(b"[LINUXULATOR] Step 6 (getpid): FAIL\n");
+            all_ok = false;
+        }
+
+        // Step 7: clock_gettime
+        if step7_clock_gettime() {
+            write_stdout(b"[LINUXULATOR] Step 7 (clock_gettime): OK\n");
+        } else {
+            write_stdout(b"[LINUXULATOR] Step 7 (clock_gettime): FAIL\n");
+            all_ok = false;
+        }
+
+        // Step 8: uname
+        if step8_uname() {
+            write_stdout(b"[LINUXULATOR] Step 8 (uname): OK\n");
+        } else {
+            write_stdout(b"[LINUXULATOR] Step 8 (uname): FAIL\n");
             all_ok = false;
         }
 

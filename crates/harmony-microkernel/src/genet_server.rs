@@ -222,10 +222,12 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
         let qpath = entry.qpath; // Copy before match to avoid borrow conflict
         match qpath {
             QPATH_DATA => {
-                self.driver.send(&mut self.bank, data).map_err(|e| match e {
-                    GenetError::TxRingFull => IpcError::ResourceExhausted,
-                    _ => IpcError::InvalidArgument,
-                })?;
+                self.driver
+                    .send(&mut self.bank, data)
+                    .map_err(|e| match e {
+                        GenetError::TxRingFull => IpcError::ResourceExhausted,
+                        _ => IpcError::InvalidArgument,
+                    })?;
                 Ok(data.len() as u32)
             }
             _ => Err(IpcError::ReadOnly),
