@@ -1584,4 +1584,85 @@ mod tests {
             assert_eq!(sp % 16, 0, "SP must be 16-byte aligned for argv {:?}", args);
         }
     }
+
+    #[test]
+    fn boot_static_elf_at_random_contains_entropy() {
+        let mut backend = LoaderMockBackend::new();
+        let elf_bytes = build_static_elf(&[0xCC; 16]);
+        let random_bytes: [u8; 16] = [
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+            0x13, 0x37, 0x42, 0x00, 0xFF, 0xEE, 0xDD, 0xCC,
+        ];
+
+        let (_, sp) = boot_static_elf(
+            &mut backend,
+            &elf_bytes,
+            &["./test"],
+            &[],
+            &random_bytes,
+            0x7FFE_0000,
+            8 * 4096,
+        )
+        .expect("boot should succeed");
+
+        // Find the stack write in the mock backend.
+        let stack_write = backend
+            .written
+            .iter()
+            .find(|(addr, data)| {
+                let end = *addr + data.len() as u64;
+                sp >= *addr && sp < end
+            })
+            .expect("stack data should be in mock backend writes");
+        let (base, data) = stack_write;
+
+        // Walk the stack from SP to find auxv.
+        let sp_off = (sp - base) as usize;
+        let read_u64 = |off: usize| -> u64 {
+            u64::from_le_bytes(data[off..off + 8].try_into().unwrap())
+        };
+
+        // argc
+        let argc = read_u64(sp_off);
+        let mut pos = sp_off + 8;
+
+        // Skip argv pointers + NULL
+        for _ in 0..argc {
+            pos += 8;
+        }
+        pos += 8; // argv NULL terminator
+
+        // Skip envp pointers + NULL
+        loop {
+            let val = read_u64(pos);
+            pos += 8;
+            if val == 0 {
+                break;
+            }
+        }
+
+        // Now at auxv. Find AT_RANDOM.
+        let mut at_random_ptr = None;
+        loop {
+            let key = read_u64(pos);
+            let val = read_u64(pos + 8);
+            pos += 16;
+            if key == auxv::AT_NULL {
+                break;
+            }
+            if key == auxv::AT_RANDOM {
+                at_random_ptr = Some(val);
+            }
+        }
+
+        let ptr = at_random_ptr.expect("AT_RANDOM should be in auxv");
+
+        // Read 16 bytes at the AT_RANDOM pointer from the stack data.
+        let random_off = (ptr - base) as usize;
+        let stored = &data[random_off..random_off + 16];
+        assert_eq!(
+            stored, &random_bytes,
+            "AT_RANDOM should point to the provided entropy bytes"
+        );
+    }
 }
