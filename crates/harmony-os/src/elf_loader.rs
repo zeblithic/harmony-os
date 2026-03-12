@@ -488,6 +488,39 @@ pub fn build_initial_stack(
     stack_base + pos as u64
 }
 
+/// Allocate a stack region, build the Linux-standard initial stack
+/// layout (argc/argv/envp/auxv), write it into the process's VM,
+/// and return the initial SP.
+///
+/// `stack_top` is the virtual address of the stack region's base
+/// (lowest address). The stack grows downward from
+/// `stack_top + stack_size`.
+pub fn prepare_process_stack(
+    backend: &mut dyn SyscallBackend,
+    argv: &[&str],
+    envp: &[&str],
+    auxv: &[(u64, u64)],
+    random_bytes: &[u8; 16],
+    stack_top: u64,
+    stack_size: usize,
+) -> u64 {
+    // Build the stack layout in a local buffer.
+    let mut stack_buf = alloc::vec![0u8; stack_size];
+    let sp = build_initial_stack(
+        &mut stack_buf,
+        stack_top,
+        argv,
+        envp,
+        auxv,
+        random_bytes,
+    );
+
+    // Write the entire stack buffer into the process's VM.
+    backend.vm_write_bytes(stack_top, &stack_buf);
+
+    sp
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1425,6 +1458,44 @@ mod tests {
             "oversized interpreter should be rejected, got {:?}",
             result,
         );
+    }
+
+    #[test]
+    fn prepare_process_stack_builds_valid_layout() {
+        let mut backend = LoaderMockBackend::new();
+
+        let auxv = vec![
+            (auxv::AT_PAGESZ, 4096),
+            (auxv::AT_RANDOM, 0), // placeholder — gets patched
+            (auxv::AT_NULL, 0),
+        ];
+        let random_bytes = [0x42u8; 16];
+
+        let sp = prepare_process_stack(
+            &mut backend,
+            &["./hello", "--verbose"],
+            &["HOME=/root"],
+            &auxv,
+            &random_bytes,
+            0x7FFE_0000, // stack top (virtual address)
+            8 * 4096,    // 8 pages
+        );
+
+        assert_ne!(sp, 0, "SP should be non-zero");
+        assert_eq!(sp % 16, 0, "SP must be 16-byte aligned");
+
+        // Verify argc was written at SP.
+        let writes = &backend.written;
+        let stack_write = writes.iter().find(|(addr, data)| {
+            let start = *addr;
+            let end = start + data.len() as u64;
+            sp >= start && sp < end
+        });
+        assert!(stack_write.is_some(), "stack data should be written to VM");
+        let (base_addr, data) = stack_write.unwrap();
+        let argc_offset = (sp - base_addr) as usize;
+        let argc = u64::from_le_bytes(data[argc_offset..argc_offset + 8].try_into().unwrap());
+        assert_eq!(argc, 2, "argc should be 2");
     }
 
     #[test]
