@@ -13,6 +13,8 @@ pub mod elf_loader;
 pub mod linuxulator;
 pub mod narinfo;
 pub mod nix_base32;
+#[cfg(feature = "std")]
+pub mod nix_store_fetcher;
 
 #[cfg(test)]
 mod tests {
