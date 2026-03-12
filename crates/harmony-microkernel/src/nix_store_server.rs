@@ -20,6 +20,9 @@ use crate::fid_tracker::FidTracker;
 use crate::nar::{NarArchive, NarEntry, NarError};
 use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
 
+#[cfg(feature = "std")]
+use std::sync::Mutex;
+
 // ── Types ─────────────────────────────────────────────────────────────
 
 /// A single imported store path: the raw NAR blob (for zero-copy reads)
@@ -390,12 +393,54 @@ impl FileServer for NixStoreServer {
     }
 }
 
+/// Thread-safe wrapper around `NixStoreServer`.
+///
+/// The kernel holds this as a `Box<dyn FileServer>`, while the fetcher
+/// thread holds a clone of the inner `Arc<Mutex<NixStoreServer>>` for
+/// `drain_misses()` and `import_nar()` calls.
+#[cfg(feature = "std")]
+pub struct SharedNixStoreServer {
+    pub inner: Arc<Mutex<NixStoreServer>>,
+}
+
+#[cfg(feature = "std")]
+impl FileServer for SharedNixStoreServer {
+    fn walk(&mut self, fid: Fid, new_fid: Fid, name: &str) -> Result<QPath, IpcError> {
+        self.inner.lock().unwrap().walk(fid, new_fid, name)
+    }
+
+    fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
+        self.inner.lock().unwrap().open(fid, mode)
+    }
+
+    fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
+        self.inner.lock().unwrap().read(fid, offset, count)
+    }
+
+    fn write(&mut self, fid: Fid, offset: u64, data: &[u8]) -> Result<u32, IpcError> {
+        self.inner.lock().unwrap().write(fid, offset, data)
+    }
+
+    fn clunk(&mut self, fid: Fid) -> Result<(), IpcError> {
+        self.inner.lock().unwrap().clunk(fid)
+    }
+
+    fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
+        self.inner.lock().unwrap().stat(fid)
+    }
+
+    fn clone_fid(&mut self, fid: Fid, new_fid: Fid) -> Result<QPath, IpcError> {
+        self.inner.lock().unwrap().clone_fid(fid, new_fid)
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::nar::tests::{nar_directory_with_files, nar_regular_file, nar_symlink};
+    use std::sync::Mutex;
 
     /// Helper: create a NixStoreServer with one directory store path.
     fn test_server() -> NixStoreServer {
@@ -679,6 +724,34 @@ mod tests {
         assert_eq!(misses.len(), 2);
         assert_eq!(&*misses[0], "same-pkg");
         assert_eq!(&*misses[1], "same-pkg");
+    }
+
+    #[test]
+    fn shared_wrapper_delegates_walk_and_stat() {
+        use alloc::sync::Arc;
+
+        let inner = NixStoreServer::new();
+        let shared_inner = Arc::new(Mutex::new(inner));
+        shared_inner
+            .lock()
+            .unwrap()
+            .import_nar("abc123-hello", nar_directory_with_files())
+            .unwrap();
+
+        let mut wrapper = SharedNixStoreServer {
+            inner: Arc::clone(&shared_inner),
+        };
+
+        // Walk and stat through the wrapper.
+        let qp = wrapper.walk(0, 1, "abc123-hello").unwrap();
+        assert_ne!(qp, 0);
+        let st = wrapper.stat(1).unwrap();
+        assert_eq!(&*st.name, "abc123-hello");
+        assert_eq!(st.file_type, FileType::Directory);
+
+        // Verify the inner server's state changed (fid was allocated).
+        let inner_st = shared_inner.lock().unwrap().stat(1).unwrap();
+        assert_eq!(&*inner_st.name, "abc123-hello");
     }
 
     #[test]
