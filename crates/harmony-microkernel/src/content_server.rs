@@ -451,9 +451,7 @@ impl FileServer for ContentServer {
         }
         let node = entry.payload.clone();
         match &node {
-            NodeKind::Root | NodeKind::BlobsDir | NodeKind::PagesDir => {
-                Err(IpcError::IsDirectory)
-            }
+            NodeKind::Root | NodeKind::BlobsDir | NodeKind::PagesDir => Err(IpcError::IsDirectory),
             NodeKind::Ingest => {
                 let response = self.finalize_ingest(fid)?;
                 Ok(slice_data(&response, offset, count))
@@ -476,9 +474,7 @@ impl FileServer for ContentServer {
         }
         let node = entry.payload.clone();
         match &node {
-            NodeKind::Root | NodeKind::BlobsDir | NodeKind::PagesDir => {
-                Err(IpcError::IsDirectory)
-            }
+            NodeKind::Root | NodeKind::BlobsDir | NodeKind::PagesDir => Err(IpcError::IsDirectory),
             NodeKind::Blob(_) | NodeKind::Page(_) => Err(IpcError::ReadOnly),
             NodeKind::Ingest => {
                 let buf = self

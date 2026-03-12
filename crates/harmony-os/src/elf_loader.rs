@@ -12,7 +12,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use harmony_microkernel::vm::{FrameClassification, PageFlags};
+use harmony_microkernel::vm::{FrameClassification, PageFlags, VmError};
 use harmony_microkernel::{Fid, IpcError, OpenMode};
 
 use crate::elf::{parse_elf, ElfError, ElfType, ParsedElf, SegmentFlags};
@@ -61,6 +61,8 @@ pub enum ElfLoadError {
     OverlappingSegments,
     /// A PT_LOAD segment has both W and X flags — rejected by W^X policy.
     WXViolation,
+    /// Failed to map the stack region via `vm_mmap`.
+    StackMmapFailed(VmError),
 }
 
 // ── Load result ─────────────────────────────────────────────────────
@@ -488,6 +490,91 @@ pub fn build_initial_stack(
     stack_base + pos as u64
 }
 
+/// Build the Linux-standard initial stack layout (argc/argv/envp/auxv)
+/// and write it into an already-mapped stack region in the process's VM.
+/// Returns the initial SP.
+///
+/// The caller must ensure the stack region at `stack_top` is already
+/// mapped (e.g. via `vm_mmap`). `stack_top` is the lowest virtual
+/// address of the region. The stack grows downward from
+/// `stack_top + stack_size`.
+pub fn prepare_process_stack(
+    backend: &mut dyn SyscallBackend,
+    argv: &[&str],
+    envp: &[&str],
+    auxv: &[(u64, u64)],
+    random_bytes: &[u8; 16],
+    stack_top: u64,
+    stack_size: usize,
+) -> u64 {
+    // Build the stack layout in a local buffer.
+    let mut stack_buf = alloc::vec![0u8; stack_size];
+    let sp = build_initial_stack(&mut stack_buf, stack_top, argv, envp, auxv, random_bytes);
+
+    // Write only the live portion (SP onward) — everything below SP is
+    // zero-initialized by vm_mmap so we skip writing it.
+    let sp_offset = (sp - stack_top) as usize;
+    backend.vm_write_bytes(sp, &stack_buf[sp_offset..]);
+
+    sp
+}
+
+/// Parse, load, and set up the initial stack for a statically-linked
+/// ELF binary (no PT_INTERP / dynamic linker).
+///
+/// Accepts both ET_EXEC and ET_DYN (static PIE) binaries — the
+/// underlying `InterpreterLoader` handles load-bias relocation for
+/// either type.
+///
+/// Returns `(entry_point, initial_sp)` — everything needed to start
+/// execution. The caller sets PC and SP to these values.
+///
+/// This is the high-level boot function that composes:
+/// - `parse_elf()` — extract ELF metadata
+/// - `InterpreterLoader::load()` — map ELF segments into VM
+/// - `vm_mmap()` — allocate RW stack region
+/// - `prepare_process_stack()` — build Linux stack layout
+pub fn boot_static_elf(
+    backend: &mut dyn SyscallBackend,
+    elf_bytes: &[u8],
+    argv: &[&str],
+    envp: &[&str],
+    random_bytes: &[u8; 16],
+    stack_top: u64,
+    stack_size: usize,
+) -> Result<(u64, u64), ElfLoadError> {
+    // 1. Load the ELF (parse + map segments + build auxv).
+    let mut loader = InterpreterLoader::default();
+    let result = loader.load(elf_bytes, backend)?;
+
+    // 2. Map the stack region (RW, no execute).
+    let mapped_addr = backend
+        .vm_mmap(
+            stack_top,
+            stack_size,
+            PageFlags::USER | PageFlags::READABLE | PageFlags::WRITABLE,
+            FrameClassification::empty(),
+        )
+        .map_err(ElfLoadError::StackMmapFailed)?;
+    debug_assert_eq!(
+        mapped_addr, stack_top,
+        "vm_mmap returned {mapped_addr:#x} but stack_top is {stack_top:#x}"
+    );
+
+    // 3. Build the initial stack with the auxv from the loader.
+    let sp = prepare_process_stack(
+        backend,
+        argv,
+        envp,
+        &result.auxv,
+        random_bytes,
+        stack_top,
+        stack_size,
+    );
+
+    Ok((result.entry_point, sp))
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -503,7 +590,10 @@ mod tests {
     // ── Test ELF builders ───────────────────────────────────────────
 
     /// Build a minimal valid ELF64 binary with configurable type.
-    /// `code` is placed as a PT_LOAD segment at `vaddr`.
+    ///
+    /// The PT_LOAD segment starts at file offset 0 so the ELF header and
+    /// program headers are included in the mapping — this ensures AT_PHDR
+    /// points to mapped memory, matching real ELF layouts.
     fn build_test_elf_typed(code: &[u8], elf_type: ElfType, vaddr: u64, entry: u64) -> Vec<u8> {
         let phdr_size = 56usize;
         let phnum = 1usize;
@@ -537,15 +627,17 @@ mod tests {
         elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
         elf[56..58].copy_from_slice(&(phnum as u16).to_le_bytes()); // e_phnum
 
-        // PT_LOAD program header
+        // PT_LOAD: starts at file offset 0 to include ELF header + phdrs.
+        // vaddr is page-aligned; the segment covers the entire file image.
+        let segment_base = vaddr & !0xFFF; // page-align down
         let ph = &mut elf[64..64 + phdr_size];
         ph[0..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
         ph[4..8].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
-        ph[8..16].copy_from_slice(&(code_offset as u64).to_le_bytes()); // p_offset
-        ph[16..24].copy_from_slice(&vaddr.to_le_bytes()); // p_vaddr
-        ph[24..32].copy_from_slice(&vaddr.to_le_bytes()); // p_paddr
-        ph[32..40].copy_from_slice(&(code.len() as u64).to_le_bytes()); // p_filesz
-        ph[40..48].copy_from_slice(&(code.len() as u64).to_le_bytes()); // p_memsz
+        ph[8..16].copy_from_slice(&0u64.to_le_bytes()); // p_offset = 0
+        ph[16..24].copy_from_slice(&segment_base.to_le_bytes()); // p_vaddr
+        ph[24..32].copy_from_slice(&segment_base.to_le_bytes()); // p_paddr
+        ph[32..40].copy_from_slice(&(total as u64).to_le_bytes()); // p_filesz
+        ph[40..48].copy_from_slice(&(total as u64).to_le_bytes()); // p_memsz
         ph[48..56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
 
         // Code
@@ -554,9 +646,12 @@ mod tests {
         elf
     }
 
-    /// Build a static ET_EXEC ELF at vaddr 0x401000 with entry 0x401000.
+    /// Build a static ET_EXEC ELF at vaddr 0x400000 with entry 0x400000.
+    ///
+    /// The PT_LOAD starts at file offset 0, so the ELF header and phdrs
+    /// are mapped — making AT_PHDR valid (as in real musl binaries).
     fn build_static_elf(code: &[u8]) -> Vec<u8> {
-        build_test_elf_typed(code, ElfType::Exec, 0x401000, 0x401000)
+        build_test_elf_typed(code, ElfType::Exec, 0x400000, 0x400000)
     }
 
     /// Build a test ELF with a PT_INTERP segment.
@@ -777,14 +872,14 @@ mod tests {
         let result = loader.load(&elf, &mut backend).unwrap();
 
         // Static ET_EXEC: entry is the exe's own entry point.
-        assert_eq!(result.entry_point, 0x401000);
+        assert_eq!(result.entry_point, 0x400000);
         // No interpreter loaded.
         assert_eq!(result.interp_base, 0);
         // ET_EXEC base is 0 (loaded at absolute vaddrs).
         assert_eq!(result.exe_base, 0);
 
         // Auxv must contain required entries.
-        assert_eq!(auxv_get(&result.auxv, auxv::AT_ENTRY), Some(0x401000));
+        assert_eq!(auxv_get(&result.auxv, auxv::AT_ENTRY), Some(0x400000));
         assert!(auxv_get(&result.auxv, auxv::AT_PHDR).is_some());
         assert!(auxv_get(&result.auxv, auxv::AT_PHNUM).is_some());
         assert_eq!(auxv_get(&result.auxv, auxv::AT_PAGESZ), Some(4096));
@@ -900,15 +995,18 @@ mod tests {
         assert_eq!(backend.mapped.len(), 1);
         assert_eq!(backend.written.len(), 2);
 
-        // Segment mapped at page-aligned vaddr.
-        assert_eq!(backend.mapped[0].0, page_floor(0x401000));
+        // Segment mapped at page-aligned vaddr (0x400000).
+        assert_eq!(backend.mapped[0].0, 0x400000);
 
         // First write: zero-fill of the mapped region.
-        assert_eq!(backend.written[0].0, page_floor(0x401000));
+        assert_eq!(backend.written[0].0, 0x400000);
 
-        // Second write: segment data at exact vaddr.
-        assert_eq!(backend.written[1].0, 0x401000);
-        assert_eq!(backend.written[1].1, vec![0x90, 0x90, 0xCC, 0xCC]);
+        // Second write: full segment data (ELF header + phdrs + code)
+        // at the segment vaddr. The code bytes are at the end.
+        assert_eq!(backend.written[1].0, 0x400000);
+        let written_data = &backend.written[1].1;
+        let code_start = written_data.len() - code.len();
+        assert_eq!(&written_data[code_start..], &[0x90, 0x90, 0xCC, 0xCC]);
     }
 
     #[test]
@@ -1217,7 +1315,7 @@ mod tests {
     fn end_to_end_static_elf_load() {
         // 1. Build a synthetic ET_EXEC ELF.
         let code = [0xCC; 32];
-        let exe_entry = 0x401000u64;
+        let exe_entry = 0x400000u64;
         let elf = build_static_elf(&code);
 
         // 2. Create backend and loader.
@@ -1428,6 +1526,86 @@ mod tests {
     }
 
     #[test]
+    fn prepare_process_stack_builds_valid_layout() {
+        let mut backend = LoaderMockBackend::new();
+
+        let auxv = vec![
+            (auxv::AT_PAGESZ, 4096),
+            (auxv::AT_RANDOM, 0), // placeholder — gets patched
+            (auxv::AT_NULL, 0),
+        ];
+        let random_bytes = [0x42u8; 16];
+
+        let sp = prepare_process_stack(
+            &mut backend,
+            &["./hello", "--verbose"],
+            &["HOME=/root"],
+            &auxv,
+            &random_bytes,
+            0x7FFE_0000, // stack top (virtual address)
+            8 * 4096,    // 8 pages
+        );
+
+        assert_ne!(sp, 0, "SP should be non-zero");
+        assert_eq!(sp % 16, 0, "SP must be 16-byte aligned");
+
+        // Verify argc was written at SP.
+        let writes = &backend.written;
+        let stack_write = writes.iter().find(|(addr, data)| {
+            let start = *addr;
+            let end = start + data.len() as u64;
+            sp >= start && sp < end
+        });
+        assert!(stack_write.is_some(), "stack data should be written to VM");
+        let (base_addr, data) = stack_write.unwrap();
+        let argc_offset = (sp - base_addr) as usize;
+        let argc = u64::from_le_bytes(data[argc_offset..argc_offset + 8].try_into().unwrap());
+        assert_eq!(argc, 2, "argc should be 2");
+    }
+
+    #[test]
+    fn boot_static_elf_returns_entry_and_sp() {
+        let mut backend = LoaderMockBackend::new();
+        let elf_bytes = build_static_elf(&[0xCC; 16]);
+        let random_bytes = [0xAB; 16];
+        let stack_top = 0x7FFE_0000u64;
+        let stack_size = 8 * 4096;
+
+        let result = boot_static_elf(
+            &mut backend,
+            &elf_bytes,
+            &["./hello"],
+            &[],
+            &random_bytes,
+            stack_top,
+            stack_size,
+        );
+
+        let (entry, sp) = result.expect("boot should succeed");
+        assert_eq!(entry, 0x400000, "entry should be the ELF's entry_point");
+        assert_eq!(sp % 16, 0, "SP must be 16-byte aligned");
+        assert!(sp >= stack_top, "SP should be within stack region");
+        assert!(
+            sp < stack_top + stack_size as u64,
+            "SP should be within stack region"
+        );
+
+        // Verify the stack region was mapped (RW, no execute).
+        let stack_mapping = backend
+            .mapped
+            .iter()
+            .find(|(addr, len, _)| *addr == stack_top && *len == stack_size);
+        assert!(
+            stack_mapping.is_some(),
+            "boot_static_elf should map the stack region"
+        );
+        let (_, _, flags) = stack_mapping.unwrap();
+        assert!(flags.contains(PageFlags::READABLE));
+        assert!(flags.contains(PageFlags::WRITABLE));
+        assert!(!flags.contains(PageFlags::EXECUTABLE));
+    }
+
+    #[test]
     fn stack_sp_alignment() {
         let random = [0xDD; 16];
         let test_auxv = vec![
@@ -1450,5 +1628,204 @@ mod tests {
             let sp = build_initial_stack(&mut stack, stack_base, args, &[], &test_auxv, &random);
             assert_eq!(sp % 16, 0, "SP must be 16-byte aligned for argv {:?}", args);
         }
+    }
+
+    /// Build a static ET_EXEC ELF with PT_LOAD + PT_TLS.
+    fn build_static_elf_with_tls(code: &[u8], tls_memsz: u64) -> Vec<u8> {
+        let phdr_size = 56usize;
+        let phnum = 2usize; // PT_LOAD + PT_TLS
+        let code_offset = 64 + phnum * phdr_size;
+        let tls_data = [0u8; 8]; // 8 bytes of .tdata
+        let tls_offset = code_offset + code.len();
+        let total = tls_offset + tls_data.len();
+        let mut elf = vec![0u8; total];
+
+        // ELF header
+        elf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        #[cfg(target_arch = "x86_64")]
+        elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
+        #[cfg(target_arch = "aarch64")]
+        elf[18..20].copy_from_slice(&0xB7u16.to_le_bytes());
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf[24..32].copy_from_slice(&0x400000u64.to_le_bytes()); // entry
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // phoff
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&(phnum as u16).to_le_bytes());
+
+        // PT_LOAD: p_offset = 0, vaddr = 0x400000, filesz = entire file
+        // This is how real ELFs work — the first LOAD segment starts at file
+        // offset 0 and covers the ELF header + phdrs, so they're mapped.
+        let ph = &mut elf[64..64 + phdr_size];
+        ph[0..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        ph[4..8].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
+        ph[8..16].copy_from_slice(&0u64.to_le_bytes()); // p_offset = 0
+        ph[16..24].copy_from_slice(&0x400000u64.to_le_bytes()); // vaddr
+        ph[24..32].copy_from_slice(&0x400000u64.to_le_bytes());
+        ph[32..40].copy_from_slice(&(total as u64).to_le_bytes()); // filesz = entire file
+        ph[40..48].copy_from_slice(&(total as u64).to_le_bytes()); // memsz
+        ph[48..56].copy_from_slice(&0x1000u64.to_le_bytes());
+
+        // PT_TLS
+        let tph = &mut elf[64 + phdr_size..64 + 2 * phdr_size];
+        tph[0..4].copy_from_slice(&7u32.to_le_bytes()); // PT_TLS
+        tph[4..8].copy_from_slice(&4u32.to_le_bytes()); // PF_R
+        tph[8..16].copy_from_slice(&(tls_offset as u64).to_le_bytes());
+        tph[16..24].copy_from_slice(&0x403000u64.to_le_bytes()); // vaddr
+        tph[24..32].copy_from_slice(&0x403000u64.to_le_bytes());
+        tph[32..40].copy_from_slice(&(tls_data.len() as u64).to_le_bytes());
+        tph[40..48].copy_from_slice(&tls_memsz.to_le_bytes());
+        tph[48..56].copy_from_slice(&16u64.to_le_bytes()); // align
+
+        elf[tls_offset..tls_offset + tls_data.len()].copy_from_slice(&tls_data);
+
+        elf
+    }
+
+    #[test]
+    fn boot_elf_with_tls_has_pt_tls_in_mapped_phdrs() {
+        use crate::elf::parse_elf;
+
+        let elf_bytes = build_static_elf_with_tls(&[0xCC; 16], 32);
+        let parsed = parse_elf(&elf_bytes).unwrap();
+
+        // Verify PT_TLS was parsed.
+        assert!(parsed.tls.is_some(), "ParsedElf should contain TLS info");
+        let tls = parsed.tls.unwrap();
+        assert_eq!(tls.memsz, 32);
+
+        // Verify phdr count includes PT_TLS.
+        assert_eq!(parsed.phdr_count, 2, "should have PT_LOAD + PT_TLS");
+
+        // Load via InterpreterLoader to verify no errors.
+        let mut backend = LoaderMockBackend::new();
+        let mut loader = InterpreterLoader::default();
+        let result = loader.load(&elf_bytes, &mut backend);
+        assert!(result.is_ok(), "loading ELF with PT_TLS should succeed");
+
+        // Verify AT_PHDR is in the auxv and points within the mapped region.
+        let load_result = result.unwrap();
+        let at_phdr = load_result
+            .auxv
+            .iter()
+            .find(|(k, _)| *k == auxv::AT_PHDR)
+            .map(|(_, v)| *v)
+            .expect("AT_PHDR should be in auxv");
+
+        // AT_PHDR should point within the mapped region (0x400000...).
+        assert!(
+            at_phdr >= 0x400000,
+            "AT_PHDR ({:#x}) should be within mapped region",
+            at_phdr
+        );
+
+        // Verify the mapped memory at AT_PHDR contains the raw phdr bytes.
+        // Use rfind because the loader zero-fills the region first, then
+        // overwrites with the actual segment data — we want the latter.
+        let phdr_write = backend.written.iter().rev().find(|(addr, data)| {
+            let end = *addr + data.len() as u64;
+            at_phdr >= *addr && at_phdr + 56 * 2 <= end
+        });
+        assert!(
+            phdr_write.is_some(),
+            "program headers should be written to VM memory"
+        );
+
+        // Read the second phdr (PT_TLS) from the mapped data.
+        let (base, data) = phdr_write.unwrap();
+        let phdr_off = (at_phdr - base) as usize;
+        let second_phdr_off = phdr_off + 56;
+        let p_type = u32::from_le_bytes(
+            data[second_phdr_off..second_phdr_off + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(p_type, 7, "second phdr should be PT_TLS (type 7)");
+    }
+
+    #[test]
+    fn boot_static_elf_at_random_contains_entropy() {
+        let mut backend = LoaderMockBackend::new();
+        let elf_bytes = build_static_elf(&[0xCC; 16]);
+        let random_bytes: [u8; 16] = [
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x13, 0x37, 0x42, 0x00, 0xFF, 0xEE,
+            0xDD, 0xCC,
+        ];
+
+        let (_, sp) = boot_static_elf(
+            &mut backend,
+            &elf_bytes,
+            &["./test"],
+            &[],
+            &random_bytes,
+            0x7FFE_0000,
+            8 * 4096,
+        )
+        .expect("boot should succeed");
+
+        // Find the stack write in the mock backend.
+        let stack_write = backend
+            .written
+            .iter()
+            .find(|(addr, data)| {
+                let end = *addr + data.len() as u64;
+                sp >= *addr && sp < end
+            })
+            .expect("stack data should be in mock backend writes");
+        let (base, data) = stack_write;
+
+        // Walk the stack from SP to find auxv.
+        let sp_off = (sp - base) as usize;
+        let read_u64 =
+            |off: usize| -> u64 { u64::from_le_bytes(data[off..off + 8].try_into().unwrap()) };
+
+        // argc
+        let argc = read_u64(sp_off);
+        let mut pos = sp_off + 8;
+
+        // Skip argv pointers + NULL
+        for _ in 0..argc {
+            pos += 8;
+        }
+        pos += 8; // argv NULL terminator
+
+        // Skip envp pointers + NULL
+        loop {
+            let val = read_u64(pos);
+            pos += 8;
+            if val == 0 {
+                break;
+            }
+        }
+
+        // Now at auxv. Find AT_RANDOM.
+        let mut at_random_ptr = None;
+        loop {
+            let key = read_u64(pos);
+            let val = read_u64(pos + 8);
+            pos += 16;
+            if key == auxv::AT_NULL {
+                break;
+            }
+            if key == auxv::AT_RANDOM {
+                at_random_ptr = Some(val);
+            }
+        }
+
+        let ptr = at_random_ptr.expect("AT_RANDOM should be in auxv");
+
+        // Read 16 bytes at the AT_RANDOM pointer from the stack data.
+        let random_off = (ptr - base) as usize;
+        let stored = &data[random_off..random_off + 16];
+        assert_eq!(
+            stored, &random_bytes,
+            "AT_RANDOM should point to the provided entropy bytes"
+        );
     }
 }
