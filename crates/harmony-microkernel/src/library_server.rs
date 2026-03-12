@@ -77,11 +77,11 @@ impl FileServer for LibraryServer {
     }
 
     fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
-        let entry = self.tracker.get_mut(fid)?;
         if mode != OpenMode::Read {
             return Err(IpcError::ReadOnly);
         }
-        entry.is_open = true;
+        let entry = self.tracker.begin_open(fid)?;
+        entry.mark_open(mode);
         Ok(())
     }
 
@@ -334,6 +334,15 @@ mod tests {
             srv.walk(1, 2, "ld-musl-aarch64.so.1"),
             Err(IpcError::InvalidFid)
         );
+    }
+
+    #[test]
+    fn double_open_rejected() {
+        let mut srv = test_server();
+        srv.walk(0, 1, "libc.so").unwrap();
+        srv.open(1, OpenMode::Read).unwrap();
+        // Second open on same fid should fail (9P semantics).
+        assert_eq!(srv.open(1, OpenMode::Read), Err(IpcError::PermissionDenied));
     }
 
     #[test]
