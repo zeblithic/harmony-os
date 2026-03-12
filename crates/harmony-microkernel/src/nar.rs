@@ -31,6 +31,10 @@ pub enum NarError {
     InvalidType,
     /// An arithmetic overflow occurred when computing offsets.
     OffsetOverflow,
+    /// A directory contains two entries with the same name.
+    DuplicateEntry,
+    /// The archive has trailing bytes after the root node.
+    TrailingData,
 }
 
 // ── Entry types ─────────────────────────────────────────────────────
@@ -266,7 +270,9 @@ fn parse_directory(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarErro
         // Expect ")" to close the entry.
         pos = expect_string(data, pos, b")")?;
 
-        entries.insert(name, child_entry);
+        if entries.insert(name, child_entry).is_some() {
+            return Err(NarError::DuplicateEntry);
+        }
     }
 }
 
@@ -299,7 +305,11 @@ impl NarArchive {
         }
 
         // Parse the root node.
-        let (root, _pos) = parse_node(data, pos)?;
+        let (root, end_pos) = parse_node(data, pos)?;
+
+        if end_pos != data.len() {
+            return Err(NarError::TrailingData);
+        }
 
         Ok(NarArchive { root })
     }
@@ -712,5 +722,49 @@ pub(crate) mod tests {
         // Nonexistent path.
         assert!(archive.lookup("nonexistent").is_none());
         assert!(archive.lookup("bin/nonexistent").is_none());
+    }
+
+    #[test]
+    fn archive_rejects_trailing_data() {
+        let mut nar = nar_regular_file(b"data", false);
+        nar.extend_from_slice(&[0xDE, 0xAD]); // trailing garbage
+        assert_eq!(NarArchive::parse(&nar), Err(NarError::TrailingData));
+    }
+
+    #[test]
+    fn archive_rejects_duplicate_directory_entry() {
+        let mut buf = Vec::new();
+        buf.extend(nar_string(b"nix-archive-1"));
+        buf.extend(nar_string(b"("));
+        buf.extend(nar_string(b"type"));
+        buf.extend(nar_string(b"directory"));
+        // First entry named "a"
+        buf.extend(nar_string(b"entry"));
+        buf.extend(nar_string(b"("));
+        buf.extend(nar_string(b"name"));
+        buf.extend(nar_string(b"a"));
+        buf.extend(nar_string(b"node"));
+        buf.extend(nar_string(b"("));
+        buf.extend(nar_string(b"type"));
+        buf.extend(nar_string(b"regular"));
+        buf.extend(nar_string(b"contents"));
+        buf.extend(nar_string(b"first"));
+        buf.extend(nar_string(b")"));
+        buf.extend(nar_string(b")"));
+        // Duplicate entry named "a"
+        buf.extend(nar_string(b"entry"));
+        buf.extend(nar_string(b"("));
+        buf.extend(nar_string(b"name"));
+        buf.extend(nar_string(b"a"));
+        buf.extend(nar_string(b"node"));
+        buf.extend(nar_string(b"("));
+        buf.extend(nar_string(b"type"));
+        buf.extend(nar_string(b"regular"));
+        buf.extend(nar_string(b"contents"));
+        buf.extend(nar_string(b"second"));
+        buf.extend(nar_string(b")"));
+        buf.extend(nar_string(b")"));
+        buf.extend(nar_string(b")"));
+        assert_eq!(NarArchive::parse(&buf), Err(NarError::DuplicateEntry));
     }
 }

@@ -65,6 +65,12 @@ fn qpath_for(path: &str) -> QPath {
 }
 
 /// Map a `NarEntry` to the corresponding `FileType`.
+///
+/// Symlinks are reported as `Regular` because `FileType` has no symlink
+/// variant. The server returns symlink targets as opaque byte content;
+/// symlink resolution is the Linuxulator's responsibility (it already
+/// needs `readlink` for Linux compat). When `FileType::Symlink` is
+/// added, this mapping should be updated.
 fn file_type_of(entry: &NarEntry) -> FileType {
     match entry {
         NarEntry::Directory { .. } => FileType::Directory,
@@ -159,7 +165,9 @@ impl NixStoreServer {
                     return Vec::new();
                 }
                 let start = contents_offset + off;
-                let end = (start + count as usize).min(contents_offset + contents_len);
+                let end = start
+                    .saturating_add(count as usize)
+                    .min(contents_offset + contents_len);
                 sp.nar_blob[start..end].to_vec()
             }
             NarEntry::Symlink { target } => {
@@ -168,7 +176,7 @@ impl NixStoreServer {
                 if off >= bytes.len() {
                     return Vec::new();
                 }
-                let end = (off + count as usize).min(bytes.len());
+                let end = off.saturating_add(count as usize).min(bytes.len());
                 bytes[off..end].to_vec()
             }
             NarEntry::Directory { entries } => {
@@ -182,7 +190,7 @@ impl NixStoreServer {
                 if off >= bytes.len() {
                     return Vec::new();
                 }
-                let end = (off + count as usize).min(bytes.len());
+                let end = off.saturating_add(count as usize).min(bytes.len());
                 bytes[off..end].to_vec()
             }
         }
