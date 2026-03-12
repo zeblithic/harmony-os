@@ -65,8 +65,14 @@ impl<A: ContentAnnouncer> NarPublisher<A> {
         self.published_paths
             .insert(store_path_name.to_string(), root_cid);
 
-        // Extract store hash (first 32 chars) for the Zenoh key.
-        let store_hash = &store_path_name[..std::cmp::min(32, store_path_name.len())];
+        // Validate store path format: must be >= 33 chars with a hyphen at position 32.
+        if store_path_name.len() < 33 || store_path_name.as_bytes()[32] != b'-' {
+            return Err(format!(
+                "store path name does not have expected '<32-char-hash>-<name>' format: {:?}",
+                store_path_name
+            ));
+        }
+        let store_hash = &store_path_name[..32];
 
         // Announce store path mapping: key = harmony/nix/store/{store_hash},
         // payload = root CID as hex.
@@ -293,5 +299,26 @@ mod tests {
         // Reassemble from the publisher's blob store should recover original NAR.
         let recovered = dag::reassemble(&root_cid, publisher.blob_store()).unwrap();
         assert_eq!(recovered, nar);
+    }
+
+    #[test]
+    fn publish_rejects_malformed_store_path() {
+        let (announcer, _log) = MockAnnouncer::new();
+        let mut publisher = NarPublisher::new(announcer);
+        let nar = build_test_nar(b"test");
+
+        // Too short.
+        let result = publisher.publish("short", &nar);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("format"));
+
+        // 33+ chars but no hyphen at position 32.
+        let no_hyphen = "abcdefghijklmnopqrstuvwxyz012345Xrest";
+        let result = publisher.publish(no_hyphen, &nar);
+        assert!(result.is_err());
+
+        // Exactly 32 chars (missing hyphen + name).
+        let result = publisher.publish("abc12345678901234567890123456789", &nar);
+        assert!(result.is_err());
     }
 }

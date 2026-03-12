@@ -9,6 +9,8 @@
 //! The [`ContentQuerier`] trait abstracts the actual Zenoh query transport,
 //! allowing full unit testing with an in-memory mock.
 
+use std::collections::HashSet;
+
 use harmony_content::blob::{BlobStore, MemoryBlobStore};
 use harmony_content::bundle;
 use harmony_content::cid::{CidType, ContentId};
@@ -96,8 +98,9 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
         let mut store = MemoryBlobStore::new();
         store.store(root_cid, root_data);
 
-        // 6. Recursively fetch all children.
-        self.fetch_children(&root_cid, &mut store)?;
+        // 6. Recursively fetch all children (with cycle guard).
+        let mut visited = HashSet::new();
+        self.fetch_children(&root_cid, &mut store, &mut visited)?;
 
         // 7. Reassemble the original data.
         let reassembled = dag::reassemble(&root_cid, &store)
@@ -107,7 +110,19 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
     }
 
     /// Recursively fetch all DAG children that are not yet in the store.
-    fn fetch_children(&self, cid: &ContentId, store: &mut MemoryBlobStore) -> Result<(), String> {
+    ///
+    /// The `visited` set prevents infinite recursion from malicious or
+    /// buggy peers that return self-referential bundle CIDs.
+    fn fetch_children(
+        &self,
+        cid: &ContentId,
+        store: &mut MemoryBlobStore,
+        visited: &mut HashSet<ContentId>,
+    ) -> Result<(), String> {
+        if !visited.insert(*cid) {
+            return Ok(()); // Already processed — break potential cycle.
+        }
+
         match cid.cid_type() {
             CidType::Blob => {
                 // Leaf node — fetch if not already present.
@@ -143,7 +158,7 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
                             .ok_or_else(|| format!("mesh missing {child_hex}"))?;
                         store.store(*child, data);
                     }
-                    self.fetch_children(child, store)?;
+                    self.fetch_children(child, store, visited)?;
                 }
             }
             CidType::InlineMetadata => {

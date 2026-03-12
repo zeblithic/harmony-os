@@ -142,9 +142,12 @@ impl NixStoreFetcher {
             // Skip if already imported (race: kernel re-recorded a miss
             // for a path imported in a previous cycle).
             if server.has_store_path(name) {
-                return Ok(());
+                return Ok(false); // Not newly imported — don't re-publish.
             }
-            server.import_nar(name, nar).map_err(|e| format!("{:?}", e))
+            server
+                .import_nar(name, nar)
+                .map(|()| true)
+                .map_err(|e| format!("{:?}", e))
         })
     }
 
@@ -166,9 +169,12 @@ impl NixStoreFetcher {
             // Skip if already imported (race: kernel re-recorded a miss
             // for a path imported in a previous cycle).
             if guard.has_store_path(name) {
-                return Ok(());
+                return Ok(false); // Not newly imported — don't re-publish.
             }
-            guard.import_nar(name, nar).map_err(|e| format!("{:?}", e))
+            guard
+                .import_nar(name, nar)
+                .map(|()| true)
+                .map_err(|e| format!("{:?}", e))
         })
     }
 
@@ -176,16 +182,17 @@ impl NixStoreFetcher {
     /// Misses are already deduplicated by `drain_misses()` (BTreeSet).
     ///
     /// If a mesh source is configured, each path is tried there first;
-    /// on mesh miss the fetcher falls back to the upstream HTTP cache.
+    /// on mesh miss (or mesh import failure) the fetcher falls back to
+    /// the upstream HTTP cache.
     ///
-    /// Returns `(store_path_name, nar_bytes)` for every successful import.
+    /// Returns `(store_path_name, nar_bytes)` for every *newly* imported path.
     fn process_miss_list<F>(
         &mut self,
         misses: Vec<Arc<str>>,
         mut import_fn: F,
     ) -> Vec<(String, Vec<u8>)>
     where
-        F: FnMut(&str, Vec<u8>) -> Result<(), String>,
+        F: FnMut(&str, Vec<u8>) -> Result<bool, String>,
     {
         let mut imported = Vec::new();
         for name in &misses {
@@ -195,34 +202,68 @@ impl NixStoreFetcher {
             }
 
             // Try mesh first (if available).
-            let fetch_result = if let Some(ref mesh) = self.mesh {
-                if let Some(nar_bytes) = mesh.fetch_nar(&name_str) {
-                    Ok(nar_bytes)
-                } else {
-                    self.fetch_nar(&name_str)
+            let mut nar_bytes = None;
+            if let Some(ref mesh) = self.mesh {
+                if let Some(mesh_nar) = mesh.fetch_nar(&name_str) {
+                    nar_bytes = Some(mesh_nar);
                 }
-            } else {
-                self.fetch_nar(&name_str)
-            };
+            }
 
-            match fetch_result {
-                Ok(nar_bytes) => {
-                    let nar_clone = nar_bytes.clone();
-                    if let Err(e) = import_fn(&name_str, nar_bytes) {
-                        eprintln!("[nix-fetcher] import failed for {}: {}", name_str, e);
-                        self.failed.insert(name_str);
-                    } else {
-                        imported.push((name_str, nar_clone));
+            // Fall back to HTTP if mesh didn't provide data.
+            if nar_bytes.is_none() {
+                match self.fetch_nar(&name_str) {
+                    Ok(http_nar) => nar_bytes = Some(http_nar),
+                    Err(e) => {
+                        eprintln!("[nix-fetcher] fetch failed for {}: {:?}", name_str, e);
+                        if !matches!(e, FetchError::Network(_)) {
+                            self.failed.insert(name_str);
+                        }
+                        continue;
                     }
+                }
+            }
+
+            let nar_bytes = nar_bytes.unwrap();
+            match import_fn(&name_str, nar_bytes.clone()) {
+                Ok(true) => {
+                    // Newly imported — include for mesh publishing.
+                    imported.push((name_str, nar_bytes));
+                }
+                Ok(false) => {
+                    // Already present — skip re-publishing.
                 }
                 Err(e) => {
-                    eprintln!("[nix-fetcher] fetch failed for {}: {:?}", name_str, e);
-                    // Only blacklist permanent failures. Transient network
-                    // errors (DNS, timeout, connection reset) should be
-                    // retried on the next drain cycle.
-                    if !matches!(e, FetchError::Network(_)) {
-                        self.failed.insert(name_str);
+                    // If mesh data failed import, try HTTP before blacklisting.
+                    if self.mesh.is_some() {
+                        eprintln!(
+                            "[nix-fetcher] mesh import failed for {}, trying HTTP: {}",
+                            name_str, e
+                        );
+                        match self.fetch_nar(&name_str) {
+                            Ok(http_nar) => match import_fn(&name_str, http_nar.clone()) {
+                                Ok(true) => {
+                                    imported.push((name_str, http_nar));
+                                    continue;
+                                }
+                                Ok(false) => continue,
+                                Err(e2) => {
+                                    eprintln!(
+                                        "[nix-fetcher] HTTP import also failed for {}: {}",
+                                        name_str, e2
+                                    );
+                                }
+                            },
+                            Err(e2) => {
+                                eprintln!(
+                                    "[nix-fetcher] HTTP fallback fetch failed for {}: {:?}",
+                                    name_str, e2
+                                );
+                            }
+                        }
+                    } else {
+                        eprintln!("[nix-fetcher] import failed for {}: {}", name_str, e);
                     }
+                    self.failed.insert(name_str);
                 }
             }
         }
