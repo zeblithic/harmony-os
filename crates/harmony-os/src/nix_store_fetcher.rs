@@ -412,6 +412,76 @@ mod tests {
         assert!(fetcher.failed.contains(store_path_name.as_str()));
     }
 
+    // ── Test: SharedNixStoreServer + NixStoreFetcher integration ────
+
+    #[test]
+    fn shared_server_fetch_and_walk() {
+        use harmony_microkernel::nix_store_server::SharedNixStoreServer;
+        use std::sync::{Arc, Mutex};
+
+        // Build test NAR + responses (reuse existing helpers from this test module).
+        let nar = build_test_nar(b"shared test data");
+        let hash = sha2::Sha256::digest(&nar);
+        let _hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        let nix_b32 = encode_nix_base32(&hash);
+        let store_hash = "abc12345678901234567890123456789";
+        let store_path_name = format!("{store_hash}-shared-test");
+
+        let narinfo = format!(
+            "StorePath: /nix/store/{store_path_name}\n\
+             URL: nar/test.nar.xz\n\
+             Compression: xz\n\
+             NarHash: sha256:{nix_b32}\n\
+             NarSize: {}\n",
+            nar.len()
+        );
+
+        let nar_xz = compress_xz(&nar);
+
+        let mut responses = std::collections::HashMap::new();
+        responses.insert(
+            format!("https://cache.nixos.org/{store_hash}.narinfo"),
+            Ok(narinfo.into_bytes()),
+        );
+        responses.insert(
+            "https://cache.nixos.org/nar/test.nar.xz".to_string(),
+            Ok(nar_xz),
+        );
+        let http = MockHttp { responses };
+
+        // Set up shared server.
+        let server = NixStoreServer::new();
+        let shared = Arc::new(Mutex::new(server));
+
+        // Wrap for FileServer use (simulating kernel).
+        let mut wrapper = SharedNixStoreServer {
+            inner: Arc::clone(&shared),
+        };
+
+        // Walk miss through wrapper — records the miss.
+        use harmony_microkernel::FileServer;
+        assert_eq!(
+            wrapper.walk(0, 1, &store_path_name),
+            Err(harmony_microkernel::IpcError::NotFound)
+        );
+
+        // Fetcher processes misses through the Arc<Mutex>.
+        let mut fetcher = NixStoreFetcher::new(Box::new(http));
+        {
+            let mut srv = shared.lock().unwrap();
+            fetcher.process_misses(&mut srv);
+        }
+
+        // Now walk through the wrapper should succeed.
+        let qp = wrapper.walk(0, 2, &store_path_name).unwrap();
+        assert_ne!(qp, 0);
+
+        // Read the file through the wrapper.
+        wrapper.open(2, harmony_microkernel::OpenMode::Read).unwrap();
+        let data = wrapper.read(2, 0, 1024).unwrap();
+        assert_eq!(data, b"shared test data");
+    }
+
     // ── Test: UreqHttpClient smoke test ─────────────────────────────
 
     #[test]
