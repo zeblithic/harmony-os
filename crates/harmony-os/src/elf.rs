@@ -24,6 +24,7 @@ const EM_X86_64: u16 = 0x3E;
 const EM_AARCH64: u16 = 0xB7;
 const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
+const PT_TLS: u32 = 7;
 
 const ELF64_HEADER_SIZE: usize = 64;
 const ELF64_PHDR_SIZE: usize = 56;
@@ -85,6 +86,18 @@ pub struct ElfSegment {
     pub align: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlsInfo {
+    /// Virtual address of the TLS template data (.tdata).
+    pub vaddr: u64,
+    /// Size of initialized TLS data (.tdata) in the ELF file.
+    pub filesz: u64,
+    /// Total TLS size in memory (.tdata + .tbss zero-fill).
+    pub memsz: u64,
+    /// TLS alignment requirement.
+    pub align: u64,
+}
+
 /// Parsed ELF metadata. Does not contain the actual segment data —
 /// use `offset` and `filesz` to slice the original ELF bytes.
 #[derive(Debug, PartialEq, Eq)]
@@ -107,6 +120,8 @@ pub struct ParsedElf {
     /// vaddr=0, offset=0).  Used to compute the in-memory address of
     /// program headers: `base + load_bias + phdr_offset`.
     pub load_bias: u64,
+    /// Thread-local storage segment metadata (None if no PT_TLS).
+    pub tls: Option<TlsInfo>,
 }
 
 // ── Little-endian helpers ───────────────────────────────────────────
@@ -211,9 +226,10 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, ElfError> {
         return Err(ElfError::TooShort);
     }
 
-    // Parse program headers: PT_LOAD segments and PT_INTERP
+    // Parse program headers: PT_LOAD segments, PT_INTERP, and PT_TLS
     let mut segments = Vec::new();
     let mut interpreter = None;
+    let mut tls = None;
 
     for i in 0..e_phnum {
         let ph = &data[e_phoff + i * e_phentsize..];
@@ -271,6 +287,18 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, ElfError> {
                     core::str::from_utf8(path).map_err(|_| ElfError::InterpreterPathInvalid)?;
                 interpreter = Some(String::from(path_str));
             }
+            PT_TLS => {
+                let p_vaddr = u64_le(ph, 16);
+                let p_filesz = u64_le(ph, 32);
+                let p_memsz = u64_le(ph, 40);
+                let p_align = u64_le(ph, 48);
+                tls = Some(TlsInfo {
+                    vaddr: p_vaddr,
+                    filesz: p_filesz,
+                    memsz: p_memsz,
+                    align: p_align,
+                });
+            }
             _ => {}
         }
     }
@@ -296,6 +324,7 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, ElfError> {
         phdr_entry_size: e_phentsize as u16,
         phdr_count: e_phnum as u16,
         load_bias,
+        tls,
     })
 }
 
@@ -600,5 +629,86 @@ mod tests {
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let elf = build_test_elf_with_machine(&code, 0x3E);
         assert_eq!(parse_elf(&elf), Err(ElfError::UnsupportedMachine));
+    }
+
+    /// Build a test ELF with a PT_TLS segment in addition to PT_LOAD.
+    fn build_test_elf_with_tls(
+        code: &[u8],
+        tls_data: &[u8],
+        tls_memsz: u64,
+        tls_align: u64,
+    ) -> Vec<u8> {
+        let phdr_size = 56;
+        let phnum = 2; // PT_LOAD + PT_TLS
+        let code_offset = 64 + phnum * phdr_size;
+        let tls_offset = code_offset + code.len();
+        let total = tls_offset + tls_data.len();
+        let mut elf = vec![0u8; total];
+
+        // ELF header
+        elf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+        #[cfg(target_arch = "x86_64")]
+        elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
+        #[cfg(target_arch = "aarch64")]
+        elf[18..20].copy_from_slice(&0xB7u16.to_le_bytes());
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf[24..32].copy_from_slice(&0x401000u64.to_le_bytes());
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&(phnum as u16).to_le_bytes());
+
+        // PT_LOAD program header
+        let ph = &mut elf[64..64 + phdr_size];
+        ph[0..4].copy_from_slice(&1u32.to_le_bytes());
+        ph[4..8].copy_from_slice(&5u32.to_le_bytes());
+        ph[8..16].copy_from_slice(&(code_offset as u64).to_le_bytes());
+        ph[16..24].copy_from_slice(&0x401000u64.to_le_bytes());
+        ph[24..32].copy_from_slice(&0x401000u64.to_le_bytes());
+        ph[32..40].copy_from_slice(&(code.len() as u64).to_le_bytes());
+        ph[40..48].copy_from_slice(&(code.len() as u64).to_le_bytes());
+        ph[48..56].copy_from_slice(&0x1000u64.to_le_bytes());
+
+        // PT_TLS program header
+        let tph = &mut elf[64 + phdr_size..64 + 2 * phdr_size];
+        tph[0..4].copy_from_slice(&7u32.to_le_bytes());
+        tph[4..8].copy_from_slice(&4u32.to_le_bytes());
+        tph[8..16].copy_from_slice(&(tls_offset as u64).to_le_bytes());
+        tph[16..24].copy_from_slice(&0x403000u64.to_le_bytes());
+        tph[24..32].copy_from_slice(&0x403000u64.to_le_bytes());
+        tph[32..40].copy_from_slice(&(tls_data.len() as u64).to_le_bytes());
+        tph[40..48].copy_from_slice(&tls_memsz.to_le_bytes());
+        tph[48..56].copy_from_slice(&tls_align.to_le_bytes());
+
+        elf[code_offset..code_offset + code.len()].copy_from_slice(code);
+        elf[tls_offset..tls_offset + tls_data.len()].copy_from_slice(tls_data);
+
+        elf
+    }
+
+    #[test]
+    fn parse_pt_tls() {
+        let elf = build_test_elf_with_tls(&[0xCC; 16], &[0x42; 8], 32, 16);
+        let parsed = parse_elf(&elf).unwrap();
+
+        let tls = parsed.tls.as_ref().expect("PT_TLS should be parsed");
+        assert_eq!(tls.vaddr, 0x403000);
+        assert_eq!(tls.filesz, 8);
+        assert_eq!(tls.memsz, 32);
+        assert_eq!(tls.align, 16);
+    }
+
+    #[test]
+    fn no_tls_for_elf_without_pt_tls() {
+        let code = [0xCC; 16];
+        let elf = build_test_elf(&code);
+        let parsed = parse_elf(&elf).unwrap();
+        assert!(parsed.tls.is_none());
     }
 }
