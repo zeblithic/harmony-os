@@ -165,10 +165,10 @@ impl NixStoreServer {
                 if off >= *contents_len {
                     return Vec::new();
                 }
-                let start = contents_offset + off;
+                let start = contents_offset.saturating_add(off);
                 let end = start
                     .saturating_add(count as usize)
-                    .min(contents_offset + contents_len);
+                    .min(contents_offset.saturating_add(*contents_len));
                 sp.nar_blob[start..end].to_vec()
             }
             NarEntry::Symlink { target } => {
@@ -286,7 +286,7 @@ impl FileServer for NixStoreServer {
                 if off >= bytes.len() {
                     return Ok(Vec::new());
                 }
-                let end = (off + count as usize).min(bytes.len());
+                let end = off.saturating_add(count as usize).min(bytes.len());
                 Ok(bytes[off..end].to_vec())
             }
             NixFidPayload::StorePathRoot { name } => {

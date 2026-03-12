@@ -33,6 +33,8 @@ pub enum NarError {
     OffsetOverflow,
     /// A directory contains two entries with the same name.
     DuplicateEntry,
+    /// Directory entries are not in lexicographic order (NAR spec requirement).
+    OutOfOrder,
     /// The archive has trailing bytes after the root node.
     TrailingData,
 }
@@ -194,6 +196,13 @@ fn parse_regular(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarError>
         return Err(NarError::TooShort);
     }
 
+    // Validate that content padding bytes are zero (same policy as read_string).
+    for &b in &data[contents_end..padded_end] {
+        if b != 0 {
+            return Err(NarError::InvalidString);
+        }
+    }
+
     let pos = padded_end;
 
     // Expect closing ")".
@@ -234,6 +243,7 @@ fn parse_symlink(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarError>
 /// then `)`.
 fn parse_directory(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarError> {
     let mut entries = BTreeMap::new();
+    let mut last_name: Option<Arc<str>> = None;
     let mut pos = pos;
 
     loop {
@@ -262,6 +272,14 @@ fn parse_directory(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarErro
         pos = new_pos;
         let name_str = core::str::from_utf8(name_bytes).map_err(|_| NarError::InvalidString)?;
         let name: Arc<str> = Arc::from(name_str);
+
+        // NAR spec requires entries in strictly ascending lexicographic order.
+        if let Some(ref prev) = last_name {
+            if *name <= **prev {
+                return Err(NarError::OutOfOrder);
+            }
+        }
+        last_name = Some(Arc::clone(&name));
 
         // Expect "node".
         pos = expect_string(data, pos, b"node")?;
@@ -768,6 +786,63 @@ pub(crate) mod tests {
         buf.extend(nar_string(b")"));
         buf.extend(nar_string(b")"));
         buf.extend(nar_string(b")"));
-        assert_eq!(NarArchive::parse(&buf), Err(NarError::DuplicateEntry));
+        // Equal names are caught by the sort-order check (<=) before the duplicate check.
+        assert_eq!(NarArchive::parse(&buf), Err(NarError::OutOfOrder));
+    }
+
+    #[test]
+    fn archive_rejects_out_of_order_entries() {
+        let mut buf = Vec::new();
+        buf.extend(nar_string(b"nix-archive-1"));
+        buf.extend(nar_string(b"("));
+        buf.extend(nar_string(b"type"));
+        buf.extend(nar_string(b"directory"));
+        // First entry named "b" (should come second lexicographically)
+        buf.extend(nar_string(b"entry"));
+        buf.extend(nar_string(b"("));
+        buf.extend(nar_string(b"name"));
+        buf.extend(nar_string(b"b"));
+        buf.extend(nar_string(b"node"));
+        buf.extend(nar_string(b"("));
+        buf.extend(nar_string(b"type"));
+        buf.extend(nar_string(b"regular"));
+        buf.extend(nar_string(b"contents"));
+        buf.extend(nar_string(b"first"));
+        buf.extend(nar_string(b")"));
+        buf.extend(nar_string(b")"));
+        // Second entry named "a" (wrong order)
+        buf.extend(nar_string(b"entry"));
+        buf.extend(nar_string(b"("));
+        buf.extend(nar_string(b"name"));
+        buf.extend(nar_string(b"a"));
+        buf.extend(nar_string(b"node"));
+        buf.extend(nar_string(b"("));
+        buf.extend(nar_string(b"type"));
+        buf.extend(nar_string(b"regular"));
+        buf.extend(nar_string(b"contents"));
+        buf.extend(nar_string(b"second"));
+        buf.extend(nar_string(b")"));
+        buf.extend(nar_string(b")"));
+        buf.extend(nar_string(b")"));
+        assert_eq!(NarArchive::parse(&buf), Err(NarError::OutOfOrder));
+    }
+
+    #[test]
+    fn regular_file_rejects_nonzero_content_padding() {
+        // Build a regular file with contents "hi" (2 bytes → 6 padding bytes).
+        let mut buf = Vec::new();
+        buf.extend(nar_string(b"nix-archive-1"));
+        buf.extend(nar_string(b"("));
+        buf.extend(nar_string(b"type"));
+        buf.extend(nar_string(b"regular"));
+        buf.extend(nar_string(b"contents"));
+        // Manually encode contents with non-zero padding.
+        let content = b"hi";
+        buf.extend_from_slice(&(content.len() as u64).to_le_bytes());
+        buf.extend_from_slice(content);
+        // 6 padding bytes, but make one non-zero.
+        buf.extend_from_slice(&[0, 0, 0, 0, 0, 0xFF]);
+        buf.extend(nar_string(b")"));
+        assert_eq!(NarArchive::parse(&buf), Err(NarError::InvalidString));
     }
 }
