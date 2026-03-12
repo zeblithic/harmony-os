@@ -521,6 +521,42 @@ pub fn prepare_process_stack(
     sp
 }
 
+/// Parse, load, and set up the initial stack for a static ELF binary.
+///
+/// Returns `(entry_point, initial_sp)` — everything needed to start
+/// execution. The caller sets PC and SP to these values.
+///
+/// This is the high-level boot function that composes:
+/// - `parse_elf()` — extract ELF metadata
+/// - `InterpreterLoader::load()` — map segments into VM
+/// - `prepare_process_stack()` — build Linux stack layout
+pub fn boot_static_elf(
+    backend: &mut dyn SyscallBackend,
+    elf_bytes: &[u8],
+    argv: &[&str],
+    envp: &[&str],
+    random_bytes: &[u8; 16],
+    stack_top: u64,
+    stack_size: usize,
+) -> Result<(u64, u64), ElfLoadError> {
+    // 1. Load the ELF (parse + map segments + build auxv).
+    let mut loader = InterpreterLoader::default();
+    let result = loader.load(elf_bytes, backend)?;
+
+    // 2. Build the initial stack with the auxv from the loader.
+    let sp = prepare_process_stack(
+        backend,
+        argv,
+        envp,
+        &result.auxv,
+        random_bytes,
+        stack_top,
+        stack_size,
+    );
+
+    Ok((result.entry_point, sp))
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1496,6 +1532,32 @@ mod tests {
         let argc_offset = (sp - base_addr) as usize;
         let argc = u64::from_le_bytes(data[argc_offset..argc_offset + 8].try_into().unwrap());
         assert_eq!(argc, 2, "argc should be 2");
+    }
+
+    #[test]
+    fn boot_static_elf_returns_entry_and_sp() {
+        let mut backend = LoaderMockBackend::new();
+        let elf_bytes = build_static_elf(&[0xCC; 16]);
+        let random_bytes = [0xAB; 16];
+
+        let result = boot_static_elf(
+            &mut backend,
+            &elf_bytes,
+            &["./hello"],
+            &[],
+            &random_bytes,
+            0x7FFE_0000, // stack base
+            8 * 4096,    // stack size
+        );
+
+        let (entry, sp) = result.expect("boot should succeed");
+        assert_eq!(entry, 0x401000, "entry should be the ELF's entry_point");
+        assert_eq!(sp % 16, 0, "SP must be 16-byte aligned");
+        assert!(sp >= 0x7FFE_0000, "SP should be within stack region");
+        assert!(
+            sp < 0x7FFE_0000 + 8 * 4096,
+            "SP should be within stack region"
+        );
     }
 
     #[test]
