@@ -52,7 +52,7 @@ impl NarInfo {
 
         Ok(NarInfo {
             url: url.ok_or(NarInfoError::MissingField("URL"))?,
-            compression: compression.unwrap_or_else(|| "xz".to_string()),
+            compression: compression.unwrap_or_else(|| "bzip2".to_string()),
             nar_hash: nar_hash.ok_or(NarInfoError::MissingField("NarHash"))?,
             nar_size: nar_size.ok_or(NarInfoError::MissingField("NarSize"))?,
         })
@@ -127,7 +127,7 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
         assert_eq!(info.url, "nar/bar.nar.xz");
         assert_eq!(info.nar_hash, "sha256:xyz");
         assert_eq!(info.nar_size, 42);
-        assert_eq!(info.compression, "xz"); // default when absent
+        assert_eq!(info.compression, "bzip2"); // Nix spec default when absent
     }
 
     #[test]
