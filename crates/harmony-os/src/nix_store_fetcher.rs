@@ -44,6 +44,36 @@ pub trait HttpClient {
     fn get(&self, url: &str) -> Result<Vec<u8>, FetchError>;
 }
 
+// ── UreqHttpClient ──────────────────────────────────────────────────
+
+/// Production HTTP client using `ureq`.
+pub struct UreqHttpClient;
+
+impl UreqHttpClient {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for UreqHttpClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HttpClient for UreqHttpClient {
+    fn get(&self, url: &str) -> Result<Vec<u8>, FetchError> {
+        let response = ureq::get(url).call().map_err(|e| match e {
+            ureq::Error::StatusCode(404) => FetchError::NotFound,
+            other => FetchError::Network(other.to_string()),
+        })?;
+        response
+            .into_body()
+            .read_to_vec()
+            .map_err(|e| FetchError::Network(e.to_string()))
+    }
+}
+
 // ── NixStoreFetcher ──────────────────────────────────────────────────
 
 /// Ring 3 lazy fetch orchestrator for [`NixStoreServer`].
@@ -380,5 +410,13 @@ mod tests {
 
         // Verify name is in the failed set.
         assert!(fetcher.failed.contains(store_path_name.as_str()));
+    }
+
+    // ── Test: UreqHttpClient smoke test ─────────────────────────────
+
+    #[test]
+    fn ureq_client_exists() {
+        // Smoke test: UreqHttpClient can be constructed.
+        let _client = UreqHttpClient::new();
     }
 }
