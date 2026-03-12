@@ -14,6 +14,7 @@ use harmony_microkernel::nix_store_server::NixStoreServer;
 use sha2::{Digest, Sha256};
 use xz2::read::XzDecoder;
 
+use crate::mesh_nar_source::MeshNarFetch;
 use crate::narinfo::NarInfo;
 use crate::nix_base32::decode_nix_base32;
 
@@ -95,6 +96,7 @@ impl HttpClient for UreqHttpClient {
 /// imports the decompressed + verified NAR into the server.
 pub struct NixStoreFetcher {
     http: Box<dyn HttpClient>,
+    mesh: Option<Box<dyn MeshNarFetch>>,
     cache_url: String,
     /// Store path names that have already failed to fetch. Prevents
     /// repeated fetch attempts for the same path.
@@ -108,6 +110,18 @@ impl NixStoreFetcher {
     pub fn new(http: Box<dyn HttpClient>) -> Self {
         Self {
             http,
+            mesh: None,
+            cache_url: String::from("https://cache.nixos.org"),
+            failed: HashSet::new(),
+        }
+    }
+
+    /// Create a new fetcher that tries the mesh network first, falling
+    /// back to HTTP on mesh miss.
+    pub fn with_mesh(http: Box<dyn HttpClient>, mesh: Box<dyn MeshNarFetch>) -> Self {
+        Self {
+            http,
+            mesh: Some(mesh),
             cache_url: String::from("https://cache.nixos.org"),
             failed: HashSet::new(),
         }
@@ -119,21 +133,33 @@ impl NixStoreFetcher {
     }
 
     /// Process all pending misses: drain, deduplicate, fetch, import.
-    pub fn process_misses(&mut self, server: &mut NixStoreServer) {
+    ///
+    /// Returns a list of `(store_path_name, nar_bytes)` for each
+    /// successfully imported path, so callers can publish to the mesh.
+    pub fn process_misses(&mut self, server: &mut NixStoreServer) -> Vec<(String, Vec<u8>)> {
         let misses = server.drain_misses();
         self.process_miss_list(misses, |name, nar| {
             // Skip if already imported (race: kernel re-recorded a miss
             // for a path imported in a previous cycle).
             if server.has_store_path(name) {
-                return Ok(());
+                return Ok(false); // Not newly imported — don't re-publish.
             }
-            server.import_nar(name, nar).map_err(|e| format!("{:?}", e))
-        });
+            server
+                .import_nar(name, nar)
+                .map(|()| true)
+                .map_err(|e| format!("{:?}", e))
+        })
     }
 
     /// Process misses from a shared (Arc<Mutex>) server, releasing the lock
     /// during HTTP I/O so the kernel thread isn't blocked.
-    pub fn process_misses_shared(&mut self, server: &Arc<Mutex<NixStoreServer>>) {
+    ///
+    /// Returns a list of `(store_path_name, nar_bytes)` for each
+    /// successfully imported path, so callers can publish to the mesh.
+    pub fn process_misses_shared(
+        &mut self,
+        server: &Arc<Mutex<NixStoreServer>>,
+    ) -> Vec<(String, Vec<u8>)> {
         let misses = server
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -143,41 +169,121 @@ impl NixStoreFetcher {
             // Skip if already imported (race: kernel re-recorded a miss
             // for a path imported in a previous cycle).
             if guard.has_store_path(name) {
-                return Ok(());
+                return Ok(false); // Not newly imported — don't re-publish.
             }
-            guard.import_nar(name, nar).map_err(|e| format!("{:?}", e))
-        });
+            guard
+                .import_nar(name, nar)
+                .map(|()| true)
+                .map_err(|e| format!("{:?}", e))
+        })
     }
 
     /// Fetch and import each miss via caller-provided closure.
     /// Misses are already deduplicated by `drain_misses()` (BTreeSet).
-    fn process_miss_list<F>(&mut self, misses: Vec<Arc<str>>, mut import_fn: F)
+    ///
+    /// If a mesh source is configured, each path is tried there first;
+    /// on mesh miss (or mesh import failure) the fetcher falls back to
+    /// the upstream HTTP cache.
+    ///
+    /// Returns `(store_path_name, nar_bytes)` for every *newly* imported path.
+    fn process_miss_list<F>(
+        &mut self,
+        misses: Vec<Arc<str>>,
+        mut import_fn: F,
+    ) -> Vec<(String, Vec<u8>)>
     where
-        F: FnMut(&str, Vec<u8>) -> Result<(), String>,
+        F: FnMut(&str, Vec<u8>) -> Result<bool, String>,
     {
+        let mut imported = Vec::new();
         for name in &misses {
             let name_str = name.to_string();
             if self.failed.contains(&name_str) {
                 continue;
             }
-            match self.fetch_nar(&name_str) {
-                Ok(nar_bytes) => {
-                    if let Err(e) = import_fn(&name_str, nar_bytes) {
-                        eprintln!("[nix-fetcher] import failed for {}: {}", name_str, e);
+
+            // Try mesh first (if available), tracking data source.
+            let mut nar_bytes = None;
+            let mut from_mesh = false;
+            if let Some(ref mesh) = self.mesh {
+                if let Some(mesh_nar) = mesh.fetch_nar(&name_str) {
+                    nar_bytes = Some(mesh_nar);
+                    from_mesh = true;
+                }
+            }
+
+            // Fall back to HTTP if mesh didn't provide data.
+            if nar_bytes.is_none() {
+                match self.fetch_nar(&name_str) {
+                    Ok(http_nar) => nar_bytes = Some(http_nar),
+                    Err(e) => {
+                        eprintln!("[nix-fetcher] fetch failed for {}: {:?}", name_str, e);
+                        if !matches!(e, FetchError::Network(_)) {
+                            self.failed.insert(name_str);
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            let nar_bytes = nar_bytes.unwrap();
+
+            if from_mesh {
+                // Mesh-sourced: no clone needed — we never return these
+                // for re-publishing (they're already on the mesh).
+                match import_fn(&name_str, nar_bytes) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        // Mesh data failed import — try HTTP before blacklisting.
+                        eprintln!(
+                            "[nix-fetcher] mesh import failed for {}, trying HTTP: {}",
+                            name_str, e
+                        );
+                        match self.fetch_nar(&name_str) {
+                            Ok(http_nar) => match import_fn(&name_str, http_nar.clone()) {
+                                Ok(true) => {
+                                    imported.push((name_str, http_nar));
+                                    continue;
+                                }
+                                Ok(false) => continue,
+                                Err(e2) => {
+                                    eprintln!(
+                                        "[nix-fetcher] HTTP import also failed for {}: {}",
+                                        name_str, e2
+                                    );
+                                }
+                            },
+                            Err(e2) => {
+                                eprintln!(
+                                    "[nix-fetcher] HTTP fallback fetch failed for {}: {:?}",
+                                    name_str, e2
+                                );
+                                // Respect transient-error policy in fallback path too.
+                                if matches!(e2, FetchError::Network(_)) {
+                                    continue;
+                                }
+                            }
+                        }
                         self.failed.insert(name_str);
                     }
                 }
-                Err(e) => {
-                    eprintln!("[nix-fetcher] fetch failed for {}: {:?}", name_str, e);
-                    // Only blacklist permanent failures. Transient network
-                    // errors (DNS, timeout, connection reset) should be
-                    // retried on the next drain cycle.
-                    if !matches!(e, FetchError::Network(_)) {
+            } else {
+                // HTTP-sourced: clone needed — import_fn consumes the Vec,
+                // but we need the original for the return value.
+                match import_fn(&name_str, nar_bytes.clone()) {
+                    Ok(true) => {
+                        imported.push((name_str, nar_bytes));
+                    }
+                    Ok(false) => {
+                        // Already present — skip re-publishing.
+                    }
+                    Err(e) => {
+                        eprintln!("[nix-fetcher] import failed for {}: {}", name_str, e);
                         self.failed.insert(name_str);
                     }
                 }
             }
         }
+        imported
     }
 
     /// Fetch a single store path: narinfo -> NAR -> decompress -> verify.
@@ -404,7 +510,9 @@ mod tests {
         let _ = server.walk(0, 1, &store_path_name);
 
         // Process misses — should fetch and import.
-        fetcher.process_misses(&mut server);
+        let imported = fetcher.process_misses(&mut server);
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].0, store_path_name);
 
         // Verify the store path is now available.
         let qp = server.walk(0, 2, &store_path_name).unwrap();
@@ -566,5 +674,156 @@ mod tests {
     fn ureq_client_exists() {
         // Smoke test: UreqHttpClient can be constructed with timeouts.
         let _client = UreqHttpClient::new();
+    }
+
+    // ── Mesh mock helpers ───────────────────────────────────────────
+
+    use crate::mesh_nar_source::MeshNarFetch;
+
+    struct MockMesh {
+        nar: Vec<u8>,
+    }
+    impl MeshNarFetch for MockMesh {
+        fn fetch_nar(&self, _: &str) -> Option<Vec<u8>> {
+            Some(self.nar.clone())
+        }
+    }
+
+    struct EmptyMesh;
+    impl MeshNarFetch for EmptyMesh {
+        fn fetch_nar(&self, _: &str) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    // ── Test: mesh first skips HTTP ─────────────────────────────────
+
+    #[test]
+    fn mesh_first_skips_http() {
+        // Build a valid NAR that the mesh will provide directly.
+        let nar_bytes = build_test_nar(b"mesh-provided content");
+
+        // Empty HTTP mock — every URL returns 404.
+        let mock_http = MockHttp {
+            responses: HashMap::new(),
+        };
+
+        let mock_mesh = MockMesh {
+            nar: nar_bytes.clone(),
+        };
+
+        let mut fetcher = NixStoreFetcher::with_mesh(Box::new(mock_http), Box::new(mock_mesh));
+        let mut server = NixStoreServer::new();
+
+        let store_path_name = "abc12345678901234567890123456789-mesh-pkg";
+
+        // Trigger a miss.
+        use harmony_microkernel::FileServer;
+        let _ = server.walk(0, 1, store_path_name);
+
+        // Process — mesh provides NAR, HTTP is never consulted.
+        // Mesh-sourced NARs are NOT returned for re-publishing (already on mesh).
+        let imported = fetcher.process_misses(&mut server);
+        assert!(
+            imported.is_empty(),
+            "mesh-sourced NARs should not be returned for re-publishing"
+        );
+
+        // Verify import succeeded — store path is available despite empty return.
+        let qp = server.walk(0, 2, store_path_name).unwrap();
+        assert_ne!(qp, 0);
+
+        assert!(fetcher.failed_paths().is_empty());
+    }
+
+    // ── Test: mesh miss falls back to HTTP ──────────────────────────
+
+    #[test]
+    fn mesh_miss_falls_back_to_http() {
+        // Build valid NAR + narinfo for the HTTP path.
+        let nar_bytes = build_test_nar(b"http-fallback content");
+        let hash = Sha256::digest(&nar_bytes);
+        let hash_b32 = encode_nix_base32(hash.as_slice());
+        let compressed = compress_xz(&nar_bytes);
+
+        let store_hash = "abc12345678901234567890123456789";
+        let store_path_name = format!("{}-fallback-pkg", store_hash);
+        let narinfo_text = format!(
+            "StorePath: /nix/store/{}\nURL: nar/fb.nar.xz\nCompression: xz\nNarHash: sha256:{}\nNarSize: {}\n",
+            store_path_name, hash_b32, nar_bytes.len()
+        );
+
+        let mut responses = HashMap::new();
+        responses.insert(
+            format!("https://cache.nixos.org/{}.narinfo", store_hash),
+            Ok(narinfo_text.into_bytes()),
+        );
+        responses.insert(
+            "https://cache.nixos.org/nar/fb.nar.xz".to_string(),
+            Ok(compressed),
+        );
+
+        let mock_http = MockHttp { responses };
+        // Mesh always returns None.
+        let mock_mesh = EmptyMesh;
+
+        let mut fetcher = NixStoreFetcher::with_mesh(Box::new(mock_http), Box::new(mock_mesh));
+        let mut server = NixStoreServer::new();
+
+        // Trigger a miss.
+        use harmony_microkernel::FileServer;
+        let _ = server.walk(0, 1, &store_path_name);
+
+        // Process — mesh misses, HTTP succeeds.
+        let imported = fetcher.process_misses(&mut server);
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].0, store_path_name);
+
+        // Verify the store path is now available.
+        let qp = server.walk(0, 2, &store_path_name).unwrap();
+        assert_ne!(qp, 0);
+
+        assert!(fetcher.failed_paths().is_empty());
+    }
+
+    // ── Test: process_misses returns imported pairs ──────────────────
+
+    #[test]
+    fn process_misses_returns_imported_pairs() {
+        // Standard HTTP fetch (no mesh). Verify the return Vec.
+        let nar_bytes = build_test_nar(b"return-test content");
+        let hash = Sha256::digest(&nar_bytes);
+        let hash_b32 = encode_nix_base32(hash.as_slice());
+        let compressed = compress_xz(&nar_bytes);
+
+        let store_hash = "abc12345678901234567890123456789";
+        let store_path_name = format!("{}-return-test", store_hash);
+        let narinfo_text = format!(
+            "StorePath: /nix/store/{}\nURL: nar/ret.nar.xz\nCompression: xz\nNarHash: sha256:{}\nNarSize: {}\n",
+            store_path_name, hash_b32, nar_bytes.len()
+        );
+
+        let mut responses = HashMap::new();
+        responses.insert(
+            format!("https://cache.nixos.org/{}.narinfo", store_hash),
+            Ok(narinfo_text.into_bytes()),
+        );
+        responses.insert(
+            "https://cache.nixos.org/nar/ret.nar.xz".to_string(),
+            Ok(compressed),
+        );
+
+        let mock = MockHttp { responses };
+        let mut fetcher = NixStoreFetcher::new(Box::new(mock));
+        let mut server = NixStoreServer::new();
+
+        // Trigger a miss.
+        use harmony_microkernel::FileServer;
+        let _ = server.walk(0, 1, &store_path_name);
+
+        let imported = fetcher.process_misses(&mut server);
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].0, store_path_name);
+        assert_eq!(imported[0].1, nar_bytes);
     }
 }
