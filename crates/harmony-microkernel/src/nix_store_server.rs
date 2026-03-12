@@ -11,7 +11,7 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -19,6 +19,9 @@ use alloc::vec::Vec;
 use crate::fid_tracker::FidTracker;
 use crate::nar::{NarArchive, NarEntry, NarError};
 use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
+
+#[cfg(feature = "std")]
+use std::sync::Mutex;
 
 // ── Types ─────────────────────────────────────────────────────────────
 
@@ -50,6 +53,7 @@ enum NixFidPayload {
 pub struct NixStoreServer {
     store_paths: BTreeMap<Arc<str>, StorePath>,
     tracker: FidTracker<NixFidPayload>,
+    misses: BTreeSet<Arc<str>>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
@@ -107,6 +111,7 @@ impl NixStoreServer {
         Self {
             store_paths: BTreeMap::new(),
             tracker: FidTracker::new(0, NixFidPayload::Root),
+            misses: BTreeSet::new(),
         }
     }
 
@@ -148,6 +153,18 @@ impl NixStoreServer {
             },
         );
         Ok(())
+    }
+
+    /// Check whether a store path has already been imported.
+    pub fn has_store_path(&self, name: &str) -> bool {
+        self.store_paths.contains_key(name)
+    }
+
+    /// Drain all recorded miss events (store path names that were walked
+    /// but not found). The fetcher calls this periodically to discover
+    /// which store paths need fetching. Misses are deduplicated at source.
+    pub fn drain_misses(&mut self) -> Vec<Arc<str>> {
+        core::mem::take(&mut self.misses).into_iter().collect()
     }
 
     /// Build the full path string for qpath computation from a payload.
@@ -231,6 +248,7 @@ impl FileServer for NixStoreServer {
                 // Walk from root to a store path.
                 let key: Arc<str> = Arc::from(name);
                 if !self.store_paths.contains_key(&key) {
+                    self.misses.insert(Arc::clone(&key));
                     return Err(IpcError::NotFound);
                 }
                 NixFidPayload::StorePathRoot { name: key }
@@ -377,6 +395,84 @@ impl FileServer for NixStoreServer {
 
     fn clone_fid(&mut self, fid: Fid, new_fid: Fid) -> Result<QPath, IpcError> {
         self.tracker.clone_fid(fid, new_fid)
+    }
+}
+
+/// Thread-safe wrapper around `NixStoreServer`.
+///
+/// The kernel holds this as a `Box<dyn FileServer>`, while the fetcher
+/// thread holds a clone of the inner `Arc<Mutex<NixStoreServer>>` for
+/// `drain_misses()` and `import_nar()` calls.
+#[cfg(feature = "std")]
+pub struct SharedNixStoreServer {
+    inner: Arc<Mutex<NixStoreServer>>,
+}
+
+#[cfg(feature = "std")]
+impl SharedNixStoreServer {
+    /// Create a new shared server, returning the wrapper (for the kernel)
+    /// and a clone of the inner `Arc<Mutex<NixStoreServer>>` (for the
+    /// fetcher thread).
+    pub fn new(server: NixStoreServer) -> (Self, Arc<Mutex<NixStoreServer>>) {
+        let inner = Arc::new(Mutex::new(server));
+        (
+            Self {
+                inner: Arc::clone(&inner),
+            },
+            inner,
+        )
+    }
+}
+
+#[cfg(feature = "std")]
+impl FileServer for SharedNixStoreServer {
+    fn walk(&mut self, fid: Fid, new_fid: Fid, name: &str) -> Result<QPath, IpcError> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .walk(fid, new_fid, name)
+    }
+
+    fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .open(fid, mode)
+    }
+
+    fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .read(fid, offset, count)
+    }
+
+    fn write(&mut self, fid: Fid, offset: u64, data: &[u8]) -> Result<u32, IpcError> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .write(fid, offset, data)
+    }
+
+    fn clunk(&mut self, fid: Fid) -> Result<(), IpcError> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clunk(fid)
+    }
+
+    fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stat(fid)
+    }
+
+    fn clone_fid(&mut self, fid: Fid, new_fid: Fid) -> Result<QPath, IpcError> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone_fid(fid, new_fid)
     }
 }
 
@@ -627,6 +723,77 @@ mod tests {
         let data = srv.read(0, 0, 4096).unwrap();
         let listing = core::str::from_utf8(&data).unwrap();
         assert_eq!(listing, "aaa-first\nzzz-last\n");
+    }
+
+    #[test]
+    fn walk_miss_is_recorded() {
+        let mut srv = NixStoreServer::new();
+        // Walk to a non-existent store path.
+        assert_eq!(srv.walk(0, 1, "nonexistent-pkg"), Err(IpcError::NotFound));
+        // The miss should be recorded.
+        let misses = srv.drain_misses();
+        assert_eq!(misses.len(), 1);
+        assert_eq!(&*misses[0], "nonexistent-pkg");
+    }
+
+    #[test]
+    fn drain_misses_clears_list() {
+        let mut srv = NixStoreServer::new();
+        assert_eq!(srv.walk(0, 1, "miss-one"), Err(IpcError::NotFound));
+        assert_eq!(srv.walk(0, 2, "miss-two"), Err(IpcError::NotFound));
+        // First drain returns both.
+        let misses = srv.drain_misses();
+        assert_eq!(misses.len(), 2);
+        // Second drain returns empty.
+        let misses2 = srv.drain_misses();
+        assert!(misses2.is_empty());
+    }
+
+    #[test]
+    fn drain_misses_on_empty_server() {
+        let mut srv = NixStoreServer::new();
+        let misses = srv.drain_misses();
+        assert!(misses.is_empty());
+    }
+
+    #[test]
+    fn duplicate_misses_are_deduplicated() {
+        let mut srv = NixStoreServer::new();
+        assert_eq!(srv.walk(0, 1, "same-pkg"), Err(IpcError::NotFound));
+        assert_eq!(srv.walk(0, 2, "same-pkg"), Err(IpcError::NotFound));
+        let misses = srv.drain_misses();
+        // BTreeSet deduplicates at source.
+        assert_eq!(misses.len(), 1);
+        assert_eq!(&*misses[0], "same-pkg");
+    }
+
+    #[test]
+    fn shared_wrapper_delegates_walk_and_stat() {
+        let mut server = NixStoreServer::new();
+        server
+            .import_nar("abc123-hello", nar_directory_with_files())
+            .unwrap();
+
+        let (mut wrapper, shared_inner) = SharedNixStoreServer::new(server);
+
+        // Walk and stat through the wrapper.
+        let qp = wrapper.walk(0, 1, "abc123-hello").unwrap();
+        assert_ne!(qp, 0);
+        let st = wrapper.stat(1).unwrap();
+        assert_eq!(&*st.name, "abc123-hello");
+        assert_eq!(st.file_type, FileType::Directory);
+
+        // Verify the inner server's state changed (fid was allocated).
+        let inner_st = shared_inner.lock().unwrap().stat(1).unwrap();
+        assert_eq!(&*inner_st.name, "abc123-hello");
+    }
+
+    #[test]
+    fn existing_store_path_walk_does_not_record_miss() {
+        let mut srv = test_server(); // has "abc123-hello"
+        srv.walk(0, 1, "abc123-hello").unwrap();
+        let misses = srv.drain_misses();
+        assert!(misses.is_empty());
     }
 
     // ── Kernel integration tests ─────────────────────────────────────
