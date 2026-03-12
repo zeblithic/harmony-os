@@ -12,7 +12,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use harmony_microkernel::vm::{FrameClassification, PageFlags};
+use harmony_microkernel::vm::{FrameClassification, PageFlags, VmError};
 use harmony_microkernel::{Fid, IpcError, OpenMode};
 
 use crate::elf::{parse_elf, ElfError, ElfType, ParsedElf, SegmentFlags};
@@ -61,6 +61,8 @@ pub enum ElfLoadError {
     OverlappingSegments,
     /// A PT_LOAD segment has both W and X flags — rejected by W^X policy.
     WXViolation,
+    /// Failed to map the stack region via `vm_mmap`.
+    StackMmapFailed(VmError),
 }
 
 // ── Load result ─────────────────────────────────────────────────────
@@ -522,7 +524,8 @@ pub fn prepare_process_stack(
 ///
 /// This is the high-level boot function that composes:
 /// - `parse_elf()` — extract ELF metadata
-/// - `InterpreterLoader::load()` — map segments into VM
+/// - `InterpreterLoader::load()` — map ELF segments into VM
+/// - `vm_mmap()` — allocate RW stack region
 /// - `prepare_process_stack()` — build Linux stack layout
 pub fn boot_static_elf(
     backend: &mut dyn SyscallBackend,
@@ -537,7 +540,17 @@ pub fn boot_static_elf(
     let mut loader = InterpreterLoader::default();
     let result = loader.load(elf_bytes, backend)?;
 
-    // 2. Build the initial stack with the auxv from the loader.
+    // 2. Map the stack region (RW, no execute).
+    backend
+        .vm_mmap(
+            stack_top,
+            stack_size,
+            PageFlags::USER | PageFlags::READABLE | PageFlags::WRITABLE,
+            FrameClassification::empty(),
+        )
+        .map_err(ElfLoadError::StackMmapFailed)?;
+
+    // 3. Build the initial stack with the auxv from the loader.
     let sp = prepare_process_stack(
         backend,
         argv,
@@ -1533,6 +1546,8 @@ mod tests {
         let mut backend = LoaderMockBackend::new();
         let elf_bytes = build_static_elf(&[0xCC; 16]);
         let random_bytes = [0xAB; 16];
+        let stack_top = 0x7FFE_0000u64;
+        let stack_size = 8 * 4096;
 
         let result = boot_static_elf(
             &mut backend,
@@ -1540,18 +1555,32 @@ mod tests {
             &["./hello"],
             &[],
             &random_bytes,
-            0x7FFE_0000, // stack base
-            8 * 4096,    // stack size
+            stack_top,
+            stack_size,
         );
 
         let (entry, sp) = result.expect("boot should succeed");
         assert_eq!(entry, 0x401000, "entry should be the ELF's entry_point");
         assert_eq!(sp % 16, 0, "SP must be 16-byte aligned");
-        assert!(sp >= 0x7FFE_0000, "SP should be within stack region");
+        assert!(sp >= stack_top, "SP should be within stack region");
         assert!(
-            sp < 0x7FFE_0000 + 8 * 4096,
+            sp < stack_top + stack_size as u64,
             "SP should be within stack region"
         );
+
+        // Verify the stack region was mapped (RW, no execute).
+        let stack_mapping = backend
+            .mapped
+            .iter()
+            .find(|(addr, len, _)| *addr == stack_top && *len == stack_size);
+        assert!(
+            stack_mapping.is_some(),
+            "boot_static_elf should map the stack region"
+        );
+        let (_, _, flags) = stack_mapping.unwrap();
+        assert!(flags.contains(PageFlags::READABLE));
+        assert!(flags.contains(PageFlags::WRITABLE));
+        assert!(!flags.contains(PageFlags::EXECUTABLE));
     }
 
     #[test]
