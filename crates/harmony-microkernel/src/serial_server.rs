@@ -5,22 +5,14 @@
 //! accumulate in an internal buffer (or go to a real serial port in
 //! the boot crate).
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use crate::fid_tracker::FidTracker;
 use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
 
 const QPATH_ROOT: QPath = 0;
 const QPATH_LOG: QPath = 1;
-
-// TODO: FidState and open/clunk/clone_fid are duplicated with EchoServer.
-// Extract a shared FidTracker helper when a third server appears.
-struct FidState {
-    qpath: QPath,
-    is_open: bool,
-    mode: Option<OpenMode>,
-}
 
 /// A FileServer that captures writes to a buffer.
 ///
@@ -32,7 +24,7 @@ struct FidState {
 /// In tests, call `buffer()` to inspect what was written.
 /// In the boot crate, the buffer can be drained to a real serial port.
 pub struct SerialServer {
-    fids: BTreeMap<Fid, FidState>,
+    tracker: FidTracker<()>,
     buf: Vec<u8>,
 }
 
@@ -44,17 +36,8 @@ impl Default for SerialServer {
 
 impl SerialServer {
     pub fn new() -> Self {
-        let mut fids = BTreeMap::new();
-        fids.insert(
-            0,
-            FidState {
-                qpath: QPATH_ROOT,
-                is_open: false,
-                mode: None,
-            },
-        );
         SerialServer {
-            fids,
+            tracker: FidTracker::new(QPATH_ROOT, ()),
             buf: Vec::new(),
         }
     }
@@ -67,38 +50,24 @@ impl SerialServer {
 
 impl FileServer for SerialServer {
     fn walk(&mut self, fid: Fid, new_fid: Fid, name: &str) -> Result<QPath, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        if state.qpath != QPATH_ROOT {
+        let entry = self.tracker.get(fid)?;
+        if entry.qpath != QPATH_ROOT {
             return Err(IpcError::NotDirectory);
-        }
-        if self.fids.contains_key(&new_fid) {
-            return Err(IpcError::InvalidFid);
         }
         if name != "log" {
             return Err(IpcError::NotFound);
         }
-        self.fids.insert(
-            new_fid,
-            FidState {
-                qpath: QPATH_LOG,
-                is_open: false,
-                mode: None,
-            },
-        );
+        self.tracker.insert(new_fid, QPATH_LOG, ())?;
         Ok(QPATH_LOG)
     }
 
     fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
-        let state = self.fids.get_mut(&fid).ok_or(IpcError::InvalidFid)?;
-        if state.is_open {
-            return Err(IpcError::PermissionDenied);
-        }
+        let entry = self.tracker.begin_open(fid)?;
         // Reject write modes on directories at open time (9P semantics).
-        if state.qpath == QPATH_ROOT && matches!(mode, OpenMode::Write | OpenMode::ReadWrite) {
+        if entry.qpath == QPATH_ROOT && matches!(mode, OpenMode::Write | OpenMode::ReadWrite) {
             return Err(IpcError::IsDirectory);
         }
-        state.is_open = true;
-        state.mode = Some(mode);
+        entry.mark_open(mode);
         Ok(())
     }
 
@@ -106,14 +75,14 @@ impl FileServer for SerialServer {
     /// page through the accumulated log. Write offset is still ignored
     /// (append-only).
     fn read(&mut self, fid: Fid, offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        if !state.is_open {
+        let entry = self.tracker.get(fid)?;
+        if !entry.is_open() {
             return Err(IpcError::NotOpen);
         }
-        if state.qpath == QPATH_ROOT {
+        if entry.qpath == QPATH_ROOT {
             return Err(IpcError::IsDirectory);
         }
-        if matches!(state.mode, Some(OpenMode::Write)) {
+        if matches!(entry.mode(), Some(OpenMode::Write)) {
             return Err(IpcError::PermissionDenied);
         }
         let start = core::cmp::min(offset.min(usize::MAX as u64) as usize, self.buf.len());
@@ -124,14 +93,14 @@ impl FileServer for SerialServer {
     /// Write appends data to the log buffer. Offset is intentionally
     /// ignored — this is an append-only log.
     fn write(&mut self, fid: Fid, _offset: u64, data: &[u8]) -> Result<u32, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        if !state.is_open {
+        let entry = self.tracker.get(fid)?;
+        if !entry.is_open() {
             return Err(IpcError::NotOpen);
         }
-        if state.qpath == QPATH_ROOT {
+        if entry.qpath == QPATH_ROOT {
             return Err(IpcError::IsDirectory);
         }
-        if matches!(state.mode, Some(OpenMode::Read)) {
+        if matches!(entry.mode(), Some(OpenMode::Read)) {
             return Err(IpcError::PermissionDenied);
         }
         let len = u32::try_from(data.len()).map_err(|_| IpcError::ResourceExhausted)?;
@@ -140,39 +109,22 @@ impl FileServer for SerialServer {
     }
 
     fn clunk(&mut self, fid: Fid) -> Result<(), IpcError> {
-        if fid == 0 {
-            return Err(IpcError::PermissionDenied);
-        }
-        self.fids.remove(&fid).ok_or(IpcError::InvalidFid)?;
-        Ok(())
+        self.tracker.clunk(fid)
     }
 
     fn clone_fid(&mut self, fid: Fid, new_fid: Fid) -> Result<QPath, IpcError> {
-        if self.fids.contains_key(&new_fid) {
-            return Err(IpcError::InvalidFid);
-        }
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        let qpath = state.qpath;
-        self.fids.insert(
-            new_fid,
-            FidState {
-                qpath,
-                is_open: false,
-                mode: None,
-            },
-        );
-        Ok(qpath)
+        self.tracker.clone_fid(fid, new_fid)
     }
 
     fn stat(&mut self, fid: Fid) -> Result<FileStat, IpcError> {
-        let state = self.fids.get(&fid).ok_or(IpcError::InvalidFid)?;
-        let (name, file_type, size) = match state.qpath {
+        let qpath = self.tracker.get(fid)?.qpath;
+        let (name, file_type, size) = match qpath {
             QPATH_ROOT => ("/", FileType::Directory, 0),
             QPATH_LOG => ("log", FileType::Regular, self.buf.len() as u64),
             _ => return Err(IpcError::NotFound),
         };
         Ok(FileStat {
-            qpath: state.qpath,
+            qpath,
             name: Arc::from(name),
             size,
             file_type,
