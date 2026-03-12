@@ -507,14 +507,7 @@ pub fn prepare_process_stack(
 ) -> u64 {
     // Build the stack layout in a local buffer.
     let mut stack_buf = alloc::vec![0u8; stack_size];
-    let sp = build_initial_stack(
-        &mut stack_buf,
-        stack_top,
-        argv,
-        envp,
-        auxv,
-        random_bytes,
-    );
+    let sp = build_initial_stack(&mut stack_buf, stack_top, argv, envp, auxv, random_bytes);
 
     // Write the entire stack buffer into the process's VM.
     backend.vm_write_bytes(stack_top, &stack_buf);
@@ -1710,8 +1703,8 @@ mod tests {
         let mut backend = LoaderMockBackend::new();
         let elf_bytes = build_static_elf(&[0xCC; 16]);
         let random_bytes: [u8; 16] = [
-            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
-            0x13, 0x37, 0x42, 0x00, 0xFF, 0xEE, 0xDD, 0xCC,
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x13, 0x37, 0x42, 0x00, 0xFF, 0xEE,
+            0xDD, 0xCC,
         ];
 
         let (_, sp) = boot_static_elf(
@@ -1738,9 +1731,8 @@ mod tests {
 
         // Walk the stack from SP to find auxv.
         let sp_off = (sp - base) as usize;
-        let read_u64 = |off: usize| -> u64 {
-            u64::from_le_bytes(data[off..off + 8].try_into().unwrap())
-        };
+        let read_u64 =
+            |off: usize| -> u64 { u64::from_le_bytes(data[off..off + 8].try_into().unwrap()) };
 
         // argc
         let argc = read_u64(sp_off);
