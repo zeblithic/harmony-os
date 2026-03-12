@@ -76,8 +76,8 @@ impl<A: ContentAnnouncer> NarPublisher<A> {
             .announce(&store_key, root_cid_hex.as_bytes())?;
 
         // Walk the DAG to collect all leaf blob CIDs.
-        let blob_cids = dag::walk(&root_cid, &self.blob_store)
-            .map_err(|e| format!("DAG walk failed: {e}"))?;
+        let blob_cids =
+            dag::walk(&root_cid, &self.blob_store).map_err(|e| format!("DAG walk failed: {e}"))?;
 
         // Announce each blob.
         for cid in &blob_cids {
@@ -85,8 +85,7 @@ impl<A: ContentAnnouncer> NarPublisher<A> {
             let blob_key = announce::key(&cid_hex);
             let size = cid.payload_size();
             let size_str = size.to_string();
-            self.announcer
-                .announce(&blob_key, size_str.as_bytes())?;
+            self.announcer.announce(&blob_key, size_str.as_bytes())?;
         }
 
         // If root is a bundle (multi-chunk), announce the bundle itself.

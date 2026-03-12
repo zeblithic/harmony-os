@@ -655,8 +655,7 @@ mod tests {
             nar: nar_bytes.clone(),
         };
 
-        let mut fetcher =
-            NixStoreFetcher::with_mesh(Box::new(mock_http), Box::new(mock_mesh));
+        let mut fetcher = NixStoreFetcher::with_mesh(Box::new(mock_http), Box::new(mock_mesh));
         let mut server = NixStoreServer::new();
 
         let store_path_name = "abc12345678901234567890123456789-mesh-pkg";
@@ -709,8 +708,7 @@ mod tests {
         // Mesh always returns None.
         let mock_mesh = EmptyMesh;
 
-        let mut fetcher =
-            NixStoreFetcher::with_mesh(Box::new(mock_http), Box::new(mock_mesh));
+        let mut fetcher = NixStoreFetcher::with_mesh(Box::new(mock_http), Box::new(mock_mesh));
         let mut server = NixStoreServer::new();
 
         // Trigger a miss.

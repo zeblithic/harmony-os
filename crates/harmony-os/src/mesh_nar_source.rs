@@ -107,11 +107,7 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
     }
 
     /// Recursively fetch all DAG children that are not yet in the store.
-    fn fetch_children(
-        &self,
-        cid: &ContentId,
-        store: &mut MemoryBlobStore,
-    ) -> Result<(), String> {
+    fn fetch_children(&self, cid: &ContentId, store: &mut MemoryBlobStore) -> Result<(), String> {
         match cid.cid_type() {
             CidType::Blob => {
                 // Leaf node — fetch if not already present.
@@ -216,10 +212,7 @@ mod tests {
 
     /// Ingest data into a MemoryBlobStore, then populate a MockQuerier
     /// with all the key-value pairs needed to fetch it from the mesh.
-    fn populate_querier_from_data(
-        data: &[u8],
-        store_path_name: &str,
-    ) -> MockQuerier {
+    fn populate_querier_from_data(data: &[u8], store_path_name: &str) -> MockQuerier {
         let mut store = MemoryBlobStore::new();
 
         // Use a small chunker config so even modest test data gets split.
@@ -241,10 +234,7 @@ mod tests {
 
         // Insert root blob/bundle under its fetch key.
         let root_fetch_key = content::fetch_key(&root_cid_hex);
-        map.insert(
-            root_fetch_key,
-            store.get(&root_cid).unwrap().to_vec(),
-        );
+        map.insert(root_fetch_key, store.get(&root_cid).unwrap().to_vec());
 
         // Walk the DAG and insert every node under its fetch key.
         insert_dag_nodes(&root_cid, &store, &mut map);
@@ -270,8 +260,7 @@ mod tests {
                 if let Some(bundle_data) = store.get(cid) {
                     let hex_key = hex::encode(cid.to_bytes());
                     let fetch_key = content::fetch_key(&hex_key);
-                    map.entry(fetch_key)
-                        .or_insert_with(|| bundle_data.to_vec());
+                    map.entry(fetch_key).or_insert_with(|| bundle_data.to_vec());
 
                     if let Ok(children) = bundle::parse_bundle(bundle_data) {
                         for child in children {
