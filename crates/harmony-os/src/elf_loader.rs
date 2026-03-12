@@ -511,8 +511,10 @@ pub fn prepare_process_stack(
     let mut stack_buf = alloc::vec![0u8; stack_size];
     let sp = build_initial_stack(&mut stack_buf, stack_top, argv, envp, auxv, random_bytes);
 
-    // Write the entire stack buffer into the process's VM.
-    backend.vm_write_bytes(stack_top, &stack_buf);
+    // Write only the live portion (SP onward) — everything below SP is
+    // zero-initialized by vm_mmap so we skip writing it.
+    let sp_offset = (sp - stack_top) as usize;
+    backend.vm_write_bytes(sp, &stack_buf[sp_offset..]);
 
     sp
 }
@@ -546,7 +548,7 @@ pub fn boot_static_elf(
     let result = loader.load(elf_bytes, backend)?;
 
     // 2. Map the stack region (RW, no execute).
-    backend
+    let mapped_addr = backend
         .vm_mmap(
             stack_top,
             stack_size,
@@ -554,6 +556,10 @@ pub fn boot_static_elf(
             FrameClassification::empty(),
         )
         .map_err(ElfLoadError::StackMmapFailed)?;
+    debug_assert_eq!(
+        mapped_addr, stack_top,
+        "vm_mmap returned {mapped_addr:#x} but stack_top is {stack_top:#x}"
+    );
 
     // 3. Build the initial stack with the auxv from the loader.
     let sp = prepare_process_stack(
@@ -584,7 +590,10 @@ mod tests {
     // ── Test ELF builders ───────────────────────────────────────────
 
     /// Build a minimal valid ELF64 binary with configurable type.
-    /// `code` is placed as a PT_LOAD segment at `vaddr`.
+    ///
+    /// The PT_LOAD segment starts at file offset 0 so the ELF header and
+    /// program headers are included in the mapping — this ensures AT_PHDR
+    /// points to mapped memory, matching real ELF layouts.
     fn build_test_elf_typed(code: &[u8], elf_type: ElfType, vaddr: u64, entry: u64) -> Vec<u8> {
         let phdr_size = 56usize;
         let phnum = 1usize;
@@ -618,15 +627,17 @@ mod tests {
         elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
         elf[56..58].copy_from_slice(&(phnum as u16).to_le_bytes()); // e_phnum
 
-        // PT_LOAD program header
+        // PT_LOAD: starts at file offset 0 to include ELF header + phdrs.
+        // vaddr is page-aligned; the segment covers the entire file image.
+        let segment_base = vaddr & !0xFFF; // page-align down
         let ph = &mut elf[64..64 + phdr_size];
         ph[0..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
         ph[4..8].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
-        ph[8..16].copy_from_slice(&(code_offset as u64).to_le_bytes()); // p_offset
-        ph[16..24].copy_from_slice(&vaddr.to_le_bytes()); // p_vaddr
-        ph[24..32].copy_from_slice(&vaddr.to_le_bytes()); // p_paddr
-        ph[32..40].copy_from_slice(&(code.len() as u64).to_le_bytes()); // p_filesz
-        ph[40..48].copy_from_slice(&(code.len() as u64).to_le_bytes()); // p_memsz
+        ph[8..16].copy_from_slice(&0u64.to_le_bytes()); // p_offset = 0
+        ph[16..24].copy_from_slice(&segment_base.to_le_bytes()); // p_vaddr
+        ph[24..32].copy_from_slice(&segment_base.to_le_bytes()); // p_paddr
+        ph[32..40].copy_from_slice(&(total as u64).to_le_bytes()); // p_filesz
+        ph[40..48].copy_from_slice(&(total as u64).to_le_bytes()); // p_memsz
         ph[48..56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
 
         // Code
@@ -635,9 +646,12 @@ mod tests {
         elf
     }
 
-    /// Build a static ET_EXEC ELF at vaddr 0x401000 with entry 0x401000.
+    /// Build a static ET_EXEC ELF at vaddr 0x400000 with entry 0x400000.
+    ///
+    /// The PT_LOAD starts at file offset 0, so the ELF header and phdrs
+    /// are mapped — making AT_PHDR valid (as in real musl binaries).
     fn build_static_elf(code: &[u8]) -> Vec<u8> {
-        build_test_elf_typed(code, ElfType::Exec, 0x401000, 0x401000)
+        build_test_elf_typed(code, ElfType::Exec, 0x400000, 0x400000)
     }
 
     /// Build a test ELF with a PT_INTERP segment.
@@ -858,14 +872,14 @@ mod tests {
         let result = loader.load(&elf, &mut backend).unwrap();
 
         // Static ET_EXEC: entry is the exe's own entry point.
-        assert_eq!(result.entry_point, 0x401000);
+        assert_eq!(result.entry_point, 0x400000);
         // No interpreter loaded.
         assert_eq!(result.interp_base, 0);
         // ET_EXEC base is 0 (loaded at absolute vaddrs).
         assert_eq!(result.exe_base, 0);
 
         // Auxv must contain required entries.
-        assert_eq!(auxv_get(&result.auxv, auxv::AT_ENTRY), Some(0x401000));
+        assert_eq!(auxv_get(&result.auxv, auxv::AT_ENTRY), Some(0x400000));
         assert!(auxv_get(&result.auxv, auxv::AT_PHDR).is_some());
         assert!(auxv_get(&result.auxv, auxv::AT_PHNUM).is_some());
         assert_eq!(auxv_get(&result.auxv, auxv::AT_PAGESZ), Some(4096));
@@ -981,15 +995,18 @@ mod tests {
         assert_eq!(backend.mapped.len(), 1);
         assert_eq!(backend.written.len(), 2);
 
-        // Segment mapped at page-aligned vaddr.
-        assert_eq!(backend.mapped[0].0, page_floor(0x401000));
+        // Segment mapped at page-aligned vaddr (0x400000).
+        assert_eq!(backend.mapped[0].0, 0x400000);
 
         // First write: zero-fill of the mapped region.
-        assert_eq!(backend.written[0].0, page_floor(0x401000));
+        assert_eq!(backend.written[0].0, 0x400000);
 
-        // Second write: segment data at exact vaddr.
-        assert_eq!(backend.written[1].0, 0x401000);
-        assert_eq!(backend.written[1].1, vec![0x90, 0x90, 0xCC, 0xCC]);
+        // Second write: full segment data (ELF header + phdrs + code)
+        // at the segment vaddr. The code bytes are at the end.
+        assert_eq!(backend.written[1].0, 0x400000);
+        let written_data = &backend.written[1].1;
+        let code_start = written_data.len() - code.len();
+        assert_eq!(&written_data[code_start..], &[0x90, 0x90, 0xCC, 0xCC]);
     }
 
     #[test]
@@ -1298,7 +1315,7 @@ mod tests {
     fn end_to_end_static_elf_load() {
         // 1. Build a synthetic ET_EXEC ELF.
         let code = [0xCC; 32];
-        let exe_entry = 0x401000u64;
+        let exe_entry = 0x400000u64;
         let elf = build_static_elf(&code);
 
         // 2. Create backend and loader.
@@ -1565,7 +1582,7 @@ mod tests {
         );
 
         let (entry, sp) = result.expect("boot should succeed");
-        assert_eq!(entry, 0x401000, "entry should be the ELF's entry_point");
+        assert_eq!(entry, 0x400000, "entry should be the ELF's entry_point");
         assert_eq!(sp % 16, 0, "SP must be 16-byte aligned");
         assert!(sp >= stack_top, "SP should be within stack region");
         assert!(
@@ -1636,7 +1653,7 @@ mod tests {
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
         elf[20..24].copy_from_slice(&1u32.to_le_bytes());
-        elf[24..32].copy_from_slice(&0x401000u64.to_le_bytes()); // entry
+        elf[24..32].copy_from_slice(&0x400000u64.to_le_bytes()); // entry
         elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // phoff
         elf[52..54].copy_from_slice(&64u16.to_le_bytes());
         elf[54..56].copy_from_slice(&56u16.to_le_bytes());
