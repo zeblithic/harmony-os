@@ -115,6 +115,18 @@ impl NixStoreServer {
     /// `name` is the store path name (e.g. `"abc123-hello"`).
     /// `nar_bytes` is the raw NAR blob.
     pub fn import_nar(&mut self, name: &str, nar_bytes: Vec<u8>) -> Result<(), NarError> {
+        // Validate store-path name — same constraints as NAR entry names.
+        // Listings use '\n' as separator, so newlines would create ambiguous output.
+        if name.is_empty()
+            || name.contains('/')
+            || name.contains('\0')
+            || name.contains('\n')
+            || name.contains('\r')
+            || name == "."
+            || name == ".."
+        {
+            return Err(NarError::InvalidString);
+        }
         let archive = NarArchive::parse(&nar_bytes)?;
         let key: Arc<str> = Arc::from(name);
         if self.store_paths.contains_key(&*key) {
@@ -562,6 +574,25 @@ mod tests {
             srv.import_nar("abc123-hello", nar_regular_file(b"other", false)),
             Err(NarError::DuplicateEntry)
         );
+    }
+
+    #[test]
+    fn import_rejects_invalid_store_path_names() {
+        let mut srv = NixStoreServer::new();
+        let nar = nar_regular_file(b"data", false);
+        assert_eq!(
+            srv.import_nar("foo\nbar", nar.clone()),
+            Err(NarError::InvalidString)
+        );
+        assert_eq!(
+            srv.import_nar("", nar.clone()),
+            Err(NarError::InvalidString)
+        );
+        assert_eq!(
+            srv.import_nar("a/b", nar.clone()),
+            Err(NarError::InvalidString)
+        );
+        assert_eq!(srv.import_nar(".", nar), Err(NarError::InvalidString));
     }
 
     #[test]

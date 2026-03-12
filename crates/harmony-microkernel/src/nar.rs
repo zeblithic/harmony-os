@@ -288,9 +288,13 @@ fn parse_directory(data: &[u8], pos: usize) -> Result<(NarEntry, usize), NarErro
         pos = new_pos;
         let name_str = core::str::from_utf8(name_bytes).map_err(|_| NarError::InvalidString)?;
         // NAR spec: entry names must not be empty, contain '/' or '\0', or be "." / "..".
+        // Also reject '\n' and '\r' — listings use '\n' as separator, so these would
+        // create ambiguous output that clients misparse.
         if name_str.is_empty()
             || name_str.contains('/')
             || name_str.contains('\0')
+            || name_str.contains('\n')
+            || name_str.contains('\r')
             || name_str == "."
             || name_str == ".."
         {
@@ -922,6 +926,22 @@ pub(crate) mod tests {
     fn rejects_empty_entry_name() {
         assert_eq!(
             NarArchive::parse(&nar_dir_with_name(b"")),
+            Err(NarError::InvalidString)
+        );
+    }
+
+    #[test]
+    fn rejects_entry_name_with_newline() {
+        assert_eq!(
+            NarArchive::parse(&nar_dir_with_name(b"foo\nbar")),
+            Err(NarError::InvalidString)
+        );
+    }
+
+    #[test]
+    fn rejects_entry_name_with_carriage_return() {
+        assert_eq!(
+            NarArchive::parse(&nar_dir_with_name(b"foo\rbar")),
             Err(NarError::InvalidString)
         );
     }
