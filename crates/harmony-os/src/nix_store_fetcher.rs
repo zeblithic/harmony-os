@@ -228,8 +228,11 @@ impl NixStoreFetcher {
             let nar_bytes = nar_bytes.unwrap();
             match import_fn(&name_str, nar_bytes.clone()) {
                 Ok(true) => {
-                    // Newly imported — include for mesh publishing.
-                    imported.push((name_str, nar_bytes));
+                    // Newly imported — only publish if data came from HTTP
+                    // (mesh-sourced NARs are already on the mesh).
+                    if !from_mesh {
+                        imported.push((name_str, nar_bytes));
+                    }
                 }
                 Ok(false) => {
                     // Already present — skip re-publishing.
@@ -713,12 +716,14 @@ mod tests {
         let _ = server.walk(0, 1, store_path_name);
 
         // Process — mesh provides NAR, HTTP is never consulted.
+        // Mesh-sourced NARs are NOT returned for re-publishing (already on mesh).
         let imported = fetcher.process_misses(&mut server);
-        assert_eq!(imported.len(), 1);
-        assert_eq!(imported[0].0, store_path_name);
-        assert_eq!(imported[0].1, nar_bytes);
+        assert!(
+            imported.is_empty(),
+            "mesh-sourced NARs should not be returned for re-publishing"
+        );
 
-        // Verify import succeeded — store path is available.
+        // Verify import succeeded — store path is available despite empty return.
         let qp = server.walk(0, 2, store_path_name).unwrap();
         assert_ne!(qp, 0);
 

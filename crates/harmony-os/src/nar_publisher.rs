@@ -66,13 +66,10 @@ impl<A: ContentAnnouncer> NarPublisher<A> {
         }
         let store_hash = &store_path_name[..32];
 
-        // Ingest into the DAG.
+        // Ingest into the DAG (blob_store mutation is harmless on error —
+        // content-addressed blobs are just cached data, not mappings).
         let root_cid = dag::ingest(nar_bytes, &self.chunker_config, &mut self.blob_store)
             .map_err(|e| format!("ingest failed: {e}"))?;
-
-        // Record the mapping.
-        self.published_paths
-            .insert(store_path_name.to_string(), root_cid);
 
         // Announce store path mapping: key = harmony/nix/store/{store_hash},
         // payload = root CID as hex.
@@ -102,6 +99,11 @@ impl<A: ContentAnnouncer> NarPublisher<A> {
             self.announcer
                 .announce(&bundle_key, bundle_size_str.as_bytes())?;
         }
+
+        // Record the mapping only after all announces succeed — prevents
+        // get_root_cid() from returning data for an unannounced path.
+        self.published_paths
+            .insert(store_path_name.to_string(), root_cid);
 
         Ok(root_cid)
     }
@@ -285,6 +287,10 @@ mod tests {
             err.contains("zenoh unavailable"),
             "error should contain 'zenoh unavailable', got: {err}"
         );
+
+        // Announcer failure must not leak state — no mapping should exist.
+        assert!(publisher.published_paths().is_empty());
+        assert!(publisher.get_root_cid(store_path).is_none());
     }
 
     #[test]
