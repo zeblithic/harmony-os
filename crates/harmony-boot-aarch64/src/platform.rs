@@ -14,26 +14,32 @@ compile_error!("Exactly one platform feature must be enabled: `qemu-virt` or `rp
 #[cfg(feature = "qemu-virt")]
 pub const PL011_BASE: usize = 0x0900_0000;
 
-/// PL011 UART base address for RPi5.
+/// PL011 UART base address for RPi5 (BCM2712 debug UART).
 ///
-/// TODO(rpi5-hw): This is the BCM2711 (RPi4) legacy peripheral address.
-/// BCM2712 (RPi5) routes UART through the RP1 south-bridge — the correct
-/// post-ExitBootServices address needs verification on real hardware.
+/// This is the SoC-native debug UART at 0x107d001000, connected to the
+/// 3-pin JST debug connector. It is always-on and does not require PCIe
+/// or RP1 initialization — safe to use immediately after ExitBootServices.
+///
+/// The GPIO-header UART (GPIO 14/15) goes through RP1 via PCIe at
+/// 0x1F00030000, but requires PCIe controller initialization which we
+/// don't do in bare-metal mode.
 #[cfg(feature = "rpi5")]
-pub const PL011_BASE: usize = 0xFE20_1000;
+pub const PL011_BASE: usize = 0x10_7D00_1000;
 
 /// UART reference clock frequency in Hz.
 #[cfg(feature = "qemu-virt")]
 pub const UART_CLOCK_HZ: u32 = 24_000_000;
 
+/// BCM2712 debug UART clock (48 MHz from crystal oscillator).
 #[cfg(feature = "rpi5")]
 pub const UART_CLOCK_HZ: u32 = 48_000_000;
 
-// RPi5-only peripherals (reserved for future network driver)
-// TODO(rpi5-hw): Verify GENET base address on BCM2712 hardware.
+// RPi5-only peripherals (reserved for future network driver).
+// The BCM2712 GENET is accessed through RP1 PCIe BAR at 0x1F_xxxx_xxxx.
+// Not usable without PCIe initialization.
 #[cfg(feature = "rpi5")]
 #[allow(dead_code)]
-pub const GENET_BASE: usize = 0xFD58_0000;
+pub const GENET_BASE: usize = 0x1F_0058_0000;
 
 #[cfg(test)]
 mod tests {
