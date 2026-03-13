@@ -7,6 +7,8 @@
 //! the most-significant digit first, but each digit's bits are scattered into
 //! the output in LSB-first order within each 5-bit group.
 
+use alloc::vec::Vec;
+
 /// Nix base32 alphabet (32 chars, missing e/o/t/u).
 pub const NIX_BASE32_CHARS: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
 

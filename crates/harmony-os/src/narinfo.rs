@@ -5,6 +5,8 @@
 //! NARInfo is a simple line-based format served by Nix binary caches.
 //! We only need three fields for Layer 4 (lazy fetch).
 
+use alloc::string::{String, ToString};
+
 /// Parsed NARInfo — the three fields needed for lazy fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NarInfo {

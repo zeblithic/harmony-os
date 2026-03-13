@@ -120,7 +120,7 @@ impl FileServer for SerialServer {
         let qpath = self.tracker.get(fid)?.qpath;
         let (name, file_type, size) = match qpath {
             QPATH_ROOT => ("/", FileType::Directory, 0),
-            QPATH_LOG => ("log", FileType::Regular, self.buf.len() as u64),
+            QPATH_LOG => ("log", FileType::CharDev, self.buf.len() as u64),
             _ => return Err(IpcError::NotFound),
         };
         Ok(FileStat {

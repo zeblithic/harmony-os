@@ -5,8 +5,6 @@
 //! operations via a [`SyscallBackend`] trait. Manages a POSIX-style
 //! fd table that maps Linux file descriptors to 9P fids.
 
-extern crate alloc;
-
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 

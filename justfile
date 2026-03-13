@@ -185,14 +185,38 @@ test-qemu-aarch64: build-test-elf build-aarch64
     #!/usr/bin/env bash
     set -uo pipefail
     echo "Booting QEMU aarch64 and checking for Linuxulator output..."
+
+    KERNEL=crates/harmony-boot-aarch64/target/aarch64-unknown-uefi/release/harmony-boot-aarch64.efi
+    FIRMWARE=/usr/local/share/qemu/edk2-aarch64-code.fd
+    ESP_IMG=target/harmony-qemu-esp.img
     LOG=$(mktemp)
-    trap "rm -f $LOG" EXIT
-    timeout 15 qemu-system-aarch64 \
+
+    cleanup() { rm -f "$LOG"; }
+    trap cleanup EXIT
+
+    # Build a minimal FAT12 ESP image with the EFI binary at the UEFI
+    # default boot path.  EDK2 firmware discovers BOOTAA64.EFI on the
+    # first FAT volume automatically.
+    mkdir -p target
+    dd if=/dev/zero of="$ESP_IMG" bs=1M count=64 status=none
+    mformat -F -i "$ESP_IMG" ::
+    mmd -i "$ESP_IMG" ::EFI
+    mmd -i "$ESP_IMG" ::EFI/BOOT
+    mcopy -i "$ESP_IMG" "$KERNEL" ::EFI/BOOT/BOOTAA64.EFI
+
+    # Copy EDK2 firmware to a writable flash image (QEMU pflash
+    # requires read-write for the code volume on aarch64 virt).
+    FLASH=$(mktemp)
+    cp -f "$FIRMWARE" "$FLASH"
+    trap "rm -f $LOG $FLASH" EXIT
+
+    timeout 30 qemu-system-aarch64 \
         -machine virt \
         -cpu max \
         -m 256M \
         -nographic \
-        -bios crates/harmony-boot-aarch64/target/aarch64-unknown-uefi/release/harmony-boot-aarch64.efi \
+        -drive if=pflash,format=raw,file="$FLASH" \
+        -drive format=raw,file="$ESP_IMG" \
         2>/dev/null | tee "$LOG"
     # timeout exits 124 on timeout (expected — kernel enters idle loop).
     # We check log content rather than exit code.
