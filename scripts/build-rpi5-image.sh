@@ -2,7 +2,17 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Build a bootable RPi5 SD card image for Harmony OS.
 #
-# Output: target/harmony-rpi5.img (256 MB FAT32)
+# Output: target/harmony-rpi5.img (64 MB FAT32)
+#
+# RPi5 boot sequence:
+#   SPI flash EEPROM → config.txt → RPI_EFI.fd (UEFI) → EFI/BOOT/BOOTAA64.EFI
+#
+# Unlike RPi4, the RPi5 bootloader firmware lives in SPI flash EEPROM
+# on the board — no start4.elf or fixup4.dat needed on the SD card.
+# The SD card only needs config.txt, UEFI firmware, and the kernel.
+#
+# UEFI firmware: worproject/rpi5-uefi (archived Feb 2025).
+# For current D0 (rev 1.1) boards, use NumberOneGit/rpi5-uefi fork.
 #
 # Requirements: mtools, curl, unzip, cargo, aarch64-unknown-linux-musl target
 set -euo pipefail
@@ -12,15 +22,12 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TARGET_DIR="$ROOT_DIR/target"
 FIRMWARE_DIR="$TARGET_DIR/rpi5-firmware"
 IMG="$TARGET_DIR/harmony-rpi5.img"
-IMG_SIZE_MB=256
+IMG_SIZE_MB=64
 
 # ── Firmware URLs ──
-# TODO(rpi5-hw): These firmware files are from the RPi4 (BCM2711) ecosystem.
-# The RPi5 (BCM2712) may need different GPU blobs and a BCM2712-compatible
-# EDK2 build.  The script works for QEMU testing; real RPi5 hardware boot
-# needs verification once we have a board.
-FIRMWARE_REPO="https://github.com/raspberrypi/firmware/raw/master/boot"
-EDK2_RELEASE="https://github.com/pftf/RPi4/releases/download/v1.38/RPi4_UEFI_Firmware_v1.38.zip"
+# worproject/rpi5-uefi v0.3 — archived but releases still downloadable.
+# For D0 boards, build from NumberOneGit/rpi5-uefi instead.
+EDK2_RELEASE="https://github.com/worproject/rpi5-uefi/releases/download/v0.3/RPi5_UEFI_Release_v0.3.zip"
 
 echo "=== Building Harmony RPi5 SD card image ==="
 
@@ -39,28 +46,12 @@ echo "[2/4] Building Harmony kernel (aarch64-uefi, rpi5)..."
 KERNEL="$ROOT_DIR/crates/harmony-boot-aarch64/target/aarch64-unknown-uefi/release/harmony-boot-aarch64.efi"
 echo "  Kernel: $(wc -c < "$KERNEL") bytes"
 
-# ── Step 3: Download/cache firmware ──
+# ── Step 3: Download/cache UEFI firmware ──
 echo "[3/4] Preparing firmware..."
 mkdir -p "$FIRMWARE_DIR"
 
-download_if_missing() {
-    local url="$1" dest="$2"
-    if [ ! -f "$dest" ]; then
-        local tmp="${dest}.tmp"
-        echo "  Downloading $(basename "$dest")..."
-        curl -fSL "$url" -o "$tmp"
-        mv -f "$tmp" "$dest"
-    else
-        echo "  Cached: $(basename "$dest")"
-    fi
-}
-
-download_if_missing "$FIRMWARE_REPO/start4.elf" "$FIRMWARE_DIR/start4.elf"
-download_if_missing "$FIRMWARE_REPO/fixup4.dat" "$FIRMWARE_DIR/fixup4.dat"
-download_if_missing "$FIRMWARE_REPO/bcm2712-rpi-5-b.dtb" "$FIRMWARE_DIR/bcm2712-rpi-5-b.dtb"
-
 if [ ! -f "$FIRMWARE_DIR/RPI_EFI.fd" ]; then
-    echo "  Downloading EDK2 UEFI firmware..."
+    echo "  Downloading RPi5 EDK2 UEFI firmware (worproject v0.3)..."
     curl -fSL "$EDK2_RELEASE" -o "$FIRMWARE_DIR/edk2.zip.tmp"
     mv -f "$FIRMWARE_DIR/edk2.zip.tmp" "$FIRMWARE_DIR/edk2.zip"
     unzip -o -j "$FIRMWARE_DIR/edk2.zip" "RPI_EFI.fd" -d "$FIRMWARE_DIR/"
@@ -72,18 +63,21 @@ fi
 # ── Step 4: Create FAT32 image ──
 echo "[4/4] Creating FAT32 image..."
 rm -f "$IMG"
-# Create empty image
 dd if=/dev/zero of="$IMG" bs=1M count=$IMG_SIZE_MB status=none
-# Format as FAT32
 mformat -F -i "$IMG" ::
 
-# Copy firmware files
-mcopy -i "$IMG" "$FIRMWARE_DIR/start4.elf" ::
-mcopy -i "$IMG" "$FIRMWARE_DIR/fixup4.dat" ::
-mcopy -i "$IMG" "$FIRMWARE_DIR/bcm2712-rpi-5-b.dtb" ::
+# Copy UEFI firmware (loaded by SPI bootloader via config.txt armstub=)
 mcopy -i "$IMG" "$FIRMWARE_DIR/RPI_EFI.fd" ::
 
-# Create config.txt
+# Create config.txt for RPi5
+# - arm_64bit=1: boot in AArch64 mode
+# - enable_uart=1: enable debug UART (BCM2712 native at 0x107d001000)
+# - uart_2ndstage=1: UART output during second-stage boot
+# - armstub=RPI_EFI.fd: load UEFI firmware as the ARM stub
+# - pciex4_reset=0: don't reset PCIe controller (preserves RP1 UART init
+#   if needed, though we use the BCM2712 debug UART instead)
+# - disable_commandline_tags=1: don't pass cmdline to the stub
+# - disable_overscan=1: no overscan compensation
 CONFIG=$(mktemp)
 trap 'rm -f "$CONFIG"' EXIT
 cat > "$CONFIG" <<'CONFIGEOF'
@@ -91,13 +85,14 @@ arm_64bit=1
 enable_uart=1
 uart_2ndstage=1
 armstub=RPI_EFI.fd
+pciex4_reset=0
 disable_commandline_tags=1
 disable_overscan=1
 CONFIGEOF
 mcopy -i "$IMG" "$CONFIG" ::config.txt
 rm -f "$CONFIG"
 
-# Create EFI/BOOT/ directory and copy kernel
+# Create EFI/BOOT/ directory and copy kernel as the default boot target
 mmd -i "$IMG" ::EFI
 mmd -i "$IMG" ::EFI/BOOT
 mcopy -i "$IMG" "$KERNEL" ::EFI/BOOT/BOOTAA64.EFI
@@ -106,3 +101,6 @@ echo ""
 echo "=== Image built successfully ==="
 echo "  Output: $IMG (${IMG_SIZE_MB} MB)"
 echo "  Write to SD card: dd if=$IMG of=/dev/sdX bs=4M status=progress"
+echo ""
+echo "  Serial output: BCM2712 debug UART (3-pin JST connector)"
+echo "  Baud rate: 115200 8N1"
