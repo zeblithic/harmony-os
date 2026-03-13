@@ -191,10 +191,10 @@ test-qemu-aarch64: build-test-elf build-aarch64
     ESP_IMG=target/harmony-qemu-esp.img
     LOG=$(mktemp)
 
-    cleanup() { rm -f "$LOG"; }
+    cleanup() { rm -f "$LOG" "$FLASH" "$ESP_IMG"; }
     trap cleanup EXIT
 
-    # Build a minimal FAT12 ESP image with the EFI binary at the UEFI
+    # Build a minimal FAT32 ESP image with the EFI binary at the UEFI
     # default boot path.  EDK2 firmware discovers BOOTAA64.EFI on the
     # first FAT volume automatically.
     mkdir -p target
@@ -208,7 +208,6 @@ test-qemu-aarch64: build-test-elf build-aarch64
     # requires read-write for the code volume on aarch64 virt).
     FLASH=$(mktemp)
     cp -f "$FIRMWARE" "$FLASH"
-    trap "rm -f $LOG $FLASH" EXIT
 
     timeout 30 qemu-system-aarch64 \
         -machine virt \
