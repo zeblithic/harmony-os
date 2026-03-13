@@ -190,6 +190,7 @@ test-qemu-aarch64: build-test-elf build-aarch64
     FIRMWARE=/usr/local/share/qemu/edk2-aarch64-code.fd
     ESP_IMG=target/harmony-qemu-esp.img
     LOG=$(mktemp)
+    FLASH=""
 
     cleanup() { rm -f "$LOG" "$FLASH" "$ESP_IMG"; }
     trap cleanup EXIT
