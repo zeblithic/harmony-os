@@ -20,4 +20,3 @@ pub mod narinfo;
 pub mod nix_base32;
 #[cfg(feature = "std")]
 pub mod nix_store_fetcher;
-
