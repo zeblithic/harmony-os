@@ -2,10 +2,9 @@
 # Run: cargo deny check
 
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-unsound = "deny"
-notice = "warn"
+# Severity defaults (deny vulnerabilities, warn on unmaintained) are correct
+# for our policy. Per-type overrides require cargo-deny >=0.17; the Nix flake
+# pins an older version, so we rely on defaults and ignore specific advisories.
 ignore = [
     # paste is unmaintained (RUSTSEC-2024-0436) but has no replacement yet;
     # it's a transitive dep via defmt-macros. Revisit when defmt drops it.
