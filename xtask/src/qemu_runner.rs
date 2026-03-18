@@ -13,6 +13,8 @@ pub struct Milestone {
 }
 
 /// Panic patterns — if any serial line contains one of these, fail immediately.
+/// NOTE: panics before the serial UART is initialized produce no serial output
+/// and will therefore appear as QemuResult::ExitedEarly, not QemuResult::Panic.
 pub const PANIC_PATTERNS: &[&str] = &["[PANIC]", "!!! PANIC"];
 
 /// Result of a QEMU test run.
