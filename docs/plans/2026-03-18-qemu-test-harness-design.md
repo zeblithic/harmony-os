@@ -81,7 +81,7 @@ Each architecture has an ordered list of milestones — substrings that must app
 1. `[PL011] Serial initialized` — serial up after ExitBootServices
 2. `[RNDR]` — hardware RNG available
 3. `[Identity]` — identity generated
-4. `[Runtime]` — unikernel runtime entered idle loop (full line: `[Runtime] Entering idle loop ...`)
+4. `[Runtime] Entering idle loop` — unikernel runtime entered idle loop (after Linuxulator init)
 
 Milestones are substring matches — `[Identity]` matches regardless of whether the kernel prints Ed25519 or ML-DSA details. This keeps the harness decoupled from crypto implementation changes.
 

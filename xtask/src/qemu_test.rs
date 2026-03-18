@@ -1,5 +1,6 @@
 use crate::project_root;
 use crate::qemu_runner::{run_qemu_test, Milestone, QemuConfig, QemuResult};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -42,7 +43,7 @@ fn aarch64_milestones() -> Vec<Milestone> {
             description: "identity generated",
         },
         Milestone {
-            pattern: "[Runtime]",
+            pattern: "[Runtime] Entering idle loop",
             description: "runtime idle loop",
         },
     ]
@@ -76,9 +77,11 @@ fn find_aarch64_firmware() -> Result<PathBuf, String> {
         return Err(format!("OVMF_FD={path} does not exist"));
     }
 
-    // Find QEMU binary and look for firmware relative to it.
+    // Find QEMU binary and resolve symlinks (Nix wraps binaries in /nix/store
+    // wrapper dirs whose parent is NOT where share/qemu/ lives).
     let qemu_path = which("qemu-system-aarch64")
         .map_err(|_| "qemu-system-aarch64 not found on PATH".to_string())?;
+    let qemu_path = qemu_path.canonicalize().unwrap_or(qemu_path);
     let qemu_dir = qemu_path.parent().unwrap();
     let firmware = qemu_dir.join("../share/qemu/edk2-aarch64-code.fd");
     let firmware = firmware
@@ -347,6 +350,7 @@ pub fn run(args: &[String]) {
         match target {
             "x86_64" => {
                 print!("[x86_64]  BUILDING... ");
+                let _ = std::io::stdout().flush();
                 let build_start = Instant::now();
                 match build_x86_64() {
                     Ok(()) => {
@@ -382,6 +386,7 @@ pub fn run(args: &[String]) {
                 };
 
                 print!("[aarch64] BUILDING... ");
+                let _ = std::io::stdout().flush();
                 let build_start = Instant::now();
                 match build_aarch64() {
                     Ok(()) => {
