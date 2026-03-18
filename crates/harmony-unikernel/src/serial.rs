@@ -42,13 +42,14 @@ pub fn hex_encode(bytes: &[u8], buf: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::rc::Rc;
     use alloc::string::String;
-    use alloc::sync::Arc;
     use alloc::vec::Vec;
     use core::cell::RefCell;
 
-    fn capture_writer() -> (SerialWriter<impl FnMut(u8)>, Arc<RefCell<Vec<u8>>>) {
-        let buf = Arc::new(RefCell::new(Vec::new()));
+    #[allow(clippy::type_complexity)]
+    fn capture_writer() -> (SerialWriter<impl FnMut(u8)>, Rc<RefCell<Vec<u8>>>) {
+        let buf = Rc::new(RefCell::new(Vec::new()));
         let buf_clone = buf.clone();
         let writer = SerialWriter::new(move |byte| {
             buf_clone.borrow_mut().push(byte);

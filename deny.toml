@@ -19,6 +19,7 @@ deny = [
 [licenses]
 confidence-threshold = 0.8
 allow = [
+    "GPL-2.0-or-later",
     "MIT",
     "Apache-2.0",
     "BSD-2-Clause",
@@ -32,7 +33,7 @@ allow = [
 ]
 
 [sources]
-unknown-registry = "warn"
+unknown-registry = "deny"
 unknown-git = "deny"
 [sources.allow-org]
 github = ["zeblithic"]

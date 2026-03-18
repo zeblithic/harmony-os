@@ -396,7 +396,7 @@ mod tests {
             .writes
             .iter()
             .filter(|(off, _)| *off == 0x2C)
-            .last()
+            .next_back()
             .unwrap();
         assert_eq!(val & PAD_PULL_MASK, PAD_PULL_DOWN);
     }
@@ -412,7 +412,7 @@ mod tests {
             .writes
             .iter()
             .filter(|(off, _)| *off == 0x2C)
-            .last()
+            .next_back()
             .unwrap();
         assert_eq!(val & PAD_PULL_MASK, 0);
     }

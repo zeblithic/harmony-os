@@ -440,9 +440,8 @@ mod tests {
         let mut runtime = make_runtime();
         let actions = runtime.tick(1000);
         for action in &actions {
-            match action {
-                RuntimeAction::SendOnInterface { .. } => panic!("no interfaces, should not send"),
-                _ => {}
+            if let RuntimeAction::SendOnInterface { .. } = action {
+                panic!("no interfaces, should not send");
             }
         }
     }
