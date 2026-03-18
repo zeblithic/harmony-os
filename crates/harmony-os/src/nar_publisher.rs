@@ -163,12 +163,14 @@ mod tests {
 
     // ── Mock announcer ──────────────────────────────────────────────
 
+    type AnnouncementLog = Rc<RefCell<Vec<(String, Vec<u8>)>>>;
+
     struct MockAnnouncer {
-        announcements: Rc<RefCell<Vec<(String, Vec<u8>)>>>,
+        announcements: AnnouncementLog,
     }
 
     impl MockAnnouncer {
-        fn new() -> (Self, Rc<RefCell<Vec<(String, Vec<u8>)>>>) {
+        fn new() -> (Self, AnnouncementLog) {
             let log = Rc::new(RefCell::new(Vec::new()));
             let announcer = MockAnnouncer {
                 announcements: Rc::clone(&log),

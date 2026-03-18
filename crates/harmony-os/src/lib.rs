@@ -21,10 +21,3 @@ pub mod nix_base32;
 #[cfg(feature = "std")]
 pub mod nix_store_fetcher;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn ring3_placeholder() {
-        assert!(true);
-    }
-}
