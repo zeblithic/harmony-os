@@ -21,12 +21,6 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      # Cache Nix store to avoid rebuilding the toolchain on every run.
-      - uses: cachix/cachix-action@v15
-        with:
-          name: harmony-os
-          skipPush: true  # read-only until we set up a signing key
-
       # Cache cargo artifacts across runs.
       - uses: actions/cache@v4
         with:
@@ -61,11 +55,6 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-
-      - uses: cachix/cachix-action@v15
-        with:
-          name: harmony-os
-          skipPush: true
 
       # Cache cargo artifacts — includes bare-metal build outputs.
       - uses: actions/cache@v4
