@@ -39,7 +39,7 @@ wildcards = "warn"
 [[bans.deny]]
 name = "keccak"
 version = "=0.2.0"
-# Wrap reason so cargo-deny parses it (must be a string, not a comment)
+reason = "keccak 0.2.0 removed KeccakP1600; only 0.2.0-rc.2 works with sha3 0.11.0-rc.8 — see Cargo.toml"
 
 [sources]
 unknown-registry = "warn"

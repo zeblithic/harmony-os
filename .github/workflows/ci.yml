@@ -36,7 +36,7 @@ jobs:
         run: nix develop --command cargo fmt --all -- --check
 
       - name: Clippy
-        run: nix develop --command cargo clippy --workspace -- -D warnings
+        run: nix develop --command cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Tests
         run: nix develop --command cargo test --workspace
@@ -69,6 +69,7 @@ jobs:
           key: ${{ runner.os }}-cargo-qemu-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-qemu-
+            ${{ runner.os }}-cargo-
 
       - name: Boot x86_64 + aarch64 in QEMU
         run: nix develop --command cargo xtask qemu-test
