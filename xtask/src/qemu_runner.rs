@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -17,8 +18,8 @@ pub const PANIC_PATTERNS: &[&str] = &["[PANIC]", "!!! PANIC"];
 /// Result of a QEMU test run.
 pub enum QemuResult {
     Pass { duration: Duration },
-    Panic { line: String, output_tail: Vec<String> },
-    Timeout { reached: usize, total: usize, output_tail: Vec<String> },
+    Panic { line: String, output_tail: VecDeque<String> },
+    Timeout { reached: usize, total: usize, output_tail: VecDeque<String> },
     LaunchFailed { error: String },
 }
 
@@ -47,7 +48,7 @@ pub fn run_qemu_test(config: &QemuConfig) -> QemuResult {
     let mut child = match Command::new(&config.qemu_binary)
         .args(&config.qemu_args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
     {
         Ok(child) => child,
@@ -78,7 +79,7 @@ pub fn run_qemu_test(config: &QemuConfig) -> QemuResult {
 
     let start = Instant::now();
     let mut milestone_idx = 0;
-    let mut tail: Vec<String> = Vec::new();
+    let mut tail: VecDeque<String> = VecDeque::new();
     let tail_max = 20;
 
     loop {
@@ -99,9 +100,9 @@ pub fn run_qemu_test(config: &QemuConfig) -> QemuResult {
         match rx.recv_timeout(remaining) {
             Ok(line) => {
                 // Maintain tail buffer for diagnostics.
-                tail.push(line.clone());
+                tail.push_back(line.clone());
                 if tail.len() > tail_max {
-                    tail.remove(0);
+                    tail.pop_front();
                 }
 
                 // Check for panic.

@@ -1,3 +1,4 @@
+use crate::project_root;
 use crate::qemu_runner::{run_qemu_test, Milestone, QemuConfig, QemuResult};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -48,13 +49,6 @@ fn aarch64_milestones() -> Vec<Milestone> {
 }
 
 // ── Paths ────────────────────────────────────────────────────────────
-
-fn project_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .to_path_buf()
-}
 
 fn x86_64_image_path() -> PathBuf {
     project_root().join("target/harmony-boot-bios.img")
@@ -163,7 +157,7 @@ fn build_aarch64() -> Result<(), String> {
             "bs=1M",
             "count=4",
         ])
-        .stderr(Stdio::null())
+        .stderr(Stdio::null()) // dd always prints transfer stats to stderr
         .status()
         .map_err(|e| format!("dd: {e}"))?;
     if !status.success() {
@@ -193,7 +187,6 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Result<(), String> {
     let status = Command::new(cmd)
         .args(args)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .status()
         .map_err(|e| format!("{cmd}: {e}"))?;
     if !status.success() {
@@ -304,25 +297,32 @@ pub fn run(args: &[String]) {
         match args[i].as_str() {
             "--target" => {
                 i += 1;
-                if i < args.len() {
-                    targets.push(match args[i].as_str() {
-                        "x86_64" | "x86" => "x86_64",
-                        "aarch64" | "arm64" => "aarch64",
-                        other => {
-                            eprintln!("Unknown target: {other} (expected x86_64 or aarch64)");
-                            std::process::exit(1);
-                        }
-                    });
+                if i >= args.len() {
+                    eprintln!("--target requires a value (x86_64 or aarch64)");
+                    std::process::exit(1);
+                }
+                let t = match args[i].as_str() {
+                    "x86_64" | "x86" => "x86_64",
+                    "aarch64" | "arm64" => "aarch64",
+                    other => {
+                        eprintln!("Unknown target: {other} (expected x86_64 or aarch64)");
+                        std::process::exit(1);
+                    }
+                };
+                if !targets.contains(&t) {
+                    targets.push(t);
                 }
             }
             "--timeout" => {
                 i += 1;
-                if i < args.len() {
-                    timeout_secs = args[i].parse().unwrap_or_else(|_| {
-                        eprintln!("Invalid timeout: {}", args[i]);
-                        std::process::exit(1);
-                    });
+                if i >= args.len() {
+                    eprintln!("--timeout requires a value (seconds)");
+                    std::process::exit(1);
                 }
+                timeout_secs = args[i].parse().unwrap_or_else(|_| {
+                    eprintln!("Invalid timeout: {}", args[i]);
+                    std::process::exit(1);
+                });
             }
             other => {
                 eprintln!("Unknown argument: {other}");
