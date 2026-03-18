@@ -1699,13 +1699,11 @@ mod tests {
         assert_eq!(kernel.vm.buddy().free_frame_count(), initial_free - 10);
 
         // Verify classified frames are tracked.
-        assert!(
-            !kernel
-                .vm
-                .cap_tracker()
-                .frames_with_classification(FrameClassification::ENCRYPTED)
-                .is_empty()
-        );
+        assert!(!kernel
+            .vm
+            .cap_tracker()
+            .frames_with_classification(FrameClassification::ENCRYPTED)
+            .is_empty());
 
         // Destroy the process.
         kernel.destroy_process(pid).unwrap();
