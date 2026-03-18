@@ -158,10 +158,10 @@ fn build_aarch64() -> Result<(), String> {
         .args([
             "if=/dev/zero",
             &format!("of={}", esp.display()),
-            "bs=1M",
-            "count=4",
+            "bs=512",
+            "count=8192",
         ])
-        .stderr(Stdio::null()) // dd always prints transfer stats to stderr
+        .stderr(Stdio::inherit())
         .status()
         .map_err(|e| format!("dd: {e}"))?;
     if !status.success() {
