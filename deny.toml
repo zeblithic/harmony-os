@@ -2,7 +2,11 @@
 # Run: cargo deny check
 
 [advisories]
-ignore = []
+ignore = [
+    # paste is unmaintained (RUSTSEC-2024-0436) but has no replacement yet;
+    # it's a transitive dep via defmt-macros. Revisit when defmt drops it.
+    "RUSTSEC-2024-0436",
+]
 
 [bans]
 multiple-versions = "warn"
@@ -30,6 +34,8 @@ allow = [
     "Zlib",
     "BSL-1.0",
     "CC0-1.0",
+    "0BSD",
+    "CDLA-Permissive-2.0",
 ]
 
 [sources]
