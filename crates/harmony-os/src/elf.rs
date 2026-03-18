@@ -102,6 +102,10 @@ pub struct TlsInfo {
 pub struct ParsedElf {
     pub entry_point: u64,
     pub elf_type: ElfType,
+    /// ELF machine type (e.g. `0x3E` for x86_64, `0xB7` for aarch64).
+    /// Callers that execute the binary should verify this matches the
+    /// runtime architecture.
+    pub machine: u16,
     pub segments: Vec<ElfSegment>,
     /// Interpreter path from PT_INTERP (None for statically-linked binaries).
     pub interpreter: Option<String>,
@@ -312,6 +316,7 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, ElfError> {
     Ok(ParsedElf {
         entry_point,
         elf_type,
+        machine: e_machine,
         segments,
         interpreter,
         phdr_offset: e_phoff as u64,
@@ -613,11 +618,10 @@ mod tests {
     }
 
     #[test]
-    fn reject_foreign_machine_type() {
+    fn reject_mips_machine_type() {
         let code = [0xCC; 16];
-        // Use an unsupported machine type (MIPS).
         // Both x86_64 (0x3E) and aarch64 (0xB7) are accepted since
-        // harmony-os targets both architectures.
+        // harmony-os targets both architectures. Other archs are rejected.
         let elf = build_test_elf_with_machine(&code, 0x08); // EM_MIPS
         assert_eq!(parse_elf(&elf), Err(ElfError::UnsupportedMachine));
     }

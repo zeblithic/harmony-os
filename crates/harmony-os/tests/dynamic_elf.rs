@@ -2,18 +2,13 @@
 
 //! Integration tests for dynamic ELF loading with real musl binaries.
 //!
-//! These tests require cross-compiled aarch64 musl binaries in
-//! `tests/fixtures/`. Generate them with:
+//! Fixtures (`tests/fixtures/hello` and `tests/fixtures/ld-musl-aarch64.so.1`)
+//! are committed to the repository. To regenerate them (e.g. after a musl
+//! version bump), run inside `nix develop`:
 //!
 //! ```bash
-//! # Install aarch64-linux-musl cross-compiler, then:
-//! echo '#include <stdio.h>
-//! int main() { printf("Hello from Harmony!\\n"); return 0; }' > /tmp/hello.c
-//! aarch64-linux-musl-gcc -o tests/fixtures/hello /tmp/hello.c
-//! cp $(aarch64-linux-musl-gcc -print-file-name=ld-musl-aarch64.so.1) tests/fixtures/
+//! ./scripts/gen-musl-fixtures.sh
 //! ```
-//!
-//! Tests are `#[ignore]` until fixtures are present.
 
 use std::path::Path;
 
@@ -27,9 +22,7 @@ fn read_fixture(path: &str) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|e| {
         panic!(
             "Failed to read fixture {path}: {e}\n\
-             Generate fixtures with:\n  \
-             aarch64-linux-musl-gcc -o tests/fixtures/hello /tmp/hello.c\n  \
-             cp $(aarch64-linux-musl-gcc -print-file-name=ld-musl-aarch64.so.1) tests/fixtures/"
+             Regenerate fixtures with: ./scripts/gen-musl-fixtures.sh (inside nix develop)"
         );
     })
 }
