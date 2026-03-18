@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Format, Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # Cache Nix store to avoid rebuilding the toolchain on every run.
+      - uses: cachix/cachix-action@v15
+        with:
+          name: harmony-os
+          skipPush: true  # read-only until we set up a signing key
+
+      # Cache cargo artifacts across runs.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Format check
+        run: nix develop --command cargo fmt --all -- --check
+
+      - name: Clippy
+        run: nix develop --command cargo clippy --workspace -- -D warnings
+
+      - name: Tests
+        run: nix develop --command cargo test --workspace
+
+      - name: cargo-deny (ban keccak 0.2.0)
+        run: nix develop --command cargo deny check bans
+
+  qemu-smoke:
+    name: QEMU Boot Tests
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - uses: cachix/cachix-action@v15
+        with:
+          name: harmony-os
+          skipPush: true
+
+      # Cache cargo artifacts — includes bare-metal build outputs.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            crates/harmony-boot/target
+            crates/harmony-boot-aarch64/target
+            xtask/target
+          key: ${{ runner.os }}-cargo-qemu-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-qemu-
+
+      - name: Boot x86_64 + aarch64 in QEMU
+        run: nix develop --command cargo xtask qemu-test

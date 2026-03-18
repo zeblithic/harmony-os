@@ -1,0 +1,46 @@
+# cargo-deny configuration for harmony-os
+# Run: cargo deny check bans
+
+[advisories]
+# We don't use the advisory DB yet — skip for now.
+db-path = "~/.cargo/advisory-db"
+vulnerability = "warn"
+unmaintained = "warn"
+yanked = "warn"
+
+[licenses]
+# GPL-2.0-or-later is the project license. We depend on harmony core
+# under its MIT arm, and various Rust ecosystem crates under permissive
+# licenses. Allow the common set.
+unlicensed = "warn"
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "BSL-1.0",
+    "GPL-2.0",
+    "CC0-1.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+
+# keccak 0.2.0 (stable) removed KeccakP1600 which sha3 0.11.0-rc.8
+# requires (transitive dep via ml-dsa/ml-kem in harmony core).
+# Only keccak 0.2.0-rc.2 works. The Cargo.lock pins this, but
+# cargo-deny provides a second safety net against accidental
+# `cargo update` breakage.
+[[bans.deny]]
+name = "keccak"
+version = "=0.2.0"
+# Wrap reason so cargo-deny parses it (must be a string, not a comment)
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "allow"  # harmony core is a git dep
