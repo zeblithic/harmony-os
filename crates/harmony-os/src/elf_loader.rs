@@ -60,7 +60,10 @@ pub enum ElfLoadError {
     BackendError(IpcError),
     OverlappingSegments,
     /// Binary's e_machine doesn't match the expected runtime architecture.
-    WrongArchitecture { expected: u16, got: u16 },
+    WrongArchitecture {
+        expected: u16,
+        got: u16,
+    },
     /// A PT_LOAD segment has both W and X flags — rejected by W^X policy.
     WXViolation,
     /// Failed to map the stack region via `vm_mmap`.
