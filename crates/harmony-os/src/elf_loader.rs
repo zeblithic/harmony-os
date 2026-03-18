@@ -309,9 +309,16 @@ impl ElfLoader for InterpreterLoader {
             let _ = backend.clunk(INTERP_FID);
             let interp_bytes = interp_bytes?;
 
-            // Parse interpreter ELF — must be ET_DYN (position-independent).
+            // Parse interpreter ELF — must be ET_DYN (position-independent)
+            // and must match the same architecture as the main executable.
             let interp_parsed =
                 parse_elf(&interp_bytes).map_err(ElfLoadError::InterpreterParseError)?;
+            if self.expected_machine != 0 && interp_parsed.machine != self.expected_machine {
+                return Err(ElfLoadError::WrongArchitecture {
+                    expected: self.expected_machine,
+                    got: interp_parsed.machine,
+                });
+            }
             if interp_parsed.elf_type != ElfType::Dyn {
                 return Err(ElfLoadError::InterpreterParseError(
                     crate::elf::ElfError::NotExecutable,
