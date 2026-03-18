@@ -37,10 +37,10 @@ jobs:
         run: nix develop --command cargo fmt --all -- --check
 
       - name: Clippy
-        run: nix develop --command cargo clippy --workspace --all-targets -- -D warnings
+        run: nix develop --command cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Tests
-        run: nix develop --command cargo test --workspace
+        run: nix develop --command cargo test --locked --workspace
 
       - name: cargo-deny
         run: nix develop --command cargo deny check
@@ -76,6 +76,7 @@ jobs:
 
       - name: Boot x86_64 + aarch64 in QEMU
         run: |
+          set -o pipefail
           mkdir -p qemu-logs
           nix develop --command cargo xtask qemu-test 2>&1 | tee qemu-logs/qemu-test.log
 

@@ -112,7 +112,6 @@ fn build_x86_64() -> Result<(), String> {
     let status = Command::new("cargo")
         .args([
             "build",
-            "--locked",
             "--target",
             "x86_64-unknown-none",
             "--release",
@@ -142,7 +141,6 @@ fn build_aarch64() -> Result<(), String> {
     let status = Command::new("cargo")
         .args([
             "build",
-            "--locked",
             "--target",
             "aarch64-unknown-linux-musl",
             "--release",
@@ -158,7 +156,7 @@ fn build_aarch64() -> Result<(), String> {
 
     // Build kernel (default features include qemu-virt).
     let status = Command::new("cargo")
-        .args(["build", "--locked", "--target", "aarch64-unknown-uefi", "--release"])
+        .args(["build", "--target", "aarch64-unknown-uefi", "--release"])
         .current_dir(&boot_dir)
         .status()
         .map_err(|e| format!("cargo build: {e}"))?;
