@@ -15,6 +15,10 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
+        # aarch64-unknown-linux-musl C cross-compiler — needed to build
+        # dynamically-linked musl test fixtures (hello world + ld-musl).
+        muslCross = pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc;
+
         # Stable Rust toolchain with cross-compilation targets.
         # Uses fenix.combine to merge the host toolchain with target rust-std libs.
         rustToolchain = fenix.packages.${system}.combine [
@@ -45,6 +49,8 @@
             pkgs.curl
             pkgs.unzip
             pkgs.git
+            # aarch64 musl C cross-compiler for test fixtures
+            muslCross
           ];
 
           buildInputs = [

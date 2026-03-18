@@ -18,9 +18,7 @@ const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
-#[cfg(target_arch = "x86_64")]
 const EM_X86_64: u16 = 0x3E;
-#[cfg(target_arch = "aarch64")]
 const EM_AARCH64: u16 = 0xB7;
 const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
@@ -187,17 +185,10 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, ElfError> {
         _ => return Err(ElfError::NotExecutable),
     };
 
-    // Must be the native machine type
+    // Accept both x86_64 and aarch64 machine types — harmony-os targets
+    // both architectures, and we need to parse cross-arch ELFs in tests.
     let e_machine = u16_le(data, 18);
-    #[cfg(target_arch = "x86_64")]
-    let expected_machine = EM_X86_64;
-    #[cfg(target_arch = "aarch64")]
-    let expected_machine = EM_AARCH64;
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    return Err(ElfError::UnsupportedMachine);
-
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    if e_machine != expected_machine {
+    if e_machine != EM_X86_64 && e_machine != EM_AARCH64 {
         return Err(ElfError::UnsupportedMachine);
     }
 
@@ -624,13 +615,10 @@ mod tests {
     #[test]
     fn reject_foreign_machine_type() {
         let code = [0xCC; 16];
-        // Use the opposite architecture's machine type
-        #[cfg(target_arch = "x86_64")]
-        let elf = build_test_elf_with_machine(&code, 0xB7); // EM_AARCH64
-        #[cfg(target_arch = "aarch64")]
-        let elf = build_test_elf_with_machine(&code, 0x3E); // EM_X86_64
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        let elf = build_test_elf_with_machine(&code, 0x3E);
+        // Use an unsupported machine type (MIPS).
+        // Both x86_64 (0x3E) and aarch64 (0xB7) are accepted since
+        // harmony-os targets both architectures.
+        let elf = build_test_elf_with_machine(&code, 0x08); // EM_MIPS
         assert_eq!(parse_elf(&elf), Err(ElfError::UnsupportedMachine));
     }
 

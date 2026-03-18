@@ -37,7 +37,6 @@ fn read_fixture(path: &str) -> Vec<u8> {
 // ── ELF parsing tests ──────────────────────────────────────────────
 
 #[test]
-#[ignore] // Requires aarch64 musl fixtures
 fn parse_real_musl_hello() {
     let elf_bytes = read_fixture(HELLO_FIXTURE);
     let parsed = harmony_os::elf::parse_elf(&elf_bytes).expect("should parse musl hello");
@@ -64,7 +63,6 @@ fn parse_real_musl_hello() {
 }
 
 #[test]
-#[ignore] // Requires aarch64 musl fixtures
 fn parse_real_ld_musl() {
     let elf_bytes = read_fixture(LD_MUSL_FIXTURE);
     let parsed = harmony_os::elf::parse_elf(&elf_bytes).expect("should parse ld-musl");
@@ -92,7 +90,6 @@ fn parse_real_ld_musl() {
 /// the [`InterpreterLoader`]. Verifies that the entry point, auxv,
 /// and base addresses are reasonable.
 #[test]
-#[ignore] // Requires aarch64 musl fixtures
 fn load_real_musl_hello() {
     use harmony_microkernel::vm::{FrameClassification, PageFlags, VmError};
     use harmony_microkernel::{Fid, FileStat, FileType, IpcError, OpenMode, QPath};
@@ -262,7 +259,6 @@ fn load_real_musl_hello() {
 // ── Segment sanity checks ──────────────────────────────────────────
 
 #[test]
-#[ignore] // Requires aarch64 musl fixtures
 fn hello_segments_have_sane_sizes() {
     let elf_bytes = read_fixture(HELLO_FIXTURE);
     let parsed = harmony_os::elf::parse_elf(&elf_bytes).expect("parse hello");
@@ -291,7 +287,6 @@ fn hello_segments_have_sane_sizes() {
 }
 
 #[test]
-#[ignore] // Requires aarch64 musl fixtures
 fn ld_musl_segments_have_sane_sizes() {
     let elf_bytes = read_fixture(LD_MUSL_FIXTURE);
     let parsed = harmony_os::elf::parse_elf(&elf_bytes).expect("parse ld-musl");
@@ -317,7 +312,6 @@ fn ld_musl_segments_have_sane_sizes() {
 // ── Stack building with real auxv ──────────────────────────────────
 
 #[test]
-#[ignore] // Requires aarch64 musl fixtures
 fn build_stack_for_real_musl_hello() {
     use harmony_os::elf_loader::{auxv, build_initial_stack};
 
