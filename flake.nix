@@ -39,27 +39,23 @@
             # dropped if the stable manifest omits it for this platform.
             fenix.packages.${system}.rust-analyzer
             pkgs.pkg-config
-          ];
-
-          buildInputs = [
-            # Simulation & imaging
+            # Host tools (executables that run on the build machine)
             pkgs.qemu
             pkgs.mtools
             pkgs.curl
             pkgs.unzip
-
-            # Build dependencies
-            pkgs.openssl.dev
             pkgs.git
+          ];
+
+          buildInputs = [
+            # Libraries linked against by Rust crates
+            pkgs.openssl.dev
           ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
             pkgs.libiconv
             # On nixpkgs 26.05+, darwin.apple_sdk.frameworks is removed.
             # Frameworks (Security, SystemConfiguration) are pulled transitively
             # by openssl and other deps — no explicit listing needed.
           ];
-
-          # Ensure pkg-config can find openssl
-          PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
         };
       }
     );

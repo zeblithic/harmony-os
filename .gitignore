@@ -1,6 +1,11 @@
 **/target
 **/*.rs.bk
-Cargo.lock
+# Excluded crates have independent Cargo.lock files — don't track them.
+# The workspace Cargo.lock IS tracked (keccak pin, reproducible builds).
+crates/harmony-boot/Cargo.lock
+crates/harmony-boot-aarch64/Cargo.lock
+crates/harmony-test-elf/Cargo.lock
+xtask/Cargo.lock
 *.swp
 *.swo
 *~
