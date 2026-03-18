@@ -9,3 +9,6 @@ Cargo.lock
 # Dolt database files (added by bd init)
 .dolt/
 *.db
+
+# Direnv cache
+.direnv/

@@ -53,8 +53,9 @@
             pkgs.git
           ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
             pkgs.libiconv
-            pkgs.darwin.apple_sdk.frameworks.Security
-            pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
+            # On nixpkgs 26.05+, darwin.apple_sdk.frameworks is removed.
+            # Frameworks (Security, SystemConfiguration) are pulled transitively
+            # by openssl and other deps — no explicit listing needed.
           ];
 
           # Ensure pkg-config can find openssl
