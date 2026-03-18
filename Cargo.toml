@@ -42,3 +42,7 @@ harmony-os = { path = "crates/harmony-os" }
 # Shared dependencies
 bitflags = "2"
 rand_core = { version = "0.6", default-features = false }
+# Pin keccak to 0.2.0-rc.2 — the stable 0.2.0 release removed KeccakP1600
+# which sha3 0.11.0-rc.8 (a transitive dep via ml-dsa/ml-kem) requires.
+# Must match the pin in zeblithic/harmony's workspace Cargo.toml.
+keccak = "=0.2.0-rc.2"
