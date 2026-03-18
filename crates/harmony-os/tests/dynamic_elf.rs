@@ -2,18 +2,13 @@
 
 //! Integration tests for dynamic ELF loading with real musl binaries.
 //!
-//! These tests require cross-compiled aarch64 musl binaries in
-//! `tests/fixtures/`. Generate them with:
+//! Fixtures (`tests/fixtures/hello` and `tests/fixtures/ld-musl-aarch64.so.1`)
+//! are committed to the repository. To regenerate them (e.g. after a musl
+//! version bump), run inside `nix develop`:
 //!
 //! ```bash
-//! # Install aarch64-linux-musl cross-compiler, then:
-//! echo '#include <stdio.h>
-//! int main() { printf("Hello from Harmony!\\n"); return 0; }' > /tmp/hello.c
-//! aarch64-linux-musl-gcc -o tests/fixtures/hello /tmp/hello.c
-//! cp $(aarch64-linux-musl-gcc -print-file-name=ld-musl-aarch64.so.1) tests/fixtures/
+//! ./scripts/gen-musl-fixtures.sh
 //! ```
-//!
-//! Tests are `#[ignore]` until fixtures are present.
 
 use std::path::Path;
 
@@ -27,9 +22,7 @@ fn read_fixture(path: &str) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|e| {
         panic!(
             "Failed to read fixture {path}: {e}\n\
-             Generate fixtures with:\n  \
-             aarch64-linux-musl-gcc -o tests/fixtures/hello /tmp/hello.c\n  \
-             cp $(aarch64-linux-musl-gcc -print-file-name=ld-musl-aarch64.so.1) tests/fixtures/"
+             Regenerate fixtures with: ./scripts/gen-musl-fixtures.sh (inside nix develop)"
         );
     })
 }
@@ -37,7 +30,6 @@ fn read_fixture(path: &str) -> Vec<u8> {
 // ── ELF parsing tests ──────────────────────────────────────────────
 
 #[test]
-#[ignore] // Requires aarch64 musl fixtures
 fn parse_real_musl_hello() {
     let elf_bytes = read_fixture(HELLO_FIXTURE);
     let parsed = harmony_os::elf::parse_elf(&elf_bytes).expect("should parse musl hello");
@@ -64,7 +56,6 @@ fn parse_real_musl_hello() {
 }
 
 #[test]
-#[ignore] // Requires aarch64 musl fixtures
 fn parse_real_ld_musl() {
     let elf_bytes = read_fixture(LD_MUSL_FIXTURE);
     let parsed = harmony_os::elf::parse_elf(&elf_bytes).expect("should parse ld-musl");
@@ -92,7 +83,6 @@ fn parse_real_ld_musl() {
 /// the [`InterpreterLoader`]. Verifies that the entry point, auxv,
 /// and base addresses are reasonable.
 #[test]
-#[ignore] // Requires aarch64 musl fixtures
 fn load_real_musl_hello() {
     use harmony_microkernel::vm::{FrameClassification, PageFlags, VmError};
     use harmony_microkernel::{Fid, FileStat, FileType, IpcError, OpenMode, QPath};
@@ -223,7 +213,11 @@ fn load_real_musl_hello() {
     let mut backend = FixtureBackend::new();
     backend.register_interp(&interp_path, interp_bytes);
 
-    let mut loader = InterpreterLoader::default();
+    let mut loader = InterpreterLoader {
+        // Fixtures are aarch64 — allow cross-arch loading in tests.
+        expected_machine: 0xB7, // EM_AARCH64
+        ..InterpreterLoader::default()
+    };
     let result = loader
         .load(&exe_bytes, &mut backend)
         .expect("should load hello via InterpreterLoader");
@@ -262,7 +256,6 @@ fn load_real_musl_hello() {
 // ── Segment sanity checks ──────────────────────────────────────────
 
 #[test]
-#[ignore] // Requires aarch64 musl fixtures
 fn hello_segments_have_sane_sizes() {
     let elf_bytes = read_fixture(HELLO_FIXTURE);
     let parsed = harmony_os::elf::parse_elf(&elf_bytes).expect("parse hello");
@@ -291,7 +284,6 @@ fn hello_segments_have_sane_sizes() {
 }
 
 #[test]
-#[ignore] // Requires aarch64 musl fixtures
 fn ld_musl_segments_have_sane_sizes() {
     let elf_bytes = read_fixture(LD_MUSL_FIXTURE);
     let parsed = harmony_os::elf::parse_elf(&elf_bytes).expect("parse ld-musl");
@@ -317,7 +309,6 @@ fn ld_musl_segments_have_sane_sizes() {
 // ── Stack building with real auxv ──────────────────────────────────
 
 #[test]
-#[ignore] // Requires aarch64 musl fixtures
 fn build_stack_for_real_musl_hello() {
     use harmony_os::elf_loader::{auxv, build_initial_stack};
 

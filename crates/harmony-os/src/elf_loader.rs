@@ -59,6 +59,8 @@ pub enum ElfLoadError {
     InterpreterParseError(ElfError),
     BackendError(IpcError),
     OverlappingSegments,
+    /// Binary's e_machine doesn't match the expected runtime architecture.
+    WrongArchitecture { expected: u16, got: u16 },
     /// A PT_LOAD segment has both W and X flags — rejected by W^X policy.
     WXViolation,
     /// Failed to map the stack region via `vm_mmap`.
@@ -110,13 +112,26 @@ pub struct InterpreterLoader {
     /// Base address for the interpreter. Must not overlap executable
     /// segments.
     pub interp_base: u64,
+    /// Expected ELF machine type. `load()` rejects binaries that don't
+    /// match. Use `EM_AARCH64` (0xB7) or `EM_X86_64` (0x3E). Set to 0
+    /// to skip the check (tests only).
+    pub expected_machine: u16,
 }
 
 impl Default for InterpreterLoader {
     fn default() -> Self {
+        // Default to the native architecture.
+        #[cfg(target_arch = "aarch64")]
+        let machine = 0xB7; // EM_AARCH64
+        #[cfg(target_arch = "x86_64")]
+        let machine = 0x3E; // EM_X86_64
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let machine = 0;
+
         Self {
             pie_base: 0x400000,
             interp_base: 0x7f000000,
+            expected_machine: machine,
         }
     }
 }
@@ -243,6 +258,15 @@ impl ElfLoader for InterpreterLoader {
         // 1. Parse executable ELF.
         let parsed = parse_elf(elf_bytes).map_err(ElfLoadError::ParseError)?;
 
+        // 1b. Verify machine type matches the expected runtime architecture.
+        // Skipped when expected_machine is 0 (cross-arch test mode).
+        if self.expected_machine != 0 && parsed.machine != self.expected_machine {
+            return Err(ElfLoadError::WrongArchitecture {
+                expected: self.expected_machine,
+                got: parsed.machine,
+            });
+        }
+
         // 2. Determine exe base: 0 for ET_EXEC, pie_base for ET_DYN.
         let exe_base = match parsed.elf_type {
             ElfType::Exec => 0,
@@ -285,9 +309,16 @@ impl ElfLoader for InterpreterLoader {
             let _ = backend.clunk(INTERP_FID);
             let interp_bytes = interp_bytes?;
 
-            // Parse interpreter ELF — must be ET_DYN (position-independent).
+            // Parse interpreter ELF — must be ET_DYN (position-independent)
+            // and must match the same architecture as the main executable.
             let interp_parsed =
                 parse_elf(&interp_bytes).map_err(ElfLoadError::InterpreterParseError)?;
+            if self.expected_machine != 0 && interp_parsed.machine != self.expected_machine {
+                return Err(ElfLoadError::WrongArchitecture {
+                    expected: self.expected_machine,
+                    got: interp_parsed.machine,
+                });
+            }
             if interp_parsed.elf_type != ElfType::Dyn {
                 return Err(ElfLoadError::InterpreterParseError(
                     crate::elf::ElfError::NotExecutable,
@@ -962,6 +993,7 @@ mod tests {
         let mut loader = InterpreterLoader {
             pie_base: 0x200000,
             interp_base: 0x7f000000,
+            ..InterpreterLoader::default()
         };
         let mut backend = LoaderMockBackend::new();
         let result = loader.load(&elf, &mut backend).unwrap();
