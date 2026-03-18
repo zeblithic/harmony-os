@@ -1,3 +1,6 @@
+mod qemu_runner;
+mod qemu_test;
+
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -20,20 +23,24 @@ fn main() {
             build_image();
             run_qemu();
         }
+        Some("qemu-test") => {
+            qemu_test::run(&args[2..]);
+        }
         _ => {
-            eprintln!("Usage: cargo xtask [build-kernel|build-image|build-image-test|run]");
+            eprintln!("Usage: cargo xtask <command>");
             eprintln!();
             eprintln!("Commands:");
             eprintln!("  build-kernel      Build the kernel ELF");
             eprintln!("  build-image       Build kernel + bootable BIOS disk image");
             eprintln!("  build-image-test  Build kernel with qemu-test feature + disk image");
             eprintln!("  run               Build image + launch QEMU");
+            eprintln!("  qemu-test         Build + boot both architectures, verify serial milestones");
             std::process::exit(1);
         }
     }
 }
 
-fn project_root() -> PathBuf {
+pub(crate) fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -45,7 +52,7 @@ fn kernel_binary() -> PathBuf {
     project_root().join(format!("crates/harmony-boot/target/{TARGET}/release/harmony-boot"))
 }
 
-fn image_path() -> PathBuf {
+pub(crate) fn image_path() -> PathBuf {
     project_root().join("target/harmony-boot-bios.img")
 }
 
