@@ -213,7 +213,11 @@ fn load_real_musl_hello() {
     let mut backend = FixtureBackend::new();
     backend.register_interp(&interp_path, interp_bytes);
 
-    let mut loader = InterpreterLoader::default();
+    let mut loader = InterpreterLoader {
+        // Fixtures are aarch64 — allow cross-arch loading in tests.
+        expected_machine: 0xB7, // EM_AARCH64
+        ..InterpreterLoader::default()
+    };
     let result = loader
         .load(&exe_bytes, &mut backend)
         .expect("should load hello via InterpreterLoader");
