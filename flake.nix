@@ -19,19 +19,22 @@
         # dynamically-linked musl test fixtures (hello world + ld-musl).
         muslCross = pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc;
 
-        # Stable Rust toolchain with cross-compilation targets.
+        # Nightly Rust toolchain with cross-compilation targets.
+        # Nightly is required because the `bootloader` crate (used by xtask for
+        # x86_64 disk image creation) invokes `cargo -Z build-std` internally.
         # Uses fenix.combine to merge the host toolchain with target rust-std libs.
         rustToolchain = fenix.packages.${system}.combine [
-          (fenix.packages.${system}.stable.withComponents [
+          (fenix.packages.${system}.latest.withComponents [
             "cargo"
             "clippy"
             "rustc"
             "rustfmt"
-            "rust-src"  # needed for build-std on no_std targets
+            "llvm-tools-preview"  # needed by bootloader crate for llvm-objcopy
+            "rust-src"  # needed for -Z build-std on no_std/bare-metal targets
           ])
-          fenix.packages.${system}.targets.aarch64-unknown-uefi.stable.rust-std
-          fenix.packages.${system}.targets.x86_64-unknown-none.stable.rust-std
-          fenix.packages.${system}.targets.aarch64-unknown-linux-musl.stable.rust-std
+          fenix.packages.${system}.targets.aarch64-unknown-uefi.latest.rust-std
+          fenix.packages.${system}.targets.x86_64-unknown-none.latest.rust-std
+          fenix.packages.${system}.targets.aarch64-unknown-linux-musl.latest.rust-std
         ];
       in
       {
