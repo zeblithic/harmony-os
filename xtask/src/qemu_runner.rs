@@ -20,6 +20,9 @@ pub enum QemuResult {
     Pass { duration: Duration },
     Panic { line: String, output_tail: VecDeque<String> },
     Timeout { reached: usize, total: usize, output_tail: VecDeque<String> },
+    /// QEMU exited (pipe closed) before all milestones were reached.
+    /// Distinct from Timeout: the guest crashed or exited, not slow.
+    ExitedEarly { reached: usize, total: usize, output_tail: VecDeque<String> },
     LaunchFailed { error: String },
 }
 
@@ -149,7 +152,8 @@ pub fn run_qemu_test(config: &QemuConfig) -> QemuResult {
                         duration: start.elapsed(),
                     };
                 }
-                return QemuResult::Timeout {
+                // QEMU exited before all milestones — crash, not timeout.
+                return QemuResult::ExitedEarly {
                     reached: milestone_idx,
                     total: config.milestones.len(),
                     output_tail: tail,

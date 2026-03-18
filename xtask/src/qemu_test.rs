@@ -1,6 +1,7 @@
 use crate::project_root;
 use crate::qemu_runner::{run_qemu_test, Milestone, QemuConfig, QemuResult};
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -51,10 +52,6 @@ fn aarch64_milestones() -> Vec<Milestone> {
 
 // ── Paths ────────────────────────────────────────────────────────────
 
-fn x86_64_image_path() -> PathBuf {
-    project_root().join("target/harmony-boot-bios.img")
-}
-
 fn aarch64_efi_path() -> PathBuf {
     project_root().join(
         "crates/harmony-boot-aarch64/target/aarch64-unknown-uefi/release/harmony-boot-aarch64.efi",
@@ -96,7 +93,11 @@ fn which(name: &str) -> Result<PathBuf, ()> {
     for dir in path_var.split(':') {
         let candidate = PathBuf::from(dir).join(name);
         if candidate.is_file() {
-            return Ok(candidate);
+            if let Ok(meta) = candidate.metadata() {
+                if meta.permissions().mode() & 0o111 != 0 {
+                    return Ok(candidate);
+                }
+            }
         }
     }
     Err(())
@@ -126,7 +127,7 @@ fn build_x86_64() -> Result<(), String> {
 
     // Create BIOS disk image.
     let kernel = boot_dir.join("target/x86_64-unknown-none/release/harmony-boot");
-    let image = x86_64_image_path();
+    let image = crate::image_path();
     bootloader::BiosBoot::new(&kernel)
         .create_disk_image(&image)
         .map_err(|e| format!("disk image creation: {e}"))?;
@@ -201,7 +202,7 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Result<(), String> {
 // ── QEMU configs ─────────────────────────────────────────────────────
 
 fn x86_64_qemu_config(timeout: Duration) -> QemuConfig {
-    let image = x86_64_image_path();
+    let image = crate::image_path();
     QemuConfig {
         qemu_binary: "qemu-system-x86_64".into(),
         qemu_args: vec![
@@ -256,7 +257,7 @@ fn aarch64_qemu_config(timeout: Duration, firmware: &PathBuf) -> QemuConfig {
 
 // ── Display ──────────────────────────────────────────────────────────
 
-fn print_result(target: &str, result: &QemuResult, milestones: &[Milestone]) {
+fn print_result(target: &str, result: &QemuResult, config: &QemuConfig) {
     match result {
         QemuResult::Pass { duration } => {
             println!("[{target}]  PASS ({:.1}s)", duration.as_secs_f64());
@@ -275,8 +276,22 @@ fn print_result(target: &str, result: &QemuResult, milestones: &[Milestone]) {
             output_tail,
         } => {
             println!("[{target}]  FAIL — timeout ({reached}/{total} milestones)");
-            if *reached < milestones.len() {
-                println!("[{target}]  Stuck at: {}", milestones[*reached].description);
+            if *reached < config.milestones.len() {
+                println!("[{target}]  Stuck at: {}", config.milestones[*reached].description);
+            }
+            println!("[{target}]  Last serial output:");
+            for l in output_tail {
+                println!("[{target}]    {l}");
+            }
+        }
+        QemuResult::ExitedEarly {
+            reached,
+            total,
+            output_tail,
+        } => {
+            println!("[{target}]  FAIL — QEMU exited early ({reached}/{total} milestones)");
+            if *reached < config.milestones.len() {
+                println!("[{target}]  Stuck at: {}", config.milestones[*reached].description);
             }
             println!("[{target}]  Last serial output:");
             for l in output_tail {
@@ -365,11 +380,10 @@ pub fn run(args: &[String]) {
 
                 println!("[x86_64]  BOOTING...");
                 let config = x86_64_qemu_config(timeout);
-                let milestones = x86_64_milestones();
                 let result = run_qemu_test(&config);
 
                 // Milestones print in real-time via on_milestone callback.
-                print_result("x86_64", &result, &milestones);
+                print_result("x86_64", &result, &config);
                 if !matches!(result, QemuResult::Pass { .. }) {
                     all_pass = false;
                 }
@@ -401,10 +415,9 @@ pub fn run(args: &[String]) {
 
                 println!("[aarch64] BOOTING...");
                 let config = aarch64_qemu_config(timeout, &firmware);
-                let milestones = aarch64_milestones();
                 let result = run_qemu_test(&config);
 
-                print_result("aarch64", &result, &milestones);
+                print_result("aarch64", &result, &config);
                 if !matches!(result, QemuResult::Pass { .. }) {
                     all_pass = false;
                 }

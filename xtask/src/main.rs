@@ -52,7 +52,7 @@ fn kernel_binary() -> PathBuf {
     project_root().join(format!("crates/harmony-boot/target/{TARGET}/release/harmony-boot"))
 }
 
-fn image_path() -> PathBuf {
+pub(crate) fn image_path() -> PathBuf {
     project_root().join("target/harmony-boot-bios.img")
 }
 
