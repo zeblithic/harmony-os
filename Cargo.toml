@@ -42,3 +42,8 @@ harmony-os = { path = "crates/harmony-os" }
 # Shared dependencies
 bitflags = "2"
 rand_core = { version = "0.6", default-features = false }
+# Note: keccak 0.2.0-rc.2 is pinned via Cargo.lock (now committed).
+# The stable keccak 0.2.0 removed KeccakP1600 which sha3 0.11.0-rc.8
+# (transitive dep via ml-dsa/ml-kem in harmony core) requires.
+# If you run `cargo update`, verify keccak stays at 0.2.0-rc.2:
+#   cargo update keccak --precise 0.2.0-rc.2

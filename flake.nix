@@ -1,0 +1,62 @@
+{
+  description = "Harmony OS — mesh-native operating system dev environment";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    fenix = {
+      url = "github:nix-community/fenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    flake-utils.url = "github:numtide/flake-utils";
+  };
+
+  outputs = { self, nixpkgs, fenix, flake-utils }:
+    flake-utils.lib.eachSystem [ "x86_64-darwin" "aarch64-darwin" "x86_64-linux" "aarch64-linux" ] (system:
+      let
+        pkgs = nixpkgs.legacyPackages.${system};
+
+        # Stable Rust toolchain with cross-compilation targets.
+        # Uses fenix.combine to merge the host toolchain with target rust-std libs.
+        rustToolchain = fenix.packages.${system}.combine [
+          (fenix.packages.${system}.stable.withComponents [
+            "cargo"
+            "clippy"
+            "rustc"
+            "rustfmt"
+            "rust-src"  # needed for build-std on no_std targets
+          ])
+          fenix.packages.${system}.targets.aarch64-unknown-uefi.stable.rust-std
+          fenix.packages.${system}.targets.x86_64-unknown-none.stable.rust-std
+          fenix.packages.${system}.targets.aarch64-unknown-linux-musl.stable.rust-std
+        ];
+      in
+      {
+        devShells.default = pkgs.mkShell {
+          nativeBuildInputs = [
+            rustToolchain
+            # rust-analyzer as a standalone fenix derivation — more reliable
+            # than including it in withComponents where it may be silently
+            # dropped if the stable manifest omits it for this platform.
+            fenix.packages.${system}.rust-analyzer
+            pkgs.pkg-config
+            # Host tools (executables that run on the build machine)
+            pkgs.qemu
+            pkgs.mtools
+            pkgs.curl
+            pkgs.unzip
+            pkgs.git
+          ];
+
+          buildInputs = [
+            # Libraries linked against by Rust crates
+            pkgs.openssl.dev
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.libiconv
+            # On nixpkgs 26.05+, darwin.apple_sdk.frameworks is removed.
+            # Frameworks (Security, SystemConfiguration) are pulled transitively
+            # by openssl and other deps — no explicit listing needed.
+          ];
+        };
+      }
+    );
+}
