@@ -67,6 +67,7 @@ jobs:
             target
             crates/harmony-boot/target
             crates/harmony-boot-aarch64/target
+            crates/harmony-test-elf/target
             xtask/target
           key: ${{ runner.os }}-cargo-qemu-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
@@ -74,4 +75,13 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Boot x86_64 + aarch64 in QEMU
-        run: nix develop --command cargo xtask qemu-test
+        run: |
+          mkdir -p qemu-logs
+          nix develop --command cargo xtask qemu-test 2>&1 | tee qemu-logs/qemu-test.log
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qemu-serial-logs
+          path: qemu-logs/
+          if-no-files-found: ignore

@@ -130,12 +130,28 @@ fn build_x86_64() -> Result<(), String> {
     let image = crate::image_path();
     bootloader::BiosBoot::new(&kernel)
         .create_disk_image(&image)
-        .map_err(|e| format!("disk image creation: {e}"))?;
+        .map_err(|e| format!("disk image creation: {e:?}"))?;
 
     Ok(())
 }
 
 fn build_aarch64() -> Result<(), String> {
+    // Pre-build the test ELF — harmony-boot-aarch64 embeds it via include_bytes!
+    let test_elf_dir = project_root().join("crates/harmony-test-elf");
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "--target",
+            "aarch64-unknown-linux-musl",
+            "--release",
+        ])
+        .current_dir(&test_elf_dir)
+        .status()
+        .map_err(|e| format!("cargo build (test-elf): {e}"))?;
+    if !status.success() {
+        return Err("aarch64 test-elf build failed".into());
+    }
+
     let boot_dir = project_root().join("crates/harmony-boot-aarch64");
 
     // Build kernel (default features include qemu-virt).
