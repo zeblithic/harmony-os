@@ -2,6 +2,10 @@
 # Run: cargo deny check
 
 [advisories]
+vulnerability = "deny"
+unmaintained = "warn"
+unsound = "deny"
+notice = "warn"
 ignore = [
     # paste is unmaintained (RUSTSEC-2024-0436) but has no replacement yet;
     # it's a transitive dep via defmt-macros. Revisit when defmt drops it.
@@ -13,9 +17,11 @@ multiple-versions = "warn"
 wildcards = "warn"
 # keccak 0.2.0 (stable) removed KeccakP1600 which sha3 0.11.0-rc.8
 # requires (transitive dep via ml-dsa/ml-kem in harmony core).
-# Only keccak 0.2.0-rc.2 works. The Cargo.lock pins this, but
-# cargo-deny provides a second safety net against accidental
-# `cargo update` breakage.
+# Only keccak 0.2.0-rc.2 works. This ban catches accidental upgrades
+# in the workspace Cargo.lock. NOTE: workspace-excluded boot crates
+# (harmony-boot, harmony-boot-aarch64) have their own Cargo.toml pin
+# (keccak = "=0.2.0-rc.2") since cargo-deny doesn't inspect their
+# independent lockfiles.
 deny = [
     { crate = "keccak@=0.2.0", reason = "keccak 0.2.0 removed KeccakP1600; only 0.2.0-rc.2 works with sha3 0.11.0-rc.8" },
 ]
