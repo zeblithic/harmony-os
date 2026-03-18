@@ -24,6 +24,12 @@ harmony-os = { path = "../harmony-os", default-features = false }
 
 sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 
+# Pin keccak pre-release: sha3 0.11.0-rc.8 needs KeccakP1600 + p1600 which
+# were removed in keccak 0.2.0 (stable). Cargo won't select an rc unless
+# explicitly pinned. This crate is excluded from the workspace so the root
+# Cargo.lock pin doesn't apply here.
+keccak = "=0.2.0-rc.2"
+
 # Force pure Rust BLAKE3 — cross-compiling for aarch64-unknown-uefi has no
 # system libc headers, so the C NEON backend fails to build.
 blake3 = { version = "1", default-features = false, features = ["no_neon"] }
