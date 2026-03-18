@@ -575,8 +575,8 @@ mod tests {
         assert_eq!(n.access_log_len(), 5);
         let log = n.access_log();
         assert_eq!(log[0].prev_hash, [0; 32]);
-        for i in 1..5 {
-            assert_ne!(log[i].prev_hash, [0; 32]);
+        for entry in &log[1..5] {
+            assert_ne!(entry.prev_hash, [0; 32]);
         }
     }
 }

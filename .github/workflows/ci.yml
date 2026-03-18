@@ -41,8 +41,8 @@ jobs:
       - name: Tests
         run: nix develop --command cargo test --workspace
 
-      - name: cargo-deny (ban keccak 0.2.0)
-        run: nix develop --command cargo deny check bans
+      - name: cargo-deny
+        run: nix develop --command cargo deny check
 
   qemu-smoke:
     name: QEMU Boot Tests
