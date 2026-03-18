@@ -121,7 +121,7 @@ Expected: Prints a version like `nix (Nix) 2.x.x`.
 
 - [ ] **Step 2: Generate `flake.lock`**
 
-Run: `cd /Users/zeblith/work/zeblithic/harmony-os && nix flake lock`
+Run: `cd <repo-root> && nix flake lock`
 
 Expected: `flake.lock` is created with pinned versions of nixpkgs, fenix, and flake-utils.
 
@@ -222,7 +222,7 @@ Expected: The dev shell activates automatically. If direnv is not installed, thi
 
 Run:
 ```bash
-cd /tmp && cd /Users/zeblith/work/zeblithic/harmony-os
+cd /tmp && cd <repo-root>
 ```
 
 Expected: direnv loads the flake shell automatically (shows `direnv: loading .envrc` and `direnv: export +PKG_CONFIG_PATH ...`).

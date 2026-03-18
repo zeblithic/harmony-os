@@ -41,7 +41,7 @@ A `flake.nix` that provides a single `nix develop` entry point. One command give
 
 ### Rust Toolchain (via fenix)
 
-Stable channel (currently 1.92), constructed via `fenix.packages.${system}.stable.withComponents` to explicitly include:
+Stable channel (pinned via `flake.lock`), constructed via `fenix.packages.${system}.stable.withComponents` to explicitly include:
 - `cargo`, `rustc`, `clippy`, `rustfmt`
 - `rust-analyzer` (must be explicitly listed — not in the default profile)
 - `rust-src` (required for `build-std` on bare-metal/no_std targets: `aarch64-unknown-uefi`, `x86_64-unknown-none`)

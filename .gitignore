@@ -8,7 +8,7 @@ Cargo.lock
 
 # Dolt database files (added by bd init)
 .dolt/
-*.db
+.beads/*.db
 
 # Direnv cache
 .direnv/
