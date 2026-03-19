@@ -36,7 +36,7 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 use mmu::MemoryRegion;
 
 #[cfg(target_os = "uefi")]
-use harmony_identity::{PqPrivateIdentity, PrivateIdentity};
+use harmony_identity::PrivateIdentity;
 #[cfg(target_os = "uefi")]
 use harmony_microkernel::vm::PAGE_SIZE;
 #[cfg(target_os = "uefi")]
@@ -237,30 +237,34 @@ fn main() -> Status {
         heap_size, heap_base
     );
 
-    // ── Generate identities — PQC primary, Ed25519 for Reticulum compat ──
+    // ── Generate Ed25519 identity for Reticulum wire compat ──
+    //    PQ identity is generated lazily by the runtime — PQ keygen's
+    //    lattice operations overflow the UEFI-provided stack.
     let mut entropy = KernelEntropy::new(|buf: &mut [u8]| {
         unsafe { rndr::fill(buf) };
     });
 
-    let pq_identity = PqPrivateIdentity::generate(&mut entropy);
-    let pq_addr = pq_identity.public_identity().address_hash;
-    let _ = writeln!(
-        serial,
-        "[Identity] PQC address (ML-DSA-65/ML-KEM-768): {:02x}{:02x}{:02x}{:02x}...",
-        pq_addr[0], pq_addr[1], pq_addr[2], pq_addr[3],
-    );
-
     let identity = PrivateIdentity::generate(&mut entropy);
-    let compat_addr = identity.public_identity().address_hash;
+    let addr = identity.public_identity().address_hash;
     let _ = writeln!(
         serial,
-        "[Compat] Ed25519 address (Reticulum wire compat): {:02x}{:02x}{:02x}{:02x}...",
-        compat_addr[0], compat_addr[1], compat_addr[2], compat_addr[3],
+        "[Identity] Ed25519 address: {:02x}{:02x}{:02x}{:02x}...",
+        addr[0], addr[1], addr[2], addr[3],
     );
 
     // ── Create runtime and enter idle loop ──
     let persistence = MemoryState::new();
-    let mut runtime = UnikernelRuntime::new_with_pq(identity, pq_identity, entropy, persistence);
+    let mut runtime = UnikernelRuntime::new(identity, entropy, persistence);
+
+    // Generate PQ identity now that the heap is available.
+    if let Some(pq_addr) = runtime.generate_pq_identity() {
+        let _ = writeln!(
+            serial,
+            "[Identity] PQ address (ML-DSA-65/ML-KEM-768): {:02x}{:02x}{:02x}{:02x}...",
+            pq_addr[0], pq_addr[1], pq_addr[2], pq_addr[3],
+        );
+    }
+
     let _ = writeln!(
         serial,
         "[Runtime] UnikernelRuntime created, entering idle loop"

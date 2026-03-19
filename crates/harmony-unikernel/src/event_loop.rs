@@ -216,9 +216,26 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
     }
 
     /// The post-quantum ML-DSA/ML-KEM identity (primary node identity).
-    /// Returns `None` on legacy configurations that haven't migrated.
+    /// Returns `None` if not yet generated or on legacy configurations.
     pub fn pq_identity(&self) -> Option<&PqPrivateIdentity> {
         self.pq_identity.as_ref()
+    }
+
+    /// Generate and store a PQ identity using the runtime's entropy source.
+    ///
+    /// Call this after the heap is fully initialized. PQ keygen (ML-KEM-768 +
+    /// ML-DSA-65) uses large intermediate lattice structures that overflow the
+    /// small initial stack provided by bare-metal bootloaders.
+    ///
+    /// Returns the PQ identity's address hash, or `None` if already generated.
+    pub fn generate_pq_identity(&mut self) -> Option<[u8; 16]> {
+        if self.pq_identity.is_some() {
+            return None;
+        }
+        let pq = PqPrivateIdentity::generate(&mut self.entropy);
+        let addr = pq.public_identity().address_hash;
+        self.pq_identity = Some(pq);
+        Some(addr)
     }
 
     pub fn entropy(&mut self) -> &mut E {
@@ -467,39 +484,51 @@ mod tests {
     }
 
     #[test]
-    fn pq_identity_present_after_new_with_pq() {
-        let mut entropy = test_entropy();
-        let identity = PrivateIdentity::generate(&mut entropy);
-        let pq_identity = PqPrivateIdentity::generate(&mut entropy);
-        let expected_addr = pq_identity.public_identity().address_hash;
-        let persistence = MemoryState::new();
-        let runtime = UnikernelRuntime::new_with_pq(identity, pq_identity, entropy, persistence);
-        let pq = runtime
-            .pq_identity()
-            .expect("should be Some after new_with_pq");
-        assert_eq!(pq.public_identity().address_hash, expected_addr);
-        assert_ne!(pq.public_identity().address_hash, [0u8; 16]);
+    fn generate_pq_identity_produces_valid_address() {
+        let mut runtime = make_runtime();
+        assert!(runtime.pq_identity().is_none());
+        let addr = runtime
+            .generate_pq_identity()
+            .expect("should return Some on first call");
+        assert_ne!(addr, [0u8; 16]);
+        assert!(runtime.pq_identity().is_some());
+        assert_eq!(
+            runtime
+                .pq_identity()
+                .unwrap()
+                .public_identity()
+                .address_hash,
+            addr
+        );
     }
 
     #[test]
-    fn pq_identity_absent_on_legacy_new() {
+    fn generate_pq_identity_idempotent() {
+        let mut runtime = make_runtime();
+        let addr = runtime.generate_pq_identity().unwrap();
+        // Second call returns None (already generated)
+        assert!(runtime.generate_pq_identity().is_none());
+        // Identity unchanged
+        assert_eq!(
+            runtime
+                .pq_identity()
+                .unwrap()
+                .public_identity()
+                .address_hash,
+            addr
+        );
+    }
+
+    #[test]
+    fn pq_identity_absent_before_generate() {
         let runtime = make_runtime();
         assert!(runtime.pq_identity().is_none());
     }
 
     #[test]
-    fn new_with_pq_classical_identity_still_accessible() {
-        let mut entropy = test_entropy();
-        let identity = PrivateIdentity::generate(&mut entropy);
-        let classical_addr = identity.public_identity().address_hash;
-        let pq_identity = PqPrivateIdentity::generate(&mut entropy);
-        let persistence = MemoryState::new();
-        let runtime = UnikernelRuntime::new_with_pq(identity, pq_identity, entropy, persistence);
-        assert_eq!(
-            runtime.identity().public_identity().address_hash,
-            classical_addr
-        );
-        // PQ and classical addresses must differ (different key material)
+    fn pq_and_classical_addresses_differ() {
+        let mut runtime = make_runtime();
+        runtime.generate_pq_identity();
         assert_ne!(
             runtime.identity().public_identity().address_hash,
             runtime
