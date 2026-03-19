@@ -444,7 +444,9 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     let mut runtime = UnikernelRuntime::new(identity, entropy, persistence);
 
     // Generate PQ identity — the 512KB heap stack provides sufficient
-    // headroom for ML-KEM/ML-DSA lattice operations (~25KB peak).
+    // headroom for ML-KEM/ML-DSA lattice operations.
+    let heap_free = ALLOCATOR.lock().free();
+    let _ = writeln!(serial, "[PQ] heap free: {} bytes, generating PQ identity...", heap_free);
     if let Some(pq_addr) = runtime.generate_pq_identity() {
         hex_encode(&pq_addr, &mut hex_buf);
         let hex_str =
