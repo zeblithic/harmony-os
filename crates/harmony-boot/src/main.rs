@@ -56,8 +56,10 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 // ---------------------------------------------------------------------------
 
 /// Size of the heap-allocated kernel stack in bytes.
-/// 128KB provides ~5x headroom for PQ lattice operations (ML-KEM + ML-DSA ~25KB).
-const KERNEL_STACK_SIZE: usize = 128 * 1024;
+/// ML-KEM-768 + ML-DSA-65 key generation uses large NTT polynomial matrices
+/// that require substantial stack space (measured >128KB on x86_64 release).
+/// 512KB provides comfortable headroom from the 4MB heap.
+const KERNEL_STACK_SIZE: usize = 512 * 1024;
 
 /// Canary value written at the stack base to detect overflow.
 const STACK_CANARY: u64 = 0xDEAD_BEEF_CAFE_BABE;
@@ -319,7 +321,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
-    // 4. Allocate 128KB stack from heap and switch to it.
+    // 4. Allocate 512KB stack from heap and switch to it.
     //    No MMU guard page yet — a canary word at the stack base detects
     //    overflow in debug builds (checked in the event loop).
     let stack_vec = alloc::vec![0u8; KERNEL_STACK_SIZE];
@@ -346,7 +348,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 // Post-stack-switch continuation
 // ---------------------------------------------------------------------------
 
-/// Continuation after switching to the 128KB heap stack.
+/// Continuation after switching to the 512KB heap stack.
 ///
 /// # Safety
 /// `state` must be a valid pointer produced by `Box::into_raw(Box::new(BootState { .. }))`.
@@ -362,7 +364,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     let stack_canary_addr = state.stack_canary_addr;
 
     let mut serial = serial_writer();
-    serial.log("STACK", "switched to 128KB heap stack");
+    serial.log("STACK", "switched to 512KB heap stack");
 
     // 1. RDRAND entropy
     if !rdrand_available() {
@@ -441,7 +443,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     let persistence = MemoryState::new();
     let mut runtime = UnikernelRuntime::new(identity, entropy, persistence);
 
-    // Generate PQ identity — the 128KB heap stack provides sufficient
+    // Generate PQ identity — the 512KB heap stack provides sufficient
     // headroom for ML-KEM/ML-DSA lattice operations (~25KB peak).
     if let Some(pq_addr) = runtime.generate_pq_identity() {
         hex_encode(&pq_addr, &mut hex_buf);
