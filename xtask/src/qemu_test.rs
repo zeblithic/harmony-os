@@ -20,7 +20,7 @@ fn x86_64_milestones() -> Vec<Milestone> {
         },
         Milestone {
             pattern: "[IDENTITY]",
-            description: "identity generated",
+            description: "PQ identity generated",
         },
         Milestone {
             pattern: "[READY] entering event loop",
@@ -41,7 +41,7 @@ fn aarch64_milestones() -> Vec<Milestone> {
         },
         Milestone {
             pattern: "[Identity]",
-            description: "identity generated",
+            description: "PQ identity generated",
         },
         Milestone {
             pattern: "[Runtime] Entering idle loop",

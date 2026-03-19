@@ -55,7 +55,9 @@ pub struct UnikernelRuntime<E: EntropySource, P: PersistentState> {
     node: Node,
     /// Classical Ed25519/X25519 identity — used for Reticulum wire compatibility.
     identity: PrivateIdentity,
-    /// Post-quantum ML-DSA/ML-KEM identity — the node's primary identity.
+    /// Post-quantum ML-DSA/ML-KEM identity — intended as the node's primary identity.
+    /// Currently stored for future use; runtime operations (announces, heartbeats)
+    /// still use the classical `identity` for Reticulum wire compatibility.
     /// `None` only for legacy/test configurations that haven't migrated yet.
     pq_identity: Option<PqPrivateIdentity>,
     entropy: E,
@@ -462,6 +464,50 @@ mod tests {
     fn runtime_initializes() {
         let runtime = make_runtime();
         assert_eq!(runtime.tick_count(), 0);
+    }
+
+    #[test]
+    fn pq_identity_present_after_new_with_pq() {
+        let mut entropy = test_entropy();
+        let identity = PrivateIdentity::generate(&mut entropy);
+        let pq_identity = PqPrivateIdentity::generate(&mut entropy);
+        let expected_addr = pq_identity.public_identity().address_hash;
+        let persistence = MemoryState::new();
+        let runtime = UnikernelRuntime::new_with_pq(identity, pq_identity, entropy, persistence);
+        let pq = runtime
+            .pq_identity()
+            .expect("should be Some after new_with_pq");
+        assert_eq!(pq.public_identity().address_hash, expected_addr);
+        assert_ne!(pq.public_identity().address_hash, [0u8; 16]);
+    }
+
+    #[test]
+    fn pq_identity_absent_on_legacy_new() {
+        let runtime = make_runtime();
+        assert!(runtime.pq_identity().is_none());
+    }
+
+    #[test]
+    fn new_with_pq_classical_identity_still_accessible() {
+        let mut entropy = test_entropy();
+        let identity = PrivateIdentity::generate(&mut entropy);
+        let classical_addr = identity.public_identity().address_hash;
+        let pq_identity = PqPrivateIdentity::generate(&mut entropy);
+        let persistence = MemoryState::new();
+        let runtime = UnikernelRuntime::new_with_pq(identity, pq_identity, entropy, persistence);
+        assert_eq!(
+            runtime.identity().public_identity().address_hash,
+            classical_addr
+        );
+        // PQ and classical addresses must differ (different key material)
+        assert_ne!(
+            runtime.identity().public_identity().address_hash,
+            runtime
+                .pq_identity()
+                .unwrap()
+                .public_identity()
+                .address_hash,
+        );
     }
 
     #[test]
