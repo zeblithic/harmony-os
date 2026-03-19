@@ -572,6 +572,7 @@ dependencies = [
  "harmony-identity",
  "harmony-platform",
  "harmony-unikernel",
+ "rand_core 0.6.4",
 ]
 
 [[package]]

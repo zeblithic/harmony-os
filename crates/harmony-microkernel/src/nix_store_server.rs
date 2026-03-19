@@ -806,7 +806,7 @@ mod tests {
         use crate::vm::manager::AddressSpaceManager;
         use crate::vm::mock::MockPageTable;
         use crate::vm::PhysAddr;
-        use harmony_identity::PrivateIdentity;
+        use harmony_identity::PqPrivateIdentity;
         use harmony_unikernel::KernelEntropy;
 
         fn make_test_entropy() -> KernelEntropy<impl FnMut(&mut [u8])> {
@@ -828,7 +828,7 @@ mod tests {
         /// and a client process that can access it.
         fn setup_kernel_with_nix_store() -> (Kernel<MockPageTable>, u32, u32) {
             let mut entropy = make_test_entropy();
-            let kernel_id = PrivateIdentity::generate(&mut entropy);
+            let kernel_id = PqPrivateIdentity::generate(&mut entropy);
             let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
             // Build and populate the nix store server.

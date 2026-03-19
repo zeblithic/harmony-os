@@ -5,11 +5,11 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use harmony_identity::{
-    verify_token, CapabilityType, MemoryIdentityStore, MemoryProofStore, MemoryRevocationSet,
-    PrivateIdentity, UcanToken,
-};
+use harmony_identity::{CapabilityType, MemoryRevocationSet, PqPrivateIdentity, PqUcanToken};
 use harmony_platform::EntropySource;
+use rand_core::CryptoRngCore;
+
+use crate::pq_capability::{verify_pq_token, PqMemoryIdentityStore, PqMemoryProofStore};
 
 use crate::integrity::lyll::{HashEntry, Lyll, LyllConfig};
 use crate::integrity::nakaiah::{CapChain, Nakaiah};
@@ -38,7 +38,7 @@ pub struct Process {
     pub pid: u32,
     pub name: Arc<str>,
     pub(crate) namespace: Namespace,
-    pub(crate) capabilities: Vec<UcanToken>,
+    pub(crate) capabilities: Vec<PqUcanToken>,
     /// Milestone A: PID-derived placeholder. Production builds will use
     /// a cryptographic address (e.g. SHA-256 of the process's public key).
     pub(crate) address_hash: [u8; 16],
@@ -49,9 +49,9 @@ pub struct Process {
 pub struct Kernel<P: PageTable> {
     processes: BTreeMap<u32, Process>,
     next_pid: u32,
-    identity: PrivateIdentity,
-    identity_store: MemoryIdentityStore,
-    proof_store: MemoryProofStore,
+    identity: PqPrivateIdentity,
+    identity_store: PqMemoryIdentityStore,
+    proof_store: PqMemoryProofStore,
     revocations: MemoryRevocationSet,
     /// Maps (client_pid, client_fid) -> (target_pid, server_fid).
     /// The kernel translates client fids to server-local fids to prevent
@@ -70,15 +70,15 @@ pub struct Kernel<P: PageTable> {
 
 impl<P: PageTable> Kernel<P> {
     /// Create a new microkernel with the given identity and VM manager.
-    pub fn new(identity: PrivateIdentity, vm: AddressSpaceManager<P>) -> Self {
-        let mut identity_store = MemoryIdentityStore::new();
+    pub fn new(identity: PqPrivateIdentity, vm: AddressSpaceManager<P>) -> Self {
+        let mut identity_store = PqMemoryIdentityStore::new();
         identity_store.insert(identity.public_identity().clone());
         let mut kernel = Kernel {
             processes: BTreeMap::new(),
             next_pid: 0,
             identity,
             identity_store,
-            proof_store: MemoryProofStore::new(),
+            proof_store: PqMemoryProofStore::new(),
             revocations: MemoryRevocationSet::new(),
             fid_owners: BTreeMap::new(),
             next_server_fid: 1,
@@ -234,7 +234,7 @@ impl<P: PageTable> Kernel<P> {
     /// the target process's FileServer via IPC.
     pub fn grant_endpoint_cap(
         &mut self,
-        entropy: &mut impl EntropySource,
+        entropy: &mut (impl EntropySource + CryptoRngCore),
         process_pid: u32,
         target_pid: u32,
         now: u64,
@@ -248,7 +248,7 @@ impl<P: PageTable> Kernel<P> {
         let resource = alloc::format!("pid:{}", target_pid);
         let cap = self
             .identity
-            .issue_root_token(
+            .issue_pq_root_token(
                 entropy,
                 &audience,
                 CapabilityType::Endpoint,
@@ -269,7 +269,7 @@ impl<P: PageTable> Kernel<P> {
     /// Check whether `capabilities` contain a valid EndpointCap for `target_pid`.
     pub(crate) fn check_endpoint_cap(
         &self,
-        capabilities: &[UcanToken],
+        capabilities: &[PqUcanToken],
         audience_hash: &[u8; 16],
         target_pid: u32,
         now: u64,
@@ -294,7 +294,7 @@ impl<P: PageTable> Kernel<P> {
                 continue;
             }
             // Cryptographic verification
-            if verify_token(
+            if verify_pq_token(
                 cap,
                 now,
                 &self.proof_store,
@@ -734,7 +734,7 @@ mod tests {
     #[test]
     fn spawn_process_assigns_pid() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         let pid = kernel
@@ -751,12 +751,12 @@ mod tests {
     #[test]
     fn capability_check_with_valid_cap() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
 
         // Issue the token before moving identity into the kernel.
         let process_addr = [0x01u8; 16];
         let cap = kernel_id
-            .issue_root_token(
+            .issue_pq_root_token(
                 &mut entropy,
                 &process_addr,
                 CapabilityType::Endpoint,
@@ -776,7 +776,7 @@ mod tests {
     #[test]
     fn capability_check_no_cap() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         let kernel = Kernel::new(kernel_id, make_test_vm());
 
         let process_addr = [0x01u8; 16];
@@ -789,12 +789,12 @@ mod tests {
     #[test]
     fn capability_check_wrong_pid() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
 
         // Issue the token before moving identity into the kernel.
         let process_addr = [0x01u8; 16];
         let cap = kernel_id
-            .issue_root_token(
+            .issue_pq_root_token(
                 &mut entropy,
                 &process_addr,
                 CapabilityType::Endpoint,
@@ -816,12 +816,12 @@ mod tests {
     #[test]
     fn capability_check_wildcard() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
 
         // Issue the token before moving identity into the kernel.
         let process_addr = [0x01u8; 16];
         let cap = kernel_id
-            .issue_root_token(
+            .issue_pq_root_token(
                 &mut entropy,
                 &process_addr,
                 CapabilityType::Endpoint,
@@ -846,7 +846,7 @@ mod tests {
 
     fn setup_kernel_with_echo() -> (Kernel<MockPageTable>, u32, u32) {
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         // pid 0 = echo server
@@ -910,7 +910,7 @@ mod tests {
     #[test]
     fn ipc_denied_without_capability() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         let server_pid = kernel
@@ -965,7 +965,7 @@ mod tests {
     #[test]
     fn ipc_multi_client_fid_isolation() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         // Shared echo server
@@ -1052,7 +1052,7 @@ mod tests {
     #[test]
     fn grant_cap_nonexistent_target_rejected() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         let pid = kernel
@@ -1068,12 +1068,12 @@ mod tests {
     #[test]
     fn capability_check_expired_token_rejected() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
 
         let process_addr = [0x01u8; 16];
         // Token that expires at time 100
         let cap = kernel_id
-            .issue_root_token(
+            .issue_pq_root_token(
                 &mut entropy,
                 &process_addr,
                 CapabilityType::Endpoint,
@@ -1109,7 +1109,7 @@ mod tests {
     #[test]
     fn integration_two_processes_full_ipc() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         // Spawn echo server as pid 0
@@ -1183,7 +1183,7 @@ mod tests {
         use crate::content_server::ContentServer;
 
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         // Spawn content server
@@ -1246,7 +1246,7 @@ mod tests {
         use crate::vm::{FrameClassification, PAGE_SIZE};
 
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         let budget = MemoryBudget::new(PAGE_SIZE as usize * 16, FrameClassification::all());
@@ -1268,7 +1268,7 @@ mod tests {
     #[test]
     fn spawn_without_vm_config_no_address_space() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         let pid = kernel
@@ -1282,7 +1282,7 @@ mod tests {
     #[test]
     fn destroy_process_removes_from_table() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         let pid = kernel
@@ -1303,7 +1303,7 @@ mod tests {
         use crate::vm::{FrameClassification, PAGE_SIZE};
 
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         let budget = MemoryBudget::new(PAGE_SIZE as usize * 16, FrameClassification::all());
@@ -1344,7 +1344,7 @@ mod tests {
     #[test]
     fn destroy_nonexistent_process_fails() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         assert_eq!(kernel.destroy_process(99), Err(IpcError::NotFound));
@@ -1353,7 +1353,7 @@ mod tests {
     #[test]
     fn destroy_process_without_vm_succeeds() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         let pid = kernel
@@ -1369,7 +1369,7 @@ mod tests {
         use crate::vm::{FrameClassification, PAGE_SIZE};
 
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         let budget = MemoryBudget::new(PAGE_SIZE as usize * 16, FrameClassification::all());
@@ -1413,7 +1413,7 @@ mod tests {
         use crate::vm::{FrameClassification, PAGE_SIZE};
 
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         let budget = MemoryBudget::new(PAGE_SIZE as usize * 16, FrameClassification::all());
@@ -1554,7 +1554,7 @@ mod tests {
         use crate::vm::{FrameClassification, PAGE_SIZE};
 
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         let budget = MemoryBudget::new(PAGE_SIZE as usize * 16, FrameClassification::all());
@@ -1634,7 +1634,7 @@ mod tests {
         use crate::vm::{FrameClassification, PAGE_SIZE};
 
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         let initial_free = kernel.vm.buddy().free_frame_count();
@@ -1762,7 +1762,7 @@ mod tests {
 
     fn make_kernel() -> Kernel<MockPageTable> {
         let mut entropy = make_test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         Kernel::new(kernel_id, make_test_vm())
     }
 
