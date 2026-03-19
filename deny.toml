@@ -13,7 +13,7 @@ ignore = [
 
 [bans]
 multiple-versions = "warn"
-wildcards = "warn"
+wildcards = "deny"
 # keccak 0.2.0 (stable) removed KeccakP1600 which sha3 0.11.0-rc.8
 # requires (transitive dep via ml-dsa/ml-kem in harmony core).
 # Only keccak 0.2.0-rc.2 works. This ban catches accidental upgrades
