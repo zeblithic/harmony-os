@@ -287,8 +287,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         .into_option()
         .expect("physical_memory_offset not provided by bootloader");
 
-    // 3. Heap init — find first usable region >= 1 MiB
-    const MIN_HEAP_SIZE: usize = 1024 * 1024; // 1 MiB
+    // 3. Heap init — find first usable region >= 4 MiB
+    //    (2MB kernel stack + 2MB runtime allocations)
+    const MIN_HEAP_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
     let mut heap_start: Option<u64> = None;
     let mut heap_size: usize = 0;
 
@@ -316,14 +317,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(serial, "[HEAP] {}", heap_size);
         }
         None => {
-            serial.log("HEAP", "FAILED: no usable region >= 1 MiB");
+            serial.log("HEAP", "FAILED: no usable region >= 4 MiB");
             loop {
                 x86_64::instructions::hlt();
             }
         }
     }
 
-    // 4. Allocate 512KB stack from heap and switch to it.
+    // 4. Allocate kernel stack from heap and switch to it.
     //    No MMU guard page yet — a canary word at the stack base detects
     //    overflow in debug builds (checked in the event loop).
     let stack_vec = alloc::vec![0u8; KERNEL_STACK_SIZE];
@@ -350,7 +351,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 // Post-stack-switch continuation
 // ---------------------------------------------------------------------------
 
-/// Continuation after switching to the 512KB heap stack.
+/// Continuation after switching to the heap-allocated kernel stack.
 ///
 /// # Safety
 /// `state` must be a valid pointer produced by `Box::into_raw(Box::new(BootState { .. }))`.
@@ -366,7 +367,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     let stack_canary_addr = state.stack_canary_addr;
 
     let mut serial = serial_writer();
-    serial.log("STACK", "switched to 512KB heap stack");
+    let _ = writeln!(serial, "[STACK] switched to {}KB heap stack", KERNEL_STACK_SIZE / 1024);
 
     // 1. RDRAND entropy
     if !rdrand_available() {
