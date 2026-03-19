@@ -443,16 +443,19 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     let persistence = MemoryState::new();
     let mut runtime = UnikernelRuntime::new(identity, entropy, persistence);
 
-    // Generate PQ identity — the 512KB heap stack provides sufficient
-    // headroom for ML-KEM/ML-DSA lattice operations.
-    let heap_free = ALLOCATOR.lock().free();
-    let _ = writeln!(serial, "[PQ] heap free: {} bytes, generating PQ identity...", heap_free);
-    if let Some(pq_addr) = runtime.generate_pq_identity() {
-        hex_encode(&pq_addr, &mut hex_buf);
-        let hex_str =
-            core::str::from_utf8(&hex_buf).unwrap_or("????????????????????????????????");
-        serial.log("PQ_IDENTITY", hex_str);
-    }
+
+    // PQ keygen crashes on x86_64-unknown-none (triple fault inside
+    // ml-kem/ml-dsa lattice ops — suspected keccak/sha3 codegen issue
+    // with soft-float target). aarch64 PQ keygen works fine.
+    // TODO(harmony-os-0vp): investigate x86_64 PQ keygen crash.
+    //
+    // When this is fixed, uncomment:
+    // if let Some(pq_addr) = runtime.generate_pq_identity() {
+    //     hex_encode(&pq_addr, &mut hex_buf);
+    //     let hex_str =
+    //         core::str::from_utf8(&hex_buf).unwrap_or("????????????????????????????????");
+    //     serial.log("PQ_IDENTITY", hex_str);
+    // }
 
     if virtio_net.is_some() {
         runtime.register_interface("eth0");
