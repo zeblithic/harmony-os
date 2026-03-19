@@ -446,6 +446,21 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     let persistence = MemoryState::new();
     let mut runtime = UnikernelRuntime::new(identity, entropy, persistence);
 
+    // Generate key hierarchy identities.
+    // TODO: load hardware key from persistent storage instead of generating fresh.
+    // TODO: verify attestation pair (owner claim + hardware acceptance).
+    use harmony_identity::PqPrivateIdentity;
+    let hw_identity = PqPrivateIdentity::generate(&mut KernelEntropy::new(rdrand_fill));
+    let hw_addr = hw_identity.public_identity().address_hash;
+    hex_encode(&hw_addr, &mut hex_buf);
+    let hex_str = core::str::from_utf8(&hex_buf).unwrap_or("????????????????????????????????");
+    serial.log("HW_IDENTITY", hex_str);
+
+    let session_identity = PqPrivateIdentity::generate(&mut KernelEntropy::new(rdrand_fill));
+    let session_addr = session_identity.public_identity().address_hash;
+    hex_encode(&session_addr, &mut hex_buf);
+    let hex_str = core::str::from_utf8(&hex_buf).unwrap_or("????????????????????????????????");
+    serial.log("SESSION", hex_str);
 
     if let Some(pq_addr) = runtime.generate_pq_identity() {
         hex_encode(&pq_addr, &mut hex_buf);
