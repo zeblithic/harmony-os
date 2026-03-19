@@ -1,0 +1,56 @@
+# cargo-deny configuration for harmony-os
+# Run: cargo deny check
+
+[advisories]
+# Severity defaults (deny vulnerabilities, warn on unmaintained) are correct
+# for our policy. Per-type overrides require cargo-deny >=0.17; the Nix flake
+# pins an older version, so we rely on defaults and ignore specific advisories.
+ignore = [
+    # paste is unmaintained (RUSTSEC-2024-0436) but has no replacement yet;
+    # it's a transitive dep via defmt-macros. Revisit when defmt drops it.
+    "RUSTSEC-2024-0436",
+]
+
+[bans]
+multiple-versions = "warn"
+# "warn" not "deny": workspace path deps are wildcard by nature and these
+# crates are not published to crates.io. cargo-deny's allow-wildcard-paths
+# only exempts crates with publish=false, which we haven't set everywhere.
+wildcards = "warn"
+# keccak 0.2.0 (stable) removed KeccakP1600 which sha3 0.11.0-rc.8
+# requires (transitive dep via ml-dsa/ml-kem in harmony core).
+# Only keccak 0.2.0-rc.2 works. This ban catches accidental upgrades
+# in the workspace Cargo.lock. NOTE: workspace-excluded boot crates
+# (harmony-boot, harmony-boot-aarch64) have their own Cargo.toml pin
+# (keccak = "=0.2.0-rc.2") since cargo-deny doesn't inspect their
+# independent lockfiles.
+deny = [
+    { crate = "keccak@=0.2.0", reason = "keccak 0.2.0 removed KeccakP1600; only 0.2.0-rc.2 works with sha3 0.11.0-rc.8" },
+]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    # This repo is GPL-2.0-or-later (Linux ecosystem compat). All workspace
+    # crates use this license, so blanket-allowing is correct — GPL transitive
+    # deps are compatible. Core (harmony) stays MIT/Apache-2.0 in a separate repo.
+    "GPL-2.0-or-later",
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "0BSD",
+    "CDLA-Permissive-2.0",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+[sources.allow-org]
+github = ["zeblithic"]

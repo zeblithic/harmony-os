@@ -686,7 +686,7 @@ mod tests {
         server.walk(0, 1, "blobs").unwrap();
         // 62 ASCII chars + 'é' (2-byte UTF-8) = 64 bytes but not valid ASCII hex.
         // Must not panic — should return NotFound.
-        let mut bad = alloc::string::String::from("aa".repeat(31));
+        let mut bad = "aa".repeat(31);
         bad.push('é'); // 2 bytes in UTF-8
         assert_eq!(bad.len(), 64);
         assert_eq!(server.walk(1, 2, &bad), Err(IpcError::NotFound));

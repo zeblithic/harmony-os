@@ -40,6 +40,7 @@ pub struct QemuConfig {
     pub timeout: Duration,
     /// Called when a milestone is matched (for real-time progress display).
     /// Arguments: milestone index, milestone reference.
+    #[allow(clippy::type_complexity)]
     pub on_milestone: Option<Box<dyn Fn(usize, &Milestone)>>,
 }
 

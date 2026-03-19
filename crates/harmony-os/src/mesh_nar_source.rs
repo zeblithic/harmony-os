@@ -139,18 +139,17 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
         }
 
         match cid.cid_type() {
-            CidType::Blob => {
+            CidType::Blob if !store.contains(cid) => {
                 // Leaf node — fetch if not already present.
-                if !store.contains(cid) {
-                    let cid_hex = hex::encode(cid.to_bytes());
-                    let key = content::fetch_key(&cid_hex);
-                    let data = self
-                        .querier
-                        .query(&key)?
-                        .ok_or_else(|| format!("mesh missing blob {cid_hex}"))?;
-                    store.store(*cid, data);
-                }
+                let cid_hex = hex::encode(cid.to_bytes());
+                let key = content::fetch_key(&cid_hex);
+                let data = self
+                    .querier
+                    .query(&key)?
+                    .ok_or_else(|| format!("mesh missing blob {cid_hex}"))?;
+                store.store(*cid, data);
             }
+            CidType::Blob => { /* already in store */ }
             CidType::Bundle(_) => {
                 // Interior node — parse children, fetch each, then recurse.
                 let bundle_data = store

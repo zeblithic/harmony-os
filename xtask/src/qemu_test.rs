@@ -2,7 +2,7 @@ use crate::project_root;
 use crate::qemu_runner::{run_qemu_test, Milestone, QemuConfig, QemuResult};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -112,6 +112,7 @@ fn build_x86_64() -> Result<(), String> {
     let status = Command::new("cargo")
         .args([
             "build",
+            "--locked",
             "--target",
             "x86_64-unknown-none",
             "--release",
@@ -128,19 +129,40 @@ fn build_x86_64() -> Result<(), String> {
     // Create BIOS disk image.
     let kernel = boot_dir.join("target/x86_64-unknown-none/release/harmony-boot");
     let image = crate::image_path();
+    if let Some(parent) = image.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create target dir: {e}"))?;
+    }
     bootloader::BiosBoot::new(&kernel)
         .create_disk_image(&image)
-        .map_err(|e| format!("disk image creation: {e}"))?;
+        .map_err(|e| format!("disk image creation: {e:?}"))?;
 
     Ok(())
 }
 
 fn build_aarch64() -> Result<(), String> {
+    // Pre-build the test ELF — harmony-boot-aarch64 embeds it via include_bytes!
+    // No --locked: test-elf has zero deps and no fragile pre-release pins,
+    // so its lockfile is not committed (unlike the boot crates).
+    let test_elf_dir = project_root().join("crates/harmony-test-elf");
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "--target",
+            "aarch64-unknown-linux-musl",
+            "--release",
+        ])
+        .current_dir(&test_elf_dir)
+        .status()
+        .map_err(|e| format!("cargo build (test-elf): {e}"))?;
+    if !status.success() {
+        return Err("aarch64 test-elf build failed".into());
+    }
+
     let boot_dir = project_root().join("crates/harmony-boot-aarch64");
 
     // Build kernel (default features include qemu-virt).
     let status = Command::new("cargo")
-        .args(["build", "--target", "aarch64-unknown-uefi", "--release"])
+        .args(["build", "--locked", "--target", "aarch64-unknown-uefi", "--release"])
         .current_dir(&boot_dir)
         .status()
         .map_err(|e| format!("cargo build: {e}"))?;
@@ -151,6 +173,9 @@ fn build_aarch64() -> Result<(), String> {
     // Create FAT32 ESP image using mtools.
     let efi = aarch64_efi_path();
     let esp = aarch64_esp_path();
+    if let Some(parent) = esp.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create target dir: {e}"))?;
+    }
 
     // Create 4MB FAT image.
     let _ = std::fs::remove_file(&esp);
@@ -226,7 +251,7 @@ fn x86_64_qemu_config(timeout: Duration) -> QemuConfig {
     }
 }
 
-fn aarch64_qemu_config(timeout: Duration, firmware: &PathBuf) -> QemuConfig {
+fn aarch64_qemu_config(timeout: Duration, firmware: &Path) -> QemuConfig {
     let esp = aarch64_esp_path();
     QemuConfig {
         qemu_binary: "qemu-system-aarch64".into(),

@@ -835,10 +835,10 @@ mod tests {
 
         // Wildcard should match any pid
         assert!(kernel
-            .check_endpoint_cap(&[cap.clone()], &process_addr, 1, 0)
+            .check_endpoint_cap(std::slice::from_ref(&cap), &process_addr, 1, 0)
             .is_ok());
         assert!(kernel
-            .check_endpoint_cap(&[cap], &process_addr, 99, 0)
+            .check_endpoint_cap(std::slice::from_ref(&cap), &process_addr, 99, 0)
             .is_ok());
     }
 
@@ -1087,7 +1087,7 @@ mod tests {
 
         // At time 50 — token is valid
         assert!(kernel
-            .check_endpoint_cap(&[cap.clone()], &process_addr, 1, 50)
+            .check_endpoint_cap(std::slice::from_ref(&cap), &process_addr, 1, 50)
             .is_ok());
 
         // At time 200 — token has expired
@@ -1699,14 +1699,11 @@ mod tests {
         assert_eq!(kernel.vm.buddy().free_frame_count(), initial_free - 10);
 
         // Verify classified frames are tracked.
-        assert!(
-            kernel
-                .vm
-                .cap_tracker()
-                .frames_with_classification(FrameClassification::ENCRYPTED)
-                .len()
-                > 0
-        );
+        assert!(!kernel
+            .vm
+            .cap_tracker()
+            .frames_with_classification(FrameClassification::ENCRYPTED)
+            .is_empty());
 
         // Destroy the process.
         kernel.destroy_process(pid).unwrap();

@@ -46,6 +46,7 @@
             # dropped if the stable manifest omits it for this platform.
             fenix.packages.${system}.rust-analyzer
             pkgs.pkg-config
+            pkgs.cargo-deny
             # Host tools (executables that run on the build machine)
             pkgs.qemu
             pkgs.mtools

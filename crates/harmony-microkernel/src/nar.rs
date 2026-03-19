@@ -430,9 +430,7 @@ pub(crate) mod tests {
         buf.extend_from_slice(s);
         // Pad with zeros to 8-byte boundary.
         let padding = padded_len - s.len();
-        for _ in 0..padding {
-            buf.push(0);
-        }
+        buf.resize(buf.len() + padding, 0);
         buf
     }
 

@@ -287,8 +287,7 @@ mod tests {
             .io
             .writes
             .iter()
-            .filter(|(off, _)| *off == 0x14)
-            .last()
+            .rfind(|(off, _)| *off == 0x14)
             .unwrap();
         assert_eq!(val & CTRL_FUNCSEL_MASK, FUNCSEL_ALT0);
     }
@@ -379,8 +378,7 @@ mod tests {
             .pads
             .writes
             .iter()
-            .filter(|(off, _)| *off == 0x2C)
-            .last()
+            .rfind(|(off, _)| *off == 0x2C)
             .unwrap();
         assert_eq!(val & PAD_PULL_MASK, PAD_PULL_UP);
     }
@@ -395,8 +393,7 @@ mod tests {
             .pads
             .writes
             .iter()
-            .filter(|(off, _)| *off == 0x2C)
-            .last()
+            .rfind(|(off, _)| *off == 0x2C)
             .unwrap();
         assert_eq!(val & PAD_PULL_MASK, PAD_PULL_DOWN);
     }
@@ -411,8 +408,7 @@ mod tests {
             .pads
             .writes
             .iter()
-            .filter(|(off, _)| *off == 0x2C)
-            .last()
+            .rfind(|(off, _)| *off == 0x2C)
             .unwrap();
         assert_eq!(val & PAD_PULL_MASK, 0);
     }
