@@ -59,6 +59,9 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 /// 128KB provides ~5x headroom for PQ lattice operations (ML-KEM + ML-DSA ~25KB).
 const KERNEL_STACK_SIZE: usize = 128 * 1024;
 
+/// Canary value written at the stack base to detect overflow.
+const STACK_CANARY: u64 = 0xDEAD_BEEF_CAFE_BABE;
+
 /// State from early boot that must survive the stack switch.
 /// Heap-allocated via `Box` so the pointer remains valid after RSP changes.
 struct BootState {
@@ -324,7 +327,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let stack_top = (stack_base + KERNEL_STACK_SIZE) & !0xF;
     // Write canary at the very bottom of the stack (first 8 bytes).
     // If a stack overflow reaches here, the canary will be corrupted.
-    const STACK_CANARY: u64 = 0xDEAD_BEEF_CAFE_BABE;
     unsafe {
         core::ptr::write_volatile(stack_base as *mut u64, STACK_CANARY);
     }
