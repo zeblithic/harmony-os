@@ -22,6 +22,9 @@ pub enum CapChain {
     ReadOnly { granted_by: u32 },
     /// Read-write delegation from another process.
     ReadWrite { granted_by: u32 },
+    /// Session-scoped access to encrypted-ephemeral frames.
+    /// Invalidated when the session key is zeroized at shutdown.
+    Session { session_address: [u8; 16] },
 }
 
 impl CapChain {
@@ -30,6 +33,7 @@ impl CapChain {
             Self::Owner => true,
             Self::ReadOnly { .. } => matches!(op, AccessOp::Read),
             Self::ReadWrite { .. } => matches!(op, AccessOp::Read | AccessOp::Write),
+            Self::Session { .. } => matches!(op, AccessOp::Read | AccessOp::Write),
         }
     }
 }
@@ -559,6 +563,16 @@ mod tests {
         assert_eq!(n.state_hash(), after_register);
         n.unregister_frame(PhysAddr(0x1000));
         assert_eq!(n.state_hash(), ContentHash::ZERO);
+    }
+
+    #[test]
+    fn session_chain_permits_read_and_write() {
+        let chain = CapChain::Session {
+            session_address: [0xAA; 16],
+        };
+        assert!(chain.permits(AccessOp::Read));
+        assert!(chain.permits(AccessOp::Write));
+        assert!(!chain.permits(AccessOp::Execute));
     }
 
     #[test]
