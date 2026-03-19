@@ -141,6 +141,8 @@ fn build_x86_64() -> Result<(), String> {
 
 fn build_aarch64() -> Result<(), String> {
     // Pre-build the test ELF — harmony-boot-aarch64 embeds it via include_bytes!
+    // No --locked: test-elf has zero deps and no fragile pre-release pins,
+    // so its lockfile is not committed (unlike the boot crates).
     let test_elf_dir = project_root().join("crates/harmony-test-elf");
     let status = Command::new("cargo")
         .args([
