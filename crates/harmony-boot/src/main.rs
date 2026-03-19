@@ -56,9 +56,9 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 // ---------------------------------------------------------------------------
 
 /// Size of the heap-allocated kernel stack in bytes.
-/// ML-KEM-768 + ML-DSA-65 key generation uses ~25KB of stack for NTT polynomial
-/// matrices. 512KB provides ample headroom from the 4MB heap for future growth.
-const KERNEL_STACK_SIZE: usize = 512 * 1024;
+/// 2MB to rule out stack overflow as cause of PQ keygen triple fault.
+/// Will be reduced once the root cause is found (harmony-os-0vp).
+const KERNEL_STACK_SIZE: usize = 2 * 1024 * 1024;
 
 /// Canary value written at the stack base to detect overflow.
 const STACK_CANARY: u64 = 0xDEAD_BEEF_CAFE_BABE;
@@ -443,18 +443,14 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     let mut runtime = UnikernelRuntime::new(identity, entropy, persistence);
 
 
-    // PQ keygen crashes on x86_64-unknown-none (triple fault inside
-    // ml-kem/ml-dsa lattice ops — suspected keccak/sha3 codegen issue
-    // with soft-float target). aarch64 PQ keygen works fine.
-    // TODO(harmony-os-0vp): investigate x86_64 PQ keygen crash.
-    //
-    // When this is fixed, uncomment:
-    // if let Some(pq_addr) = runtime.generate_pq_identity() {
-    //     hex_encode(&pq_addr, &mut hex_buf);
-    //     let hex_str =
-    //         core::str::from_utf8(&hex_buf).unwrap_or("????????????????????????????????");
-    //     serial.log("PQ_IDENTITY", hex_str);
-    // }
+    // Test PQ keygen with 2MB stack to rule out stack overflow.
+    serial.log("PQ", "generating PQ identity (2MB stack)...");
+    if let Some(pq_addr) = runtime.generate_pq_identity() {
+        hex_encode(&pq_addr, &mut hex_buf);
+        let hex_str =
+            core::str::from_utf8(&hex_buf).unwrap_or("????????????????????????????????");
+        serial.log("PQ_IDENTITY", hex_str);
+    }
 
     if virtio_net.is_some() {
         runtime.register_interface("eth0");
