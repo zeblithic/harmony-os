@@ -47,10 +47,11 @@ State from early boot that must survive the stack switch. All early-boot locals 
 struct BootState {
     boot_info: &'static mut BootInfo,
     phys_offset: u64,
-    heap_size: usize,
     pit: PitTimer,
 }
 ```
+
+`heap_size` is not carried — it is only used for the `[HEAP]` log line in `kernel_main`, before the switch.
 
 `PitTimer` has accumulated state (`accumulated_ticks`, `last_count`) that must be preserved — it cannot be reconstructed from hardware registers. `serial` is reconstructed via `serial_writer()` which creates a stateless closure over port I/O.
 
