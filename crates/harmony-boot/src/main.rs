@@ -56,9 +56,8 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 // ---------------------------------------------------------------------------
 
 /// Size of the heap-allocated kernel stack in bytes.
-/// ML-KEM-768 + ML-DSA-65 key generation uses large NTT polynomial matrices
-/// that require substantial stack space (measured >128KB on x86_64 release).
-/// 512KB provides comfortable headroom from the 4MB heap.
+/// ML-KEM-768 + ML-DSA-65 key generation uses ~25KB of stack for NTT polynomial
+/// matrices. 512KB provides ample headroom from the 4MB heap for future growth.
 const KERNEL_STACK_SIZE: usize = 512 * 1024;
 
 /// Canary value written at the stack base to detect overflow.
