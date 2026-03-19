@@ -33,6 +33,8 @@ pub mod vm;
 #[cfg(feature = "kernel")]
 pub mod integrity;
 #[cfg(feature = "kernel")]
+pub mod key_hierarchy;
+#[cfg(feature = "kernel")]
 pub mod pq_capability;
 
 use alloc::sync::Arc;
