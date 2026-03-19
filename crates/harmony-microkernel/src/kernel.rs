@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Microkernel — process table, IPC dispatch, capability enforcement.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -9,6 +9,7 @@ use harmony_identity::{CapabilityType, MemoryRevocationSet, PqPrivateIdentity, P
 use harmony_platform::EntropySource;
 use rand_core::CryptoRngCore;
 
+use crate::key_hierarchy::{verify_session_binding, AttestationPair, BoundCapability};
 use crate::pq_capability::{verify_pq_token, PqMemoryIdentityStore, PqMemoryProofStore};
 
 use crate::integrity::lyll::{HashEntry, Lyll, LyllConfig};
@@ -38,7 +39,10 @@ pub struct Process {
     pub pid: u32,
     pub name: Arc<str>,
     pub(crate) namespace: Namespace,
-    pub(crate) capabilities: Vec<PqUcanToken>,
+    /// Kernel-issued capabilities (signed by session key, no binding needed).
+    pub(crate) kernel_capabilities: Vec<PqUcanToken>,
+    /// User-submitted capabilities (require session binding).
+    pub(crate) user_capabilities: Vec<BoundCapability>,
     /// Milestone A: PID-derived placeholder. Production builds will use
     /// a cryptographic address (e.g. SHA-256 of the process's public key).
     pub(crate) address_hash: [u8; 16],
@@ -49,7 +53,13 @@ pub struct Process {
 pub struct Kernel<P: PageTable> {
     processes: BTreeMap<u32, Process>,
     next_pid: u32,
-    identity: PqPrivateIdentity,
+    hardware_identity: PqPrivateIdentity,
+    session_identity: PqPrivateIdentity,
+    /// Stored for future boot verification and user provisioning.
+    /// Not yet read — will be used when owner provisioning UX is added.
+    #[allow(dead_code)]
+    attestation: AttestationPair,
+    used_binding_nonces: BTreeSet<[u8; 16]>,
     identity_store: PqMemoryIdentityStore,
     proof_store: PqMemoryProofStore,
     revocations: MemoryRevocationSet,
@@ -69,14 +79,23 @@ pub struct Kernel<P: PageTable> {
 }
 
 impl<P: PageTable> Kernel<P> {
-    /// Create a new microkernel with the given identity and VM manager.
-    pub fn new(identity: PqPrivateIdentity, vm: AddressSpaceManager<P>) -> Self {
+    /// Create a new microkernel with the given key hierarchy and VM manager.
+    pub fn new(
+        hardware_identity: PqPrivateIdentity,
+        session_identity: PqPrivateIdentity,
+        attestation: AttestationPair,
+        vm: AddressSpaceManager<P>,
+    ) -> Self {
         let mut identity_store = PqMemoryIdentityStore::new();
-        identity_store.insert(identity.public_identity().clone());
+        identity_store.insert(hardware_identity.public_identity().clone());
+        identity_store.insert(session_identity.public_identity().clone());
         let mut kernel = Kernel {
             processes: BTreeMap::new(),
             next_pid: 0,
-            identity,
+            hardware_identity,
+            session_identity,
+            attestation,
+            used_binding_nonces: BTreeSet::new(),
             identity_store,
             proof_store: PqMemoryProofStore::new(),
             revocations: MemoryRevocationSet::new(),
@@ -165,7 +184,8 @@ impl<P: PageTable> Kernel<P> {
                 pid,
                 name: Arc::from(name),
                 namespace,
-                capabilities: Vec::new(),
+                kernel_capabilities: Vec::new(),
+                user_capabilities: Vec::new(),
                 address_hash,
                 server,
             },
@@ -247,7 +267,7 @@ impl<P: PageTable> Kernel<P> {
 
         let resource = alloc::format!("pid:{}", target_pid);
         let cap = self
-            .identity
+            .session_identity
             .issue_pq_root_token(
                 entropy,
                 &audience,
@@ -262,38 +282,39 @@ impl<P: PageTable> Kernel<P> {
             .processes
             .get_mut(&process_pid)
             .ok_or(IpcError::NotFound)?;
-        process.capabilities.push(cap);
+        process.kernel_capabilities.push(cap);
         Ok(())
     }
 
-    /// Check whether `capabilities` contain a valid EndpointCap for `target_pid`.
+    /// Check whether a process holds a valid EndpointCap for `target_pid`.
+    ///
+    /// Scans both `kernel_capabilities` (session-key-signed, no binding)
+    /// and `user_capabilities` (UCAN + session binding). Either vector
+    /// producing a valid match returns `Ok`.
     pub(crate) fn check_endpoint_cap(
         &self,
-        capabilities: &[PqUcanToken],
-        audience_hash: &[u8; 16],
+        process: &Process,
         target_pid: u32,
         now: u64,
     ) -> Result<(), IpcError> {
         let target_resource = alloc::format!("pid:{}", target_pid);
+        let audience_hash = &process.address_hash;
 
-        for cap in capabilities {
-            // Must be an Endpoint capability
+        // 1. Scan kernel-issued capabilities (signed by session key).
+        for cap in &process.kernel_capabilities {
             if cap.capability != CapabilityType::Endpoint {
                 continue;
             }
-            // Must be issued to this process
             if &cap.audience != audience_hash {
                 continue;
             }
-            // Resource must match target pid or be wildcard
             let resource_str = match core::str::from_utf8(&cap.resource) {
                 Ok(s) => s,
-                Err(_) => continue, // Invalid UTF-8: skip token
+                Err(_) => continue,
             };
             if resource_str != target_resource && resource_str != "*" {
                 continue;
             }
-            // Cryptographic verification
             if verify_pq_token(
                 cap,
                 now,
@@ -301,6 +322,50 @@ impl<P: PageTable> Kernel<P> {
                 &self.identity_store,
                 &self.revocations,
                 MAX_DELEGATION_DEPTH,
+            )
+            .is_ok()
+            {
+                return Ok(());
+            }
+        }
+
+        // 2. Scan user-submitted capabilities (UCAN + session binding).
+        for bound in &process.user_capabilities {
+            let cap = &bound.token;
+            if cap.capability != CapabilityType::Endpoint {
+                continue;
+            }
+            if &cap.audience != audience_hash {
+                continue;
+            }
+            let resource_str = match core::str::from_utf8(&cap.resource) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if resource_str != target_resource && resource_str != "*" {
+                continue;
+            }
+            // Verify the UCAN token itself.
+            if verify_pq_token(
+                cap,
+                now,
+                &self.proof_store,
+                &self.identity_store,
+                &self.revocations,
+                MAX_DELEGATION_DEPTH,
+            )
+            .is_err()
+            {
+                continue;
+            }
+            // Verify the session binding.
+            let token_hash = cap.content_hash();
+            if verify_session_binding(
+                &bound.binding,
+                self.session_identity.public_identity(),
+                &self.hardware_identity.public_identity().address_hash,
+                &token_hash,
+                &self.used_binding_nonces,
             )
             .is_ok()
             {
@@ -341,12 +406,7 @@ impl<P: PageTable> Kernel<P> {
             let server_root_fid = mount.root_fid;
             // Capability check uses &self — compatible with the shared
             // borrow through `process`, so no clone needed.
-            self.check_endpoint_cap(
-                &process.capabilities,
-                &process.address_hash,
-                target_pid,
-                now,
-            )?;
+            self.check_endpoint_cap(process, target_pid, now)?;
             (target_pid, server_root_fid, remainder)
         };
 
@@ -710,10 +770,12 @@ impl<P: PageTable> Kernel<P> {
 mod tests {
     use super::*;
     use crate::echo::EchoServer;
+    use crate::key_hierarchy::{AttestationPair, HardwareAcceptance, OwnerClaim};
     use crate::vm::buddy::BuddyAllocator;
     use crate::vm::mock::MockPageTable;
     use crate::vm::PhysAddr;
     use harmony_unikernel::KernelEntropy;
+    use rand_core::CryptoRngCore;
 
     fn make_test_entropy() -> KernelEntropy<impl FnMut(&mut [u8])> {
         let mut seed = 42u64;
@@ -731,11 +793,65 @@ mod tests {
         AddressSpaceManager::new(buddy)
     }
 
+    /// Generate a minimal key hierarchy for tests: hardware identity,
+    /// session identity, and a valid `AttestationPair`.
+    ///
+    /// Generates identities sequentially, dropping the owner before
+    /// generating the session key, so only two PQ identities coexist
+    /// on the stack at any point. ML-DSA-65 key generation still uses
+    /// substantial stack space — see `.cargo/config.toml` for the
+    /// `RUST_MIN_STACK` setting that accommodates this.
+    fn make_test_hierarchy(
+        entropy: &mut impl CryptoRngCore,
+    ) -> (PqPrivateIdentity, PqPrivateIdentity, AttestationPair) {
+        let owner = PqPrivateIdentity::generate(entropy);
+        let owner_addr = owner.public_identity().address_hash;
+
+        let hardware = PqPrivateIdentity::generate(entropy);
+        let hw_addr = hardware.public_identity().address_hash;
+
+        // Create OwnerClaim
+        let mut nonce = [0u8; 16];
+        entropy.fill_bytes(&mut nonce);
+        let mut claim = OwnerClaim {
+            owner_address: owner_addr,
+            hardware_address: hw_addr,
+            claimed_at: 0,
+            owner_index: 0,
+            nonce,
+            signature: [0u8; 3309],
+        };
+        let sig = owner.sign(&claim.signable_bytes()).unwrap();
+        claim.signature.copy_from_slice(&sig);
+
+        // Create HardwareAcceptance
+        let mut acceptance = HardwareAcceptance {
+            hardware_address: hw_addr,
+            owner_address: owner_addr,
+            accepted_at: 0,
+            owner_claim_hash: claim.content_hash(),
+            signature: [0u8; 3309],
+        };
+        let sig = hardware.sign(&acceptance.signable_bytes()).unwrap();
+        acceptance.signature.copy_from_slice(&sig);
+
+        // Drop owner — only needed for signing, not stored in the kernel.
+        drop(owner);
+
+        let session = PqPrivateIdentity::generate(entropy);
+
+        let attestation = AttestationPair {
+            owner_claim: claim,
+            hardware_acceptance: acceptance,
+        };
+        (hardware, session, attestation)
+    }
+
     #[test]
     fn spawn_process_assigns_pid() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
         let pid = kernel
             .spawn_process("echo", Box::new(EchoServer::new()), &[], None)
@@ -751,11 +867,11 @@ mod tests {
     #[test]
     fn capability_check_with_valid_cap() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
 
-        // Issue the token before moving identity into the kernel.
+        // Issue the token using the session key before moving it into the kernel.
         let process_addr = [0x01u8; 16];
-        let cap = kernel_id
+        let cap = session
             .issue_pq_root_token(
                 &mut entropy,
                 &process_addr,
@@ -766,22 +882,39 @@ mod tests {
             )
             .unwrap();
 
-        let kernel = Kernel::new(kernel_id, make_test_vm());
+        let kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
-        assert!(kernel
-            .check_endpoint_cap(&[cap], &process_addr, 1, 0)
-            .is_ok());
+        // Build a synthetic process with the kernel capability.
+        let process = Process {
+            pid: 0,
+            name: Arc::from("test"),
+            namespace: crate::namespace::Namespace::new(),
+            kernel_capabilities: alloc::vec![cap],
+            user_capabilities: Vec::new(),
+            address_hash: process_addr,
+            server: Box::new(EchoServer::new()),
+        };
+
+        assert!(kernel.check_endpoint_cap(&process, 1, 0).is_ok());
     }
 
     #[test]
     fn capability_check_no_cap() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-        let kernel = Kernel::new(kernel_id, make_test_vm());
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
-        let process_addr = [0x01u8; 16];
+        let process = Process {
+            pid: 0,
+            name: Arc::from("test"),
+            namespace: crate::namespace::Namespace::new(),
+            kernel_capabilities: Vec::new(),
+            user_capabilities: Vec::new(),
+            address_hash: [0x01u8; 16],
+            server: Box::new(EchoServer::new()),
+        };
         assert_eq!(
-            kernel.check_endpoint_cap(&[], &process_addr, 1, 0),
+            kernel.check_endpoint_cap(&process, 1, 0),
             Err(IpcError::PermissionDenied)
         );
     }
@@ -789,11 +922,11 @@ mod tests {
     #[test]
     fn capability_check_wrong_pid() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
 
-        // Issue the token before moving identity into the kernel.
+        // Issue the token using the session key before moving it into the kernel.
         let process_addr = [0x01u8; 16];
-        let cap = kernel_id
+        let cap = session
             .issue_pq_root_token(
                 &mut entropy,
                 &process_addr,
@@ -804,11 +937,21 @@ mod tests {
             )
             .unwrap();
 
-        let kernel = Kernel::new(kernel_id, make_test_vm());
+        let kernel = Kernel::new(hw, session, attestation, make_test_vm());
+
+        let process = Process {
+            pid: 0,
+            name: Arc::from("test"),
+            namespace: crate::namespace::Namespace::new(),
+            kernel_capabilities: alloc::vec![cap],
+            user_capabilities: Vec::new(),
+            address_hash: process_addr,
+            server: Box::new(EchoServer::new()),
+        };
 
         // Cap is for pid:1, trying to access pid:2
         assert_eq!(
-            kernel.check_endpoint_cap(&[cap], &process_addr, 2, 0),
+            kernel.check_endpoint_cap(&process, 2, 0),
             Err(IpcError::PermissionDenied)
         );
     }
@@ -816,11 +959,11 @@ mod tests {
     #[test]
     fn capability_check_wildcard() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
 
-        // Issue the token before moving identity into the kernel.
+        // Issue the token using the session key before moving it into the kernel.
         let process_addr = [0x01u8; 16];
-        let cap = kernel_id
+        let cap = session
             .issue_pq_root_token(
                 &mut entropy,
                 &process_addr,
@@ -831,23 +974,29 @@ mod tests {
             )
             .unwrap();
 
-        let kernel = Kernel::new(kernel_id, make_test_vm());
+        let kernel = Kernel::new(hw, session, attestation, make_test_vm());
+
+        let process = Process {
+            pid: 0,
+            name: Arc::from("test"),
+            namespace: crate::namespace::Namespace::new(),
+            kernel_capabilities: alloc::vec![cap],
+            user_capabilities: Vec::new(),
+            address_hash: process_addr,
+            server: Box::new(EchoServer::new()),
+        };
 
         // Wildcard should match any pid
-        assert!(kernel
-            .check_endpoint_cap(std::slice::from_ref(&cap), &process_addr, 1, 0)
-            .is_ok());
-        assert!(kernel
-            .check_endpoint_cap(std::slice::from_ref(&cap), &process_addr, 99, 0)
-            .is_ok());
+        assert!(kernel.check_endpoint_cap(&process, 1, 0).is_ok());
+        assert!(kernel.check_endpoint_cap(&process, 99, 0).is_ok());
     }
 
     // ── IPC dispatch tests ──────────────────────────────────────────
 
     fn setup_kernel_with_echo() -> (Kernel<MockPageTable>, u32, u32) {
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
         // pid 0 = echo server
         let server_pid = kernel
@@ -910,8 +1059,8 @@ mod tests {
     #[test]
     fn ipc_denied_without_capability() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
         let server_pid = kernel
             .spawn_process("echo-server", Box::new(EchoServer::new()), &[], None)
@@ -965,8 +1114,8 @@ mod tests {
     #[test]
     fn ipc_multi_client_fid_isolation() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
         // Shared echo server
         let server_pid = kernel
@@ -1052,8 +1201,8 @@ mod tests {
     #[test]
     fn grant_cap_nonexistent_target_rejected() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
         let pid = kernel
             .spawn_process("test", Box::new(EchoServer::new()), &[], None)
@@ -1068,11 +1217,11 @@ mod tests {
     #[test]
     fn capability_check_expired_token_rejected() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
 
         let process_addr = [0x01u8; 16];
         // Token that expires at time 100
-        let cap = kernel_id
+        let cap = session
             .issue_pq_root_token(
                 &mut entropy,
                 &process_addr,
@@ -1083,16 +1232,24 @@ mod tests {
             )
             .unwrap();
 
-        let kernel = Kernel::new(kernel_id, make_test_vm());
+        let kernel = Kernel::new(hw, session, attestation, make_test_vm());
+
+        let process = Process {
+            pid: 0,
+            name: Arc::from("test"),
+            namespace: crate::namespace::Namespace::new(),
+            kernel_capabilities: alloc::vec![cap],
+            user_capabilities: Vec::new(),
+            address_hash: process_addr,
+            server: Box::new(EchoServer::new()),
+        };
 
         // At time 50 — token is valid
-        assert!(kernel
-            .check_endpoint_cap(std::slice::from_ref(&cap), &process_addr, 1, 50)
-            .is_ok());
+        assert!(kernel.check_endpoint_cap(&process, 1, 50).is_ok());
 
         // At time 200 — token has expired
         assert_eq!(
-            kernel.check_endpoint_cap(&[cap], &process_addr, 1, 200),
+            kernel.check_endpoint_cap(&process, 1, 200),
             Err(IpcError::PermissionDenied)
         );
     }
@@ -1109,8 +1266,8 @@ mod tests {
     #[test]
     fn integration_two_processes_full_ipc() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
         // Spawn echo server as pid 0
         let server_pid = kernel
@@ -1183,8 +1340,8 @@ mod tests {
         use crate::content_server::ContentServer;
 
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
         // Spawn content server
         let server_pid = kernel
@@ -1246,8 +1403,8 @@ mod tests {
         use crate::vm::{FrameClassification, PAGE_SIZE};
 
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
         let budget = MemoryBudget::new(PAGE_SIZE as usize * 16, FrameClassification::all());
         let page_table = MockPageTable::new(PhysAddr(0x20_0000));
@@ -1268,8 +1425,8 @@ mod tests {
     #[test]
     fn spawn_without_vm_config_no_address_space() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
         let pid = kernel
             .spawn_process("no-vm", Box::new(EchoServer::new()), &[], None)
@@ -1282,8 +1439,8 @@ mod tests {
     #[test]
     fn destroy_process_removes_from_table() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
         let pid = kernel
             .spawn_process("doomed", Box::new(EchoServer::new()), &[], None)
@@ -1303,8 +1460,8 @@ mod tests {
         use crate::vm::{FrameClassification, PAGE_SIZE};
 
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
         let budget = MemoryBudget::new(PAGE_SIZE as usize * 16, FrameClassification::all());
         let page_table = MockPageTable::new(PhysAddr(0x20_0000));
@@ -1344,8 +1501,8 @@ mod tests {
     #[test]
     fn destroy_nonexistent_process_fails() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
         assert_eq!(kernel.destroy_process(99), Err(IpcError::NotFound));
     }
@@ -1353,8 +1510,8 @@ mod tests {
     #[test]
     fn destroy_process_without_vm_succeeds() {
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
         let pid = kernel
             .spawn_process("no-vm", Box::new(EchoServer::new()), &[], None)
@@ -1369,8 +1526,8 @@ mod tests {
         use crate::vm::{FrameClassification, PAGE_SIZE};
 
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
         let budget = MemoryBudget::new(PAGE_SIZE as usize * 16, FrameClassification::all());
 
@@ -1413,8 +1570,8 @@ mod tests {
         use crate::vm::{FrameClassification, PAGE_SIZE};
 
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
         let budget = MemoryBudget::new(PAGE_SIZE as usize * 16, FrameClassification::all());
 
@@ -1554,8 +1711,8 @@ mod tests {
         use crate::vm::{FrameClassification, PAGE_SIZE};
 
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
         let budget = MemoryBudget::new(PAGE_SIZE as usize * 16, FrameClassification::all());
         let pid = kernel
@@ -1634,8 +1791,8 @@ mod tests {
         use crate::vm::{FrameClassification, PAGE_SIZE};
 
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
         let initial_free = kernel.vm.buddy().free_frame_count();
 
@@ -1762,8 +1919,8 @@ mod tests {
 
     fn make_kernel() -> Kernel<MockPageTable> {
         let mut entropy = make_test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-        Kernel::new(kernel_id, make_test_vm())
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        Kernel::new(hw, session, attestation, make_test_vm())
     }
 
     fn default_budget() -> MemoryBudget {
