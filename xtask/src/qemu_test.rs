@@ -129,6 +129,9 @@ fn build_x86_64() -> Result<(), String> {
     // Create BIOS disk image.
     let kernel = boot_dir.join("target/x86_64-unknown-none/release/harmony-boot");
     let image = crate::image_path();
+    if let Some(parent) = image.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create target dir: {e}"))?;
+    }
     bootloader::BiosBoot::new(&kernel)
         .create_disk_image(&image)
         .map_err(|e| format!("disk image creation: {e:?}"))?;
@@ -168,6 +171,9 @@ fn build_aarch64() -> Result<(), String> {
     // Create FAT32 ESP image using mtools.
     let efi = aarch64_efi_path();
     let esp = aarch64_esp_path();
+    if let Some(parent) = esp.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create target dir: {e}"))?;
+    }
 
     // Create 4MB FAT image.
     let _ = std::fs::remove_file(&esp);
