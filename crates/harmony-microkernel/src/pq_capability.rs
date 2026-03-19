@@ -174,3 +174,469 @@ fn verify_pq_token_recursive(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harmony_identity::{CapabilityType, MemoryRevocationSet, PqPrivateIdentity};
+    use harmony_unikernel::KernelEntropy;
+
+    fn test_rng() -> KernelEntropy<impl FnMut(&mut [u8])> {
+        let mut seed = 42u64;
+        KernelEntropy::new(move |buf: &mut [u8]| {
+            for b in buf.iter_mut() {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *b = (seed >> 33) as u8;
+            }
+        })
+    }
+
+    fn issue(
+        rng: &mut (impl rand_core::CryptoRngCore),
+        issuer: &PqPrivateIdentity,
+        audience: &[u8; 16],
+        cap: CapabilityType,
+        resource: &[u8],
+        not_before: u64,
+        expires_at: u64,
+    ) -> PqUcanToken {
+        issuer
+            .issue_pq_root_token(rng, audience, cap, resource, not_before, expires_at)
+            .unwrap()
+    }
+
+    fn setup_stores(issuer: &PqPrivateIdentity) -> (PqMemoryIdentityStore, PqMemoryProofStore) {
+        let mut ids = PqMemoryIdentityStore::new();
+        ids.insert(issuer.public_identity().clone());
+        (ids, PqMemoryProofStore::new())
+    }
+
+    #[test]
+    fn valid_root_token_passes() {
+        let mut rng = test_rng();
+        let issuer = PqPrivateIdentity::generate(&mut rng);
+        let token = issue(
+            &mut rng,
+            &issuer,
+            &[0xAA; 16],
+            CapabilityType::Endpoint,
+            b"pid:1",
+            0,
+            0,
+        );
+        let (ids, proofs) = setup_stores(&issuer);
+        let revocations = MemoryRevocationSet::new();
+        assert!(verify_pq_token(&token, 100, &proofs, &ids, &revocations, 5).is_ok());
+    }
+
+    #[test]
+    fn expired_token_rejected() {
+        let mut rng = test_rng();
+        let issuer = PqPrivateIdentity::generate(&mut rng);
+        let token = issue(
+            &mut rng,
+            &issuer,
+            &[0xAA; 16],
+            CapabilityType::Endpoint,
+            b"x",
+            0,
+            50,
+        );
+        let (ids, proofs) = setup_stores(&issuer);
+        let revocations = MemoryRevocationSet::new();
+        assert!(matches!(
+            verify_pq_token(&token, 100, &proofs, &ids, &revocations, 5),
+            Err(UcanError::Expired)
+        ));
+    }
+
+    #[test]
+    fn not_yet_valid_rejected() {
+        let mut rng = test_rng();
+        let issuer = PqPrivateIdentity::generate(&mut rng);
+        let token = issue(
+            &mut rng,
+            &issuer,
+            &[0xAA; 16],
+            CapabilityType::Endpoint,
+            b"x",
+            200,
+            0,
+        );
+        let (ids, proofs) = setup_stores(&issuer);
+        let revocations = MemoryRevocationSet::new();
+        assert!(matches!(
+            verify_pq_token(&token, 100, &proofs, &ids, &revocations, 5),
+            Err(UcanError::NotYetValid)
+        ));
+    }
+
+    #[test]
+    fn issuer_not_found_rejected() {
+        let mut rng = test_rng();
+        let issuer = PqPrivateIdentity::generate(&mut rng);
+        let token = issue(
+            &mut rng,
+            &issuer,
+            &[0xAA; 16],
+            CapabilityType::Endpoint,
+            b"x",
+            0,
+            0,
+        );
+        // Empty identity store — issuer is unknown.
+        let ids = PqMemoryIdentityStore::new();
+        let proofs = PqMemoryProofStore::new();
+        let revocations = MemoryRevocationSet::new();
+        assert!(matches!(
+            verify_pq_token(&token, 100, &proofs, &ids, &revocations, 5),
+            Err(UcanError::IssuerNotFound)
+        ));
+    }
+
+    #[test]
+    fn wrong_signer_rejected() {
+        let mut rng = test_rng();
+        let issuer = PqPrivateIdentity::generate(&mut rng);
+        let wrong = PqPrivateIdentity::generate(&mut rng);
+        // Token signed by `issuer`, but store only has `wrong`'s identity
+        // registered under issuer's address hash — signature won't match.
+        let token = issue(
+            &mut rng,
+            &issuer,
+            &[0xAA; 16],
+            CapabilityType::Endpoint,
+            b"x",
+            0,
+            0,
+        );
+        let mut ids = PqMemoryIdentityStore::new();
+        ids.insert(wrong.public_identity().clone());
+        let proofs = PqMemoryProofStore::new();
+        let revocations = MemoryRevocationSet::new();
+        // Issuer address hash won't be found (wrong identity has different hash).
+        assert!(verify_pq_token(&token, 100, &proofs, &ids, &revocations, 5).is_err());
+    }
+
+    #[test]
+    fn revoked_token_rejected() {
+        let mut rng = test_rng();
+        let issuer = PqPrivateIdentity::generate(&mut rng);
+        let token = issue(
+            &mut rng,
+            &issuer,
+            &[0xAA; 16],
+            CapabilityType::Endpoint,
+            b"x",
+            0,
+            0,
+        );
+        let (ids, proofs) = setup_stores(&issuer);
+        let mut revocations = MemoryRevocationSet::new();
+        revocations.insert(token.content_hash());
+        assert!(matches!(
+            verify_pq_token(&token, 100, &proofs, &ids, &revocations, 5),
+            Err(UcanError::Revoked)
+        ));
+    }
+
+    #[test]
+    fn chain_too_deep_rejected() {
+        let mut rng = test_rng();
+        let issuer = PqPrivateIdentity::generate(&mut rng);
+        let delegate = PqPrivateIdentity::generate(&mut rng);
+        let delegate_addr = delegate.public_identity().address_hash;
+
+        let parent = issue(
+            &mut rng,
+            &issuer,
+            &delegate_addr,
+            CapabilityType::Endpoint,
+            b"pid:1",
+            0,
+            0,
+        );
+
+        let mut child = PqUcanToken {
+            issuer: delegate.public_identity().address_hash,
+            audience: [0xBB; 16],
+            capability: CapabilityType::Endpoint,
+            resource: b"pid:1".to_vec(),
+            not_before: 0,
+            expires_at: 0,
+            nonce: [0u8; 16],
+            proof: Some(parent.content_hash()),
+            signature: alloc::vec![],
+        };
+        let signable = child.signable_bytes();
+        child.signature = delegate.sign(&signable).unwrap();
+
+        let mut ids = PqMemoryIdentityStore::new();
+        ids.insert(issuer.public_identity().clone());
+        ids.insert(delegate.public_identity().clone());
+        let mut proofs = PqMemoryProofStore::new();
+        proofs.insert(parent);
+        let revocations = MemoryRevocationSet::new();
+
+        // max_depth=0 means root only — no delegation allowed.
+        assert!(matches!(
+            verify_pq_token(&child, 100, &proofs, &ids, &revocations, 0),
+            Err(UcanError::ChainTooDeep { depth: 0, limit: 0 })
+        ));
+    }
+
+    #[test]
+    fn chain_broken_audience_mismatch_rejected() {
+        let mut rng = test_rng();
+        let issuer = PqPrivateIdentity::generate(&mut rng);
+        let delegate = PqPrivateIdentity::generate(&mut rng);
+
+        // Parent is issued to [0xFF; 16], not to delegate's address.
+        let parent = issue(
+            &mut rng,
+            &issuer,
+            &[0xFF; 16],
+            CapabilityType::Endpoint,
+            b"pid:1",
+            0,
+            0,
+        );
+
+        let mut child = PqUcanToken {
+            issuer: delegate.public_identity().address_hash,
+            audience: [0xBB; 16],
+            capability: CapabilityType::Endpoint,
+            resource: b"pid:1".to_vec(),
+            not_before: 0,
+            expires_at: 0,
+            nonce: [0u8; 16],
+            proof: Some(parent.content_hash()),
+            signature: alloc::vec![],
+        };
+        let signable = child.signable_bytes();
+        child.signature = delegate.sign(&signable).unwrap();
+
+        let mut ids = PqMemoryIdentityStore::new();
+        ids.insert(issuer.public_identity().clone());
+        ids.insert(delegate.public_identity().clone());
+        let mut proofs = PqMemoryProofStore::new();
+        proofs.insert(parent);
+        let revocations = MemoryRevocationSet::new();
+
+        assert!(matches!(
+            verify_pq_token(&child, 100, &proofs, &ids, &revocations, 5),
+            Err(UcanError::ChainBroken)
+        ));
+    }
+
+    #[test]
+    fn capability_mismatch_rejected() {
+        let mut rng = test_rng();
+        let issuer = PqPrivateIdentity::generate(&mut rng);
+        let delegate = PqPrivateIdentity::generate(&mut rng);
+        let delegate_addr = delegate.public_identity().address_hash;
+
+        // Parent grants Memory, child claims Endpoint.
+        let parent = issue(
+            &mut rng,
+            &issuer,
+            &delegate_addr,
+            CapabilityType::Memory,
+            b"x",
+            0,
+            0,
+        );
+
+        let mut child = PqUcanToken {
+            issuer: delegate_addr,
+            audience: [0xBB; 16],
+            capability: CapabilityType::Endpoint,
+            resource: b"x".to_vec(),
+            not_before: 0,
+            expires_at: 0,
+            nonce: [0u8; 16],
+            proof: Some(parent.content_hash()),
+            signature: alloc::vec![],
+        };
+        let signable = child.signable_bytes();
+        child.signature = delegate.sign(&signable).unwrap();
+
+        let mut ids = PqMemoryIdentityStore::new();
+        ids.insert(issuer.public_identity().clone());
+        ids.insert(delegate.public_identity().clone());
+        let mut proofs = PqMemoryProofStore::new();
+        proofs.insert(parent);
+        let revocations = MemoryRevocationSet::new();
+
+        assert!(matches!(
+            verify_pq_token(&child, 100, &proofs, &ids, &revocations, 5),
+            Err(UcanError::CapabilityMismatch)
+        ));
+    }
+
+    #[test]
+    fn attenuation_violation_loosened_not_before_rejected() {
+        let mut rng = test_rng();
+        let issuer = PqPrivateIdentity::generate(&mut rng);
+        let delegate = PqPrivateIdentity::generate(&mut rng);
+        let delegate_addr = delegate.public_identity().address_hash;
+
+        // Parent: not_before=100.
+        let parent = issue(
+            &mut rng,
+            &issuer,
+            &delegate_addr,
+            CapabilityType::Endpoint,
+            b"x",
+            100,
+            0,
+        );
+
+        // Child: not_before=50 (earlier than parent — loosens the constraint).
+        let mut child = PqUcanToken {
+            issuer: delegate_addr,
+            audience: [0xBB; 16],
+            capability: CapabilityType::Endpoint,
+            resource: b"x".to_vec(),
+            not_before: 50,
+            expires_at: 0,
+            nonce: [0u8; 16],
+            proof: Some(parent.content_hash()),
+            signature: alloc::vec![],
+        };
+        let signable = child.signable_bytes();
+        child.signature = delegate.sign(&signable).unwrap();
+
+        let mut ids = PqMemoryIdentityStore::new();
+        ids.insert(issuer.public_identity().clone());
+        ids.insert(delegate.public_identity().clone());
+        let mut proofs = PqMemoryProofStore::new();
+        proofs.insert(parent);
+        let revocations = MemoryRevocationSet::new();
+
+        assert!(matches!(
+            verify_pq_token(&child, 200, &proofs, &ids, &revocations, 5),
+            Err(UcanError::AttenuationViolation)
+        ));
+    }
+
+    #[test]
+    fn attenuation_violation_loosened_expiry_rejected() {
+        let mut rng = test_rng();
+        let issuer = PqPrivateIdentity::generate(&mut rng);
+        let delegate = PqPrivateIdentity::generate(&mut rng);
+        let delegate_addr = delegate.public_identity().address_hash;
+
+        // Parent: expires_at=500.
+        let parent = issue(
+            &mut rng,
+            &issuer,
+            &delegate_addr,
+            CapabilityType::Endpoint,
+            b"x",
+            0,
+            500,
+        );
+
+        // Child: expires_at=1000 (later than parent — loosens the constraint).
+        let mut child = PqUcanToken {
+            issuer: delegate_addr,
+            audience: [0xBB; 16],
+            capability: CapabilityType::Endpoint,
+            resource: b"x".to_vec(),
+            not_before: 0,
+            expires_at: 1000,
+            nonce: [0u8; 16],
+            proof: Some(parent.content_hash()),
+            signature: alloc::vec![],
+        };
+        let signable = child.signable_bytes();
+        child.signature = delegate.sign(&signable).unwrap();
+
+        let mut ids = PqMemoryIdentityStore::new();
+        ids.insert(issuer.public_identity().clone());
+        ids.insert(delegate.public_identity().clone());
+        let mut proofs = PqMemoryProofStore::new();
+        proofs.insert(parent);
+        let revocations = MemoryRevocationSet::new();
+
+        assert!(matches!(
+            verify_pq_token(&child, 100, &proofs, &ids, &revocations, 5),
+            Err(UcanError::AttenuationViolation)
+        ));
+    }
+
+    #[test]
+    fn proof_not_found_rejected() {
+        let mut rng = test_rng();
+        let issuer = PqPrivateIdentity::generate(&mut rng);
+        let delegate = PqPrivateIdentity::generate(&mut rng);
+
+        // Child references a proof hash that doesn't exist in the store.
+        let mut child = PqUcanToken {
+            issuer: delegate.public_identity().address_hash,
+            audience: [0xBB; 16],
+            capability: CapabilityType::Endpoint,
+            resource: b"x".to_vec(),
+            not_before: 0,
+            expires_at: 0,
+            nonce: [0u8; 16],
+            proof: Some([0xDE; 32]),
+            signature: alloc::vec![],
+        };
+        let signable = child.signable_bytes();
+        child.signature = delegate.sign(&signable).unwrap();
+
+        let mut ids = PqMemoryIdentityStore::new();
+        ids.insert(issuer.public_identity().clone());
+        ids.insert(delegate.public_identity().clone());
+        let proofs = PqMemoryProofStore::new(); // empty
+        let revocations = MemoryRevocationSet::new();
+
+        assert!(matches!(
+            verify_pq_token(&child, 100, &proofs, &ids, &revocations, 5),
+            Err(UcanError::ProofNotFound)
+        ));
+    }
+
+    #[test]
+    fn valid_delegation_chain_passes() {
+        let mut rng = test_rng();
+        let root = PqPrivateIdentity::generate(&mut rng);
+        let delegate = PqPrivateIdentity::generate(&mut rng);
+        let delegate_addr = delegate.public_identity().address_hash;
+
+        let parent = issue(
+            &mut rng,
+            &root,
+            &delegate_addr,
+            CapabilityType::Endpoint,
+            b"pid:1",
+            0,
+            0,
+        );
+
+        let mut child = PqUcanToken {
+            issuer: delegate_addr,
+            audience: [0xBB; 16],
+            capability: CapabilityType::Endpoint,
+            resource: b"pid:1".to_vec(),
+            not_before: 0,
+            expires_at: 0,
+            nonce: [0u8; 16],
+            proof: Some(parent.content_hash()),
+            signature: alloc::vec![],
+        };
+        let signable = child.signable_bytes();
+        child.signature = delegate.sign(&signable).unwrap();
+
+        let mut ids = PqMemoryIdentityStore::new();
+        ids.insert(root.public_identity().clone());
+        ids.insert(delegate.public_identity().clone());
+        let mut proofs = PqMemoryProofStore::new();
+        proofs.insert(parent);
+        let revocations = MemoryRevocationSet::new();
+
+        assert!(verify_pq_token(&child, 100, &proofs, &ids, &revocations, 5).is_ok());
+    }
+}
