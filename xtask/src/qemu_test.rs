@@ -2,7 +2,7 @@ use crate::project_root;
 use crate::qemu_runner::{run_qemu_test, Milestone, QemuConfig, QemuResult};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -251,7 +251,7 @@ fn x86_64_qemu_config(timeout: Duration) -> QemuConfig {
     }
 }
 
-fn aarch64_qemu_config(timeout: Duration, firmware: &PathBuf) -> QemuConfig {
+fn aarch64_qemu_config(timeout: Duration, firmware: &Path) -> QemuConfig {
     let esp = aarch64_esp_path();
     QemuConfig {
         qemu_binary: "qemu-system-aarch64".into(),
