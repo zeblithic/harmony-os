@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Harmony OS x86_64 boot entry point.
 //!
-//! Initialises serial output, heap, RDRAND entropy, generates a node
-//! identity, then enters the unikernel event loop.
+//! Initialises serial output, heap, RDRAND entropy, generates PQC + Ed25519
+//! node identities, then enters the unikernel event loop.
 
 #![no_std]
 #![no_main]
@@ -23,7 +23,7 @@ use core::panic::PanicInfo;
 use linked_list_allocator::LockedHeap;
 use x86_64::instructions::port::Port;
 
-use harmony_identity::PrivateIdentity;
+use harmony_identity::{PqPrivateIdentity, PrivateIdentity};
 use harmony_unikernel::serial::{hex_encode, SerialWriter};
 use harmony_unikernel::{KernelEntropy, MemoryState, RuntimeAction, UnikernelRuntime};
 
@@ -279,14 +279,23 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     serial.log("ENTROPY", "RDRAND available");
 
-    // 5. Identity generation
+    // 5. Identity generation — PQC primary, Ed25519 for Reticulum compat
     let mut entropy = KernelEntropy::new(rdrand_fill);
-    let identity = PrivateIdentity::generate(&mut entropy);
-    let addr = identity.public_identity().address_hash;
+
+    let pq_identity = PqPrivateIdentity::generate(&mut entropy);
+    let pq_addr = pq_identity.public_identity().address_hash;
     let mut hex_buf = [0u8; 32];
-    hex_encode(&addr, &mut hex_buf);
+    hex_encode(&pq_addr, &mut hex_buf);
     let hex_str = core::str::from_utf8(&hex_buf).unwrap_or("????????????????????????????????");
     serial.log("IDENTITY", hex_str);
+    serial.log("IDENTITY", "(ML-DSA-65 / ML-KEM-768)");
+
+    let identity = PrivateIdentity::generate(&mut entropy);
+    let compat_addr = identity.public_identity().address_hash;
+    hex_encode(&compat_addr, &mut hex_buf);
+    let hex_str = core::str::from_utf8(&hex_buf).unwrap_or("????????????????????????????????");
+    serial.log("COMPAT", hex_str);
+    serial.log("COMPAT", "(Ed25519 — Reticulum wire compat)");
 
     // 5.5 VirtIO-net init
     let mut virtio_net = match pci::find_virtio_net() {
@@ -345,7 +354,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // 6. Event loop
     let persistence = MemoryState::new();
-    let mut runtime = UnikernelRuntime::new(identity, entropy, persistence);
+    let mut runtime = UnikernelRuntime::new_with_pq(identity, pq_identity, entropy, persistence);
 
     if virtio_net.is_some() {
         runtime.register_interface("eth0");
