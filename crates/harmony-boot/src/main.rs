@@ -65,6 +65,8 @@ struct BootState {
     boot_info: &'static mut BootInfo,
     phys_offset: u64,
     pit: pit::PitTimer,
+    /// Base address of the heap-allocated stack, where the canary lives.
+    stack_canary_addr: usize,
 }
 
 /// Switch RSP to `new_stack_top` and call `continuation(state)`.
@@ -73,7 +75,10 @@ struct BootState {
 /// - `new_stack_top` must be a valid, 16-byte-aligned, writable address
 ///   with sufficient space below it for the continuation's stack usage.
 /// - `continuation` must be `extern "C"` and never return.
-/// - `state` is passed as `rdi` (SysV ABI first argument).
+/// - `state` is passed via the explicit `in("rdi")` constraint. The
+///   `in(reg)` operands for `stack` and `cont` cannot alias `rdi`
+///   because LLVM's register allocator treats the explicit `in("rdi")`
+///   as an occupied register and excludes it from the `in(reg)` pool.
 unsafe fn switch_to_stack(
     state: *mut BootState,
     new_stack_top: usize,
@@ -311,15 +316,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
-    // 4. Allocate 128KB stack from heap and switch to it
+    // 4. Allocate 128KB stack from heap and switch to it.
+    //    No MMU guard page yet — a canary word at the stack base detects
+    //    overflow in debug builds (checked in the event loop).
     let stack_vec = alloc::vec![0u8; KERNEL_STACK_SIZE];
-    let stack_top = (stack_vec.as_ptr() as usize + KERNEL_STACK_SIZE) & !0xF;
+    let stack_base = stack_vec.as_ptr() as usize;
+    let stack_top = (stack_base + KERNEL_STACK_SIZE) & !0xF;
+    // Write canary at the very bottom of the stack (first 8 bytes).
+    // If a stack overflow reaches here, the canary will be corrupted.
+    const STACK_CANARY: u64 = 0xDEAD_BEEF_CAFE_BABE;
+    unsafe {
+        core::ptr::write_volatile(stack_base as *mut u64, STACK_CANARY);
+    }
     core::mem::forget(stack_vec);
 
     let state = Box::into_raw(Box::new(BootState {
         boot_info,
         phys_offset,
         pit,
+        stack_canary_addr: stack_base,
     }));
 
     unsafe { switch_to_stack(state, stack_top, kernel_continue) }
@@ -336,14 +351,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     let state = *Box::from_raw(state);
     // Retained for future use — ring2/ring3 VM work may need the memory map.
+    // Currently a dead-end binding scoped to kernel_continue. When ring2/ring3
+    // needs the memory map, this will need to move to a static or be passed
+    // through a kernel struct.
     let _boot_info = state.boot_info;
     let phys_offset = state.phys_offset;
     let mut pit = state.pit;
+    let stack_canary_addr = state.stack_canary_addr;
 
     let mut serial = serial_writer();
     serial.log("STACK", "switched to 128KB heap stack");
 
-    // 4. RDRAND entropy
+    // 1. RDRAND entropy
     if !rdrand_available() {
         serial.log("ENTROPY", "RDRAND not available -- halting");
         loop {
@@ -352,7 +371,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     }
     serial.log("ENTROPY", "RDRAND available");
 
-    // 5. Identity generation — Ed25519 for Reticulum wire compat.
+    // 2. Identity generation — Ed25519 for Reticulum wire compat.
     let mut entropy = KernelEntropy::new(rdrand_fill);
     let identity = PrivateIdentity::generate(&mut entropy);
     let addr = identity.public_identity().address_hash;
@@ -361,7 +380,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     let hex_str = core::str::from_utf8(&hex_buf).unwrap_or("????????????????????????????????");
     serial.log("IDENTITY", hex_str);
 
-    // 5.5 VirtIO-net init
+    // 3. VirtIO-net init
     let mut virtio_net = match pci::find_virtio_net() {
         Some(pci_dev) => {
             pci_dev.enable_bus_master();
@@ -391,7 +410,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         }
     };
 
-    // 5.6 Initialize IP network stack (UDP interface for mesh-over-IP)
+    // 4. Initialize IP network stack (UDP interface for mesh-over-IP)
     // QEMU user-mode networking defaults — override for non-QEMU targets.
     use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
     const NETSTACK_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
@@ -416,7 +435,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
 
     serial.log("NETSTACK", "udp0 at 10.0.2.15/24, port 4242");
 
-    // 6. Event loop
+    // 5. Event loop
     let persistence = MemoryState::new();
     let mut runtime = UnikernelRuntime::new(identity, entropy, persistence);
 
@@ -775,6 +794,13 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                 let _ = net.send_raw(&frame);
             }
         }
+
+        // Check stack canary — detects overflow into heap memory.
+        debug_assert_eq!(
+            unsafe { core::ptr::read_volatile(stack_canary_addr as *const u64) },
+            STACK_CANARY,
+            "kernel stack overflow detected (canary corrupted)"
+        );
 
         core::hint::spin_loop();
     }
