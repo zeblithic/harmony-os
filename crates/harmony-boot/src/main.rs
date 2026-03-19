@@ -447,9 +447,14 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     let mut runtime = UnikernelRuntime::new(identity, entropy, persistence);
 
     // Generate key hierarchy identities.
-    // TODO: load hardware key from persistent storage instead of generating fresh.
+    // WARNING: Hardware key is generated fresh each boot — the attestation
+    // chain is non-functional until persistent storage is implemented.
+    // Any owner claim or attestation pair created offline will be invalid
+    // because the hardware address changes on every reboot.
+    // TODO: load hardware key from persistent storage.
     // TODO: verify attestation pair (owner claim + hardware acceptance).
     use harmony_identity::PqPrivateIdentity;
+    serial.log("WARN", "hardware key not persisted — attestation chain inactive");
     let hw_identity = PqPrivateIdentity::generate(&mut KernelEntropy::new(rdrand_fill));
     let hw_addr = hw_identity.public_identity().address_hash;
     hex_encode(&hw_addr, &mut hex_buf);

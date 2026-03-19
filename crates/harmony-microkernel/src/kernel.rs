@@ -89,6 +89,15 @@ impl<P: PageTable> Kernel<P> {
         let mut identity_store = PqMemoryIdentityStore::new();
         identity_store.insert(hardware_identity.public_identity().clone());
         identity_store.insert(session_identity.public_identity().clone());
+        // Register the owner's public identity so Chain-2 UCANs (Owner → User)
+        // can be verified. The owner's identity is extracted from the attestation
+        // pair's claim — the owner_address is their PQ address hash, and we need
+        // to resolve their full public key for signature verification.
+        // NOTE: For the owner's public key to be verifiable, it must be submitted
+        // separately (e.g., via a provisioning step). For now, the attestation pair
+        // carries the address hashes but not the full public keys. User capability
+        // verification requires the owner's full PqIdentity in the store — this is
+        // wired up during provisioning (future work) or in tests via identity_store.
         let mut kernel = Kernel {
             processes: BTreeMap::new(),
             next_pid: 0,
@@ -110,6 +119,29 @@ impl<P: PageTable> Kernel<P> {
         };
         kernel.sync_guardian_state_hashes();
         kernel
+    }
+
+    /// Register an external identity (e.g., the owner's public key) so that
+    /// UCANs issued by that identity can be verified via `verify_pq_token`.
+    ///
+    /// The owner's public key must be registered before user capabilities
+    /// (Chain-2 UCANs signed by the owner) can pass verification.
+    pub fn register_identity(&mut self, identity: harmony_identity::PqIdentity) {
+        self.identity_store.insert(identity);
+    }
+
+    /// Submit a user capability (UCAN + session binding) to a process.
+    ///
+    /// The capability is NOT verified at submission time — it will be verified
+    /// lazily at walk time via `check_endpoint_cap`.
+    pub fn submit_user_capability(
+        &mut self,
+        pid: u32,
+        capability: BoundCapability,
+    ) -> Result<(), IpcError> {
+        let process = self.processes.get_mut(&pid).ok_or(IpcError::NotFound)?;
+        process.user_capabilities.push(capability);
+        Ok(())
     }
 
     /// Exchange state hashes between Lyll and Nakaiah so each guardian
@@ -291,21 +323,26 @@ impl<P: PageTable> Kernel<P> {
     /// Scans both `kernel_capabilities` (session-key-signed, no binding)
     /// and `user_capabilities` (UCAN + session binding). Either vector
     /// producing a valid match returns `Ok`.
+    /// Check whether `process` holds a valid endpoint capability for `target_pid`.
+    ///
+    /// Returns `Ok(nonce)` where `nonce` is `Some` if a user capability's
+    /// session binding was accepted (the caller MUST record this nonce in
+    /// `used_binding_nonces` to prevent replay), or `None` for kernel caps.
     pub(crate) fn check_endpoint_cap(
         &self,
         process: &Process,
         target_pid: u32,
         now: u64,
-    ) -> Result<(), IpcError> {
+    ) -> Result<Option<[u8; 16]>, IpcError> {
         let target_resource = alloc::format!("pid:{}", target_pid);
-        let audience_hash = &process.address_hash;
+        let audience_hash = process.address_hash;
 
         // 1. Scan kernel-issued capabilities (signed by session key).
         for cap in &process.kernel_capabilities {
             if cap.capability != CapabilityType::Endpoint {
                 continue;
             }
-            if &cap.audience != audience_hash {
+            if cap.audience != audience_hash {
                 continue;
             }
             let resource_str = match core::str::from_utf8(&cap.resource) {
@@ -325,7 +362,7 @@ impl<P: PageTable> Kernel<P> {
             )
             .is_ok()
             {
-                return Ok(());
+                return Ok(None);
             }
         }
 
@@ -335,7 +372,7 @@ impl<P: PageTable> Kernel<P> {
             if cap.capability != CapabilityType::Endpoint {
                 continue;
             }
-            if &cap.audience != audience_hash {
+            if cap.audience != audience_hash {
                 continue;
             }
             let resource_str = match core::str::from_utf8(&cap.resource) {
@@ -369,7 +406,7 @@ impl<P: PageTable> Kernel<P> {
             )
             .is_ok()
             {
-                return Ok(());
+                return Ok(Some(bound.binding.nonce));
             }
         }
 
@@ -400,13 +437,20 @@ impl<P: PageTable> Kernel<P> {
         // resolve() mean `remainder` borrows from `path`, not from `self`,
         // so no heap allocation is needed to release the process borrow.
         let (target_pid, server_root_fid, remainder) = {
-            let process = self.processes.get(&from_pid).ok_or(IpcError::NotFound)?;
-            let (mount, remainder) = process.namespace.resolve(path).ok_or(IpcError::NotFound)?;
-            let target_pid = mount.target_pid;
-            let server_root_fid = mount.root_fid;
-            // Capability check uses &self — compatible with the shared
-            // borrow through `process`, so no clone needed.
-            self.check_endpoint_cap(process, target_pid, now)?;
+            let (target_pid, server_root_fid, remainder, accepted_nonce) = {
+                let process = self.processes.get(&from_pid).ok_or(IpcError::NotFound)?;
+                let (mount, remainder) =
+                    process.namespace.resolve(path).ok_or(IpcError::NotFound)?;
+                let target_pid = mount.target_pid;
+                let server_root_fid = mount.root_fid;
+                let remainder = remainder.to_owned();
+                let accepted_nonce = self.check_endpoint_cap(process, target_pid, now)?;
+                (target_pid, server_root_fid, remainder, accepted_nonce)
+            };
+            // Record session binding nonce after the process borrow is released.
+            if let Some(nonce) = accepted_nonce {
+                self.used_binding_nonces.insert(nonce);
+            }
             (target_pid, server_root_fid, remainder)
         };
 

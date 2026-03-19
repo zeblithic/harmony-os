@@ -39,6 +39,8 @@ pub enum AttestationError {
     ClaimHashMismatch,
     /// An ML-DSA-65 signature failed verification.
     SignatureInvalid(IdentityError),
+    /// The hardware acceptance timestamp predates the owner claim.
+    TemporalIncoherence,
 }
 
 /// Errors produced by session binding verification.
@@ -240,6 +242,11 @@ pub fn verify_attestation(
     hardware_pubkey
         .verify(&acceptance.signable_bytes(), &acceptance.signature)
         .map_err(AttestationError::SignatureInvalid)?;
+
+    // 6. Temporal coherence: acceptance cannot predate its claim.
+    if acceptance.accepted_at < claim.claimed_at {
+        return Err(AttestationError::TemporalIncoherence);
+    }
 
     Ok(())
 }
