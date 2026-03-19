@@ -39,6 +39,9 @@ jobs:
       - name: Clippy
         run: nix develop --command cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      - name: Clippy (xtask)
+        run: nix develop --command cargo clippy --manifest-path xtask/Cargo.toml -- -D warnings
+
       - name: Tests
         run: nix develop --command cargo test --locked --workspace
 

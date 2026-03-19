@@ -31,6 +31,9 @@ deny = [
 [licenses]
 confidence-threshold = 0.8
 allow = [
+    # This repo is GPL-2.0-or-later (Linux ecosystem compat). All workspace
+    # crates use this license, so blanket-allowing is correct — GPL transitive
+    # deps are compatible. Core (harmony) stays MIT/Apache-2.0 in a separate repo.
     "GPL-2.0-or-later",
     "MIT",
     "Apache-2.0",
