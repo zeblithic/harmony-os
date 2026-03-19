@@ -192,7 +192,7 @@ mod tests {
     }
 
     fn issue(
-        rng: &mut (impl rand_core::CryptoRngCore),
+        rng: &mut impl rand_core::CryptoRngCore,
         issuer: &PqPrivateIdentity,
         audience: &[u8; 16],
         cap: CapabilityType,
