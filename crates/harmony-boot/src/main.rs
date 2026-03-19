@@ -9,6 +9,8 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
+
 mod pci;
 mod pit;
 #[cfg(feature = "ring3")]
@@ -48,6 +50,54 @@ entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
+
+// ---------------------------------------------------------------------------
+// Heap-allocated kernel stack
+// ---------------------------------------------------------------------------
+
+/// Size of the heap-allocated kernel stack in bytes.
+/// ML-KEM-768 + ML-DSA-65 key generation uses ~25KB of stack for NTT polynomial
+/// matrices. 512KB provides ample headroom from the 4MB heap for future growth.
+const KERNEL_STACK_SIZE: usize = 512 * 1024;
+
+/// Canary value written at the stack base to detect overflow.
+const STACK_CANARY: u64 = 0xDEAD_BEEF_CAFE_BABE;
+
+/// State from early boot that must survive the stack switch.
+/// Heap-allocated via `Box` so the pointer remains valid after RSP changes.
+struct BootState {
+    boot_info: &'static mut BootInfo,
+    phys_offset: u64,
+    pit: pit::PitTimer,
+    /// Base address of the heap-allocated stack, where the canary lives.
+    stack_canary_addr: usize,
+}
+
+/// Switch RSP to `new_stack_top` and call `continuation(state)`.
+///
+/// # Safety
+/// - `new_stack_top` must be a valid, 16-byte-aligned, writable address
+///   with sufficient space below it for the continuation's stack usage.
+/// - `continuation` must be `extern "C"` and never return.
+/// - `state` is passed via the explicit `in("rdi")` constraint. The
+///   `in(reg)` operands for `stack` and `cont` cannot alias `rdi`
+///   because LLVM's register allocator treats the explicit `in("rdi")`
+///   as an occupied register and excludes it from the `in(reg)` pool.
+unsafe fn switch_to_stack(
+    state: *mut BootState,
+    new_stack_top: usize,
+    continuation: unsafe extern "C" fn(*mut BootState) -> !,
+) -> ! {
+    core::arch::asm!(
+        "mov rsp, {stack}",
+        "call {cont}",
+        "ud2",
+        stack = in(reg) new_stack_top,
+        cont = in(reg) continuation,
+        in("rdi") state,
+        options(noreturn),
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Serial I/O helpers (UART 0x3F8)
@@ -225,7 +275,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let mut serial = serial_writer();
     serial.log("BOOT", "Harmony unikernel v0.1.0");
 
-    let mut pit = pit::PitTimer::init();
+    let pit = pit::PitTimer::init();
     serial.log("PIT", "timer initialized");
 
     // 2. Get the physical memory offset so we can convert physical -> virtual
@@ -270,7 +320,52 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
-    // 4. RDRAND entropy
+    // 4. Allocate 512KB stack from heap and switch to it.
+    //    No MMU guard page yet — a canary word at the stack base detects
+    //    overflow in debug builds (checked in the event loop).
+    let stack_vec = alloc::vec![0u8; KERNEL_STACK_SIZE];
+    let stack_base = stack_vec.as_ptr() as usize;
+    let stack_top = (stack_base + KERNEL_STACK_SIZE) & !0xF;
+    // Write canary at the very bottom of the stack (first 8 bytes).
+    // If a stack overflow reaches here, the canary will be corrupted.
+    unsafe {
+        core::ptr::write_volatile(stack_base as *mut u64, STACK_CANARY);
+    }
+    core::mem::forget(stack_vec);
+
+    let state = Box::into_raw(Box::new(BootState {
+        boot_info,
+        phys_offset,
+        pit,
+        stack_canary_addr: stack_base,
+    }));
+
+    unsafe { switch_to_stack(state, stack_top, kernel_continue) }
+}
+
+// ---------------------------------------------------------------------------
+// Post-stack-switch continuation
+// ---------------------------------------------------------------------------
+
+/// Continuation after switching to the 512KB heap stack.
+///
+/// # Safety
+/// `state` must be a valid pointer produced by `Box::into_raw(Box::new(BootState { .. }))`.
+unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
+    let state = *Box::from_raw(state);
+    // Retained for future use — ring2/ring3 VM work may need the memory map.
+    // Currently a dead-end binding scoped to kernel_continue. When ring2/ring3
+    // needs the memory map, this will need to move to a static or be passed
+    // through a kernel struct.
+    let _boot_info = state.boot_info;
+    let phys_offset = state.phys_offset;
+    let mut pit = state.pit;
+    let stack_canary_addr = state.stack_canary_addr;
+
+    let mut serial = serial_writer();
+    serial.log("STACK", "switched to 512KB heap stack");
+
+    // 1. RDRAND entropy
     if !rdrand_available() {
         serial.log("ENTROPY", "RDRAND not available -- halting");
         loop {
@@ -279,10 +374,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     serial.log("ENTROPY", "RDRAND available");
 
-    // 5. Identity generation — Ed25519 for Reticulum wire compat.
-    //    PQ identity (ML-DSA-65/ML-KEM-768) is generated lazily by the
-    //    runtime after construction — PQ keygen's lattice operations need
-    //    more stack than the bootloader provides at kernel entry.
+    // 2. Identity generation — Ed25519 for Reticulum wire compat.
     let mut entropy = KernelEntropy::new(rdrand_fill);
     let identity = PrivateIdentity::generate(&mut entropy);
     let addr = identity.public_identity().address_hash;
@@ -291,7 +383,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let hex_str = core::str::from_utf8(&hex_buf).unwrap_or("????????????????????????????????");
     serial.log("IDENTITY", hex_str);
 
-    // 5.5 VirtIO-net init
+    // 3. VirtIO-net init
     let mut virtio_net = match pci::find_virtio_net() {
         Some(pci_dev) => {
             pci_dev.enable_bus_master();
@@ -321,7 +413,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     };
 
-    // 5.6 Initialize IP network stack (UDP interface for mesh-over-IP)
+    // 4. Initialize IP network stack (UDP interface for mesh-over-IP)
     // QEMU user-mode networking defaults — override for non-QEMU targets.
     use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
     const NETSTACK_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
@@ -346,21 +438,23 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     serial.log("NETSTACK", "udp0 at 10.0.2.15/24, port 4242");
 
-    // 6. Event loop
+    // 5. Event loop
     let persistence = MemoryState::new();
     let mut runtime = UnikernelRuntime::new(identity, entropy, persistence);
 
-    // Generate PQ identity now that the heap is available.
-    // Skipped in qemu-test: the bootloader's x86_64 stack is too small
-    // for ML-KEM/ML-DSA lattice operations. PQ keygen is verified by
-    // unit tests; the smoke test only checks boot-to-event-loop.
-    #[cfg(not(feature = "qemu-test"))]
-    if let Some(pq_addr) = runtime.generate_pq_identity() {
-        hex_encode(&pq_addr, &mut hex_buf);
-        let hex_str =
-            core::str::from_utf8(&hex_buf).unwrap_or("????????????????????????????????");
-        serial.log("PQ_IDENTITY", hex_str);
-    }
+
+    // PQ keygen crashes on x86_64-unknown-none (triple fault inside
+    // ml-kem/ml-dsa lattice ops — suspected keccak/sha3 codegen issue
+    // with soft-float target). aarch64 PQ keygen works fine.
+    // TODO(harmony-os-0vp): investigate x86_64 PQ keygen crash.
+    //
+    // When this is fixed, uncomment:
+    // if let Some(pq_addr) = runtime.generate_pq_identity() {
+    //     hex_encode(&pq_addr, &mut hex_buf);
+    //     let hex_str =
+    //         core::str::from_utf8(&hex_buf).unwrap_or("????????????????????????????????");
+    //     serial.log("PQ_IDENTITY", hex_str);
+    // }
 
     if virtio_net.is_some() {
         runtime.register_interface("eth0");
@@ -708,6 +802,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 let _ = net.send_raw(&frame);
             }
         }
+
+        // Check stack canary — detects overflow into heap memory.
+        debug_assert_eq!(
+            unsafe { core::ptr::read_volatile(stack_canary_addr as *const u64) },
+            STACK_CANARY,
+            "kernel stack overflow detected (canary corrupted)"
+        );
 
         core::hint::spin_loop();
     }
