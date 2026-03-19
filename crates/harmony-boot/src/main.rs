@@ -9,6 +9,8 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
+
 mod pci;
 mod pit;
 #[cfg(feature = "ring3")]
@@ -264,7 +266,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let mut serial = serial_writer();
     serial.log("BOOT", "Harmony unikernel v0.1.0");
 
-    let mut pit = pit::PitTimer::init();
+    let pit = pit::PitTimer::init();
     serial.log("PIT", "timer initialized");
 
     // 2. Get the physical memory offset so we can convert physical -> virtual
@@ -309,6 +311,37 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
+    // 4. Allocate 128KB stack from heap and switch to it
+    let stack_vec = alloc::vec![0u8; KERNEL_STACK_SIZE];
+    let stack_top = (stack_vec.as_ptr() as usize + KERNEL_STACK_SIZE) & !0xF;
+    core::mem::forget(stack_vec);
+
+    let state = Box::into_raw(Box::new(BootState {
+        boot_info,
+        phys_offset,
+        pit,
+    }));
+
+    unsafe { switch_to_stack(state, stack_top, kernel_continue) }
+}
+
+// ---------------------------------------------------------------------------
+// Post-stack-switch continuation
+// ---------------------------------------------------------------------------
+
+/// Continuation after switching to the 128KB heap stack.
+///
+/// # Safety
+/// `state` must be a valid pointer produced by `Box::into_raw(Box::new(BootState { .. }))`.
+unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
+    let state = *Box::from_raw(state);
+    let _boot_info = state.boot_info;
+    let phys_offset = state.phys_offset;
+    let mut pit = state.pit;
+
+    let mut serial = serial_writer();
+    serial.log("STACK", "switched to 128KB heap stack");
+
     // 4. RDRAND entropy
     if !rdrand_available() {
         serial.log("ENTROPY", "RDRAND not available -- halting");
@@ -319,9 +352,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial.log("ENTROPY", "RDRAND available");
 
     // 5. Identity generation — Ed25519 for Reticulum wire compat.
-    //    PQ identity (ML-DSA-65/ML-KEM-768) is generated lazily by the
-    //    runtime after construction — PQ keygen's lattice operations need
-    //    more stack than the bootloader provides at kernel entry.
     let mut entropy = KernelEntropy::new(rdrand_fill);
     let identity = PrivateIdentity::generate(&mut entropy);
     let addr = identity.public_identity().address_hash;
@@ -389,11 +419,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let persistence = MemoryState::new();
     let mut runtime = UnikernelRuntime::new(identity, entropy, persistence);
 
-    // Generate PQ identity now that the heap is available.
-    // Skipped in qemu-test: the bootloader's x86_64 stack is too small
-    // for ML-KEM/ML-DSA lattice operations. PQ keygen is verified by
-    // unit tests; the smoke test only checks boot-to-event-loop.
-    #[cfg(not(feature = "qemu-test"))]
+    // Generate PQ identity — the 128KB heap stack provides sufficient
+    // headroom for ML-KEM/ML-DSA lattice operations (~25KB peak).
     if let Some(pq_addr) = runtime.generate_pq_identity() {
         hex_encode(&pq_addr, &mut hex_buf);
         let hex_str =
