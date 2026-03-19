@@ -56,8 +56,11 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 // ---------------------------------------------------------------------------
 
 /// Size of the heap-allocated kernel stack in bytes.
-/// 2MB to rule out stack overflow as cause of PQ keygen triple fault.
-/// Will be reduced once the root cause is found (harmony-os-0vp).
+///
+/// ML-KEM-768 + ML-DSA-65 keygen on `x86_64-unknown-none` (without SSE2)
+/// requires >512KB of stack because the compiler cannot use XMM registers
+/// and spills aggressively to the stack during NTT polynomial operations.
+/// 2MB provides comfortable headroom from the 4MB heap.
 const KERNEL_STACK_SIZE: usize = 2 * 1024 * 1024;
 
 /// Canary value written at the stack base to detect overflow.
@@ -443,8 +446,6 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     let mut runtime = UnikernelRuntime::new(identity, entropy, persistence);
 
 
-    // Test PQ keygen with 2MB stack to rule out stack overflow.
-    serial.log("PQ", "generating PQ identity (2MB stack)...");
     if let Some(pq_addr) = runtime.generate_pq_identity() {
         hex_encode(&pq_addr, &mut hex_buf);
         let hex_str =
