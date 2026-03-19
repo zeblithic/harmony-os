@@ -241,6 +241,8 @@ fn x86_64_qemu_config(timeout: Duration) -> QemuConfig {
             "isa-debug-exit,iobase=0xf4,iosize=0x04".into(),
             "-cpu".into(),
             "qemu64,+rdrand".into(),
+            "-m".into(),
+            "256M".into(),
             "-no-reboot".into(),
         ],
         milestones: x86_64_milestones(),
