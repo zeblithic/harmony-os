@@ -295,12 +295,12 @@ mod tests {
     }
 
     #[test]
-    fn wrong_signer_rejected() {
+    fn wrong_signer_signature_invalid() {
         let mut rng = test_rng();
         let issuer = PqPrivateIdentity::generate(&mut rng);
         let wrong = PqPrivateIdentity::generate(&mut rng);
-        // Token signed by `issuer`, but store only has `wrong`'s identity
-        // registered under issuer's address hash — signature won't match.
+        // Token signed by `issuer`. Store maps issuer's address hash to
+        // `wrong`'s verifying key — resolve() finds it but verify_signature fails.
         let token = issue(
             &mut rng,
             &issuer,
@@ -310,12 +310,16 @@ mod tests {
             0,
             0,
         );
+        let mut wrong_pub = wrong.public_identity().clone();
+        wrong_pub.address_hash = issuer.public_identity().address_hash;
         let mut ids = PqMemoryIdentityStore::new();
-        ids.insert(wrong.public_identity().clone());
+        ids.insert(wrong_pub);
         let proofs = PqMemoryProofStore::new();
         let revocations = MemoryRevocationSet::new();
-        // Issuer address hash won't be found (wrong identity has different hash).
-        assert!(verify_pq_token(&token, 100, &proofs, &ids, &revocations, 5).is_err());
+        assert!(matches!(
+            verify_pq_token(&token, 100, &proofs, &ids, &revocations, 5),
+            Err(UcanError::SignatureInvalid)
+        ));
     }
 
     #[test]

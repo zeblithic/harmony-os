@@ -72,37 +72,15 @@ pub struct UnikernelRuntime<E: EntropySource, P: PersistentState> {
 }
 
 impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P> {
-    /// Create a runtime with only a classical Ed25519 identity (legacy/test path).
-    pub fn new(identity: PrivateIdentity, entropy: E, persistence: P) -> Self {
-        Self::new_inner(identity, None, entropy, persistence)
-    }
-
-    /// Create a runtime with both PQ and classical identities.
+    /// Create a runtime with a classical Ed25519 identity.
     ///
-    /// The PQ identity (ML-DSA/ML-KEM) is the node's primary identity for
-    /// signing and encryption. The classical identity (Ed25519/X25519) is
-    /// retained for Reticulum wire compatibility — announces, links, and
-    /// encrypted payloads on the Reticulum transport still use Ed25519.
-    pub fn new_with_pq(
-        identity: PrivateIdentity,
-        pq_identity: PqPrivateIdentity,
-        entropy: E,
-        persistence: P,
-    ) -> Self {
-        Self::new_inner(identity, Some(pq_identity), entropy, persistence)
-    }
-
-    fn new_inner(
-        identity: PrivateIdentity,
-        pq_identity: Option<PqPrivateIdentity>,
-        entropy: E,
-        persistence: P,
-    ) -> Self {
+    /// Call `generate_pq_identity()` after construction to add PQ support.
+    pub fn new(identity: PrivateIdentity, entropy: E, persistence: P) -> Self {
         let node = Node::new();
         UnikernelRuntime {
             node,
             identity,
-            pq_identity,
+            pq_identity: None,
             entropy,
             persistence,
             tick_count: 0,
