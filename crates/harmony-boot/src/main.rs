@@ -335,6 +335,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 /// `state` must be a valid pointer produced by `Box::into_raw(Box::new(BootState { .. }))`.
 unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     let state = *Box::from_raw(state);
+    // Retained for future use — ring2/ring3 VM work may need the memory map.
     let _boot_info = state.boot_info;
     let phys_offset = state.phys_offset;
     let mut pit = state.pit;
