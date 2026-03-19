@@ -50,6 +50,45 @@ entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 // ---------------------------------------------------------------------------
+// Heap-allocated kernel stack
+// ---------------------------------------------------------------------------
+
+/// Size of the heap-allocated kernel stack in bytes.
+/// 128KB provides ~5x headroom for PQ lattice operations (ML-KEM + ML-DSA ~25KB).
+const KERNEL_STACK_SIZE: usize = 128 * 1024;
+
+/// State from early boot that must survive the stack switch.
+/// Heap-allocated via `Box` so the pointer remains valid after RSP changes.
+struct BootState {
+    boot_info: &'static mut BootInfo,
+    phys_offset: u64,
+    pit: pit::PitTimer,
+}
+
+/// Switch RSP to `new_stack_top` and call `continuation(state)`.
+///
+/// # Safety
+/// - `new_stack_top` must be a valid, 16-byte-aligned, writable address
+///   with sufficient space below it for the continuation's stack usage.
+/// - `continuation` must be `extern "C"` and never return.
+/// - `state` is passed as `rdi` (SysV ABI first argument).
+unsafe fn switch_to_stack(
+    state: *mut BootState,
+    new_stack_top: usize,
+    continuation: unsafe extern "C" fn(*mut BootState) -> !,
+) -> ! {
+    core::arch::asm!(
+        "mov rsp, {stack}",
+        "call {cont}",
+        "ud2",
+        stack = in(reg) new_stack_top,
+        cont = in(reg) continuation,
+        in("rdi") state,
+        options(noreturn),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Serial I/O helpers (UART 0x3F8)
 // ---------------------------------------------------------------------------
 
