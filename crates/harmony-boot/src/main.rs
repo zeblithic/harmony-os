@@ -351,6 +351,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let mut runtime = UnikernelRuntime::new(identity, entropy, persistence);
 
     // Generate PQ identity now that the heap is available.
+    // Skipped in qemu-test: the bootloader's x86_64 stack is too small
+    // for ML-KEM/ML-DSA lattice operations. PQ keygen is verified by
+    // unit tests; the smoke test only checks boot-to-event-loop.
+    #[cfg(not(feature = "qemu-test"))]
     if let Some(pq_addr) = runtime.generate_pq_identity() {
         hex_encode(&pq_addr, &mut hex_buf);
         let hex_str =
