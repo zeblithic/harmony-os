@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Harmony OS x86_64 boot entry point.
 //!
-//! Initialises serial output, heap, RDRAND entropy, generates a node
-//! identity, then enters the unikernel event loop.
+//! Initialises serial output, heap, RDRAND entropy, generates PQC + Ed25519
+//! node identities, then enters the unikernel event loop.
 
 #![no_std]
 #![no_main]
@@ -279,7 +279,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     serial.log("ENTROPY", "RDRAND available");
 
-    // 5. Identity generation
+    // 5. Identity generation — Ed25519 for Reticulum wire compat.
+    //    PQ identity (ML-DSA-65/ML-KEM-768) is generated lazily by the
+    //    runtime after construction — PQ keygen's lattice operations need
+    //    more stack than the bootloader provides at kernel entry.
     let mut entropy = KernelEntropy::new(rdrand_fill);
     let identity = PrivateIdentity::generate(&mut entropy);
     let addr = identity.public_identity().address_hash;
@@ -346,6 +349,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // 6. Event loop
     let persistence = MemoryState::new();
     let mut runtime = UnikernelRuntime::new(identity, entropy, persistence);
+
+    // Generate PQ identity now that the heap is available.
+    // Skipped in qemu-test: the bootloader's x86_64 stack is too small
+    // for ML-KEM/ML-DSA lattice operations. PQ keygen is verified by
+    // unit tests; the smoke test only checks boot-to-event-loop.
+    #[cfg(not(feature = "qemu-test"))]
+    if let Some(pq_addr) = runtime.generate_pq_identity() {
+        hex_encode(&pq_addr, &mut hex_buf);
+        let hex_str =
+            core::str::from_utf8(&hex_buf).unwrap_or("????????????????????????????????");
+        serial.log("PQ_IDENTITY", hex_str);
+    }
 
     if virtio_net.is_some() {
         runtime.register_interface("eth0");

@@ -4459,7 +4459,7 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use harmony_identity::PrivateIdentity;
+    use harmony_identity::PqPrivateIdentity;
     use harmony_microkernel::echo::EchoServer;
     use harmony_microkernel::kernel::Kernel;
     use harmony_microkernel::serial_server::SerialServer;
@@ -4567,7 +4567,7 @@ mod integration_tests {
     #[test]
     fn linuxulator_writes_hello_through_kernel_to_serial() {
         let mut entropy = test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         // Spawn SerialServer
@@ -4617,7 +4617,7 @@ mod integration_tests {
     #[test]
     fn linuxulator_full_fd_lifecycle() {
         let mut entropy = test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         let mut kernel = Kernel::new(kernel_id, make_test_vm());
 
         let serial_pid = kernel
@@ -4676,7 +4676,7 @@ mod integration_tests {
         KernelEntropy<impl FnMut(&mut [u8])>,
     ) {
         let mut entropy = test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         // 256 frames = 1 MiB physical
         let buddy = BuddyAllocator::new(PhysAddr(0x10_0000), 256).unwrap();
         let vm = AddressSpaceManager::new(buddy);
@@ -4752,7 +4752,7 @@ mod integration_tests {
     #[test]
     fn vm_mmap_budget_exhaustion() {
         let mut entropy = test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         // 256 frames total
         let buddy = BuddyAllocator::new(PhysAddr(0x10_0000), 256).unwrap();
         let vm = AddressSpaceManager::new(buddy);
@@ -4816,7 +4816,7 @@ mod integration_tests {
         use harmony_microkernel::vm::{FrameClassification, VirtAddr};
 
         let mut entropy = test_entropy();
-        let kernel_id = PrivateIdentity::generate(&mut entropy);
+        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
         // Large frame pool for ELF loading.
         let buddy = BuddyAllocator::new(PhysAddr(0x10_0000), 256).unwrap();
         let vm = AddressSpaceManager::new(buddy);

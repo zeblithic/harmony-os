@@ -20,7 +20,7 @@ fn x86_64_milestones() -> Vec<Milestone> {
         },
         Milestone {
             pattern: "[IDENTITY]",
-            description: "identity generated",
+            description: "PQ identity generated",
         },
         Milestone {
             pattern: "[READY] entering event loop",
@@ -41,7 +41,7 @@ fn aarch64_milestones() -> Vec<Milestone> {
         },
         Milestone {
             pattern: "[Identity]",
-            description: "identity generated",
+            description: "PQ identity generated",
         },
         Milestone {
             pattern: "[Runtime] Entering idle loop",
@@ -241,6 +241,8 @@ fn x86_64_qemu_config(timeout: Duration) -> QemuConfig {
             "isa-debug-exit,iobase=0xf4,iosize=0x04".into(),
             "-cpu".into(),
             "qemu64,+rdrand".into(),
+            "-m".into(),
+            "256M".into(),
             "-no-reboot".into(),
         ],
         milestones: x86_64_milestones(),

@@ -5,7 +5,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use harmony_identity::PrivateIdentity;
+use harmony_identity::{PqPrivateIdentity, PrivateIdentity};
 use harmony_platform::{EntropySource, PersistentState};
 use harmony_reticulum::destination::DestinationName;
 use harmony_reticulum::interface::InterfaceMode;
@@ -53,7 +53,13 @@ pub struct PeerInfo {
 
 pub struct UnikernelRuntime<E: EntropySource, P: PersistentState> {
     node: Node,
+    /// Classical Ed25519/X25519 identity — used for Reticulum wire compatibility.
     identity: PrivateIdentity,
+    /// Post-quantum ML-DSA/ML-KEM identity — intended as the node's primary identity.
+    /// Currently stored for future use; runtime operations (announces, heartbeats)
+    /// still use the classical `identity` for Reticulum wire compatibility.
+    /// `None` only for legacy/test configurations that haven't migrated yet.
+    pq_identity: Option<PqPrivateIdentity>,
     entropy: E,
     persistence: P,
     tick_count: u64,
@@ -66,11 +72,15 @@ pub struct UnikernelRuntime<E: EntropySource, P: PersistentState> {
 }
 
 impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P> {
+    /// Create a runtime with a classical Ed25519 identity.
+    ///
+    /// Call `generate_pq_identity()` after construction to add PQ support.
     pub fn new(identity: PrivateIdentity, entropy: E, persistence: P) -> Self {
         let node = Node::new();
         UnikernelRuntime {
             node,
             identity,
+            pq_identity: None,
             entropy,
             persistence,
             tick_count: 0,
@@ -178,8 +188,32 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
         self.tick_count
     }
 
+    /// The classical Ed25519/X25519 identity (for Reticulum wire compat).
     pub fn identity(&self) -> &PrivateIdentity {
         &self.identity
+    }
+
+    /// The post-quantum ML-DSA/ML-KEM identity (primary node identity).
+    /// Returns `None` if not yet generated or on legacy configurations.
+    pub fn pq_identity(&self) -> Option<&PqPrivateIdentity> {
+        self.pq_identity.as_ref()
+    }
+
+    /// Generate and store a PQ identity using the runtime's entropy source.
+    ///
+    /// Call this after the heap is fully initialized. PQ keygen (ML-KEM-768 +
+    /// ML-DSA-65) uses large intermediate lattice structures that overflow the
+    /// small initial stack provided by bare-metal bootloaders.
+    ///
+    /// Returns the PQ identity's address hash, or `None` if already generated.
+    pub fn generate_pq_identity(&mut self) -> Option<[u8; 16]> {
+        if self.pq_identity.is_some() {
+            return None;
+        }
+        let pq = PqPrivateIdentity::generate(&mut self.entropy);
+        let addr = pq.public_identity().address_hash;
+        self.pq_identity = Some(pq);
+        Some(addr)
     }
 
     pub fn entropy(&mut self) -> &mut E {
@@ -425,6 +459,62 @@ mod tests {
     fn runtime_initializes() {
         let runtime = make_runtime();
         assert_eq!(runtime.tick_count(), 0);
+    }
+
+    #[test]
+    fn generate_pq_identity_produces_valid_address() {
+        let mut runtime = make_runtime();
+        assert!(runtime.pq_identity().is_none());
+        let addr = runtime
+            .generate_pq_identity()
+            .expect("should return Some on first call");
+        assert_ne!(addr, [0u8; 16]);
+        assert!(runtime.pq_identity().is_some());
+        assert_eq!(
+            runtime
+                .pq_identity()
+                .unwrap()
+                .public_identity()
+                .address_hash,
+            addr
+        );
+    }
+
+    #[test]
+    fn generate_pq_identity_idempotent() {
+        let mut runtime = make_runtime();
+        let addr = runtime.generate_pq_identity().unwrap();
+        // Second call returns None (already generated)
+        assert!(runtime.generate_pq_identity().is_none());
+        // Identity unchanged
+        assert_eq!(
+            runtime
+                .pq_identity()
+                .unwrap()
+                .public_identity()
+                .address_hash,
+            addr
+        );
+    }
+
+    #[test]
+    fn pq_identity_absent_before_generate() {
+        let runtime = make_runtime();
+        assert!(runtime.pq_identity().is_none());
+    }
+
+    #[test]
+    fn pq_and_classical_addresses_differ() {
+        let mut runtime = make_runtime();
+        runtime.generate_pq_identity();
+        assert_ne!(
+            runtime.identity().public_identity().address_hash,
+            runtime
+                .pq_identity()
+                .unwrap()
+                .public_identity()
+                .address_hash,
+        );
     }
 
     #[test]

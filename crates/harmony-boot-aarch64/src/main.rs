@@ -237,7 +237,9 @@ fn main() -> Status {
         heap_size, heap_base
     );
 
-    // ── Generate Ed25519/X25519 identity ──
+    // ── Generate Ed25519 identity for Reticulum wire compat ──
+    //    PQ identity is generated lazily by the runtime — PQ keygen's
+    //    lattice operations overflow the UEFI-provided stack.
     let mut entropy = KernelEntropy::new(|buf: &mut [u8]| {
         unsafe { rndr::fill(buf) };
     });
@@ -246,13 +248,23 @@ fn main() -> Status {
     let addr = identity.public_identity().address_hash;
     let _ = writeln!(
         serial,
-        "[Identity] Generated Ed25519 address: {:02x}{:02x}{:02x}{:02x}...",
+        "[Identity] Ed25519 address: {:02x}{:02x}{:02x}{:02x}...",
         addr[0], addr[1], addr[2], addr[3],
     );
 
     // ── Create runtime and enter idle loop ──
     let persistence = MemoryState::new();
     let mut runtime = UnikernelRuntime::new(identity, entropy, persistence);
+
+    // Generate PQ identity now that the heap is available.
+    if let Some(pq_addr) = runtime.generate_pq_identity() {
+        let _ = writeln!(
+            serial,
+            "[Identity] PQ address (ML-DSA-65/ML-KEM-768): {:02x}{:02x}{:02x}{:02x}...",
+            pq_addr[0], pq_addr[1], pq_addr[2], pq_addr[3],
+        );
+    }
+
     let _ = writeln!(
         serial,
         "[Runtime] UnikernelRuntime created, entering idle loop"
