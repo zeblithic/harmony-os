@@ -99,6 +99,7 @@ impl PersistentNarStore {
         // validation so that no writes occur outside the store directory.
         if name.is_empty()
             || name.contains('/')
+            || name.contains('\\')
             || name.contains('\0')
             || name == "."
             || name == ".."

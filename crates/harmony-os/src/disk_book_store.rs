@@ -91,7 +91,7 @@ impl DiskBookStore {
             // Size check: the CID encodes the payload size. If the file
             // is truncated or corrupted, skip it rather than serving bad data.
             let expected_size = cid.payload_size() as usize;
-            if expected_size > 0 && data.len() != expected_size {
+            if data.len() != expected_size {
                 eprintln!(
                     "[disk-book-store] size mismatch for {name}: expected {expected_size}, got {}, skipping",
                     data.len()
