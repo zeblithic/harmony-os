@@ -30,7 +30,15 @@ pub trait ContentAnnouncer {
 ///
 /// Generic over the book store backend: defaults to [`MemoryBlobStore`]
 /// for backward compatibility, but accepts [`DiskBookStore`](crate::disk_book_store::DiskBookStore)
-/// (or any `BlobStore` impl) for persistent storage.
+/// (or any `BlobStore` impl) for durable book storage across restarts.
+///
+/// **Persistence scope:** Only the underlying book chunks are persisted
+/// by the store backend. The in-memory `published_paths` map (store-path
+/// → root CID) is **not** written to disk and will be empty after a
+/// process restart. Callers that need to restore the mapping must
+/// re-publish paths or separately persist this mapping.
+/// [`PersistentNarStore`](crate::persistent_nar_store::PersistentNarStore)
+/// handles the NAR-level persistence independently.
 pub struct NarPublisher<A: ContentAnnouncer, S: BlobStore = MemoryBlobStore> {
     announcer: A,
     blob_store: S,
