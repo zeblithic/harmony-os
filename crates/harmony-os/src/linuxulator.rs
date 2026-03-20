@@ -39,16 +39,17 @@ const O_CLOEXEC: i32 = 0o2000000;
 fn ipc_err_to_errno(e: IpcError) -> i64 {
     match e {
         IpcError::NotFound => ENOENT,
-        IpcError::PermissionDenied => -13,  // EACCES
-        IpcError::NotOpen => -9,            // EBADF
-        IpcError::InvalidFid => -9,         // EBADF
-        IpcError::NotDirectory => -20,      // ENOTDIR
-        IpcError::IsDirectory => -21,       // EISDIR
-        IpcError::ReadOnly => -30,          // EROFS
-        IpcError::ResourceExhausted => -12, // ENOMEM
-        IpcError::Conflict => -17,          // EEXIST
-        IpcError::NotSupported => -38,      // ENOSYS
-        IpcError::InvalidArgument => -22,   // EINVAL
+        IpcError::PermissionDenied => -13,   // EACCES
+        IpcError::NotOpen => -9,             // EBADF
+        IpcError::InvalidFid => -9,          // EBADF
+        IpcError::NotDirectory => -20,       // ENOTDIR
+        IpcError::IsDirectory => -21,        // EISDIR
+        IpcError::ReadOnly => -30,           // EROFS
+        IpcError::ResourceExhausted => -12,  // ENOMEM
+        IpcError::Conflict => -17,           // EEXIST
+        IpcError::NotSupported => -38,       // ENOSYS
+        IpcError::InvalidArgument => -22,    // EINVAL
+        IpcError::NonceLimitExceeded => -11, // EAGAIN
     }
 }
 
@@ -4462,6 +4463,7 @@ mod integration_tests {
     use harmony_identity::PqPrivateIdentity;
     use harmony_microkernel::echo::EchoServer;
     use harmony_microkernel::kernel::Kernel;
+    use harmony_microkernel::key_hierarchy::{AttestationPair, HardwareAcceptance, OwnerClaim};
     use harmony_microkernel::serial_server::SerialServer;
     use harmony_microkernel::vm::buddy::BuddyAllocator;
     use harmony_microkernel::vm::cap_tracker::MemoryBudget;
@@ -4474,6 +4476,48 @@ mod integration_tests {
     fn make_test_vm() -> AddressSpaceManager<MockPageTable> {
         let buddy = BuddyAllocator::new(PhysAddr(0x10_0000), 64).unwrap();
         AddressSpaceManager::new(buddy)
+    }
+
+    fn make_test_hierarchy(
+        entropy: &mut KernelEntropy<impl FnMut(&mut [u8])>,
+    ) -> (PqPrivateIdentity, PqPrivateIdentity, AttestationPair) {
+        let owner = PqPrivateIdentity::generate(entropy);
+        let owner_addr = owner.public_identity().address_hash;
+
+        let hardware = PqPrivateIdentity::generate(entropy);
+        let hw_addr = hardware.public_identity().address_hash;
+
+        let nonce = [0xAA; 16];
+        let mut claim = OwnerClaim {
+            owner_address: owner_addr,
+            hardware_address: hw_addr,
+            claimed_at: 0,
+            owner_index: 0,
+            nonce,
+            signature: [0u8; 3309],
+        };
+        let sig = owner.sign(&claim.signable_bytes()).unwrap();
+        claim.signature.copy_from_slice(&sig);
+
+        let mut acceptance = HardwareAcceptance {
+            hardware_address: hw_addr,
+            owner_address: owner_addr,
+            accepted_at: 0,
+            owner_claim_hash: claim.content_hash(),
+            signature: [0u8; 3309],
+        };
+        let sig = hardware.sign(&acceptance.signable_bytes()).unwrap();
+        acceptance.signature.copy_from_slice(&sig);
+
+        drop(owner);
+
+        let session = PqPrivateIdentity::generate(entropy);
+
+        let attestation = AttestationPair {
+            owner_claim: claim,
+            hardware_acceptance: acceptance,
+        };
+        (hardware, session, attestation)
     }
 
     /// SyscallBackend backed by a real Ring 2 Kernel.
@@ -4567,8 +4611,8 @@ mod integration_tests {
     #[test]
     fn linuxulator_writes_hello_through_kernel_to_serial() {
         let mut entropy = test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
         // Spawn SerialServer
         let serial_pid = kernel
@@ -4617,8 +4661,8 @@ mod integration_tests {
     #[test]
     fn linuxulator_full_fd_lifecycle() {
         let mut entropy = test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-        let mut kernel = Kernel::new(kernel_id, make_test_vm());
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
         let serial_pid = kernel
             .spawn_process("serial", Box::new(SerialServer::new()), &[], None)
@@ -4676,11 +4720,11 @@ mod integration_tests {
         KernelEntropy<impl FnMut(&mut [u8])>,
     ) {
         let mut entropy = test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
         // 256 frames = 1 MiB physical
         let buddy = BuddyAllocator::new(PhysAddr(0x10_0000), 256).unwrap();
         let vm = AddressSpaceManager::new(buddy);
-        let mut kernel = Kernel::new(kernel_id, vm);
+        let mut kernel = Kernel::new(hw, session, attestation, vm);
 
         let serial_pid = kernel
             .spawn_process("serial", Box::new(SerialServer::new()), &[], None)
@@ -4752,11 +4796,11 @@ mod integration_tests {
     #[test]
     fn vm_mmap_budget_exhaustion() {
         let mut entropy = test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
         // 256 frames total
         let buddy = BuddyAllocator::new(PhysAddr(0x10_0000), 256).unwrap();
         let vm = AddressSpaceManager::new(buddy);
-        let mut kernel = Kernel::new(kernel_id, vm);
+        let mut kernel = Kernel::new(hw, session, attestation, vm);
 
         let serial_pid = kernel
             .spawn_process("serial", Box::new(SerialServer::new()), &[], None)
@@ -4816,11 +4860,11 @@ mod integration_tests {
         use harmony_microkernel::vm::{FrameClassification, VirtAddr};
 
         let mut entropy = test_entropy();
-        let kernel_id = PqPrivateIdentity::generate(&mut entropy);
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
         // Large frame pool for ELF loading.
         let buddy = BuddyAllocator::new(PhysAddr(0x10_0000), 256).unwrap();
         let vm = AddressSpaceManager::new(buddy);
-        let mut kernel = Kernel::new(kernel_id, vm);
+        let mut kernel = Kernel::new(hw, session, attestation, vm);
 
         // Build a minimal ELF with two PT_LOAD segments:
         // - .text at 0x401000 (R-X): 16 bytes of code

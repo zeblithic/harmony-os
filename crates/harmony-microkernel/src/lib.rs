@@ -33,6 +33,8 @@ pub mod vm;
 #[cfg(feature = "kernel")]
 pub mod integrity;
 #[cfg(feature = "kernel")]
+pub mod key_hierarchy;
+#[cfg(feature = "kernel")]
 pub mod pq_capability;
 
 use alloc::sync::Arc;
@@ -80,6 +82,9 @@ pub enum IpcError {
     Conflict,
     NotSupported,
     InvalidArgument,
+    /// The per-session nonce table is full — no more user-capability
+    /// bindings can be accepted until the next reboot.
+    NonceLimitExceeded,
 }
 
 // ── File metadata ────────────────────────────────────────────────────

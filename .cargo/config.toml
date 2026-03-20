@@ -1,2 +1,8 @@
 [alias]
 xtask = "run --manifest-path xtask/Cargo.toml --"
+
+[env]
+# ML-DSA-65 key generation and signing use substantial stack space in
+# debug builds. The key hierarchy tests generate multiple PQ identities
+# per test, which can overflow the default 8 MiB test thread stack.
+RUST_MIN_STACK = "16777216"  # 16 MiB

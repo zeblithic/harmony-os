@@ -802,12 +802,14 @@ mod tests {
         use super::*;
         use crate::echo::EchoServer;
         use crate::kernel::Kernel;
+        use crate::key_hierarchy::{AttestationPair, HardwareAcceptance, OwnerClaim};
         use crate::vm::buddy::BuddyAllocator;
         use crate::vm::manager::AddressSpaceManager;
         use crate::vm::mock::MockPageTable;
         use crate::vm::PhysAddr;
         use harmony_identity::PqPrivateIdentity;
         use harmony_unikernel::KernelEntropy;
+        use rand_core::CryptoRngCore;
 
         fn make_test_entropy() -> KernelEntropy<impl FnMut(&mut [u8])> {
             let mut seed = 42u64;
@@ -824,12 +826,55 @@ mod tests {
             AddressSpaceManager::new(buddy)
         }
 
+        fn make_test_hierarchy(
+            entropy: &mut impl CryptoRngCore,
+        ) -> (PqPrivateIdentity, PqPrivateIdentity, AttestationPair) {
+            let owner = PqPrivateIdentity::generate(entropy);
+            let owner_addr = owner.public_identity().address_hash;
+
+            let hardware = PqPrivateIdentity::generate(entropy);
+            let hw_addr = hardware.public_identity().address_hash;
+
+            let mut nonce = [0u8; 16];
+            entropy.fill_bytes(&mut nonce);
+            let mut claim = OwnerClaim {
+                owner_address: owner_addr,
+                hardware_address: hw_addr,
+                claimed_at: 0,
+                owner_index: 0,
+                nonce,
+                signature: [0u8; 3309],
+            };
+            let sig = owner.sign(&claim.signable_bytes()).unwrap();
+            claim.signature.copy_from_slice(&sig);
+
+            let mut acceptance = HardwareAcceptance {
+                hardware_address: hw_addr,
+                owner_address: owner_addr,
+                accepted_at: 0,
+                owner_claim_hash: claim.content_hash(),
+                signature: [0u8; 3309],
+            };
+            let sig = hardware.sign(&acceptance.signable_bytes()).unwrap();
+            acceptance.signature.copy_from_slice(&sig);
+
+            drop(owner);
+
+            let session = PqPrivateIdentity::generate(entropy);
+
+            let attestation = AttestationPair {
+                owner_claim: claim,
+                hardware_acceptance: acceptance,
+            };
+            (hardware, session, attestation)
+        }
+
         /// Create a kernel with a NixStoreServer mounted at `/nix/store`
         /// and a client process that can access it.
         fn setup_kernel_with_nix_store() -> (Kernel<MockPageTable>, u32, u32) {
             let mut entropy = make_test_entropy();
-            let kernel_id = PqPrivateIdentity::generate(&mut entropy);
-            let mut kernel = Kernel::new(kernel_id, make_test_vm());
+            let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+            let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
 
             // Build and populate the nix store server.
             let mut nix = NixStoreServer::new();
