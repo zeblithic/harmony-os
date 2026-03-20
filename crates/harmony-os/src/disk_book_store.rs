@@ -28,6 +28,18 @@ use harmony_content::error::ContentError;
 /// Acts as a write-through cache: all data lives in memory (for `&[u8]`
 /// returns) and is also written to disk (for persistence across restarts).
 ///
+/// # Durability guarantees
+///
+/// Disk write failures in [`BlobStore::store`] and [`BlobStore::insert`]
+/// are **best-effort**: if the write fails, data remains in the in-memory
+/// cache (available this session) but will not survive a restart. This is
+/// a constraint of the [`BlobStore`] trait, which has no `Result` return
+/// on `store()` and no I/O error variant in `ContentError`. Callers that
+/// require strict durability should verify persistence via [`Self::is_persisted`].
+///
+/// On reload, files whose size does not match the CID's `payload_size()`
+/// are skipped (catches truncation from crashes or partial writes).
+///
 /// Implements the [`BlobStore`] trait (legacy naming — will become
 /// `BookStore` in a future migration).
 pub struct DiskBookStore {
@@ -69,6 +81,17 @@ impl DiskBookStore {
             };
             let cid = ContentId::from_bytes(cid_bytes);
             let data = std::fs::read(&path)?;
+
+            // Size check: the CID encodes the payload size. If the file
+            // is truncated or corrupted, skip it rather than serving bad data.
+            let expected_size = cid.payload_size() as usize;
+            if expected_size > 0 && data.len() != expected_size {
+                eprintln!(
+                    "[disk-book-store] size mismatch for {name}: expected {expected_size}, got {}, skipping",
+                    data.len()
+                );
+                continue;
+            }
             cache.insert(cid, data);
         }
 
@@ -86,6 +109,15 @@ impl DiskBookStore {
     /// Whether the store is empty.
     pub fn is_empty(&self) -> bool {
         self.cache.is_empty()
+    }
+
+    /// Check whether a specific CID has been persisted to disk.
+    ///
+    /// Returns `true` only if the file exists on disk. Use this to verify
+    /// durability after an insert if strict persistence is required.
+    pub fn is_persisted(&self, cid: &ContentId) -> bool {
+        let cid_hex = hex::encode(cid.to_bytes());
+        self.dir.join(&cid_hex).exists()
     }
 
     /// Write a book to disk. Best-effort — logs on failure.
@@ -292,5 +324,27 @@ mod tests {
         store.insert(b"data".as_slice()).unwrap();
         assert!(!store.is_empty());
         assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn truncated_file_skipped_on_reload() {
+        let tmp = TempDir::new().unwrap();
+        let data = b"full book data here";
+        let cid;
+
+        {
+            let mut store = DiskBookStore::open(tmp.path()).unwrap();
+            cid = store.insert(data.as_slice()).unwrap();
+        }
+
+        // Truncate the file on disk (simulates partial write / crash).
+        let cid_hex = hex::encode(cid.to_bytes());
+        let path = tmp.path().join(&cid_hex);
+        std::fs::write(&path, b"tru").unwrap(); // 3 bytes instead of 19
+
+        // Reload should skip the truncated file.
+        let store2 = DiskBookStore::open(tmp.path()).unwrap();
+        assert!(!store2.contains(&cid), "truncated book should be skipped");
+        assert_eq!(store2.len(), 0);
     }
 }

@@ -75,24 +75,46 @@ impl PersistentNarStore {
 
     /// Persist a NAR to disk, then import into the server.
     ///
-    /// Writes the file first (crash safety: orphaned file > lost data),
-    /// then imports into the server. On import failure, the file is
-    /// cleaned up.
+    /// Validates the name for path safety, writes the file (crash safety:
+    /// orphaned file > lost data), then imports into the server. On import
+    /// failure for a *newly created* file, the file is cleaned up. If the
+    /// file already existed (duplicate import), it is left intact.
     pub fn persist_and_import(
         &self,
         server: &mut NixStoreServer,
         name: &str,
         nar_bytes: Vec<u8>,
     ) -> io::Result<()> {
+        // Validate name before any disk I/O — prevents path traversal.
+        // Replicates the safety-critical subset of NixStoreServer::import_nar
+        // validation so that no writes occur outside the store directory.
+        if name.is_empty()
+            || name.contains('/')
+            || name.contains('\0')
+            || name == "."
+            || name == ".."
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsafe store path name: {name:?}"),
+            ));
+        }
+
         let path = self.dir.join(format!("{name}.nar"));
 
-        // Write to disk first.
-        std::fs::write(&path, &nar_bytes)?;
+        // Only write if the file does not already exist — prevents
+        // overwriting (and then deleting) a previously persisted NAR.
+        let newly_created = !path.exists();
+        if newly_created {
+            std::fs::write(&path, &nar_bytes)?;
+        }
 
         // Import into server.
         server.import_nar(name, nar_bytes).map_err(|e| {
-            // Clean up the orphaned file on import failure.
-            let _ = std::fs::remove_file(&path);
+            // Only clean up if we created the file in this call.
+            if newly_created {
+                let _ = std::fs::remove_file(&path);
+            }
             io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}"))
         })
     }
@@ -217,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_import_rejected() {
+    fn duplicate_import_rejected_preserves_original() {
         let tmp = TempDir::new().unwrap();
         let (store, mut server) = PersistentNarStore::open(tmp.path()).unwrap();
 
@@ -229,6 +251,41 @@ mod tests {
         // Second import of same name should fail.
         let result = store.persist_and_import(&mut server, "dup123-dupe", nar);
         assert!(result.is_err());
+
+        // P0 regression: the original .nar file must still exist on disk.
+        let nar_path = tmp.path().join("dup123-dupe.nar");
+        assert!(
+            nar_path.exists(),
+            "original .nar file must survive duplicate rejection"
+        );
+
+        // And the data must survive a restart.
+        let (_store2, mut server2) = PersistentNarStore::open(tmp.path()).unwrap();
+        server2.walk(0, 1, "dup123-dupe").unwrap();
+        server2.open(1, OpenMode::Read).unwrap();
+        assert_eq!(server2.read(1, 0, 1024).unwrap(), b"original");
+    }
+
+    #[test]
+    fn path_traversal_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let (store, mut server) = PersistentNarStore::open(tmp.path()).unwrap();
+
+        let nar = build_test_nar(b"malicious");
+
+        // Names with path separators must be rejected before any disk write.
+        assert!(store
+            .persist_and_import(&mut server, "../escape", nar.clone())
+            .is_err());
+        assert!(store
+            .persist_and_import(&mut server, "foo/bar", nar.clone())
+            .is_err());
+        assert!(store
+            .persist_and_import(&mut server, "/tmp/evil", nar.clone())
+            .is_err());
+
+        // No files should have been created outside the store directory.
+        assert!(!tmp.path().join("..").join("escape.nar").exists());
     }
 
     #[test]
