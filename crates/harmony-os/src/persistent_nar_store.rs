@@ -133,6 +133,10 @@ impl PersistentNarStore {
         // Import into server.
         server.import_nar(name, nar_bytes).map_err(|e| {
             // Only clean up if we wrote the file in this call.
+            // Cleanup failure is benign: if remove_file fails, the next
+            // open() will attempt to re-import the file from disk. If
+            // the data is valid, it gets imported normally; if corrupted,
+            // the parse-error skip path handles it.
             if !already_imported {
                 let _ = std::fs::remove_file(&path);
             }
