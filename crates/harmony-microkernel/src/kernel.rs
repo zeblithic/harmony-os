@@ -324,12 +324,11 @@ impl<P: PageTable> Kernel<P> {
         Ok(())
     }
 
-    /// Check whether a process holds a valid EndpointCap for `target_pid`.
+    /// Check whether `process` holds a valid endpoint capability for `target_pid`.
     ///
     /// Scans both `kernel_capabilities` (session-key-signed, no binding)
     /// and `user_capabilities` (UCAN + session binding). Either vector
     /// producing a valid match returns `Ok`.
-    /// Check whether `process` holds a valid endpoint capability for `target_pid`.
     ///
     /// Returns `Ok(nonce)` where `nonce` is `Some` if a user capability's
     /// session binding was accepted (the caller MUST record this nonce in
