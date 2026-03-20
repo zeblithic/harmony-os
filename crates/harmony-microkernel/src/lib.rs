@@ -82,6 +82,9 @@ pub enum IpcError {
     Conflict,
     NotSupported,
     InvalidArgument,
+    /// The per-session nonce table is full — no more user-capability
+    /// bindings can be accepted until the next reboot.
+    NonceLimitExceeded,
 }
 
 // ── File metadata ────────────────────────────────────────────────────

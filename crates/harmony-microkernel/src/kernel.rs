@@ -34,6 +34,12 @@ const MAX_DELEGATION_DEPTH: usize = 5;
 /// Production builds should use context-appropriate, shorter TTLs.
 const DEFAULT_CAP_TTL: u64 = 1_000_000_000;
 
+/// Maximum number of session-binding nonces tracked per boot cycle.
+/// Each entry is 16 bytes + BTreeSet node overhead (~64 bytes total).
+/// 4096 entries ≈ 256 KB — bounded and predictable. Once reached, no
+/// new user-capability bindings are accepted until the next reboot.
+const MAX_BINDING_NONCES: usize = 4096;
+
 /// A process in the microkernel.
 pub struct Process {
     pub pid: u32,
@@ -372,7 +378,11 @@ impl<P: PageTable> Kernel<P> {
             if cap.capability != CapabilityType::Endpoint {
                 continue;
             }
-            if cap.audience != audience_hash {
+            // The UCAN's audience is the *user's* cryptographic address (not the
+            // PID-derived process address). The binding attests which user is
+            // active, so verify binding.user_address == cap.audience to ensure
+            // the session binding matches the UCAN's intended recipient.
+            if bound.binding.user_address != cap.audience {
                 continue;
             }
             let resource_str = match core::str::from_utf8(&cap.resource) {
@@ -449,6 +459,9 @@ impl<P: PageTable> Kernel<P> {
             };
             // Record session binding nonce after the process borrow is released.
             if let Some(nonce) = accepted_nonce {
+                if self.used_binding_nonces.len() >= MAX_BINDING_NONCES {
+                    return Err(IpcError::NonceLimitExceeded);
+                }
                 self.used_binding_nonces.insert(nonce);
             }
             (target_pid, server_root_fid, remainder)
@@ -814,7 +827,9 @@ impl<P: PageTable> Kernel<P> {
 mod tests {
     use super::*;
     use crate::echo::EchoServer;
-    use crate::key_hierarchy::{AttestationPair, HardwareAcceptance, OwnerClaim};
+    use crate::key_hierarchy::{
+        AttestationPair, BoundCapability, HardwareAcceptance, OwnerClaim, SessionBinding,
+    };
     use crate::vm::buddy::BuddyAllocator;
     use crate::vm::mock::MockPageTable;
     use crate::vm::PhysAddr;
@@ -2408,5 +2423,211 @@ mod tests {
         // Now it's a Snapshot entry → update_snapshot works.
         kernel.lyll_mut().update_snapshot(paddr, [0xBB; 32]);
         assert_eq!(kernel.lyll().expected_hash(paddr), Some([0xBB; 32]));
+    }
+
+    // ── User capability tests ────────────────────────────────────────
+
+    /// Helper: generate an owner identity, issue a UCAN to a user, create a
+    /// valid SessionBinding, and return everything needed for user-cap tests.
+    ///
+    /// Signs the session binding *before* moving the session key into the
+    /// kernel, so the signature is valid.
+    ///
+    /// Returns `(kernel, client_pid, server_pid, bound_cap)`.
+    fn setup_user_capability() -> (
+        Kernel<MockPageTable>,
+        u32,
+        u32,
+        BoundCapability,
+    ) {
+        let mut entropy = make_test_entropy();
+
+        let owner = PqPrivateIdentity::generate(&mut entropy);
+        let owner_pub = owner.public_identity().clone();
+
+        let user = PqPrivateIdentity::generate(&mut entropy);
+        let user_addr = user.public_identity().address_hash;
+
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let session_pub = session.public_identity().clone();
+        let hw_addr = hw.public_identity().address_hash;
+
+        // Issue UCAN and sign binding BEFORE session key moves into kernel.
+        let ucan = owner
+            .issue_pq_root_token(
+                &mut entropy,
+                &user_addr,
+                CapabilityType::Endpoint,
+                b"pid:0",
+                0,
+                1_000_000_000,
+            )
+            .unwrap();
+
+        let token_hash = ucan.content_hash();
+        let mut nonce = [0u8; 16];
+        entropy.fill_bytes(&mut nonce);
+        let mut binding = SessionBinding {
+            session_address: session_pub.address_hash,
+            user_address: user_addr,
+            user_token_hash: token_hash,
+            hardware_address: hw_addr,
+            bound_at: 0,
+            nonce,
+            signature: [0u8; 3309],
+        };
+        let sig = session.sign(&binding.signable_bytes()).unwrap();
+        binding.signature.copy_from_slice(&sig);
+
+        let bound_cap = BoundCapability {
+            token: ucan,
+            binding,
+        };
+
+        // Now construct the kernel (session key moves here).
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
+        kernel.register_identity(owner_pub);
+
+        let server_pid = kernel
+            .spawn_process("echo-server", Box::new(EchoServer::new()), &[], None)
+            .unwrap();
+        let client_pid = kernel
+            .spawn_process(
+                "client",
+                Box::new(EchoServer::new()),
+                &[("/echo", server_pid, 0)],
+                None,
+            )
+            .unwrap();
+
+        kernel
+            .submit_user_capability(client_pid, bound_cap.clone())
+            .unwrap();
+
+        (kernel, client_pid, server_pid, bound_cap)
+    }
+
+    #[test]
+    fn user_capability_accepted_with_valid_binding() {
+        let (mut kernel, client, _server, _cap) = setup_user_capability();
+        // Walk should succeed using the user capability path.
+        let result = kernel.walk(client, "/echo/hello", 0, 1, 0);
+        assert!(result.is_ok(), "User capability with valid binding should be accepted");
+    }
+
+    #[test]
+    fn user_capability_rejected_when_binding_user_mismatches_audience() {
+        let mut entropy = make_test_entropy();
+
+        let owner = PqPrivateIdentity::generate(&mut entropy);
+        let owner_pub = owner.public_identity().clone();
+
+        let user = PqPrivateIdentity::generate(&mut entropy);
+        let user_addr = user.public_identity().address_hash;
+
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let session_pub = session.public_identity().clone();
+        let hw_addr = hw.public_identity().address_hash;
+
+        // Issue UCAN to the real user.
+        let ucan = owner
+            .issue_pq_root_token(
+                &mut entropy,
+                &user_addr,
+                CapabilityType::Endpoint,
+                b"pid:0",
+                0,
+                1_000_000_000,
+            )
+            .unwrap();
+
+        // Create binding with a DIFFERENT user_address (attacker tries to
+        // use someone else's UCAN with their own session binding).
+        let wrong_user_addr = [0xFFu8; 16];
+        let token_hash = ucan.content_hash();
+        let mut nonce = [0u8; 16];
+        entropy.fill_bytes(&mut nonce);
+        let mut binding = SessionBinding {
+            session_address: session_pub.address_hash,
+            user_address: wrong_user_addr, // doesn't match UCAN audience
+            user_token_hash: token_hash,
+            hardware_address: hw_addr,
+            bound_at: 0,
+            nonce,
+            signature: [0u8; 3309],
+        };
+        let sig = session.sign(&binding.signable_bytes()).unwrap();
+        binding.signature.copy_from_slice(&sig);
+
+        let bound_cap = BoundCapability {
+            token: ucan,
+            binding,
+        };
+
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
+        kernel.register_identity(owner_pub);
+
+        let server_pid = kernel
+            .spawn_process("echo-server", Box::new(EchoServer::new()), &[], None)
+            .unwrap();
+        let client_pid = kernel
+            .spawn_process(
+                "client",
+                Box::new(EchoServer::new()),
+                &[("/echo", server_pid, 0)],
+                None,
+            )
+            .unwrap();
+        kernel
+            .submit_user_capability(client_pid, bound_cap)
+            .unwrap();
+
+        // Walk should fail — binding.user_address != cap.audience.
+        assert_eq!(
+            kernel.walk(client_pid, "/echo/hello", 0, 1, 0),
+            Err(IpcError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn nonce_limit_exceeded_returns_error() {
+        let (mut kernel, client, _server, _cap) = setup_user_capability();
+
+        // Fill the nonce set to capacity.
+        for i in 0..MAX_BINDING_NONCES {
+            let mut nonce = [0u8; 16];
+            nonce[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            kernel.used_binding_nonces.insert(nonce);
+        }
+        assert_eq!(kernel.used_binding_nonces.len(), MAX_BINDING_NONCES);
+
+        // The next walk that accepts a user capability should fail
+        // because the nonce table is full.
+        assert_eq!(
+            kernel.walk(client, "/echo/hello", 0, 1, 0),
+            Err(IpcError::NonceLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn kernel_cap_unaffected_by_nonce_limit() {
+        let (mut kernel, client, server, _cap) = setup_user_capability();
+
+        // Grant a kernel capability so the kernel-cap path is taken first.
+        let mut entropy = make_test_entropy();
+        kernel
+            .grant_endpoint_cap(&mut entropy, client, server, 0)
+            .unwrap();
+
+        // Fill nonce set to capacity.
+        for i in 0..MAX_BINDING_NONCES {
+            let mut nonce = [0u8; 16];
+            nonce[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            kernel.used_binding_nonces.insert(nonce);
+        }
+
+        // Walk should still succeed via the kernel capability path
+        // (returns Ok(None) — no nonce to record).
+        assert!(kernel.walk(client, "/echo/hello", 0, 1, 0).is_ok());
     }
 }

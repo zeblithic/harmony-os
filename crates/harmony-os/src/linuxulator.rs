@@ -49,6 +49,7 @@ fn ipc_err_to_errno(e: IpcError) -> i64 {
         IpcError::Conflict => -17,          // EEXIST
         IpcError::NotSupported => -38,      // ENOSYS
         IpcError::InvalidArgument => -22,   // EINVAL
+        IpcError::NonceLimitExceeded => -11, // EAGAIN
     }
 }
 
