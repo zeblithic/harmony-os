@@ -28,8 +28,8 @@ pub trait ContentAnnouncer {
 /// locally, and announces both the store-path mapping and individual blob
 /// availability via a [`ContentAnnouncer`].
 ///
-/// Generic over the blob store backend: defaults to [`MemoryBlobStore`]
-/// for backward compatibility, but accepts [`DiskBlobStore`](crate::disk_blob_store::DiskBlobStore)
+/// Generic over the book store backend: defaults to [`MemoryBlobStore`]
+/// for backward compatibility, but accepts [`DiskBookStore`](crate::disk_book_store::DiskBookStore)
 /// (or any `BlobStore` impl) for persistent storage.
 pub struct NarPublisher<A: ContentAnnouncer, S: BlobStore = MemoryBlobStore> {
     announcer: A,
@@ -364,13 +364,13 @@ mod tests {
         assert!(log.borrow().is_empty());
     }
 
-    // ── DiskBlobStore integration ──────────────────────────────────
+    // ── DiskBookStore integration ──────────────────────────────────
 
     #[test]
-    fn publish_with_disk_blob_store() {
-        use crate::disk_blob_store::DiskBlobStore;
+    fn publish_with_disk_book_store() {
+        use crate::disk_book_store::DiskBookStore;
         let tmp = tempfile::TempDir::new().unwrap();
-        let disk_store = DiskBlobStore::open(tmp.path()).unwrap();
+        let disk_store = DiskBookStore::open(tmp.path()).unwrap();
 
         let (announcer, _log) = MockAnnouncer::new();
         let mut publisher = NarPublisher::with_store(announcer, disk_store);

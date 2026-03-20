@@ -10,7 +10,7 @@
 extern crate alloc;
 
 #[cfg(feature = "std")]
-pub mod disk_blob_store;
+pub mod disk_book_store;
 pub mod elf;
 pub mod elf_loader;
 pub mod linuxulator;
