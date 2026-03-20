@@ -55,7 +55,16 @@ impl PersistentNarStore {
                 None => continue,
             };
 
-            let nar_bytes = std::fs::read(&path)?;
+            let nar_bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[persistent-nar-store] failed to read {}: {e}, skipping",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
             if let Err(e) = server.import_nar(&name, nar_bytes) {
                 eprintln!(
                     "[persistent-nar-store] skipping {}: {:?}",
@@ -102,17 +111,20 @@ impl PersistentNarStore {
 
         let path = self.dir.join(format!("{name}.nar"));
 
-        // Only write if the file does not already exist — prevents
-        // overwriting (and then deleting) a previously persisted NAR.
-        let newly_created = !path.exists();
-        if newly_created {
+        // Gate on server state, not disk state. If the server already has
+        // this path imported, it's a true duplicate — skip the write and
+        // let import_nar reject it. If the server doesn't have it (even
+        // if a corrupted file exists on disk from a prior crash), we must
+        // write the valid data to disk.
+        let already_imported = server.has_store_path(name);
+        if !already_imported {
             std::fs::write(&path, &nar_bytes)?;
         }
 
         // Import into server.
         server.import_nar(name, nar_bytes).map_err(|e| {
-            // Only clean up if we created the file in this call.
-            if newly_created {
+            // Only clean up if we wrote the file in this call.
+            if !already_imported {
                 let _ = std::fs::remove_file(&path);
             }
             io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}"))
@@ -313,6 +325,38 @@ mod tests {
             server.walk(0, 2, "bad456-corrupt"),
             Err(harmony_microkernel::IpcError::NotFound)
         );
+    }
+
+    #[test]
+    fn corrupted_file_overwritten_on_re_persist() {
+        let tmp = TempDir::new().unwrap();
+        let nar = build_test_nar(b"valid data");
+
+        // Simulate a crash that left a corrupted .nar file on disk.
+        std::fs::write(tmp.path().join("crash1-pkg.nar"), b"truncated garbage").unwrap();
+
+        // open() skips the corrupted file (parse failure).
+        let (store, mut server) = PersistentNarStore::open(tmp.path()).unwrap();
+        assert_eq!(
+            server.walk(0, 1, "crash1-pkg"),
+            Err(harmony_microkernel::IpcError::NotFound)
+        );
+
+        // Re-persist with valid data — should overwrite the corrupted file.
+        store
+            .persist_and_import(&mut server, "crash1-pkg", nar)
+            .unwrap();
+
+        // Data should be available in memory.
+        server.walk(0, 2, "crash1-pkg").unwrap();
+        server.open(2, OpenMode::Read).unwrap();
+        assert_eq!(server.read(2, 0, 1024).unwrap(), b"valid data");
+
+        // AND survive a restart (corrupted file was overwritten).
+        let (_store2, mut server2) = PersistentNarStore::open(tmp.path()).unwrap();
+        server2.walk(0, 1, "crash1-pkg").unwrap();
+        server2.open(1, OpenMode::Read).unwrap();
+        assert_eq!(server2.read(1, 0, 1024).unwrap(), b"valid data");
     }
 
     #[test]

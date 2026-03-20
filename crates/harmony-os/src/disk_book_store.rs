@@ -80,7 +80,13 @@ impl DiskBookStore {
                 Err(_) => continue,
             };
             let cid = ContentId::from_bytes(cid_bytes);
-            let data = std::fs::read(&path)?;
+            let data = match std::fs::read(&path) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("[disk-book-store] failed to read {name}: {e}, skipping");
+                    continue;
+                }
+            };
 
             // Size check: the CID encodes the payload size. If the file
             // is truncated or corrupted, skip it rather than serving bad data.
