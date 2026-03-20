@@ -446,27 +446,13 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     let persistence = MemoryState::new();
     let mut runtime = UnikernelRuntime::new(identity, entropy, persistence);
 
-    // Generate key hierarchy identities.
-    // WARNING: Hardware key is generated fresh each boot — the attestation
-    // chain is non-functional until persistent storage is implemented.
-    // Any owner claim or attestation pair created offline will be invalid
-    // because the hardware address changes on every reboot.
-    // TODO: load hardware key from persistent storage.
-    // TODO: verify attestation pair (owner claim + hardware acceptance).
-    use harmony_identity::PqPrivateIdentity;
-    serial.log("WARN", "hardware key not persisted — attestation chain inactive");
-    let hw_identity = PqPrivateIdentity::generate(&mut KernelEntropy::new(rdrand_fill));
-    let hw_addr = hw_identity.public_identity().address_hash;
-    hex_encode(&hw_addr, &mut hex_buf);
-    let hex_str = core::str::from_utf8(&hex_buf).unwrap_or("????????????????????????????????");
-    serial.log("HW_IDENTITY", hex_str);
-
-    let session_identity = PqPrivateIdentity::generate(&mut KernelEntropy::new(rdrand_fill));
-    let session_addr = session_identity.public_identity().address_hash;
-    hex_encode(&session_addr, &mut hex_buf);
-    let hex_str = core::str::from_utf8(&hex_buf).unwrap_or("????????????????????????????????");
-    serial.log("SESSION", hex_str);
-
+    // Key hierarchy (hardware + session + attestation) is implemented in
+    // harmony-microkernel::key_hierarchy but not yet wired into this boot
+    // path. Ring 1 UnikernelRuntime uses a single PQ identity; the full
+    // four-tier hierarchy requires Ring 2 Kernel integration with persistent
+    // storage for the hardware key and attestation pair.
+    // TODO(harmony-os-5gh): wire hw_identity + session_identity into Kernel::new()
+    //   once Ring 2 boot path exists. Requires persistent storage for hw key.
     if let Some(pq_addr) = runtime.generate_pq_identity() {
         hex_encode(&pq_addr, &mut hex_buf);
         let hex_str =

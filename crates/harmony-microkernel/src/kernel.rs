@@ -445,26 +445,21 @@ impl<P: PageTable> Kernel<P> {
         // Resolve namespace and check capabilities. Split lifetimes on
         // resolve() mean `remainder` borrows from `path`, not from `self`,
         // so no heap allocation is needed to release the process borrow.
-        let (target_pid, server_root_fid, remainder) = {
-            let (target_pid, server_root_fid, remainder, accepted_nonce) = {
-                let process = self.processes.get(&from_pid).ok_or(IpcError::NotFound)?;
-                let (mount, remainder) =
-                    process.namespace.resolve(path).ok_or(IpcError::NotFound)?;
-                let target_pid = mount.target_pid;
-                let server_root_fid = mount.root_fid;
-                let remainder = remainder.to_owned();
-                let accepted_nonce = self.check_endpoint_cap(process, target_pid, now)?;
-                (target_pid, server_root_fid, remainder, accepted_nonce)
-            };
-            // Record session binding nonce after the process borrow is released.
-            if let Some(nonce) = accepted_nonce {
-                if self.used_binding_nonces.len() >= MAX_BINDING_NONCES {
-                    return Err(IpcError::NonceLimitExceeded);
-                }
-                self.used_binding_nonces.insert(nonce);
-            }
-            (target_pid, server_root_fid, remainder)
+        let (target_pid, server_root_fid, remainder, accepted_nonce) = {
+            let process = self.processes.get(&from_pid).ok_or(IpcError::NotFound)?;
+            let (mount, remainder) = process.namespace.resolve(path).ok_or(IpcError::NotFound)?;
+            let target_pid = mount.target_pid;
+            let server_root_fid = mount.root_fid;
+            let remainder = remainder.to_owned();
+            let accepted_nonce = self.check_endpoint_cap(process, target_pid, now)?;
+            (target_pid, server_root_fid, remainder, accepted_nonce)
         };
+
+        // Check nonce capacity early (before expensive work), but don't
+        // insert yet — the nonce is only consumed if the walk succeeds.
+        if accepted_nonce.is_some() && self.used_binding_nonces.len() >= MAX_BINDING_NONCES {
+            return Err(IpcError::NonceLimitExceeded);
+        }
 
         // Split remainder into path components for multi-level walks.
         // Filter "." (no-op) and reject ".." (traversal above mount root).
@@ -529,6 +524,11 @@ impl<P: PageTable> Kernel<P> {
             }
             qpath
         };
+
+        // Walk succeeded — now consume the nonce so it can't be replayed.
+        if let Some(nonce) = accepted_nonce {
+            self.used_binding_nonces.insert(nonce);
+        }
 
         // Record fid ownership with the server-side fid translation
         self.fid_owners
