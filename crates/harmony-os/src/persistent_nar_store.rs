@@ -39,7 +39,13 @@ impl PersistentNarStore {
         let mut server = NixStoreServer::new();
 
         for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("[persistent-nar-store] error reading dir entry: {e}, skipping");
+                    continue;
+                }
+            };
             let path = entry.path();
 
             // Only process .nar files.
@@ -101,6 +107,8 @@ impl PersistentNarStore {
             || name.contains('/')
             || name.contains('\\')
             || name.contains('\0')
+            || name.contains('\n')
+            || name.contains('\r')
             || name == "."
             || name == ".."
         {

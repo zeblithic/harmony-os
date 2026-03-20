@@ -58,7 +58,13 @@ impl DiskBookStore {
         let mut cache = HashMap::new();
 
         for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("[disk-book-store] error reading dir entry: {e}, skipping");
+                    continue;
+                }
+            };
             let path = entry.path();
             if !path.is_file() {
                 continue;
