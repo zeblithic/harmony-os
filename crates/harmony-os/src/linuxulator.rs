@@ -39,16 +39,16 @@ const O_CLOEXEC: i32 = 0o2000000;
 fn ipc_err_to_errno(e: IpcError) -> i64 {
     match e {
         IpcError::NotFound => ENOENT,
-        IpcError::PermissionDenied => -13,  // EACCES
-        IpcError::NotOpen => -9,            // EBADF
-        IpcError::InvalidFid => -9,         // EBADF
-        IpcError::NotDirectory => -20,      // ENOTDIR
-        IpcError::IsDirectory => -21,       // EISDIR
-        IpcError::ReadOnly => -30,          // EROFS
-        IpcError::ResourceExhausted => -12, // ENOMEM
-        IpcError::Conflict => -17,          // EEXIST
-        IpcError::NotSupported => -38,      // ENOSYS
-        IpcError::InvalidArgument => -22,   // EINVAL
+        IpcError::PermissionDenied => -13,   // EACCES
+        IpcError::NotOpen => -9,             // EBADF
+        IpcError::InvalidFid => -9,          // EBADF
+        IpcError::NotDirectory => -20,       // ENOTDIR
+        IpcError::IsDirectory => -21,        // EISDIR
+        IpcError::ReadOnly => -30,           // EROFS
+        IpcError::ResourceExhausted => -12,  // ENOMEM
+        IpcError::Conflict => -17,           // EEXIST
+        IpcError::NotSupported => -38,       // ENOSYS
+        IpcError::InvalidArgument => -22,    // EINVAL
         IpcError::NonceLimitExceeded => -11, // EAGAIN
     }
 }

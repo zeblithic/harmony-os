@@ -2434,12 +2434,7 @@ mod tests {
     /// kernel, so the signature is valid.
     ///
     /// Returns `(kernel, client_pid, server_pid, bound_cap)`.
-    fn setup_user_capability() -> (
-        Kernel<MockPageTable>,
-        u32,
-        u32,
-        BoundCapability,
-    ) {
+    fn setup_user_capability() -> (Kernel<MockPageTable>, u32, u32, BoundCapability) {
         let mut entropy = make_test_entropy();
 
         let owner = PqPrivateIdentity::generate(&mut entropy);
@@ -2512,7 +2507,10 @@ mod tests {
         let (mut kernel, client, _server, _cap) = setup_user_capability();
         // Walk should succeed using the user capability path.
         let result = kernel.walk(client, "/echo/hello", 0, 1, 0);
-        assert!(result.is_ok(), "User capability with valid binding should be accepted");
+        assert!(
+            result.is_ok(),
+            "User capability with valid binding should be accepted"
+        );
     }
 
     #[test]
