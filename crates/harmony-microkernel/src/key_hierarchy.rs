@@ -74,7 +74,10 @@ pub struct OwnerClaim {
     pub claimed_at: u64,
     /// Owner index (0 = primary). Reserved for future multi-owner extension.
     pub owner_index: u32,
-    /// Random nonce for replay protection.
+    /// Random nonce for uniqueness — ensures each `OwnerClaim` produces a
+    /// distinct signed byte sequence even when the same owner/hardware pair
+    /// re-attests. Not tracked at verification time; replay protection is
+    /// provided by the `HardwareAcceptance::owner_claim_hash` binding.
     pub nonce: [u8; 16],
     /// ML-DSA-65 signature by the owner over the signable fields.
     pub signature: [u8; SIG_LENGTH],
@@ -496,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_claim_nonce_replay_rejected() {
+    fn session_binding_nonce_replay_rejected() {
         let mut rng = test_rng();
         let session = PqPrivateIdentity::generate(&mut rng);
         let user = PqPrivateIdentity::generate(&mut rng);
