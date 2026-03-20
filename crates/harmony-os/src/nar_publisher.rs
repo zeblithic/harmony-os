@@ -27,19 +27,36 @@ pub trait ContentAnnouncer {
 /// Chunks NAR data into a content-addressed Merkle DAG, stores the blobs
 /// locally, and announces both the store-path mapping and individual blob
 /// availability via a [`ContentAnnouncer`].
-pub struct NarPublisher<A: ContentAnnouncer> {
+///
+/// Generic over the blob store backend: defaults to [`MemoryBlobStore`]
+/// for backward compatibility, but accepts [`DiskBlobStore`](crate::disk_blob_store::DiskBlobStore)
+/// (or any `BlobStore` impl) for persistent storage.
+pub struct NarPublisher<A: ContentAnnouncer, S: BlobStore = MemoryBlobStore> {
     announcer: A,
-    blob_store: MemoryBlobStore,
+    blob_store: S,
     chunker_config: ChunkerConfig,
     published_paths: HashMap<String, ContentId>,
 }
 
-impl<A: ContentAnnouncer> NarPublisher<A> {
-    /// Create a new publisher with the given announcer and default chunker config.
+impl<A: ContentAnnouncer> NarPublisher<A, MemoryBlobStore> {
+    /// Create a new publisher with the given announcer, in-memory blob store,
+    /// and default chunker config.
     pub fn new(announcer: A) -> Self {
         Self {
             announcer,
             blob_store: MemoryBlobStore::new(),
+            chunker_config: ChunkerConfig::DEFAULT,
+            published_paths: HashMap::new(),
+        }
+    }
+}
+
+impl<A: ContentAnnouncer, S: BlobStore> NarPublisher<A, S> {
+    /// Create a new publisher with a caller-provided blob store.
+    pub fn with_store(announcer: A, store: S) -> Self {
+        Self {
+            announcer,
+            blob_store: store,
             chunker_config: ChunkerConfig::DEFAULT,
             published_paths: HashMap::new(),
         }
@@ -123,8 +140,8 @@ impl<A: ContentAnnouncer> NarPublisher<A> {
         &self.published_paths
     }
 
-    /// Read-only access to the underlying blob store (needed for integration tests).
-    pub fn blob_store(&self) -> &MemoryBlobStore {
+    /// Read-only access to the underlying blob store.
+    pub fn blob_store(&self) -> &S {
         &self.blob_store
     }
 }
@@ -345,5 +362,29 @@ mod tests {
 
         // No announcements should have been made.
         assert!(log.borrow().is_empty());
+    }
+
+    // ── DiskBlobStore integration ──────────────────────────────────
+
+    #[test]
+    fn publish_with_disk_blob_store() {
+        use crate::disk_blob_store::DiskBlobStore;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disk_store = DiskBlobStore::open(tmp.path()).unwrap();
+
+        let (announcer, _log) = MockAnnouncer::new();
+        let mut publisher = NarPublisher::with_store(announcer, disk_store);
+
+        let nar = build_test_nar(b"persistent publish");
+        let store_path = "dsk12345678901234567890123456789-disk-pkg";
+        let root_cid = publisher.publish(store_path, &nar).unwrap();
+
+        // Blobs should be on disk.
+        let file_count = std::fs::read_dir(tmp.path()).unwrap().count();
+        assert!(file_count >= 1, "at least one blob file on disk");
+
+        // Round-trip: reassemble from persistent store.
+        let recovered = dag::reassemble(&root_cid, publisher.blob_store()).unwrap();
+        assert_eq!(recovered, nar);
     }
 }

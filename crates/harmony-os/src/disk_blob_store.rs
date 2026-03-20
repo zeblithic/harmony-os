@@ -1,0 +1,287 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+//! DiskBlobStore — write-through persistent [`BlobStore`] backed by a directory.
+//!
+//! Each blob is stored as a file named by the CID's hex encoding. On
+//! construction, the store scans its directory and loads all existing blobs
+//! into an in-memory cache. Subsequent inserts write to both disk and memory.
+//!
+//! The [`BlobStore::get`] method returns `&[u8]`, requiring the store to own
+//! the data — hence the in-memory cache. The disk layer provides durability
+//! across process restarts.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use harmony_content::blob::BlobStore;
+use harmony_content::cid::{ContentFlags, ContentId};
+use harmony_content::error::ContentError;
+
+/// A content-addressed blob store that persists to a directory.
+///
+/// Acts as a write-through cache: all data lives in memory (for `&[u8]`
+/// returns) and is also written to disk (for persistence across restarts).
+pub struct DiskBlobStore {
+    dir: PathBuf,
+    cache: HashMap<ContentId, Vec<u8>>,
+}
+
+impl DiskBlobStore {
+    /// Open or create a persistent blob store at the given directory.
+    ///
+    /// Creates the directory if it doesn't exist, then scans for existing
+    /// blob files (named as 64-char hex CIDs) and loads them into memory.
+    pub fn open(dir: &Path) -> std::io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+
+        let mut cache = HashMap::new();
+
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+
+            // CID hex is exactly 64 characters (32 bytes).
+            if name.len() != 64 {
+                continue;
+            }
+            let cid_bytes: [u8; 32] = match hex::decode(&name) {
+                Ok(bytes) => match bytes.try_into() {
+                    Ok(arr) => arr,
+                    Err(_) => continue,
+                },
+                Err(_) => continue,
+            };
+            let cid = ContentId::from_bytes(cid_bytes);
+            let data = std::fs::read(&path)?;
+            cache.insert(cid, data);
+        }
+
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            cache,
+        })
+    }
+
+    /// Number of blobs in the store.
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Whether the store is empty.
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+    }
+
+    /// Write a blob to disk. Best-effort — logs on failure.
+    fn persist(&self, cid: &ContentId, data: &[u8]) {
+        let cid_hex = hex::encode(cid.to_bytes());
+        let path = self.dir.join(&cid_hex);
+        if let Err(e) = std::fs::write(&path, data) {
+            eprintln!("[disk-blob-store] failed to persist {cid_hex}: {e}");
+        }
+    }
+}
+
+impl BlobStore for DiskBlobStore {
+    fn insert_with_flags(
+        &mut self,
+        data: &[u8],
+        flags: ContentFlags,
+    ) -> Result<ContentId, ContentError> {
+        let cid = ContentId::for_blob(data, flags)?;
+        if !self.cache.contains_key(&cid) {
+            self.persist(&cid, data);
+            self.cache.insert(cid, data.to_vec());
+        }
+        Ok(cid)
+    }
+
+    fn store(&mut self, cid: ContentId, data: Vec<u8>) {
+        if !self.cache.contains_key(&cid) {
+            self.persist(&cid, &data);
+            self.cache.insert(cid, data);
+        }
+    }
+
+    fn get(&self, cid: &ContentId) -> Option<&[u8]> {
+        self.cache.get(cid).map(|v| v.as_slice())
+    }
+
+    fn contains(&self, cid: &ContentId) -> bool {
+        self.cache.contains_key(cid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn new_creates_directory() {
+        let tmp = TempDir::new().unwrap();
+        let store_dir = tmp.path().join("blobs");
+        assert!(!store_dir.exists());
+
+        let _store = DiskBlobStore::open(&store_dir).unwrap();
+        assert!(store_dir.is_dir());
+    }
+
+    #[test]
+    fn insert_and_get_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = DiskBlobStore::open(tmp.path()).unwrap();
+
+        let data = b"hello persistent blob store";
+        let cid = store.insert(data.as_slice()).unwrap();
+
+        assert_eq!(store.get(&cid).unwrap(), data.as_slice());
+        assert!(store.contains(&cid));
+    }
+
+    #[test]
+    fn insert_persists_to_disk() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = DiskBlobStore::open(tmp.path()).unwrap();
+
+        let data = b"persisted data";
+        let cid = store.insert(data.as_slice()).unwrap();
+
+        let cid_hex = hex::encode(cid.to_bytes());
+        let blob_path = tmp.path().join(&cid_hex);
+        assert!(blob_path.exists(), "blob file should exist on disk");
+        assert_eq!(std::fs::read(&blob_path).unwrap(), data.as_slice());
+    }
+
+    #[test]
+    fn reload_from_disk() {
+        let tmp = TempDir::new().unwrap();
+        let data = b"survives restart";
+        let cid;
+
+        {
+            let mut store = DiskBlobStore::open(tmp.path()).unwrap();
+            cid = store.insert(data.as_slice()).unwrap();
+        }
+
+        // Create a fresh store from the same directory — should reload.
+        let store2 = DiskBlobStore::open(tmp.path()).unwrap();
+        assert!(store2.contains(&cid));
+        assert_eq!(store2.get(&cid).unwrap(), data.as_slice());
+    }
+
+    #[test]
+    fn store_precomputed_cid_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = DiskBlobStore::open(tmp.path()).unwrap();
+
+        let data = b"bundle data";
+        let cid = ContentId::for_blob(data, ContentFlags::default()).unwrap();
+
+        store.store(cid, data.to_vec());
+
+        assert_eq!(store.get(&cid).unwrap(), data.as_slice());
+        assert!(store.contains(&cid));
+    }
+
+    #[test]
+    fn store_precomputed_persists_to_disk() {
+        let tmp = TempDir::new().unwrap();
+        let data = b"precomputed persist";
+        let cid = ContentId::for_blob(data, ContentFlags::default()).unwrap();
+
+        {
+            let mut store = DiskBlobStore::open(tmp.path()).unwrap();
+            store.store(cid, data.to_vec());
+        }
+
+        // Reload from disk.
+        let store2 = DiskBlobStore::open(tmp.path()).unwrap();
+        assert!(store2.contains(&cid));
+        assert_eq!(store2.get(&cid).unwrap(), data.as_slice());
+    }
+
+    #[test]
+    fn contains_false_for_unknown_cid() {
+        let tmp = TempDir::new().unwrap();
+        let store = DiskBlobStore::open(tmp.path()).unwrap();
+
+        let cid = ContentId::for_blob(b"not stored", ContentFlags::default()).unwrap();
+        assert!(!store.contains(&cid));
+        assert!(store.get(&cid).is_none());
+    }
+
+    #[test]
+    fn duplicate_insert_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = DiskBlobStore::open(tmp.path()).unwrap();
+
+        let data = b"same data twice";
+        let cid1 = store.insert(data.as_slice()).unwrap();
+        let cid2 = store.insert(data.as_slice()).unwrap();
+
+        assert_eq!(cid1, cid2);
+        // Only one file on disk.
+        let file_count = std::fs::read_dir(tmp.path()).unwrap().count();
+        assert_eq!(file_count, 1);
+    }
+
+    #[test]
+    fn reload_preserves_multiple_blobs() {
+        let tmp = TempDir::new().unwrap();
+        let cids: Vec<ContentId>;
+
+        {
+            let mut store = DiskBlobStore::open(tmp.path()).unwrap();
+            let c1 = store.insert(b"blob one".as_slice()).unwrap();
+            let c2 = store.insert(b"blob two".as_slice()).unwrap();
+            let c3 = store.insert(b"blob three".as_slice()).unwrap();
+            cids = vec![c1, c2, c3];
+        }
+
+        let store2 = DiskBlobStore::open(tmp.path()).unwrap();
+        for cid in &cids {
+            assert!(store2.contains(cid), "blob {cid:?} should survive reload");
+        }
+        assert_eq!(store2.get(&cids[0]).unwrap(), b"blob one");
+        assert_eq!(store2.get(&cids[1]).unwrap(), b"blob two");
+        assert_eq!(store2.get(&cids[2]).unwrap(), b"blob three");
+    }
+
+    #[test]
+    fn non_hex_files_ignored_on_reload() {
+        let tmp = TempDir::new().unwrap();
+
+        {
+            let mut store = DiskBlobStore::open(tmp.path()).unwrap();
+            store.insert(b"real blob".as_slice()).unwrap();
+        }
+
+        // Create a non-hex junk file — should be silently skipped.
+        std::fs::write(tmp.path().join("not-a-blob.txt"), b"junk").unwrap();
+
+        // Should load without error, only the real blob.
+        let store2 = DiskBlobStore::open(tmp.path()).unwrap();
+        assert_eq!(store2.len(), 1);
+    }
+
+    #[test]
+    fn len_and_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = DiskBlobStore::open(tmp.path()).unwrap();
+
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
+
+        store.insert(b"data".as_slice()).unwrap();
+        assert!(!store.is_empty());
+        assert_eq!(store.len(), 1);
+    }
+}
