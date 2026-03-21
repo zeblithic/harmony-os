@@ -1622,7 +1622,13 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 if avail == 0 {
                     return EAGAIN;
                 }
-                // Partial write: clamp to available capacity.
+                // POSIX: writes <= PIPE_BUF bytes must be atomic — either
+                // all bytes fit or return EAGAIN. Only writes > PIPE_BUF
+                // may be partial.
+                const PIPE_BUF: usize = 4096;
+                if count <= PIPE_BUF && avail < count {
+                    return EAGAIN;
+                }
                 let to_write = count.min(avail);
                 let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, to_write) };
                 pipe_buf.extend_from_slice(data);
@@ -1708,10 +1714,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
                     }
                 } else {
                     let n = count.min(buf.len());
-                    let drained: Vec<u8> = buf.drain(..n).collect();
+                    // Copy directly from buffer, then drain without intermediate Vec.
                     unsafe {
-                        core::ptr::copy_nonoverlapping(drained.as_ptr(), buf_ptr as *mut u8, n);
+                        core::ptr::copy_nonoverlapping(buf.as_ptr(), buf_ptr as *mut u8, n);
                     }
+                    buf.drain(..n);
                     n as i64
                 }
             }
