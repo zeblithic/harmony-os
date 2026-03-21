@@ -1598,7 +1598,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         match kind {
             FdKind::PipeWrite { pipe_id } => {
-                // Check that a reader still exists for this pipe.
+                // Linux default pipe capacity. Writes that would exceed
+                // this return EAGAIN (consistent with the always-nonblocking
+                // emulator model — see O_NONBLOCK note in sys_pipe2).
+                const PIPE_BUF_CAP: usize = 65536;
                 let has_reader = self
                     .fd_table
                     .values()
@@ -1606,11 +1609,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 if !has_reader {
                     return EPIPE;
                 }
+                let pipe_buf = self.pipes.get_mut(&pipe_id).unwrap();
+                if pipe_buf.len() + count > PIPE_BUF_CAP {
+                    return EAGAIN;
+                }
                 let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
-                self.pipes
-                    .get_mut(&pipe_id)
-                    .unwrap()
-                    .extend_from_slice(data);
+                pipe_buf.extend_from_slice(data);
                 count as i64
             }
             FdKind::PipeRead { .. } => EBADF,
