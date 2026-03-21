@@ -22,6 +22,7 @@ const ENOMEM: i64 = -12;
 const EFAULT: i64 = -14;
 const ENOTDIR: i64 = -20;
 const EINVAL: i64 = -22;
+const ENODEV: i64 = -19;
 const ENOTTY: i64 = -25;
 const ESPIPE: i64 = -29;
 const EROFS: i64 = -30;
@@ -2315,7 +2316,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                     kind: FdKind::File { fid, .. },
                     ..
                 }) => Some(*fid),
-                Some(_) => return EBADF,
+                Some(_) => return ENODEV, // valid fd, but not a mappable type
                 None => return EBADF,
             }
         } else {
