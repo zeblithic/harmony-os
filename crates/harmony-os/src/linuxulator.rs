@@ -8689,7 +8689,10 @@ mod integration_tests {
         }) as i32;
         assert!(fd2 >= 0);
         // listen → accept → second accept should EAGAIN (nonblock guard)
-        lx.dispatch_syscall(LinuxSyscall::Listen { fd: fd2, backlog: 1 });
+        lx.dispatch_syscall(LinuxSyscall::Listen {
+            fd: fd2,
+            backlog: 1,
+        });
         let a1 = lx.dispatch_syscall(LinuxSyscall::Accept {
             fd: fd2,
             addr: 0,
