@@ -1770,26 +1770,24 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
     }
 
-    /// Linux close(2): close a file descriptor.
-    fn sys_close(&mut self, fd: i32) -> i64 {
-        let entry = match self.fd_table.remove(&fd) {
-            Some(e) => e,
-            None => return EBADF,
-        };
+    /// Clean up resources for a removed fd entry. Handles all FdKind
+    /// variants: releases 9P fids, frees orphaned pipe buffers, and
+    /// removes orphaned eventfd state.
+    ///
+    /// Must be called AFTER the entry has been removed from fd_table
+    /// (so the "still referenced" scans don't see the entry itself).
+    fn close_fd_entry(&mut self, entry: FdEntry) {
         match entry.kind {
             FdKind::File { fid, .. } => self.release_fid(fid),
             FdKind::PipeRead { pipe_id } | FdKind::PipeWrite { pipe_id } => {
-                // Clean up the pipe buffer if no other fd references this pipe.
-                let still_referenced = self
-                    .fd_table
-                    .values()
-                    .any(|e| matches!(&e.kind, FdKind::PipeRead { pipe_id: id } | FdKind::PipeWrite { pipe_id: id } if *id == pipe_id));
+                let still_referenced = self.fd_table.values().any(|e| {
+                    matches!(&e.kind, FdKind::PipeRead { pipe_id: id } | FdKind::PipeWrite { pipe_id: id } if *id == pipe_id)
+                });
                 if !still_referenced {
                     self.pipes.remove(&pipe_id);
                 }
             }
             FdKind::EventFd { eventfd_id } => {
-                // Clean up if no other fd references this eventfd.
                 let still_referenced = self.fd_table.values().any(
                     |e| matches!(&e.kind, FdKind::EventFd { eventfd_id: id } if *id == eventfd_id),
                 );
@@ -1798,6 +1796,15 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 }
             }
         }
+    }
+
+    /// Linux close(2): close a file descriptor.
+    fn sys_close(&mut self, fd: i32) -> i64 {
+        let entry = match self.fd_table.remove(&fd) {
+            Some(e) => e,
+            None => return EBADF,
+        };
+        self.close_fd_entry(entry);
         0
     }
 
@@ -1897,11 +1904,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if oldfd == newfd {
             return newfd as i64;
         }
-        // Close newfd if it's open
+        // Close newfd if it's open (handles all FdKind variants).
         if let Some(existing) = self.fd_table.remove(&newfd) {
-            if let FdKind::File { fid, .. } = existing.kind {
-                self.release_fid(fid);
-            }
+            self.close_fd_entry(existing);
         }
         self.dup_fd_to(oldfd, newfd, 0);
         newfd as i64
@@ -1929,11 +1934,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if !self.fd_table.contains_key(&oldfd) {
             return EBADF;
         }
-        // Close newfd if it's open
+        // Close newfd if it's open (handles all FdKind variants).
         if let Some(existing) = self.fd_table.remove(&newfd) {
-            if let FdKind::File { fid, .. } = existing.kind {
-                self.release_fid(fid);
-            }
+            self.close_fd_entry(existing);
         }
         let fd_flags = if flags & O_CLOEXEC != 0 {
             FD_CLOEXEC
