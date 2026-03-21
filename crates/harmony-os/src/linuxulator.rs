@@ -30,6 +30,12 @@ const EPIPE: i64 = -32;
 const ERANGE: i64 = -34;
 const ENOSYS: i64 = -38;
 const EOVERFLOW: i64 = -75;
+const EAFNOSUPPORT: i64 = -97;
+// Reserved for Task 2 (socket lifecycle — bind/listen/accept/connect).
+#[allow(dead_code)]
+const ENOTSOCK: i64 = -88;
+#[allow(dead_code)]
+const EEXIST: i64 = -17;
 
 // Clock IDs (shared by clock_gettime and clock_getres)
 const CLOCK_REALTIME: i32 = 0;
@@ -269,6 +275,11 @@ pub enum LinuxSyscall {
         initval: u64,
         flags: u64,
     },
+    Socket {
+        domain: i32,
+        sock_type: i32,
+        protocol: i32,
+    },
     Unknown {
         nr: u64,
     },
@@ -341,6 +352,11 @@ impl LinuxSyscall {
                 newfd: args[1] as i32,
             },
             39 => LinuxSyscall::Getpid,
+            41 => LinuxSyscall::Socket {
+                domain: args[0] as i32,
+                sock_type: args[1] as i32,
+                protocol: args[2] as i32,
+            },
             60 => LinuxSyscall::Exit {
                 code: args[0] as i32,
             },
@@ -614,6 +630,11 @@ impl LinuxSyscall {
             176 => LinuxSyscall::Getgid,
             177 => LinuxSyscall::Getegid,
             178 => LinuxSyscall::Gettid,
+            198 => LinuxSyscall::Socket {
+                domain: args[0] as i32,
+                sock_type: args[1] as i32,
+                protocol: args[2] as i32,
+            },
             214 => LinuxSyscall::Brk { addr: args[0] },
             215 => LinuxSyscall::Munmap {
                 addr: args[0],
@@ -1212,12 +1233,23 @@ enum FdKind {
     PipeWrite { pipe_id: usize },
     /// eventfd descriptor (shared state via eventfd_id indirection).
     EventFd { eventfd_id: usize },
+    /// Socket stub (no real networking).
+    Socket { socket_id: usize },
 }
 
 /// Shared state for an eventfd instance.
 struct EventFdState {
     counter: u64,
     semaphore: bool,
+}
+
+/// Shared state for a socket instance.
+// Fields will be read by Task 2 (bind/listen/accept/connect).
+#[allow(dead_code)]
+struct SocketState {
+    domain: i32,
+    sock_type: i32,
+    listening: bool,
 }
 
 /// Per-fd state: the kind of object and descriptor-level flags.
@@ -1268,6 +1300,10 @@ pub struct Linuxulator<B: SyscallBackend> {
     next_pipe_id: usize,
     eventfds: BTreeMap<usize, EventFdState>,
     next_eventfd_id: usize,
+    /// Socket state keyed by socket_id.
+    sockets: BTreeMap<usize, SocketState>,
+    /// Next socket_id to allocate.
+    next_socket_id: usize,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -1296,6 +1332,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
             next_pipe_id: 0,
             eventfds: BTreeMap::new(),
             next_eventfd_id: 0,
+            sockets: BTreeMap::new(),
+            next_socket_id: 0,
         }
     }
 
@@ -1589,6 +1627,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
             LinuxSyscall::EventFd2 { initval, flags } => {
                 self.sys_eventfd2(initval as u32, flags as i32)
             }
+            LinuxSyscall::Socket {
+                domain,
+                sock_type,
+                protocol,
+            } => self.sys_socket(domain, sock_type, protocol),
             LinuxSyscall::Unknown { .. } => ENOSYS,
         }
     }
@@ -1684,6 +1727,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
                     }
                     Err(e) => ipc_err_to_errno(e),
                 }
+            }
+            FdKind::Socket { .. } => {
+                // Stub: pretend all bytes written.
+                count as i64
             }
         }
     }
@@ -1783,6 +1830,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
                     Err(e) => ipc_err_to_errno(e),
                 }
             }
+            FdKind::Socket { .. } => {
+                // Stub: no data, return EOF.
+                0
+            }
         }
     }
 
@@ -1819,6 +1870,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 );
                 if !still_referenced {
                     self.eventfds.remove(&eventfd_id);
+                }
+            }
+            FdKind::Socket { socket_id } => {
+                let still_referenced = self.fd_table.values().any(
+                    |e| matches!(&e.kind, FdKind::Socket { socket_id: id } if *id == socket_id),
+                );
+                if !still_referenced {
+                    self.sockets.remove(&socket_id);
                 }
             }
         }
@@ -2073,6 +2132,51 @@ impl<B: SyscallBackend> Linuxulator<B> {
         fd as i64
     }
 
+    // ── Socket stubs ──────────────────────────────────────────────
+
+    /// Linux socket(2): create a socket stub fd.
+    fn sys_socket(&mut self, domain: i32, sock_type: i32, _protocol: i32) -> i64 {
+        const AF_UNIX: i32 = 1;
+        const AF_INET: i32 = 2;
+        const AF_INET6: i32 = 10;
+        const SOCK_CLOEXEC: i32 = 0o2000000;
+        const SOCK_NONBLOCK: i32 = 0o4000;
+
+        match domain {
+            AF_UNIX | AF_INET | AF_INET6 => {}
+            _ => return EAFNOSUPPORT,
+        }
+
+        let flags = sock_type & (SOCK_CLOEXEC | SOCK_NONBLOCK);
+        let base_type = sock_type & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
+
+        let socket_id = self.next_socket_id;
+        self.next_socket_id += 1;
+        self.sockets.insert(
+            socket_id,
+            SocketState {
+                domain,
+                sock_type: base_type,
+                listening: false,
+            },
+        );
+
+        let fd = self.alloc_fd();
+        let fd_flags = if flags & SOCK_CLOEXEC != 0 {
+            FD_CLOEXEC
+        } else {
+            0
+        };
+        self.fd_table.insert(
+            fd,
+            FdEntry {
+                kind: FdKind::Socket { socket_id },
+                flags: fd_flags,
+            },
+        );
+        fd as i64
+    }
+
     /// Linux fstat(2): get file status.
     fn sys_fstat(&mut self, fd: i32, statbuf_ptr: usize) -> i64 {
         if statbuf_ptr == 0 {
@@ -2109,6 +2213,17 @@ impl<B: SyscallBackend> Linuxulator<B> {
                         file_type: FileType::Regular,
                     },
                 );
+                0
+            }
+            FdKind::Socket { .. } => {
+                let stat = FileStat {
+                    qpath: 0,
+                    name: alloc::sync::Arc::from("socket"),
+                    size: 0,
+                    file_type: FileType::Regular, // ignored — mode_override used
+                };
+                // S_IFSOCK = 0o140000
+                write_linux_stat_with_mode(statbuf_ptr, &stat, Some(0o140644));
                 0
             }
             FdKind::File { fid, .. } => match self.backend.stat(fid) {
@@ -2523,12 +2638,15 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Unknown requests return EINVAL (not ENOSYS — ENOSYS means "syscall
     /// does not exist", while EINVAL means "unsupported request on this fd").
     fn sys_ioctl(&self, fd: i32, request: u64) -> i64 {
-        if !self.fd_table.contains_key(&fd) {
-            return EBADF;
-        }
+        let entry = match self.fd_table.get(&fd) {
+            Some(e) => e,
+            None => return EBADF,
+        };
         const TIOCGWINSZ: u64 = 0x5413;
-        match request {
-            TIOCGWINSZ => ENOTTY,
+        const FIONBIO: u64 = 0x5421;
+        match (&entry.kind, request) {
+            (FdKind::Socket { .. }, FIONBIO) => 0,
+            (_, TIOCGWINSZ) => ENOTTY,
             _ => EINVAL,
         }
     }
@@ -7477,5 +7595,28 @@ mod integration_tests {
                 flags: 1
             }
         ));
+    }
+
+    #[test]
+    fn test_socket_create() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // AF_INET (2), SOCK_STREAM (1), protocol 0
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,
+            sock_type: 1,
+            protocol: 0,
+        });
+        assert!(fd >= 0, "socket() should return non-negative fd, got {fd}");
+        assert!(lx.has_fd(fd as i32));
+
+        // Unknown domain → EAFNOSUPPORT (-97)
+        let err = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 999,
+            sock_type: 1,
+            protocol: 0,
+        });
+        assert_eq!(err, -97); // EAFNOSUPPORT
     }
 }
