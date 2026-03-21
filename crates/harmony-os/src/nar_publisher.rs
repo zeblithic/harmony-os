@@ -3,12 +3,12 @@
 //! NarPublisher — publish NAR archives into the Harmony mesh via content-addressed DAG.
 //!
 //! Chunks a NAR file into a Merkle DAG using [`harmony_content::dag::ingest`],
-//! announces the store-path-to-CID mapping and each blob's availability via a
+//! announces the store-path-to-CID mapping and each book's availability via a
 //! pluggable [`ContentAnnouncer`] trait (backed by Zenoh in production).
 
 use std::collections::HashMap;
 
-use harmony_content::blob::{BlobStore, MemoryBlobStore};
+use harmony_content::book::{BookStore, MemoryBookStore};
 use harmony_content::chunker::ChunkerConfig;
 use harmony_content::cid::{CidType, ContentId};
 use harmony_content::dag;
@@ -24,13 +24,13 @@ pub trait ContentAnnouncer {
 
 /// Publishes NAR archives into the Harmony content mesh.
 ///
-/// Chunks NAR data into a content-addressed Merkle DAG, stores the blobs
-/// locally, and announces both the store-path mapping and individual blob
+/// Chunks NAR data into a content-addressed Merkle DAG, stores the books
+/// locally, and announces both the store-path mapping and individual book
 /// availability via a [`ContentAnnouncer`].
 ///
-/// Generic over the book store backend: defaults to [`MemoryBlobStore`]
+/// Generic over the book store backend: defaults to [`MemoryBookStore`]
 /// for backward compatibility, but accepts [`DiskBookStore`](crate::disk_book_store::DiskBookStore)
-/// (or any `BlobStore` impl) for durable book storage across restarts.
+/// (or any `BookStore` impl) for durable book storage across restarts.
 ///
 /// **Persistence scope:** Only the underlying book chunks are persisted
 /// by the store backend. The in-memory `published_paths` map (store-path
@@ -39,32 +39,32 @@ pub trait ContentAnnouncer {
 /// re-publish paths or separately persist this mapping.
 /// [`PersistentNarStore`](crate::persistent_nar_store::PersistentNarStore)
 /// handles the NAR-level persistence independently.
-pub struct NarPublisher<A: ContentAnnouncer, S: BlobStore = MemoryBlobStore> {
+pub struct NarPublisher<A: ContentAnnouncer, S: BookStore = MemoryBookStore> {
     announcer: A,
-    blob_store: S,
+    book_store: S,
     chunker_config: ChunkerConfig,
     published_paths: HashMap<String, ContentId>,
 }
 
-impl<A: ContentAnnouncer> NarPublisher<A, MemoryBlobStore> {
-    /// Create a new publisher with the given announcer, in-memory blob store,
+impl<A: ContentAnnouncer> NarPublisher<A, MemoryBookStore> {
+    /// Create a new publisher with the given announcer, in-memory book store,
     /// and default chunker config.
     pub fn new(announcer: A) -> Self {
         Self {
             announcer,
-            blob_store: MemoryBlobStore::new(),
+            book_store: MemoryBookStore::new(),
             chunker_config: ChunkerConfig::DEFAULT,
             published_paths: HashMap::new(),
         }
     }
 }
 
-impl<A: ContentAnnouncer, S: BlobStore> NarPublisher<A, S> {
-    /// Create a new publisher with a caller-provided blob store.
+impl<A: ContentAnnouncer, S: BookStore> NarPublisher<A, S> {
+    /// Create a new publisher with a caller-provided book store.
     pub fn with_store(announcer: A, store: S) -> Self {
         Self {
             announcer,
-            blob_store: store,
+            book_store: store,
             chunker_config: ChunkerConfig::DEFAULT,
             published_paths: HashMap::new(),
         }
@@ -75,7 +75,7 @@ impl<A: ContentAnnouncer, S: BlobStore> NarPublisher<A, S> {
     /// 1. Chunks the NAR via `dag::ingest`
     /// 2. Records the store-path-to-root-CID mapping
     /// 3. Announces the store path mapping on `harmony/nix/store/{store_hash}`
-    /// 4. Walks the DAG and announces each blob on `harmony/announce/{cid_hex}`
+    /// 4. Walks the DAG and announces each book on `harmony/announce/{cid_hex}`
     /// 5. If the root is a bundle (multi-chunk), announces the bundle itself
     pub fn publish(
         &mut self,
@@ -91,9 +91,9 @@ impl<A: ContentAnnouncer, S: BlobStore> NarPublisher<A, S> {
         }
         let store_hash = &store_path_name[..32];
 
-        // Ingest into the DAG (blob_store mutation is harmless on error —
-        // content-addressed blobs are just cached data, not mappings).
-        let root_cid = dag::ingest(nar_bytes, &self.chunker_config, &mut self.blob_store)
+        // Ingest into the DAG (book_store mutation is harmless on error —
+        // content-addressed books are just cached data, not mappings).
+        let root_cid = dag::ingest(nar_bytes, &self.chunker_config, &mut self.book_store)
             .map_err(|e| format!("ingest failed: {e}"))?;
 
         // Announce store path mapping: key = harmony/nix/store/{store_hash},
@@ -103,17 +103,17 @@ impl<A: ContentAnnouncer, S: BlobStore> NarPublisher<A, S> {
         self.announcer
             .announce(&store_key, root_cid_hex.as_bytes())?;
 
-        // Walk the DAG to collect all leaf blob CIDs.
-        let blob_cids =
-            dag::walk(&root_cid, &self.blob_store).map_err(|e| format!("DAG walk failed: {e}"))?;
+        // Walk the DAG to collect all leaf book CIDs.
+        let book_cids =
+            dag::walk(&root_cid, &self.book_store).map_err(|e| format!("DAG walk failed: {e}"))?;
 
-        // Announce each blob.
-        for cid in &blob_cids {
+        // Announce each book.
+        for cid in &book_cids {
             let cid_hex = hex::encode(cid.to_bytes());
-            let blob_key = announce::key(&cid_hex);
+            let book_key = announce::key(&cid_hex);
             let size = cid.payload_size();
             let size_str = size.to_string();
-            self.announcer.announce(&blob_key, size_str.as_bytes())?;
+            self.announcer.announce(&book_key, size_str.as_bytes())?;
         }
 
         // If root is a bundle (multi-chunk), announce the bundle itself.
@@ -138,9 +138,9 @@ impl<A: ContentAnnouncer, S: BlobStore> NarPublisher<A, S> {
         self.published_paths.get(store_path_name)
     }
 
-    /// Retrieve blob data by CID from the local store.
-    pub fn get_blob(&self, cid: &ContentId) -> Option<&[u8]> {
-        self.blob_store.get(cid)
+    /// Retrieve book data by CID from the local store.
+    pub fn get_book(&self, cid: &ContentId) -> Option<&[u8]> {
+        self.book_store.get(cid)
     }
 
     /// Read-only view of all published store-path-to-CID mappings.
@@ -148,9 +148,9 @@ impl<A: ContentAnnouncer, S: BlobStore> NarPublisher<A, S> {
         &self.published_paths
     }
 
-    /// Read-only access to the underlying blob store.
-    pub fn blob_store(&self) -> &S {
-        &self.blob_store
+    /// Read-only access to the underlying book store.
+    pub fn book_store(&self) -> &S {
+        &self.book_store
     }
 }
 
@@ -238,7 +238,7 @@ mod tests {
 
         let announcements = log.borrow();
 
-        // At least 2 announcements: store path mapping + at least one blob.
+        // At least 2 announcements: store path mapping + at least one book.
         assert!(
             announcements.len() >= 2,
             "expected at least 2 announcements, got {}",
@@ -264,12 +264,12 @@ mod tests {
         // get_root_cid returns the same CID.
         assert_eq!(publisher.get_root_cid(store_path), Some(&root_cid));
 
-        // get_blob returns data for the root CID.
-        assert!(publisher.get_blob(&root_cid).is_some());
+        // get_book returns data for the root CID.
+        assert!(publisher.get_book(&root_cid).is_some());
     }
 
     #[test]
-    fn publish_blob_announcements_use_correct_key_format() {
+    fn publish_book_announcements_use_correct_key_format() {
         let (announcer, log) = MockAnnouncer::new();
         let mut publisher = NarPublisher::new(announcer);
 
@@ -284,7 +284,7 @@ mod tests {
         for (key, _) in announcements.iter().skip(1) {
             assert!(
                 key.starts_with("harmony/announce/"),
-                "blob announcement key should start with 'harmony/announce/', got: {key}"
+                "book announcement key should start with 'harmony/announce/', got: {key}"
             );
         }
     }
@@ -329,8 +329,8 @@ mod tests {
         let store_path = "rnd12345678901234567890123456789-round-pkg";
         let root_cid = publisher.publish(store_path, &nar).unwrap();
 
-        // Reassemble from the publisher's blob store should recover original NAR.
-        let recovered = dag::reassemble(&root_cid, publisher.blob_store()).unwrap();
+        // Reassemble from the publisher's book store should recover original NAR.
+        let recovered = dag::reassemble(&root_cid, publisher.book_store()).unwrap();
         assert_eq!(recovered, nar);
     }
 
@@ -387,12 +387,12 @@ mod tests {
         let store_path = "dsk12345678901234567890123456789-disk-pkg";
         let root_cid = publisher.publish(store_path, &nar).unwrap();
 
-        // Blobs should be on disk.
+        // Books should be on disk.
         let file_count = std::fs::read_dir(tmp.path()).unwrap().count();
-        assert!(file_count >= 1, "at least one blob file on disk");
+        assert!(file_count >= 1, "at least one book file on disk");
 
         // Round-trip: reassemble from persistent store.
-        let recovered = dag::reassemble(&root_cid, publisher.blob_store()).unwrap();
+        let recovered = dag::reassemble(&root_cid, publisher.book_store()).unwrap();
         assert_eq!(recovered, nar);
     }
 }

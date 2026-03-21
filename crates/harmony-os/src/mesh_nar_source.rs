@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 
-use harmony_content::blob::{BlobStore, MemoryBlobStore};
+use harmony_content::book::{BookStore, MemoryBookStore};
 use harmony_content::bundle;
 use harmony_content::cid::{CidType, ContentId};
 use harmony_content::dag;
@@ -53,7 +53,7 @@ pub trait MeshNarFetch {
 ///
 /// # Trust model
 ///
-/// Every fetched blob is content-verified by its CID (the CID *is* the
+/// Every fetched book is content-verified by its CID (the CID *is* the
 /// hash of the data). However, the store-path → root-CID mapping is
 /// currently unauthenticated: a malicious peer could announce a
 /// different root CID for a given store hash. This is acceptable for
@@ -102,15 +102,15 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
             .map_err(|v: Vec<u8>| format!("root CID is {} bytes, expected 32", v.len()))?;
         let root_cid = ContentId::from_bytes(root_cid_bytes);
 
-        // 4. Fetch the root blob/bundle from the mesh.
+        // 4. Fetch the root book/bundle from the mesh.
         let fetch_key = content::fetch_key(&root_cid_hex);
         let root_data = match self.querier.query(&fetch_key)? {
             Some(data) => data,
-            None => return Ok(None), // Root blob missing from mesh.
+            None => return Ok(None), // Root book missing from mesh.
         };
 
         // 5. Build a temporary store, populate with root data.
-        let mut store = MemoryBlobStore::new();
+        let mut store = MemoryBookStore::new();
         store.store(root_cid, root_data);
 
         // 6. Recursively fetch all children (with cycle guard).
@@ -131,7 +131,7 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
     fn fetch_children(
         &self,
         cid: &ContentId,
-        store: &mut MemoryBlobStore,
+        store: &mut MemoryBookStore,
         visited: &mut HashSet<ContentId>,
     ) -> Result<(), String> {
         if !visited.insert(*cid) {
@@ -139,17 +139,17 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
         }
 
         match cid.cid_type() {
-            CidType::Blob if !store.contains(cid) => {
+            CidType::Book if !store.contains(cid) => {
                 // Leaf node — fetch if not already present.
                 let cid_hex = hex::encode(cid.to_bytes());
                 let key = content::fetch_key(&cid_hex);
                 let data = self
                     .querier
                     .query(&key)?
-                    .ok_or_else(|| format!("mesh missing blob {cid_hex}"))?;
+                    .ok_or_else(|| format!("mesh missing book {cid_hex}"))?;
                 store.store(*cid, data);
             }
-            CidType::Blob => { /* already in store */ }
+            CidType::Book => { /* already in store */ }
             CidType::Bundle(_) => {
                 // Interior node — parse children, fetch each, then recurse.
                 let bundle_data = store
@@ -243,10 +243,10 @@ mod tests {
 
     // ── Test helper: populate a MockQuerier with a NAR's DAG ────────
 
-    /// Ingest data into a MemoryBlobStore, then populate a MockQuerier
+    /// Ingest data into a [`MemoryBookStore`], then populate a MockQuerier
     /// with all the key-value pairs needed to fetch it from the mesh.
     fn populate_querier_from_data(data: &[u8], store_path_name: &str) -> MockQuerier {
-        let mut store = MemoryBlobStore::new();
+        let mut store = MemoryBookStore::new();
 
         // Use a small chunker config so even modest test data gets split.
         let config = ChunkerConfig {
@@ -265,7 +265,7 @@ mod tests {
         let mapping_key = format!("harmony/nix/store/{store_hash}");
         map.insert(mapping_key, root_cid_hex.as_bytes().to_vec());
 
-        // Insert root blob/bundle under its fetch key.
+        // Insert root book/bundle under its fetch key.
         let root_fetch_key = content::fetch_key(&root_cid_hex);
         map.insert(root_fetch_key, store.get(&root_cid).unwrap().to_vec());
 
@@ -278,11 +278,11 @@ mod tests {
     /// Recursively insert all DAG nodes into the map.
     fn insert_dag_nodes(
         cid: &ContentId,
-        store: &MemoryBlobStore,
+        store: &MemoryBookStore,
         map: &mut HashMap<String, Vec<u8>>,
     ) {
         match cid.cid_type() {
-            CidType::Blob => {
+            CidType::Book => {
                 if let Some(data) = store.get(cid) {
                     let hex_key = hex::encode(cid.to_bytes());
                     let fetch_key = content::fetch_key(&hex_key);
@@ -377,19 +377,19 @@ mod tests {
     }
 
     #[test]
-    fn fetch_returns_none_when_root_blob_missing() {
+    fn fetch_returns_none_when_root_book_missing() {
         let store_path_name = "abc12345678901234567890123456789-ghost-pkg";
 
-        // Create a valid CID mapping but don't populate the actual blob.
+        // Create a valid CID mapping but don't populate the actual book.
         let mut map = HashMap::new();
-        let fake_cid = ContentId::for_blob(b"phantom data", Default::default()).unwrap();
+        let fake_cid = ContentId::for_book(b"phantom data", Default::default()).unwrap();
         let fake_hex = hex::encode(fake_cid.to_bytes());
         let store_hash = &store_path_name[..32];
         map.insert(
             format!("harmony/nix/store/{store_hash}"),
             fake_hex.as_bytes().to_vec(),
         );
-        // Intentionally do NOT insert the fetch key for the blob.
+        // Intentionally do NOT insert the fetch key for the book.
 
         let querier = MockQuerier { data: map };
         let source = MeshNarSource::new(querier);
@@ -426,7 +426,7 @@ mod tests {
         let mut publisher = NarPublisher::new(NoopAnnouncer);
         let root_cid = publisher.publish(store_path, &nar).unwrap();
 
-        // Populate mock querier with publisher's blob store data.
+        // Populate mock querier with publisher's book store data.
         let mut querier = MockQuerier::new();
         let store_hash = &store_path[..32];
         let root_cid_hex = hex::encode(root_cid.to_bytes());
@@ -437,19 +437,19 @@ mod tests {
             root_cid_hex.as_bytes().to_vec(),
         );
 
-        // Root blob/bundle.
+        // Root book/bundle.
         let root_fetch_key = content::fetch_key(&root_cid_hex);
         querier.insert(
             &root_fetch_key,
-            publisher.get_blob(&root_cid).unwrap().to_vec(),
+            publisher.get_book(&root_cid).unwrap().to_vec(),
         );
 
-        // All leaf blobs via dag::walk on publisher's blob store.
-        let blob_cids = dag::walk(&root_cid, publisher.blob_store()).unwrap();
-        for cid in &blob_cids {
+        // All leaf books via dag::walk on publisher's book store.
+        let book_cids = dag::walk(&root_cid, publisher.book_store()).unwrap();
+        for cid in &book_cids {
             let cid_hex = hex::encode(cid.to_bytes());
             let fetch_key = content::fetch_key(&cid_hex);
-            querier.insert(&fetch_key, publisher.get_blob(cid).unwrap().to_vec());
+            querier.insert(&fetch_key, publisher.get_book(cid).unwrap().to_vec());
         }
 
         // Fetch side.

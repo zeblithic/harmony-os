@@ -1,25 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! DiskBookStore — write-through persistent [`BlobStore`] backed by a directory.
+//! DiskBookStore — write-through persistent [`BookStore`] backed by a directory.
 //!
 //! Each book is stored as a file named by the CID's hex encoding. On
 //! construction, the store scans its directory and loads all existing books
 //! into an in-memory cache. Subsequent inserts write to both disk and memory.
 //!
-//! The [`BlobStore::get`] method returns `&[u8]`, requiring the store to own
+//! The [`BookStore::get`] method returns `&[u8]`, requiring the store to own
 //! the data — hence the in-memory cache. The disk layer provides durability
 //! across process restarts.
-//!
-//! **Naming note:** This type implements the [`BlobStore`] trait from
-//! `harmony-content`, which still uses legacy "blob" naming. A codebase-wide
-//! rename to `BookStore` is tracked separately. The type is named
-//! `DiskBookStore` to match the canonical "book" terminology from
-//! `harmony-athenaeum` (CID-addressed units up to 1 MB).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use harmony_content::blob::BlobStore;
+use harmony_content::book::BookStore;
 use harmony_content::cid::{ContentFlags, ContentId};
 use harmony_content::error::ContentError;
 
@@ -30,18 +24,17 @@ use harmony_content::error::ContentError;
 ///
 /// # Durability guarantees
 ///
-/// Disk write failures in [`BlobStore::store`] and [`BlobStore::insert`]
+/// Disk write failures in [`BookStore::store`] and [`BookStore::insert`]
 /// are **best-effort**: if the write fails, data remains in the in-memory
 /// cache (available this session) but will not survive a restart. This is
-/// a constraint of the [`BlobStore`] trait, which has no `Result` return
+/// a constraint of the [`BookStore`] trait, which has no `Result` return
 /// on `store()` and no I/O error variant in `ContentError`. Callers that
 /// require strict durability should verify persistence via [`Self::is_persisted`].
 ///
 /// On reload, files whose size does not match the CID's `payload_size()`
 /// are skipped (catches truncation from crashes or partial writes).
 ///
-/// Implements the [`BlobStore`] trait (legacy naming — will become
-/// `BookStore` in a future migration).
+/// Implements the [`BookStore`] trait.
 pub struct DiskBookStore {
     dir: PathBuf,
     cache: HashMap<ContentId, Vec<u8>>,
@@ -142,13 +135,13 @@ impl DiskBookStore {
     }
 }
 
-impl BlobStore for DiskBookStore {
+impl BookStore for DiskBookStore {
     fn insert_with_flags(
         &mut self,
         data: &[u8],
         flags: ContentFlags,
     ) -> Result<ContentId, ContentError> {
-        let cid = ContentId::for_blob(data, flags)?;
+        let cid = ContentId::for_book(data, flags)?;
         if !self.cache.contains_key(&cid) {
             self.persist(&cid, data);
             self.cache.insert(cid, data.to_vec());
@@ -236,7 +229,7 @@ mod tests {
         let mut store = DiskBookStore::open(tmp.path()).unwrap();
 
         let data = b"bundle data";
-        let cid = ContentId::for_blob(data, ContentFlags::default()).unwrap();
+        let cid = ContentId::for_book(data, ContentFlags::default()).unwrap();
 
         store.store(cid, data.to_vec());
 
@@ -248,7 +241,7 @@ mod tests {
     fn store_precomputed_persists_to_disk() {
         let tmp = TempDir::new().unwrap();
         let data = b"precomputed persist";
-        let cid = ContentId::for_blob(data, ContentFlags::default()).unwrap();
+        let cid = ContentId::for_book(data, ContentFlags::default()).unwrap();
 
         {
             let mut store = DiskBookStore::open(tmp.path()).unwrap();
@@ -266,7 +259,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = DiskBookStore::open(tmp.path()).unwrap();
 
-        let cid = ContentId::for_blob(b"not stored", ContentFlags::default()).unwrap();
+        let cid = ContentId::for_book(b"not stored", ContentFlags::default()).unwrap();
         assert!(!store.contains(&cid));
         assert!(store.get(&cid).is_none());
     }
