@@ -347,6 +347,29 @@ pub enum LinuxSyscall {
         addr: u64,
         addrlen: u64,
     },
+    EpollCreate1 {
+        flags: i32,
+    },
+    EpollCtl {
+        epfd: i32,
+        op: i32,
+        fd: i32,
+        event: u64,
+    },
+    EpollWait {
+        epfd: i32,
+        events: u64,
+        maxevents: i32,
+        timeout: i32,
+    },
+    EpollPwait {
+        epfd: i32,
+        events: u64,
+        maxevents: i32,
+        timeout: i32,
+        sigmask: u64,
+        sigsetsize: u64,
+    },
     Unknown {
         nr: u64,
     },
@@ -605,6 +628,29 @@ impl LinuxSyscall {
                 fds: args[0],
                 flags: args[1],
             },
+            232 => LinuxSyscall::EpollWait {
+                epfd: args[0] as i32,
+                events: args[1],
+                maxevents: args[2] as i32,
+                timeout: args[3] as i32,
+            },
+            233 => LinuxSyscall::EpollCtl {
+                epfd: args[0] as i32,
+                op: args[1] as i32,
+                fd: args[2] as i32,
+                event: args[3],
+            },
+            281 => LinuxSyscall::EpollPwait {
+                epfd: args[0] as i32,
+                events: args[1],
+                maxevents: args[2] as i32,
+                timeout: args[3] as i32,
+                sigmask: args[4],
+                sigsetsize: args[5],
+            },
+            291 => LinuxSyscall::EpollCreate1 {
+                flags: args[0] as i32,
+            },
             302 => LinuxSyscall::Prlimit64 {
                 pid: args[0] as i32,
                 resource: args[1] as i32,
@@ -634,6 +680,23 @@ impl LinuxSyscall {
             19 => LinuxSyscall::EventFd2 {
                 initval: args[0],
                 flags: args[1],
+            },
+            20 => LinuxSyscall::EpollCreate1 {
+                flags: args[0] as i32,
+            },
+            21 => LinuxSyscall::EpollCtl {
+                epfd: args[0] as i32,
+                op: args[1] as i32,
+                fd: args[2] as i32,
+                event: args[3],
+            },
+            22 => LinuxSyscall::EpollPwait {
+                epfd: args[0] as i32,
+                events: args[1],
+                maxevents: args[2] as i32,
+                timeout: args[3] as i32,
+                sigmask: args[4],
+                sigsetsize: args[5],
             },
             23 => LinuxSyscall::Dup {
                 oldfd: args[0] as i32,
@@ -1440,6 +1503,8 @@ enum FdKind {
     EventFd { eventfd_id: usize },
     /// Socket stub (no real networking).
     Socket { socket_id: usize },
+    /// Epoll instance (always-ready stub).
+    Epoll { epoll_id: usize },
 }
 
 /// Shared state for an eventfd instance.
@@ -1453,6 +1518,12 @@ struct SocketState {
     domain: i32,
     sock_type: i32,
     listening: bool,
+}
+
+/// Shared state for an epoll instance.
+struct EpollState {
+    /// Registered fds: fd → (event mask, user data).
+    interests: BTreeMap<i32, (u32, u64)>,
 }
 
 /// Per-fd state: the kind of object and descriptor-level flags.
@@ -1507,6 +1578,10 @@ pub struct Linuxulator<B: SyscallBackend> {
     sockets: BTreeMap<usize, SocketState>,
     /// Next socket_id to allocate.
     next_socket_id: usize,
+    /// Epoll state keyed by epoll_id.
+    epolls: BTreeMap<usize, EpollState>,
+    /// Next epoll_id to allocate.
+    next_epoll_id: usize,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -1537,6 +1612,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
             next_eventfd_id: 0,
             sockets: BTreeMap::new(),
             next_socket_id: 0,
+            epolls: BTreeMap::new(),
+            next_epoll_id: 0,
         }
     }
 
@@ -1882,6 +1959,26 @@ impl<B: SyscallBackend> Linuxulator<B> {
             LinuxSyscall::Getpeername { fd, addr, addrlen } => {
                 self.sys_getpeername(fd, addr, addrlen)
             }
+            LinuxSyscall::EpollCreate1 { flags } => self.sys_epoll_create1(flags),
+            LinuxSyscall::EpollCtl {
+                epfd,
+                op,
+                fd,
+                event,
+            } => self.sys_epoll_ctl(epfd, op, fd, event),
+            LinuxSyscall::EpollWait {
+                epfd,
+                events,
+                maxevents,
+                timeout,
+            } => self.sys_epoll_wait(epfd, events, maxevents, timeout),
+            LinuxSyscall::EpollPwait {
+                epfd,
+                events,
+                maxevents,
+                timeout,
+                ..
+            } => self.sys_epoll_wait(epfd, events, maxevents, timeout),
             LinuxSyscall::Unknown { .. } => ENOSYS,
         }
     }
@@ -1982,6 +2079,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 // Stub: pretend all bytes written.
                 count as i64
             }
+            FdKind::Epoll { .. } => EINVAL,
         }
     }
 
@@ -2084,6 +2182,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 // Stub: no data, return EOF.
                 0
             }
+            FdKind::Epoll { .. } => EINVAL,
         }
     }
 
@@ -2128,6 +2227,15 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 );
                 if !still_referenced {
                     self.sockets.remove(&socket_id);
+                }
+            }
+            FdKind::Epoll { epoll_id } => {
+                let still_referenced = self
+                    .fd_table
+                    .values()
+                    .any(|e| matches!(&e.kind, FdKind::Epoll { epoll_id: id } if *id == epoll_id));
+                if !still_referenced {
+                    self.epolls.remove(&epoll_id);
                 }
             }
         }
@@ -2652,6 +2760,204 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
     }
 
+    // ── Epoll ─────────────────────────────────────────────────────
+
+    /// Linux epoll_create1(2): create an epoll instance.
+    fn sys_epoll_create1(&mut self, flags: i32) -> i64 {
+        const EPOLL_CLOEXEC: i32 = 0x80000;
+        if flags & !EPOLL_CLOEXEC != 0 {
+            return EINVAL;
+        }
+
+        let epoll_id = self.next_epoll_id;
+        self.next_epoll_id += 1;
+        self.epolls.insert(
+            epoll_id,
+            EpollState {
+                interests: BTreeMap::new(),
+            },
+        );
+
+        let fd = self.alloc_fd();
+        let fd_flags = if flags & EPOLL_CLOEXEC != 0 {
+            FD_CLOEXEC
+        } else {
+            0
+        };
+        self.fd_table.insert(
+            fd,
+            FdEntry {
+                kind: FdKind::Epoll { epoll_id },
+                flags: fd_flags,
+            },
+        );
+        fd as i64
+    }
+
+    /// Helper: validate fd is an Epoll, return EINVAL/EBADF otherwise.
+    fn require_epoll(&self, epfd: i32) -> Result<usize, i64> {
+        match self.fd_table.get(&epfd) {
+            Some(FdEntry {
+                kind: FdKind::Epoll { epoll_id },
+                ..
+            }) => Ok(*epoll_id),
+            Some(_) => Err(EINVAL),
+            None => Err(EBADF),
+        }
+    }
+
+    /// Linux epoll_ctl(2): add/modify/delete an fd in the interest set.
+    fn sys_epoll_ctl(&mut self, epfd: i32, op: i32, fd: i32, event_ptr: u64) -> i64 {
+        let epoll_id = match self.require_epoll(epfd) {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+
+        if !self.fd_table.contains_key(&fd) {
+            return EBADF;
+        }
+
+        const EPOLL_CTL_ADD: i32 = 1;
+        const EPOLL_CTL_DEL: i32 = 3;
+        const EPOLL_CTL_MOD: i32 = 2;
+
+        match op {
+            EPOLL_CTL_ADD => {
+                let (events, data) = self.read_epoll_event(event_ptr);
+                let state = match self.epolls.get_mut(&epoll_id) {
+                    Some(s) => s,
+                    None => return EINVAL,
+                };
+                if state.interests.contains_key(&fd) {
+                    return EEXIST;
+                }
+                state.interests.insert(fd, (events, data));
+                0
+            }
+            EPOLL_CTL_MOD => {
+                let (events, data) = self.read_epoll_event(event_ptr);
+                let state = match self.epolls.get_mut(&epoll_id) {
+                    Some(s) => s,
+                    None => return EINVAL,
+                };
+                if !state.interests.contains_key(&fd) {
+                    return ENOENT;
+                }
+                state.interests.insert(fd, (events, data));
+                0
+            }
+            EPOLL_CTL_DEL => {
+                let state = match self.epolls.get_mut(&epoll_id) {
+                    Some(s) => s,
+                    None => return EINVAL,
+                };
+                if state.interests.remove(&fd).is_none() {
+                    return ENOENT;
+                }
+                0
+            }
+            _ => EINVAL,
+        }
+    }
+
+    /// Read an epoll_event struct from user memory.
+    /// x86_64: packed [u32 events][u64 data] = 12 bytes.
+    /// aarch64: [u32 events][4 pad][u64 data] = 16 bytes.
+    fn read_epoll_event(&self, ptr: u64) -> (u32, u64) {
+        let addr = ptr as usize;
+        let events_bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, 4) };
+        let events = u32::from_ne_bytes([
+            events_bytes[0],
+            events_bytes[1],
+            events_bytes[2],
+            events_bytes[3],
+        ]);
+
+        #[cfg(target_arch = "x86_64")]
+        let data_offset = 4; // packed
+        #[cfg(target_arch = "aarch64")]
+        let data_offset = 8; // naturally aligned
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let data_offset = 4; // default to packed
+
+        let data_bytes =
+            unsafe { core::slice::from_raw_parts((addr + data_offset) as *const u8, 8) };
+        let data = u64::from_ne_bytes([
+            data_bytes[0],
+            data_bytes[1],
+            data_bytes[2],
+            data_bytes[3],
+            data_bytes[4],
+            data_bytes[5],
+            data_bytes[6],
+            data_bytes[7],
+        ]);
+        (events, data)
+    }
+
+    /// Write an epoll_event struct to user memory.
+    fn write_epoll_event(&self, ptr: u64, events: u32, data: u64) {
+        let addr = ptr as usize;
+        let events_out = unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, 4) };
+        events_out.copy_from_slice(&events.to_ne_bytes());
+
+        #[cfg(target_arch = "x86_64")]
+        let data_offset = 4;
+        #[cfg(target_arch = "aarch64")]
+        let data_offset = 8;
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let data_offset = 4;
+
+        let data_out =
+            unsafe { core::slice::from_raw_parts_mut((addr + data_offset) as *mut u8, 8) };
+        data_out.copy_from_slice(&data.to_ne_bytes());
+    }
+
+    /// Size of one epoll_event struct in bytes.
+    fn epoll_event_size(&self) -> usize {
+        #[cfg(target_arch = "x86_64")]
+        {
+            12
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            16
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            12
+        }
+    }
+
+    /// Linux epoll_wait(2): return all registered fds as ready.
+    fn sys_epoll_wait(&self, epfd: i32, events_ptr: u64, maxevents: i32, _timeout: i32) -> i64 {
+        let epoll_id = match self.require_epoll(epfd) {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+
+        if maxevents <= 0 {
+            return EINVAL;
+        }
+
+        let state = match self.epolls.get(&epoll_id) {
+            Some(s) => s,
+            None => return EINVAL,
+        };
+
+        let event_size = self.epoll_event_size();
+        let mut written = 0i64;
+        for (&_fd, &(mask, data)) in state.interests.iter() {
+            if written >= maxevents as i64 {
+                break;
+            }
+            let offset = (written as usize) * event_size;
+            self.write_epoll_event(events_ptr + offset as u64, mask, data);
+            written += 1;
+        }
+        written
+    }
+
     /// Linux fstat(2): get file status.
     fn sys_fstat(&mut self, fd: i32, statbuf_ptr: usize) -> i64 {
         if statbuf_ptr == 0 {
@@ -2699,6 +3005,16 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 };
                 // S_IFSOCK = 0o140000
                 write_linux_stat_with_mode(statbuf_ptr, &stat, Some(0o140644));
+                0
+            }
+            FdKind::Epoll { .. } => {
+                let stat = FileStat {
+                    qpath: 0,
+                    name: alloc::sync::Arc::from("epoll"),
+                    size: 0,
+                    file_type: FileType::Regular,
+                };
+                write_linux_stat(statbuf_ptr, &stat);
                 0
             }
             FdKind::File { fid, .. } => match self.backend.stat(fid) {
@@ -8473,5 +8789,357 @@ mod integration_tests {
             addrlen: 0,
         });
         assert_eq!(r, 0);
+    }
+
+    /// Test helper for reading/writing epoll_event structs.
+    #[derive(Clone, Copy)]
+    #[repr(C)]
+    struct EpollEventBuf {
+        #[cfg(target_arch = "x86_64")]
+        buf: [u8; 12],
+        #[cfg(target_arch = "aarch64")]
+        buf: [u8; 16],
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        buf: [u8; 12],
+    }
+
+    impl EpollEventBuf {
+        fn new(events: u32, data: u64) -> Self {
+            let mut s = Self {
+                #[cfg(target_arch = "x86_64")]
+                buf: [0u8; 12],
+                #[cfg(target_arch = "aarch64")]
+                buf: [0u8; 16],
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                buf: [0u8; 12],
+            };
+            s.set_events(events);
+            s.set_data(data);
+            s
+        }
+
+        fn as_ptr(&self) -> u64 {
+            self.buf.as_ptr() as u64
+        }
+
+        fn events(&self) -> u32 {
+            u32::from_ne_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]])
+        }
+
+        fn set_events(&mut self, events: u32) {
+            self.buf[0..4].copy_from_slice(&events.to_ne_bytes());
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        fn data(&self) -> u64 {
+            u64::from_ne_bytes([
+                self.buf[4],
+                self.buf[5],
+                self.buf[6],
+                self.buf[7],
+                self.buf[8],
+                self.buf[9],
+                self.buf[10],
+                self.buf[11],
+            ])
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        fn data(&self) -> u64 {
+            u64::from_ne_bytes([
+                self.buf[8],
+                self.buf[9],
+                self.buf[10],
+                self.buf[11],
+                self.buf[12],
+                self.buf[13],
+                self.buf[14],
+                self.buf[15],
+            ])
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        fn set_data(&mut self, data: u64) {
+            self.buf[4..12].copy_from_slice(&data.to_ne_bytes());
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        fn set_data(&mut self, data: u64) {
+            self.buf[8..16].copy_from_slice(&data.to_ne_bytes());
+        }
+    }
+
+    #[test]
+    fn test_epoll_create_and_ctl() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let epfd = lx.dispatch_syscall(LinuxSyscall::EpollCreate1 { flags: 0 });
+        assert!(epfd >= 0);
+        assert!(lx.has_fd(epfd as i32));
+
+        let mut fds = [0i32; 2];
+        lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0,
+        });
+
+        let ev = EpollEventBuf::new(0x1, fds[0] as u64); // EPOLLIN
+        let r = lx.dispatch_syscall(LinuxSyscall::EpollCtl {
+            epfd: epfd as i32,
+            op: 1,
+            fd: fds[0],
+            event: ev.as_ptr(),
+        });
+        assert_eq!(r, 0);
+
+        // Duplicate ADD → EEXIST
+        let r = lx.dispatch_syscall(LinuxSyscall::EpollCtl {
+            epfd: epfd as i32,
+            op: 1,
+            fd: fds[0],
+            event: ev.as_ptr(),
+        });
+        assert_eq!(r, EEXIST);
+
+        // MOD
+        let ev2 = EpollEventBuf::new(0x4, fds[0] as u64); // EPOLLOUT
+        let r = lx.dispatch_syscall(LinuxSyscall::EpollCtl {
+            epfd: epfd as i32,
+            op: 2,
+            fd: fds[0],
+            event: ev2.as_ptr(),
+        });
+        assert_eq!(r, 0);
+
+        // DEL
+        let r = lx.dispatch_syscall(LinuxSyscall::EpollCtl {
+            epfd: epfd as i32,
+            op: 3,
+            fd: fds[0],
+            event: 0,
+        });
+        assert_eq!(r, 0);
+
+        // DEL again → ENOENT
+        let r = lx.dispatch_syscall(LinuxSyscall::EpollCtl {
+            epfd: epfd as i32,
+            op: 3,
+            fd: fds[0],
+            event: 0,
+        });
+        assert_eq!(r, ENOENT);
+
+        // MOD on removed → ENOENT
+        let r = lx.dispatch_syscall(LinuxSyscall::EpollCtl {
+            epfd: epfd as i32,
+            op: 2,
+            fd: fds[0],
+            event: ev.as_ptr(),
+        });
+        assert_eq!(r, ENOENT);
+    }
+
+    #[test]
+    fn test_epoll_wait_returns_ready() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let epfd = lx.dispatch_syscall(LinuxSyscall::EpollCreate1 { flags: 0 }) as i32;
+
+        let mut fds1 = [0i32; 2];
+        let mut fds2 = [0i32; 2];
+        lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds1.as_mut_ptr() as u64,
+            flags: 0,
+        });
+        lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds2.as_mut_ptr() as u64,
+            flags: 0,
+        });
+
+        let ev1 = EpollEventBuf::new(0x1, fds1[0] as u64);
+        let ev2 = EpollEventBuf::new(0x4, fds2[0] as u64);
+        lx.dispatch_syscall(LinuxSyscall::EpollCtl {
+            epfd,
+            op: 1,
+            fd: fds1[0],
+            event: ev1.as_ptr(),
+        });
+        lx.dispatch_syscall(LinuxSyscall::EpollCtl {
+            epfd,
+            op: 1,
+            fd: fds2[0],
+            event: ev2.as_ptr(),
+        });
+
+        let out = [EpollEventBuf::new(0, 0); 4];
+        let n = lx.dispatch_syscall(LinuxSyscall::EpollWait {
+            epfd,
+            events: out[0].as_ptr(),
+            maxevents: 4,
+            timeout: -1,
+        });
+        assert_eq!(n, 2);
+
+        let returned: alloc::collections::BTreeSet<u64> =
+            out[..2].iter().map(|e| e.data()).collect();
+        assert!(returned.contains(&(fds1[0] as u64)));
+        assert!(returned.contains(&(fds2[0] as u64)));
+    }
+
+    #[test]
+    fn test_epoll_wait_empty() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let epfd = lx.dispatch_syscall(LinuxSyscall::EpollCreate1 { flags: 0 }) as i32;
+
+        let out = [EpollEventBuf::new(0, 0); 4];
+        let n = lx.dispatch_syscall(LinuxSyscall::EpollWait {
+            epfd,
+            events: out[0].as_ptr(),
+            maxevents: 4,
+            timeout: 0,
+        });
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_epoll_wait_maxevents() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let epfd = lx.dispatch_syscall(LinuxSyscall::EpollCreate1 { flags: 0 }) as i32;
+
+        for _ in 0..3 {
+            let mut fds = [0i32; 2];
+            lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+                fds: fds.as_mut_ptr() as u64,
+                flags: 0,
+            });
+            let ev = EpollEventBuf::new(0x1, fds[0] as u64);
+            lx.dispatch_syscall(LinuxSyscall::EpollCtl {
+                epfd,
+                op: 1,
+                fd: fds[0],
+                event: ev.as_ptr(),
+            });
+        }
+
+        let out = [EpollEventBuf::new(0, 0); 4];
+        let n = lx.dispatch_syscall(LinuxSyscall::EpollWait {
+            epfd,
+            events: out[0].as_ptr(),
+            maxevents: 2,
+            timeout: -1,
+        });
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn test_epoll_ctl_bad_fd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let epfd = lx.dispatch_syscall(LinuxSyscall::EpollCreate1 { flags: 0 }) as i32;
+
+        let ev = EpollEventBuf::new(0x1, 999);
+        let r = lx.dispatch_syscall(LinuxSyscall::EpollCtl {
+            epfd,
+            op: 1,
+            fd: 999,
+            event: ev.as_ptr(),
+        });
+        assert_eq!(r, EBADF);
+    }
+
+    #[test]
+    fn test_epoll_read_write_einval() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let epfd = lx.dispatch_syscall(LinuxSyscall::EpollCreate1 { flags: 0 }) as i32;
+
+        let buf = [0u8; 8];
+        let r = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: epfd,
+            buf: buf.as_ptr() as u64,
+            count: 8,
+        });
+        assert_eq!(r, EINVAL);
+        let r = lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: epfd,
+            buf: buf.as_ptr() as u64,
+            count: 8,
+        });
+        assert_eq!(r, EINVAL);
+    }
+
+    #[test]
+    fn test_epoll_close_cleanup() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let epfd = lx.dispatch_syscall(LinuxSyscall::EpollCreate1 { flags: 0 }) as i32;
+        assert!(lx.has_fd(epfd));
+        lx.dispatch_syscall(LinuxSyscall::Close { fd: epfd });
+        assert!(!lx.has_fd(epfd));
+    }
+
+    #[test]
+    fn test_epoll_ops_wrong_fd_type() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let mut fds = [0i32; 2];
+        lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0,
+        });
+
+        let ev = EpollEventBuf::new(0x1, 0);
+        let r = lx.dispatch_syscall(LinuxSyscall::EpollCtl {
+            epfd: fds[0],
+            op: 1,
+            fd: fds[1],
+            event: ev.as_ptr(),
+        });
+        assert_eq!(r, EINVAL);
+
+        let out = [EpollEventBuf::new(0, 0); 4];
+        let r = lx.dispatch_syscall(LinuxSyscall::EpollWait {
+            epfd: fds[0],
+            events: out[0].as_ptr(),
+            maxevents: 4,
+            timeout: 0,
+        });
+        assert_eq!(r, EINVAL);
+    }
+
+    #[test]
+    fn test_epoll_data_roundtrip() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let epfd = lx.dispatch_syscall(LinuxSyscall::EpollCreate1 { flags: 0 }) as i32;
+
+        let mut fds = [0i32; 2];
+        lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0,
+        });
+
+        let magic: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        let ev = EpollEventBuf::new(0x1, magic);
+        lx.dispatch_syscall(LinuxSyscall::EpollCtl {
+            epfd,
+            op: 1,
+            fd: fds[0],
+            event: ev.as_ptr(),
+        });
+
+        let out = [EpollEventBuf::new(0, 0); 2];
+        let n = lx.dispatch_syscall(LinuxSyscall::EpollWait {
+            epfd,
+            events: out[0].as_ptr(),
+            maxevents: 2,
+            timeout: -1,
+        });
+        assert_eq!(n, 1);
+        assert_eq!(out[0].data(), magic);
+        assert_eq!(out[0].events(), 0x1);
     }
 }
