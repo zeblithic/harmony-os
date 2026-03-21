@@ -17,13 +17,16 @@ const EPERM: i64 = -1;
 const ENOENT: i64 = -2;
 const ESRCH: i64 = -3;
 const EBADF: i64 = -9;
-const EFAULT: i64 = -14;
+const EAGAIN: i64 = -11;
 const ENOMEM: i64 = -12;
+const EFAULT: i64 = -14;
 const ENOTDIR: i64 = -20;
 const EINVAL: i64 = -22;
+const ENODEV: i64 = -19;
 const ENOTTY: i64 = -25;
 const ESPIPE: i64 = -29;
 const EROFS: i64 = -30;
+const EPIPE: i64 = -32;
 const ERANGE: i64 = -34;
 const ENOSYS: i64 = -38;
 const EOVERFLOW: i64 = -75;
@@ -35,6 +38,7 @@ const CLOCK_MONOTONIC: i32 = 1;
 // File descriptor flags
 const FD_CLOEXEC: u32 = 1;
 const O_CLOEXEC: i32 = 0o2000000;
+const O_NONBLOCK: i32 = 0o4000;
 
 fn ipc_err_to_errno(e: IpcError) -> i64 {
     match e {
@@ -254,6 +258,17 @@ pub enum LinuxSyscall {
         newfd: i32,
         flags: i32,
     },
+    Pipe2 {
+        fds: u64,
+        flags: u64,
+    },
+    Pipe {
+        fds: u64,
+    },
+    EventFd2 {
+        initval: u64,
+        flags: u64,
+    },
     Unknown {
         nr: u64,
     },
@@ -312,6 +327,7 @@ impl LinuxSyscall {
                 iov: args[1],
                 iovcnt: args[2] as i32,
             },
+            22 => LinuxSyscall::Pipe { fds: args[0] },
             28 => LinuxSyscall::Madvise {
                 addr: args[0],
                 len: args[1],
@@ -424,10 +440,18 @@ impl LinuxSyscall {
                 mode: args[2] as i32,
             },
             273 => LinuxSyscall::SetRobustList,
+            290 => LinuxSyscall::EventFd2 {
+                initval: args[0],
+                flags: args[1],
+            },
             292 => LinuxSyscall::Dup3 {
                 oldfd: args[0] as i32,
                 newfd: args[1] as i32,
                 flags: args[2] as i32,
+            },
+            293 => LinuxSyscall::Pipe2 {
+                fds: args[0],
+                flags: args[1],
             },
             302 => LinuxSyscall::Prlimit64 {
                 pid: args[0] as i32,
@@ -454,6 +478,10 @@ impl LinuxSyscall {
             17 => LinuxSyscall::Getcwd {
                 buf: args[0],
                 size: args[1],
+            },
+            19 => LinuxSyscall::EventFd2 {
+                initval: args[0],
+                flags: args[1],
             },
             23 => LinuxSyscall::Dup {
                 oldfd: args[0] as i32,
@@ -495,6 +523,10 @@ impl LinuxSyscall {
                 flags: args[2] as i32,
             },
             57 => LinuxSyscall::Close { fd: args[0] as i32 },
+            59 => LinuxSyscall::Pipe2 {
+                fds: args[0],
+                flags: args[1],
+            },
             61 => LinuxSyscall::Getdents64 {
                 fd: args[0] as i32,
                 dirp: args[1],
@@ -1097,12 +1129,20 @@ fn flags_to_open_mode(flags: i32) -> OpenMode {
 ///   60      4     __pad2
 ///   64      8     st_blocks
 ///   72-128        timestamps (zeroed for MVP)
+///
+/// If `mode_override` is `Some`, it replaces the mode derived from
+/// `stat.file_type`. Used by pipe fstat to set `S_IFIFO` without
+/// adding a `Fifo` variant to the microkernel's `FileType` enum.
 fn write_linux_stat(buf_ptr: usize, stat: &FileStat) {
-    let mode: u32 = match stat.file_type {
+    write_linux_stat_with_mode(buf_ptr, stat, None);
+}
+
+fn write_linux_stat_with_mode(buf_ptr: usize, stat: &FileStat, mode_override: Option<u32>) {
+    let mode: u32 = mode_override.unwrap_or(match stat.file_type {
         FileType::Regular => 0o100000 | 0o644,   // S_IFREG | rw-r--r--
         FileType::Directory => 0o040000 | 0o755, // S_IFDIR | rwxr-xr-x
         FileType::CharDev => 0o020000 | 0o666,   // S_IFCHR | rw-rw-rw-
-    };
+    });
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -1155,14 +1195,35 @@ fn prot_to_page_flags(prot: i32) -> PageFlags {
 
 // ── Linuxulator ─────────────────────────────────────────────────────
 
-/// Per-fd state: the 9P fid and the current file offset.
+/// What kind of object backs a file descriptor.
+#[derive(Clone)]
+enum FdKind {
+    /// A 9P-backed file (regular, directory, char device, etc.).
+    File {
+        fid: Fid,
+        offset: u64,
+        path: Option<alloc::string::String>,
+        /// Cached file type — avoids IPC stat on every lseek.
+        file_type: FileType,
+    },
+    /// Read end of a pipe.
+    PipeRead { pipe_id: usize },
+    /// Write end of a pipe.
+    PipeWrite { pipe_id: usize },
+    /// eventfd descriptor (shared state via eventfd_id indirection).
+    EventFd { eventfd_id: usize },
+}
+
+/// Shared state for an eventfd instance.
+struct EventFdState {
+    counter: u64,
+    semaphore: bool,
+}
+
+/// Per-fd state: the kind of object and descriptor-level flags.
 #[derive(Clone)]
 struct FdEntry {
-    fid: Fid,
-    offset: u64,
-    path: Option<alloc::string::String>,
-    /// Cached file type — avoids IPC stat on every lseek.
-    file_type: FileType,
+    kind: FdKind,
     /// File descriptor flags (e.g. FD_CLOEXEC). Default 0.
     flags: u32,
 }
@@ -1201,6 +1262,12 @@ pub struct Linuxulator<B: SyscallBackend> {
     /// Reference counts for 9P fids shared across multiple fd_table entries
     /// (via dup/dup2/dup3). A fid is only clunked when its refcount reaches 0.
     fid_refcount: BTreeMap<Fid, u32>,
+    /// Pipe buffers keyed by pipe_id.
+    pipes: BTreeMap<usize, Vec<u8>>,
+    /// Next pipe_id to allocate.
+    next_pipe_id: usize,
+    eventfds: BTreeMap<usize, EventFdState>,
+    next_eventfd_id: usize,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -1225,6 +1292,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
             monotonic_ns: 0,
             realtime_ns: 0,
             fid_refcount: BTreeMap::new(),
+            pipes: BTreeMap::new(),
+            next_pipe_id: 0,
+            eventfds: BTreeMap::new(),
+            next_eventfd_id: 0,
         }
     }
 
@@ -1251,9 +1322,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// entry is missing.
     #[cfg(test)]
     fn insert_test_fd(&mut self, fd: i32, entry: FdEntry) {
-        let fid = entry.fid;
+        if let FdKind::File { fid, .. } = &entry.kind {
+            *self.fid_refcount.entry(*fid).or_insert(0) += 1;
+        }
         self.fd_table.insert(fd, entry);
-        *self.fid_refcount.entry(fid).or_insert(0) += 1;
     }
 
     /// Resolve a path relative to `self.cwd`.
@@ -1301,10 +1373,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.fd_table.insert(
             0,
             FdEntry {
-                fid: stdin_fid,
-                offset: 0,
-                path: None,
-                file_type: FileType::CharDev,
+                kind: FdKind::File {
+                    fid: stdin_fid,
+                    offset: 0,
+                    path: None,
+                    file_type: FileType::CharDev,
+                },
                 flags: 0,
             },
         );
@@ -1317,10 +1391,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.fd_table.insert(
             1,
             FdEntry {
-                fid: stdout_fid,
-                offset: 0,
-                path: None,
-                file_type: FileType::CharDev,
+                kind: FdKind::File {
+                    fid: stdout_fid,
+                    offset: 0,
+                    path: None,
+                    file_type: FileType::CharDev,
+                },
                 flags: 0,
             },
         );
@@ -1333,10 +1409,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.fd_table.insert(
             2,
             FdEntry {
-                fid: stderr_fid,
-                offset: 0,
-                path: None,
-                file_type: FileType::CharDev,
+                kind: FdKind::File {
+                    fid: stderr_fid,
+                    offset: 0,
+                    path: None,
+                    file_type: FileType::CharDev,
+                },
                 flags: 0,
             },
         );
@@ -1375,7 +1453,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Look up the fid for a Linux fd (for testing).
     #[cfg(test)]
     pub fn fid_for_fd(&self, fd: i32) -> Option<Fid> {
-        self.fd_table.get(&fd).map(|e| e.fid)
+        self.fd_table.get(&fd).and_then(|e| match &e.kind {
+            FdKind::File { fid, .. } => Some(*fid),
+            _ => None,
+        })
     }
 
     /// Base address of the memory arena (for testing).
@@ -1503,67 +1584,205 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 newfd,
                 flags,
             } => self.sys_dup3(oldfd, newfd, flags),
+            LinuxSyscall::Pipe2 { fds, flags } => self.sys_pipe2(fds, flags as i32),
+            LinuxSyscall::Pipe { fds } => self.sys_pipe2(fds, 0),
+            LinuxSyscall::EventFd2 { initval, flags } => {
+                self.sys_eventfd2(initval as u32, flags as i32)
+            }
             LinuxSyscall::Unknown { .. } => ENOSYS,
         }
     }
 
     /// Linux write(2): write to a file descriptor.
     fn sys_write(&mut self, fd: i32, buf_ptr: usize, count: usize) -> i64 {
-        // POSIX: write with count == 0 is a no-op.
-        if count == 0 {
-            return 0;
-        }
-
-        let entry = match self.fd_table.get_mut(&fd) {
-            Some(e) => e,
+        let kind = match self.fd_table.get(&fd) {
+            Some(entry) => entry.kind.clone(),
             None => return EBADF,
         };
-        let fid = entry.fid;
-        let offset = entry.offset;
 
-        // In the MVP flat address space, we can directly read from the pointer.
-        // Safety: caller guarantees buf_ptr points to valid memory of at least
-        // `count` bytes. This is the same trust model as a real kernel reading
-        // from user space — except here there's no protection boundary.
-        let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
-
-        match self.backend.write(fid, offset, data) {
-            Ok(n) => {
-                self.fd_table.get_mut(&fd).unwrap().offset += n as u64;
-                n as i64
+        match kind {
+            FdKind::PipeWrite { pipe_id } => {
+                // POSIX: write with count == 0 is a no-op for pipes too.
+                if count == 0 {
+                    return 0;
+                }
+                // Linux default pipe capacity. Writes that would exceed
+                // this return EAGAIN (consistent with the always-nonblocking
+                // emulator model — see O_NONBLOCK note in sys_pipe2).
+                const PIPE_BUF_CAP: usize = 65536;
+                let has_reader = self
+                    .fd_table
+                    .values()
+                    .any(|e| matches!(&e.kind, FdKind::PipeRead { pipe_id: id } if *id == pipe_id));
+                if !has_reader {
+                    return EPIPE;
+                }
+                let pipe_buf = self.pipes.get_mut(&pipe_id).unwrap();
+                let avail = PIPE_BUF_CAP.saturating_sub(pipe_buf.len());
+                if avail == 0 {
+                    return EAGAIN;
+                }
+                // POSIX: writes <= PIPE_BUF bytes must be atomic — either
+                // all bytes fit or return EAGAIN. Only writes > PIPE_BUF
+                // may be partial.
+                const PIPE_BUF: usize = 4096;
+                if count <= PIPE_BUF && avail < count {
+                    return EAGAIN;
+                }
+                let to_write = count.min(avail);
+                let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, to_write) };
+                pipe_buf.extend_from_slice(data);
+                to_write as i64
             }
-            Err(e) => ipc_err_to_errno(e),
+            FdKind::PipeRead { .. } => EBADF,
+            FdKind::EventFd { eventfd_id } => {
+                if count < 8 {
+                    return EINVAL;
+                }
+
+                let val = {
+                    let mut val_bytes = [0u8; 8];
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            buf_ptr as *const u8,
+                            val_bytes.as_mut_ptr(),
+                            8,
+                        );
+                    }
+                    u64::from_le_bytes(val_bytes)
+                };
+                if val == u64::MAX {
+                    return EINVAL;
+                }
+                let state = match self.eventfds.get(&eventfd_id) {
+                    Some(s) => s,
+                    None => return EBADF,
+                };
+                if state.counter.checked_add(val).is_none()
+                    || state.counter + val > 0xFFFFFFFFFFFFFFFE
+                {
+                    return EAGAIN;
+                }
+                self.eventfds.get_mut(&eventfd_id).unwrap().counter += val;
+                8
+            }
+            FdKind::File { fid, offset, .. } => {
+                // POSIX: write with count == 0 is a no-op for regular files.
+                if count == 0 {
+                    return 0;
+                }
+                let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
+
+                match self.backend.write(fid, offset, data) {
+                    Ok(n) => {
+                        if let FdKind::File { ref mut offset, .. } =
+                            self.fd_table.get_mut(&fd).unwrap().kind
+                        {
+                            *offset += n as u64;
+                        }
+                        n as i64
+                    }
+                    Err(e) => ipc_err_to_errno(e),
+                }
+            }
         }
     }
 
     /// Linux read(2): read from a file descriptor.
     fn sys_read(&mut self, fd: i32, buf_ptr: usize, count: usize) -> i64 {
-        if count == 0 {
-            return 0;
-        }
-
-        let (fid, file_offset) = match self.fd_table.get(&fd) {
-            Some(e) => (e.fid, e.offset),
+        let kind = match self.fd_table.get(&fd) {
+            Some(entry) => entry.kind.clone(),
             None => return EBADF,
         };
 
-        // 9P count is u32; cap to avoid silent truncation on large reads.
-        let capped = count.min(u32::MAX as usize) as u32;
-
-        match self.backend.read(fid, file_offset, capped) {
-            Ok(data) => {
-                let n = data.len().min(count);
-                if n > 0 {
-                    // Safety: caller guarantees buf_ptr points to valid memory of at
-                    // least `count` bytes. Same trust model as sys_write.
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr as *mut u8, n);
-                    }
-                    self.fd_table.get_mut(&fd).unwrap().offset += n as u64;
+        match kind {
+            FdKind::PipeRead { pipe_id } => {
+                // POSIX: read with count == 0 is a no-op for pipes too.
+                if count == 0 {
+                    return 0;
                 }
-                n as i64
+                let buf = self.pipes.get_mut(&pipe_id).unwrap();
+                if buf.is_empty() {
+                    // Check if any writer still exists.
+                    let has_writer = self.fd_table.values().any(
+                        |e| matches!(&e.kind, FdKind::PipeWrite { pipe_id: id } if *id == pipe_id),
+                    );
+                    if has_writer {
+                        EAGAIN
+                    } else {
+                        0 // EOF — write end closed
+                    }
+                } else {
+                    let n = count.min(buf.len());
+                    // Copy directly from buffer, then drain without intermediate Vec.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(buf.as_ptr(), buf_ptr as *mut u8, n);
+                    }
+                    buf.drain(..n);
+                    n as i64
+                }
             }
-            Err(e) => ipc_err_to_errno(e),
+            FdKind::PipeWrite { .. } => EBADF,
+            FdKind::EventFd { eventfd_id } => {
+                if count < 8 {
+                    return EINVAL;
+                }
+
+                let state = match self.eventfds.get(&eventfd_id) {
+                    Some(s) => s,
+                    None => return EBADF,
+                };
+                if state.counter == 0 {
+                    return EAGAIN;
+                }
+                let (val, new_counter) = if state.semaphore {
+                    (1u64, state.counter - 1)
+                } else {
+                    (state.counter, 0u64)
+                };
+                let val_bytes = val.to_le_bytes();
+                unsafe {
+                    core::ptr::copy_nonoverlapping(val_bytes.as_ptr(), buf_ptr as *mut u8, 8);
+                }
+                self.eventfds.get_mut(&eventfd_id).unwrap().counter = new_counter;
+                8
+            }
+            FdKind::File {
+                fid,
+                offset: file_offset,
+                ..
+            } => {
+                // POSIX: read with count == 0 is a no-op for regular files.
+                if count == 0 {
+                    return 0;
+                }
+                // 9P count is u32; cap to avoid silent truncation on large reads.
+                let capped = count.min(u32::MAX as usize) as u32;
+
+                match self.backend.read(fid, file_offset, capped) {
+                    Ok(data) => {
+                        let n = data.len().min(count);
+                        if n > 0 {
+                            // Safety: caller guarantees buf_ptr points to valid memory of at
+                            // least `count` bytes. Same trust model as sys_write.
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    data.as_ptr(),
+                                    buf_ptr as *mut u8,
+                                    n,
+                                );
+                            }
+                            if let FdKind::File { ref mut offset, .. } =
+                                self.fd_table.get_mut(&fd).unwrap().kind
+                            {
+                                *offset += n as u64;
+                            }
+                        }
+                        n as i64
+                    }
+                    Err(e) => ipc_err_to_errno(e),
+                }
+            }
         }
     }
 
@@ -1577,13 +1796,41 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
     }
 
+    /// Clean up resources for a removed fd entry. Handles all FdKind
+    /// variants: releases 9P fids, frees orphaned pipe buffers, and
+    /// removes orphaned eventfd state.
+    ///
+    /// Must be called AFTER the entry has been removed from fd_table
+    /// (so the "still referenced" scans don't see the entry itself).
+    fn close_fd_entry(&mut self, entry: FdEntry) {
+        match entry.kind {
+            FdKind::File { fid, .. } => self.release_fid(fid),
+            FdKind::PipeRead { pipe_id } | FdKind::PipeWrite { pipe_id } => {
+                let still_referenced = self.fd_table.values().any(|e| {
+                    matches!(&e.kind, FdKind::PipeRead { pipe_id: id } | FdKind::PipeWrite { pipe_id: id } if *id == pipe_id)
+                });
+                if !still_referenced {
+                    self.pipes.remove(&pipe_id);
+                }
+            }
+            FdKind::EventFd { eventfd_id } => {
+                let still_referenced = self.fd_table.values().any(
+                    |e| matches!(&e.kind, FdKind::EventFd { eventfd_id: id } if *id == eventfd_id),
+                );
+                if !still_referenced {
+                    self.eventfds.remove(&eventfd_id);
+                }
+            }
+        }
+    }
+
     /// Linux close(2): close a file descriptor.
     fn sys_close(&mut self, fd: i32) -> i64 {
         let entry = match self.fd_table.remove(&fd) {
             Some(e) => e,
             None => return EBADF,
         };
-        self.release_fid(entry.fid);
+        self.close_fd_entry(entry);
         0
     }
 
@@ -1645,16 +1892,17 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// indirection table (future work).
     fn dup_fd_to(&mut self, oldfd: i32, newfd: i32, fd_flags: u32) {
         let entry = self.fd_table.get(&oldfd).unwrap();
-        let new_entry = FdEntry {
-            fid: entry.fid,
-            offset: entry.offset,
-            path: entry.path.clone(),
-            file_type: entry.file_type,
-            flags: fd_flags,
-        };
-        let fid = new_entry.fid;
-        self.fd_table.insert(newfd, new_entry);
-        *self.fid_refcount.get_mut(&fid).expect("refcount missing") += 1;
+        let new_kind = entry.kind.clone();
+        if let FdKind::File { fid, .. } = &new_kind {
+            *self.fid_refcount.get_mut(fid).expect("refcount missing") += 1;
+        }
+        self.fd_table.insert(
+            newfd,
+            FdEntry {
+                kind: new_kind,
+                flags: fd_flags,
+            },
+        );
     }
 
     fn sys_dup(&mut self, oldfd: i32) -> i64 {
@@ -1682,9 +1930,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if oldfd == newfd {
             return newfd as i64;
         }
-        // Close newfd if it's open
+        // Close newfd if it's open (handles all FdKind variants).
         if let Some(existing) = self.fd_table.remove(&newfd) {
-            self.release_fid(existing.fid);
+            self.close_fd_entry(existing);
         }
         self.dup_fd_to(oldfd, newfd, 0);
         newfd as i64
@@ -1712,9 +1960,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if !self.fd_table.contains_key(&oldfd) {
             return EBADF;
         }
-        // Close newfd if it's open
+        // Close newfd if it's open (handles all FdKind variants).
         if let Some(existing) = self.fd_table.remove(&newfd) {
-            self.release_fid(existing.fid);
+            self.close_fd_entry(existing);
         }
         let fd_flags = if flags & O_CLOEXEC != 0 {
             FD_CLOEXEC
@@ -1725,21 +1973,151 @@ impl<B: SyscallBackend> Linuxulator<B> {
         newfd as i64
     }
 
+    /// Linux pipe2(2): create a pipe with flags.
+    ///
+    /// Allocates a new pipe buffer and two fds (read end at `fds[0]`, write
+    /// end at `fds[1]`). Writes the fd pair as two `i32` values to user
+    /// memory at `fds_ptr`.
+    ///
+    /// `pipe(2)` is dispatched as `pipe2(fds, 0)`.
+    fn sys_pipe2(&mut self, fds_ptr: u64, flags: i32) -> i64 {
+        if fds_ptr == 0 {
+            return EFAULT;
+        }
+        // NOTE: O_NONBLOCK is accepted to avoid EINVAL for callers that set it,
+        // but this synchronous emulator always returns EAGAIN when no data is
+        // available (true blocking is not yet supported).
+        // Only O_CLOEXEC and O_NONBLOCK are valid flags.
+        let valid_flags = O_CLOEXEC | O_NONBLOCK;
+        if flags & !valid_flags != 0 {
+            return EINVAL;
+        }
+
+        let fd_flags = if flags & O_CLOEXEC != 0 {
+            FD_CLOEXEC
+        } else {
+            0
+        };
+
+        // Allocate pipe buffer.
+        let pipe_id = self.next_pipe_id;
+        self.next_pipe_id += 1;
+        self.pipes.insert(pipe_id, Vec::new());
+
+        // Allocate two fds: read end first, then write end.
+        let read_fd = self.alloc_fd();
+        self.fd_table.insert(
+            read_fd,
+            FdEntry {
+                kind: FdKind::PipeRead { pipe_id },
+                flags: fd_flags,
+            },
+        );
+
+        let write_fd = self.alloc_fd();
+        self.fd_table.insert(
+            write_fd,
+            FdEntry {
+                kind: FdKind::PipeWrite { pipe_id },
+                flags: fd_flags,
+            },
+        );
+
+        // Write the fd pair to user memory: [read_fd: i32, write_fd: i32].
+        let mut fd_buf = [0u8; 8];
+        fd_buf[0..4].copy_from_slice(&read_fd.to_le_bytes());
+        fd_buf[4..8].copy_from_slice(&write_fd.to_le_bytes());
+        self.backend.vm_write_bytes(fds_ptr, &fd_buf);
+
+        0
+    }
+
+    /// Linux eventfd2(2): create an eventfd descriptor.
+    ///
+    /// Creates a single fd with an internal 64-bit counter initialized to
+    /// `initval`. Supports `EFD_CLOEXEC`, `EFD_NONBLOCK`, and
+    /// `EFD_SEMAPHORE` flags.
+    fn sys_eventfd2(&mut self, initval: u32, flags: i32) -> i64 {
+        const EFD_SEMAPHORE: i32 = 1;
+
+        let valid_flags = O_CLOEXEC | O_NONBLOCK | EFD_SEMAPHORE;
+        if flags & !valid_flags != 0 {
+            return EINVAL;
+        }
+
+        let fd_flags = if flags & O_CLOEXEC != 0 {
+            FD_CLOEXEC
+        } else {
+            0
+        };
+        let semaphore = flags & EFD_SEMAPHORE != 0;
+
+        let eventfd_id = self.next_eventfd_id;
+        self.next_eventfd_id += 1;
+        self.eventfds.insert(
+            eventfd_id,
+            EventFdState {
+                counter: initval as u64,
+                semaphore,
+            },
+        );
+
+        let fd = self.alloc_fd();
+        self.fd_table.insert(
+            fd,
+            FdEntry {
+                kind: FdKind::EventFd { eventfd_id },
+                flags: fd_flags,
+            },
+        );
+        fd as i64
+    }
+
     /// Linux fstat(2): get file status.
     fn sys_fstat(&mut self, fd: i32, statbuf_ptr: usize) -> i64 {
         if statbuf_ptr == 0 {
             return EFAULT;
         }
-        let fid = match self.fd_table.get(&fd) {
-            Some(e) => e.fid,
+        let kind = match self.fd_table.get(&fd) {
+            Some(entry) => entry.kind.clone(),
             None => return EBADF,
         };
-        match self.backend.stat(fid) {
-            Ok(stat) => {
-                write_linux_stat(statbuf_ptr, &stat);
+        match kind {
+            FdKind::PipeRead { .. } | FdKind::PipeWrite { .. } => {
+                // Synthetic stat with S_IFIFO — programs like bash use this
+                // to detect pipe fds.
+                write_linux_stat_with_mode(
+                    statbuf_ptr,
+                    &FileStat {
+                        qpath: fd as u64,
+                        name: alloc::sync::Arc::from("pipe"),
+                        size: 0,
+                        file_type: FileType::Regular, // ignored — mode_override used
+                    },
+                    Some(0o010000 | 0o644), // S_IFIFO | rw-r--r--
+                );
                 0
             }
-            Err(e) => ipc_err_to_errno(e),
+            FdKind::EventFd { .. } => {
+                // Synthetic stat with S_IFREG and size 0.
+                write_linux_stat(
+                    statbuf_ptr,
+                    &FileStat {
+                        qpath: fd as u64,
+                        name: alloc::sync::Arc::from("eventfd"),
+                        size: 0,
+                        file_type: FileType::Regular,
+                    },
+                );
+                0
+            }
+            FdKind::File { fid, .. } => match self.backend.stat(fid) {
+                Ok(stat) => {
+                    write_linux_stat(statbuf_ptr, &stat);
+                    0
+                }
+                Err(e) => ipc_err_to_errno(e),
+            },
         }
     }
 
@@ -1789,10 +2167,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.fd_table.insert(
             fd,
             FdEntry {
-                fid,
-                offset: 0,
-                path: Some(path),
-                file_type,
+                kind: FdKind::File {
+                    fid,
+                    offset: 0,
+                    path: Some(path),
+                    file_type,
+                },
                 flags: fd_flags,
             },
         );
@@ -1939,7 +2319,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
         // For file-backed mappings, validate the fd up front.
         let file_fid = if !is_anonymous {
             match self.fd_table.get(&fd) {
-                Some(entry) => Some(entry.fid),
+                Some(FdEntry {
+                    kind: FdKind::File { fid, .. },
+                    ..
+                }) => Some(*fid),
+                Some(_) => return ENODEV, // valid fd, but not a mappable type
                 None => return EBADF,
             }
         } else {
@@ -2269,7 +2653,17 @@ impl<B: SyscallBackend> Linuxulator<B> {
         const SEEK_END: i32 = 2;
 
         let (entry_fid, entry_offset, entry_file_type) = match self.fd_table.get(&fd) {
-            Some(e) => (e.fid, e.offset, e.file_type),
+            Some(FdEntry {
+                kind:
+                    FdKind::File {
+                        fid,
+                        offset,
+                        file_type,
+                        ..
+                    },
+                ..
+            }) => (*fid, *offset, *file_type),
+            Some(_) => return ESPIPE,
             None => return EBADF,
         };
 
@@ -2308,7 +2702,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return EINVAL;
         }
 
-        self.fd_table.get_mut(&fd).unwrap().offset = new_offset as u64;
+        if let FdKind::File { ref mut offset, .. } = self.fd_table.get_mut(&fd).unwrap().kind {
+            *offset = new_offset as u64;
+        }
         new_offset
     }
 
@@ -2487,13 +2883,16 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if dirp == 0 {
             return EFAULT;
         }
-        let entry = match self.fd_table.get(&fd) {
-            Some(e) => e.clone(),
+        let (dir_fid, start_idx) = match self.fd_table.get(&fd) {
+            Some(FdEntry {
+                kind: FdKind::File { fid, offset, .. },
+                ..
+            }) => (*fid, *offset as usize),
+            Some(_) => return ENOTDIR,
             None => return EBADF,
         };
-        let start_idx = entry.offset as usize;
 
-        let entries = match self.backend.readdir(entry.fid) {
+        let entries = match self.backend.readdir(dir_fid) {
             Ok(e) => e,
             Err(e) => return ipc_err_to_errno(e),
         };
@@ -2563,7 +2962,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         // Update the offset to track position.
         if let Some(entry) = self.fd_table.get_mut(&fd) {
-            entry.offset = idx as u64;
+            if let FdKind::File { ref mut offset, .. } = entry.kind {
+                *offset = idx as u64;
+            }
         }
 
         bytes_written as i64
@@ -2604,20 +3005,24 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux fchdir(2): change working directory to an open fd.
     fn sys_fchdir(&mut self, fd: i32) -> i64 {
-        let entry = match self.fd_table.get(&fd) {
-            Some(e) => e.clone(),
+        let (fid, path) = match self.fd_table.get(&fd) {
+            Some(FdEntry {
+                kind: FdKind::File { fid, path, .. },
+                ..
+            }) => (*fid, path.clone()),
+            Some(_) => return ENOTDIR,
             None => return EBADF,
         };
 
         // Verify it's a directory before checking path — a valid non-directory
         // fd (e.g. stdio) should return ENOTDIR, not EBADF.
-        match self.backend.stat(entry.fid) {
+        match self.backend.stat(fid) {
             Ok(stat) if stat.file_type == FileType::Directory => {}
             Ok(_) => return ENOTDIR,
             Err(e) => return ipc_err_to_errno(e),
         }
 
-        let path = match &entry.path {
+        let path = match &path {
             Some(p) => p.clone(),
             None => {
                 // fd is confirmed directory but has no tracked path —
@@ -4472,6 +4877,14 @@ mod integration_tests {
     use harmony_microkernel::vm::{PhysAddr, PAGE_SIZE as VM_PAGE_SIZE};
     use harmony_unikernel::KernelEntropy;
 
+    /// Extract the 9P fid from a File-backed fd (panics for non-File kinds).
+    fn test_fid(lx: &Linuxulator<impl SyscallBackend>, fd: i32) -> Fid {
+        match &lx.fd_table.get(&fd).unwrap().kind {
+            FdKind::File { fid, .. } => *fid,
+            _ => panic!("expected File fd for fd {fd}"),
+        }
+    }
+
     /// Create a test VM manager with 64 frames.
     fn make_test_vm() -> AddressSpaceManager<MockPageTable> {
         let buddy = BuddyAllocator::new(PhysAddr(0x10_0000), 64).unwrap();
@@ -5069,10 +5482,12 @@ mod integration_tests {
         lx.insert_test_fd(
             3,
             FdEntry {
-                fid: dir_fid,
-                offset: 0,
-                path: Some(alloc::string::String::from("/test")),
-                file_type: FileType::Directory,
+                kind: FdKind::File {
+                    fid: dir_fid,
+                    offset: 0,
+                    path: Some(alloc::string::String::from("/test")),
+                    file_type: FileType::Directory,
+                },
                 flags: 0,
             },
         );
@@ -5114,10 +5529,12 @@ mod integration_tests {
         lx.insert_test_fd(
             3,
             FdEntry {
-                fid: dir_fid,
-                offset: 0,
-                path: Some(alloc::string::String::from("/empty")),
-                file_type: FileType::Directory,
+                kind: FdKind::File {
+                    fid: dir_fid,
+                    offset: 0,
+                    path: Some(alloc::string::String::from("/empty")),
+                    file_type: FileType::Directory,
+                },
                 flags: 0,
             },
         );
@@ -6099,10 +6516,10 @@ mod integration_tests {
     fn sys_dup_shares_fid() {
         let mut lx = Linuxulator::new(MockBackend::new());
         lx.init_stdio().unwrap();
-        let original_fid = lx.fd_table.get(&1).unwrap().fid;
+        let original_fid = test_fid(&lx, 1);
         let newfd = lx.dispatch_syscall(LinuxSyscall::Dup { oldfd: 1 });
         assert!(newfd >= 0);
-        let new_fid = lx.fd_table.get(&(newfd as i32)).unwrap().fid;
+        let new_fid = test_fid(&lx, newfd as i32);
         assert_eq!(original_fid, new_fid, "dup should share the same fid");
     }
 
@@ -6153,7 +6570,7 @@ mod integration_tests {
             flags: 0,
         }) as i32;
         assert_eq!(fd, 3);
-        let fid = lx.fd_table.get(&fd).unwrap().fid;
+        let fid = test_fid(&lx, fd);
 
         // dup fd 3 → fd 4
         let dup_fd = lx.dispatch_syscall(LinuxSyscall::Dup { oldfd: fd });
@@ -6181,7 +6598,7 @@ mod integration_tests {
             flags: 0,
         }) as i32;
         assert_eq!(fd, 3);
-        let fid = lx.fd_table.get(&fd).unwrap().fid;
+        let fid = test_fid(&lx, fd);
 
         // dup fd 3 → fd 4
         let dup_fd = lx.dispatch_syscall(LinuxSyscall::Dup { oldfd: fd }) as i32;
@@ -6216,14 +6633,14 @@ mod integration_tests {
             flags: 0,
         }) as i32;
         assert_eq!(fd, 3);
-        let fid_a = lx.fd_table.get(&fd).unwrap().fid;
+        let fid_a = test_fid(&lx, fd);
 
         // dup fd 3 → fd 10 (fid_a refcount: 1 → 2)
         lx.dispatch_syscall(LinuxSyscall::Dup2 {
             oldfd: fd,
             newfd: 10,
         });
-        assert_eq!(lx.fd_table.get(&10).unwrap().fid, fid_a);
+        assert_eq!(test_fid(&lx, 10), fid_a);
 
         // dup2 fd 3 → fd 10 again (replaces the previous dup)
         // The replaced fd 10's fid_a refcount should decrement (2 → 1)
@@ -6262,8 +6679,8 @@ mod integration_tests {
         });
         assert_eq!(result, 10);
         assert!(lx.has_fd(10));
-        let orig_fid = lx.fd_table.get(&1).unwrap().fid;
-        let dup_fid = lx.fd_table.get(&10).unwrap().fid;
+        let orig_fid = test_fid(&lx, 1);
+        let dup_fid = test_fid(&lx, 10);
         assert_eq!(orig_fid, dup_fid);
     }
 
@@ -6290,7 +6707,7 @@ mod integration_tests {
         let mut lx = Linuxulator::new(MockBackend::new());
         lx.init_stdio().unwrap();
         // fd 2 (stderr) is open. dup2(0, 2) should close stderr first.
-        let stderr_fid = lx.fd_table.get(&2).unwrap().fid;
+        let stderr_fid = test_fid(&lx, 2);
         let result = lx.dispatch_syscall(LinuxSyscall::Dup2 { oldfd: 0, newfd: 2 });
         assert_eq!(result, 2);
         // The old stderr fid should have been clunked
@@ -6299,8 +6716,8 @@ mod integration_tests {
             "dup2 should clunk the old fd's fid"
         );
         // fd 2 now shares fd 0's fid
-        let stdin_fid = lx.fd_table.get(&0).unwrap().fid;
-        let new_fd2_fid = lx.fd_table.get(&2).unwrap().fid;
+        let stdin_fid = test_fid(&lx, 0);
+        let new_fd2_fid = test_fid(&lx, 2);
         assert_eq!(stdin_fid, new_fd2_fid);
     }
 
@@ -6405,7 +6822,7 @@ mod integration_tests {
     fn sys_dup3_closes_existing_newfd() {
         let mut lx = Linuxulator::new(MockBackend::new());
         lx.init_stdio().unwrap();
-        let stderr_fid = lx.fd_table.get(&2).unwrap().fid;
+        let stderr_fid = test_fid(&lx, 2);
         let result = lx.dispatch_syscall(LinuxSyscall::Dup3 {
             oldfd: 0,
             newfd: 2,
@@ -6422,13 +6839,13 @@ mod integration_tests {
     fn sys_dup3_shares_fid() {
         let mut lx = Linuxulator::new(MockBackend::new());
         lx.init_stdio().unwrap();
-        let orig_fid = lx.fd_table.get(&1).unwrap().fid;
+        let orig_fid = test_fid(&lx, 1);
         lx.dispatch_syscall(LinuxSyscall::Dup3 {
             oldfd: 1,
             newfd: 10,
             flags: 0,
         });
-        let dup_fid = lx.fd_table.get(&10).unwrap().fid;
+        let dup_fid = test_fid(&lx, 10);
         assert_eq!(orig_fid, dup_fid);
     }
 
@@ -6559,6 +6976,505 @@ mod integration_tests {
                 fd: 3,
                 cmd: 2,
                 arg: 1
+            }
+        ));
+    }
+
+    // ── sys_pipe2 / sys_pipe tests ───────────────────────────────────
+
+    #[test]
+    fn test_pipe2_creates_fds() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // Stack buffer to receive the two i32 fds.
+        let mut fds = [0i32; 2];
+        let result = lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0,
+        });
+        assert_eq!(result, 0);
+        // Read back the fds written to our buffer.
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+        assert!(read_fd >= 0);
+        assert!(write_fd >= 0);
+        assert_ne!(read_fd, write_fd);
+        // Both fds should be in the fd table.
+        assert!(lx.has_fd(read_fd));
+        assert!(lx.has_fd(write_fd));
+    }
+
+    #[test]
+    fn test_pipe2_cloexec() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let mut fds = [0i32; 2];
+        let result = lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: O_CLOEXEC as u64,
+        });
+        assert_eq!(result, 0);
+        // Verify FD_CLOEXEC is set on both fds via fcntl F_GETFD.
+        let read_flags = lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: fds[0],
+            cmd: 1, // F_GETFD
+            arg: 0,
+        });
+        let write_flags = lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: fds[1],
+            cmd: 1, // F_GETFD
+            arg: 0,
+        });
+        assert_eq!(read_flags, FD_CLOEXEC as i64);
+        assert_eq!(write_flags, FD_CLOEXEC as i64);
+    }
+
+    #[test]
+    fn test_pipe2_invalid_flags() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let mut fds = [0i32; 2];
+        // Pass an invalid flag (0x1 is not O_CLOEXEC or O_NONBLOCK).
+        let result = lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0x1,
+        });
+        assert_eq!(result, EINVAL);
+    }
+
+    #[test]
+    fn from_x86_64_pipe() {
+        let syscall = LinuxSyscall::from_x86_64(22, [0x1000, 0, 0, 0, 0, 0]);
+        assert!(matches!(syscall, LinuxSyscall::Pipe { fds: 0x1000 }));
+    }
+
+    #[test]
+    fn from_x86_64_pipe2() {
+        let syscall = LinuxSyscall::from_x86_64(293, [0x2000, 0o2000000, 0, 0, 0, 0]);
+        assert!(matches!(
+            syscall,
+            LinuxSyscall::Pipe2 {
+                fds: 0x2000,
+                flags: 0o2000000
+            }
+        ));
+    }
+
+    #[test]
+    fn from_aarch64_pipe2() {
+        let syscall = LinuxSyscall::from_aarch64(59, [0x3000, 0o4000, 0, 0, 0, 0]);
+        assert!(matches!(
+            syscall,
+            LinuxSyscall::Pipe2 {
+                fds: 0x3000,
+                flags: 0o4000
+            }
+        ));
+    }
+
+    // ── Pipe read/write/close integration tests ─────────────────────
+
+    /// Helper: create a pipe and return (read_fd, write_fd).
+    fn create_pipe(lx: &mut Linuxulator<MockBackend>) -> (i32, i32) {
+        let mut fds = [0i32; 2];
+        let result = lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0,
+        });
+        assert_eq!(result, 0);
+        (fds[0], fds[1])
+    }
+
+    #[test]
+    fn test_pipe_write_then_read() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let (rfd, wfd) = create_pipe(&mut lx);
+
+        // Write "hello" to the pipe.
+        let data = b"hello";
+        let written = lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: wfd,
+            buf: data.as_ptr() as u64,
+            count: data.len() as u64,
+        });
+        assert_eq!(written, 5);
+
+        // Read it back.
+        let mut buf = [0u8; 16];
+        let read = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: rfd,
+            buf: buf.as_mut_ptr() as u64,
+            count: buf.len() as u64,
+        });
+        assert_eq!(read, 5);
+        assert_eq!(&buf[..5], b"hello");
+    }
+
+    #[test]
+    fn test_pipe_read_eof_after_write_close() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let (rfd, wfd) = create_pipe(&mut lx);
+
+        // Close the write end.
+        let result = lx.dispatch_syscall(LinuxSyscall::Close { fd: wfd });
+        assert_eq!(result, 0);
+
+        // Read should return 0 (EOF).
+        let mut buf = [0u8; 16];
+        let read = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: rfd,
+            buf: buf.as_mut_ptr() as u64,
+            count: buf.len() as u64,
+        });
+        assert_eq!(
+            read, 0,
+            "read from pipe with closed write end should return EOF"
+        );
+    }
+
+    #[test]
+    fn test_pipe_write_epipe_after_read_close() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let (rfd, wfd) = create_pipe(&mut lx);
+
+        // Close the read end.
+        let result = lx.dispatch_syscall(LinuxSyscall::Close { fd: rfd });
+        assert_eq!(result, 0);
+
+        // Write should return EPIPE.
+        let data = b"hello";
+        let written = lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: wfd,
+            buf: data.as_ptr() as u64,
+            count: data.len() as u64,
+        });
+        assert_eq!(written, EPIPE);
+    }
+
+    #[test]
+    fn test_pipe_partial_read() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let (rfd, wfd) = create_pipe(&mut lx);
+
+        // Write 10 bytes.
+        let data = b"0123456789";
+        lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: wfd,
+            buf: data.as_ptr() as u64,
+            count: 10,
+        });
+
+        // Read first 5.
+        let mut buf1 = [0u8; 5];
+        let r1 = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: rfd,
+            buf: buf1.as_mut_ptr() as u64,
+            count: 5,
+        });
+        assert_eq!(r1, 5);
+        assert_eq!(&buf1, b"01234");
+
+        // Read remaining 5.
+        let mut buf2 = [0u8; 5];
+        let r2 = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: rfd,
+            buf: buf2.as_mut_ptr() as u64,
+            count: 5,
+        });
+        assert_eq!(r2, 5);
+        assert_eq!(&buf2, b"56789");
+    }
+
+    #[test]
+    fn test_pipe_lseek_returns_espipe() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let (rfd, wfd) = create_pipe(&mut lx);
+
+        let result = lx.dispatch_syscall(LinuxSyscall::Lseek {
+            fd: rfd,
+            offset: 0,
+            whence: 0,
+        });
+        assert_eq!(result, ESPIPE);
+
+        let result = lx.dispatch_syscall(LinuxSyscall::Lseek {
+            fd: wfd,
+            offset: 0,
+            whence: 0,
+        });
+        assert_eq!(result, ESPIPE);
+    }
+
+    #[test]
+    fn test_pipe_dup_shares_buffer() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let (rfd, wfd) = create_pipe(&mut lx);
+
+        // Dup the write end.
+        let dup_wfd = lx.dispatch_syscall(LinuxSyscall::Dup { oldfd: wfd });
+        assert!(dup_wfd >= 0);
+
+        // Write from the dup'd fd.
+        let data = b"duped";
+        lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: dup_wfd as i32,
+            buf: data.as_ptr() as u64,
+            count: data.len() as u64,
+        });
+
+        // Read from the original read fd.
+        let mut buf = [0u8; 16];
+        let read = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: rfd,
+            buf: buf.as_mut_ptr() as u64,
+            count: buf.len() as u64,
+        });
+        assert_eq!(read, 5);
+        assert_eq!(&buf[..5], b"duped");
+    }
+
+    #[test]
+    fn test_pipe_fstat_returns_fifo() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let (rfd, _wfd) = create_pipe(&mut lx);
+
+        // fstat the read end — should return S_IFIFO.
+        let mut stat_buf = [0u8; 144]; // x86_64 stat size
+        let result = lx.dispatch_syscall(LinuxSyscall::Fstat {
+            fd: rfd,
+            buf: stat_buf.as_mut_ptr() as u64,
+        });
+        assert_eq!(result, 0);
+
+        // Read st_mode from the stat buffer.
+        #[cfg(target_arch = "x86_64")]
+        let mode = u32::from_le_bytes(stat_buf[24..28].try_into().unwrap());
+        #[cfg(not(target_arch = "x86_64"))]
+        let mode = u32::from_le_bytes(stat_buf[16..20].try_into().unwrap());
+
+        let s_ififo: u32 = 0o010000;
+        assert_eq!(
+            mode & 0o170000,
+            s_ififo,
+            "st_mode should have S_IFIFO type, got {:#o}",
+            mode
+        );
+    }
+
+    // ── sys_eventfd2 tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_eventfd_init_and_read() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let fd = lx.dispatch_syscall(LinuxSyscall::EventFd2 {
+            initval: 42,
+            flags: 0,
+        });
+        assert!(fd >= 0);
+
+        // First read returns 42.
+        let mut buf = [0u8; 8];
+        let result = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: fd as i32,
+            buf: buf.as_mut_ptr() as u64,
+            count: 8,
+        });
+        assert_eq!(result, 8);
+        assert_eq!(u64::from_le_bytes(buf), 42);
+
+        // Second read returns EAGAIN (counter is 0 after first read).
+        let result = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: fd as i32,
+            buf: buf.as_mut_ptr() as u64,
+            count: 8,
+        });
+        assert_eq!(result, EAGAIN);
+    }
+
+    #[test]
+    fn test_eventfd_semaphore() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let efd_semaphore: u64 = 1;
+        let fd = lx.dispatch_syscall(LinuxSyscall::EventFd2 {
+            initval: 3,
+            flags: efd_semaphore,
+        });
+        assert!(fd >= 0);
+
+        // In semaphore mode, each read returns 1 and decrements by 1.
+        for _ in 0..3 {
+            let mut buf = [0u8; 8];
+            let result = lx.dispatch_syscall(LinuxSyscall::Read {
+                fd: fd as i32,
+                buf: buf.as_mut_ptr() as u64,
+                count: 8,
+            });
+            assert_eq!(result, 8);
+            assert_eq!(u64::from_le_bytes(buf), 1);
+        }
+
+        // Fourth read: EAGAIN (counter is 0).
+        let mut buf = [0u8; 8];
+        let result = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: fd as i32,
+            buf: buf.as_mut_ptr() as u64,
+            count: 8,
+        });
+        assert_eq!(result, EAGAIN);
+    }
+
+    #[test]
+    fn test_eventfd_write_accumulates() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let fd = lx.dispatch_syscall(LinuxSyscall::EventFd2 {
+            initval: 0,
+            flags: 0,
+        });
+        assert!(fd >= 0);
+
+        // Write 10.
+        let val: u64 = 10;
+        let result = lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: fd as i32,
+            buf: val.to_le_bytes().as_ptr() as u64,
+            count: 8,
+        });
+        assert_eq!(result, 8);
+
+        // Write 20.
+        let val: u64 = 20;
+        let result = lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: fd as i32,
+            buf: val.to_le_bytes().as_ptr() as u64,
+            count: 8,
+        });
+        assert_eq!(result, 8);
+
+        // Read should return 30.
+        let mut buf = [0u8; 8];
+        let result = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: fd as i32,
+            buf: buf.as_mut_ptr() as u64,
+            count: 8,
+        });
+        assert_eq!(result, 8);
+        assert_eq!(u64::from_le_bytes(buf), 30);
+    }
+
+    #[test]
+    fn test_eventfd_read_zero_eagain() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let fd = lx.dispatch_syscall(LinuxSyscall::EventFd2 {
+            initval: 0,
+            flags: 0,
+        });
+
+        let mut buf = [0u8; 8];
+        let result = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: fd as i32,
+            buf: buf.as_mut_ptr() as u64,
+            count: 8,
+        });
+        assert_eq!(result, EAGAIN);
+    }
+
+    #[test]
+    fn test_eventfd_buffer_too_small() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let fd = lx.dispatch_syscall(LinuxSyscall::EventFd2 {
+            initval: 42,
+            flags: 0,
+        });
+
+        // Read with count < 8 returns EINVAL.
+        let mut buf = [0u8; 4];
+        let result = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: fd as i32,
+            buf: buf.as_mut_ptr() as u64,
+            count: 4,
+        });
+        assert_eq!(result, EINVAL);
+    }
+
+    #[test]
+    fn test_eventfd_write_overflow() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let fd = lx.dispatch_syscall(LinuxSyscall::EventFd2 {
+            initval: 0,
+            flags: 0,
+        });
+
+        // Write near-max value.
+        let val: u64 = 0xFFFFFFFFFFFFFFFE;
+        let result = lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: fd as i32,
+            buf: val.to_le_bytes().as_ptr() as u64,
+            count: 8,
+        });
+        assert_eq!(result, 8);
+
+        // Writing 1 more should return EAGAIN (overflow).
+        let val: u64 = 1;
+        let result = lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: fd as i32,
+            buf: val.to_le_bytes().as_ptr() as u64,
+            count: 8,
+        });
+        assert_eq!(result, EAGAIN);
+    }
+
+    #[test]
+    fn test_eventfd_write_max_einval() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let fd = lx.dispatch_syscall(LinuxSyscall::EventFd2 {
+            initval: 0,
+            flags: 0,
+        });
+
+        // Writing u64::MAX returns EINVAL.
+        let val: u64 = u64::MAX;
+        let result = lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: fd as i32,
+            buf: val.to_le_bytes().as_ptr() as u64,
+            count: 8,
+        });
+        assert_eq!(result, EINVAL);
+    }
+
+    #[test]
+    fn from_x86_64_eventfd2() {
+        let syscall = LinuxSyscall::from_x86_64(290, [42, 0o2000000, 0, 0, 0, 0]);
+        assert!(matches!(
+            syscall,
+            LinuxSyscall::EventFd2 {
+                initval: 42,
+                flags: 0o2000000
+            }
+        ));
+    }
+
+    #[test]
+    fn from_aarch64_eventfd2() {
+        let syscall = LinuxSyscall::from_aarch64(19, [5, 1, 0, 0, 0, 0]);
+        assert!(matches!(
+            syscall,
+            LinuxSyscall::EventFd2 {
+                initval: 5,
+                flags: 1
             }
         ));
     }
