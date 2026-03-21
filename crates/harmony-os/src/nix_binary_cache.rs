@@ -21,6 +21,10 @@ pub enum CacheResponse {
     /// narinfo text (Content-Type: text/x-nix-narinfo).
     Narinfo(String),
     /// Raw NAR bytes (Content-Type: application/x-nix-nar).
+    ///
+    /// This clones the full NAR blob from `NixStoreServer`. The expected
+    /// usage is write-to-socket-then-drop — callers should not retain the
+    /// `Vec` longer than necessary.
     NarData(Vec<u8>),
     /// nix-cache-info metadata (Content-Type: text/x-nix-cache-info).
     CacheInfo(String),
@@ -88,7 +92,7 @@ impl BinaryCacheServer {
     pub fn handle_request(&mut self, path: &str) -> CacheResponse {
         if path == "/nix-cache-info" {
             return CacheResponse::CacheInfo(
-                "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 30\n".to_string(),
+                "StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n".to_string(),
             );
         }
 
@@ -217,7 +221,7 @@ mod tests {
         match resp {
             CacheResponse::CacheInfo(text) => {
                 assert!(text.contains("StoreDir: /nix/store"));
-                assert!(text.contains("WantMassQuery: 1"));
+                assert!(text.contains("WantMassQuery: 0"));
                 assert!(text.contains("Priority: 30"));
             }
             other => panic!("expected CacheInfo, got {other:?}"),
