@@ -2247,6 +2247,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
             None => return EBADF,
         };
         self.close_fd_entry(entry);
+        // Remove closed fd from all epoll interest lists (Linux does this
+        // automatically when the last fd reference is closed).
+        for epoll in self.epolls.values_mut() {
+            epoll.interests.remove(&fd);
+        }
         0
     }
 
@@ -2708,6 +2713,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
                         };
                         buf.fill(0);
                     }
+                    // Write back actual returned length.
+                    let out = unsafe {
+                        core::slice::from_raw_parts_mut(optlen_ptr as usize as *mut u8, 4)
+                    };
+                    out.copy_from_slice(&(optlen as u32).to_ne_bytes());
                 }
                 0
             }
