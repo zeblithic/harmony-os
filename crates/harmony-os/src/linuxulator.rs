@@ -1155,14 +1155,30 @@ fn prot_to_page_flags(prot: i32) -> PageFlags {
 
 // ── Linuxulator ─────────────────────────────────────────────────────
 
-/// Per-fd state: the 9P fid and the current file offset.
+/// What kind of object backs a file descriptor.
+#[derive(Clone)]
+#[allow(dead_code)] // PipeRead/PipeWrite/EventFd used by upcoming pipe/eventfd tasks
+enum FdKind {
+    /// A 9P-backed file (regular, directory, char device, etc.).
+    File {
+        fid: Fid,
+        offset: u64,
+        path: Option<alloc::string::String>,
+        /// Cached file type — avoids IPC stat on every lseek.
+        file_type: FileType,
+    },
+    /// Read end of a pipe.
+    PipeRead { pipe_id: usize },
+    /// Write end of a pipe.
+    PipeWrite { pipe_id: usize },
+    /// eventfd descriptor.
+    EventFd { counter: u64, semaphore: bool },
+}
+
+/// Per-fd state: the kind of object and descriptor-level flags.
 #[derive(Clone)]
 struct FdEntry {
-    fid: Fid,
-    offset: u64,
-    path: Option<alloc::string::String>,
-    /// Cached file type — avoids IPC stat on every lseek.
-    file_type: FileType,
+    kind: FdKind,
     /// File descriptor flags (e.g. FD_CLOEXEC). Default 0.
     flags: u32,
 }
@@ -1201,6 +1217,12 @@ pub struct Linuxulator<B: SyscallBackend> {
     /// Reference counts for 9P fids shared across multiple fd_table entries
     /// (via dup/dup2/dup3). A fid is only clunked when its refcount reaches 0.
     fid_refcount: BTreeMap<Fid, u32>,
+    /// Pipe buffers keyed by pipe_id.
+    #[allow(dead_code)] // used by upcoming pipe task
+    pipes: BTreeMap<usize, Vec<u8>>,
+    /// Next pipe_id to allocate.
+    #[allow(dead_code)] // used by upcoming pipe task
+    next_pipe_id: usize,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -1225,6 +1247,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
             monotonic_ns: 0,
             realtime_ns: 0,
             fid_refcount: BTreeMap::new(),
+            pipes: BTreeMap::new(),
+            next_pipe_id: 0,
         }
     }
 
@@ -1251,9 +1275,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// entry is missing.
     #[cfg(test)]
     fn insert_test_fd(&mut self, fd: i32, entry: FdEntry) {
-        let fid = entry.fid;
+        if let FdKind::File { fid, .. } = &entry.kind {
+            *self.fid_refcount.entry(*fid).or_insert(0) += 1;
+        }
         self.fd_table.insert(fd, entry);
-        *self.fid_refcount.entry(fid).or_insert(0) += 1;
     }
 
     /// Resolve a path relative to `self.cwd`.
@@ -1301,10 +1326,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.fd_table.insert(
             0,
             FdEntry {
-                fid: stdin_fid,
-                offset: 0,
-                path: None,
-                file_type: FileType::CharDev,
+                kind: FdKind::File {
+                    fid: stdin_fid,
+                    offset: 0,
+                    path: None,
+                    file_type: FileType::CharDev,
+                },
                 flags: 0,
             },
         );
@@ -1317,10 +1344,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.fd_table.insert(
             1,
             FdEntry {
-                fid: stdout_fid,
-                offset: 0,
-                path: None,
-                file_type: FileType::CharDev,
+                kind: FdKind::File {
+                    fid: stdout_fid,
+                    offset: 0,
+                    path: None,
+                    file_type: FileType::CharDev,
+                },
                 flags: 0,
             },
         );
@@ -1333,10 +1362,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.fd_table.insert(
             2,
             FdEntry {
-                fid: stderr_fid,
-                offset: 0,
-                path: None,
-                file_type: FileType::CharDev,
+                kind: FdKind::File {
+                    fid: stderr_fid,
+                    offset: 0,
+                    path: None,
+                    file_type: FileType::CharDev,
+                },
                 flags: 0,
             },
         );
@@ -1375,7 +1406,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Look up the fid for a Linux fd (for testing).
     #[cfg(test)]
     pub fn fid_for_fd(&self, fd: i32) -> Option<Fid> {
-        self.fd_table.get(&fd).map(|e| e.fid)
+        self.fd_table.get(&fd).and_then(|e| match &e.kind {
+            FdKind::File { fid, .. } => Some(*fid),
+            _ => None,
+        })
     }
 
     /// Base address of the memory arena (for testing).
@@ -1514,12 +1548,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return 0;
         }
 
-        let entry = match self.fd_table.get_mut(&fd) {
-            Some(e) => e,
+        let (fid, offset) = match self.fd_table.get(&fd) {
+            Some(FdEntry {
+                kind: FdKind::File { fid, offset, .. },
+                ..
+            }) => (*fid, *offset),
+            Some(_) => return EBADF,
             None => return EBADF,
         };
-        let fid = entry.fid;
-        let offset = entry.offset;
 
         // In the MVP flat address space, we can directly read from the pointer.
         // Safety: caller guarantees buf_ptr points to valid memory of at least
@@ -1529,7 +1565,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         match self.backend.write(fid, offset, data) {
             Ok(n) => {
-                self.fd_table.get_mut(&fd).unwrap().offset += n as u64;
+                if let FdKind::File { ref mut offset, .. } =
+                    self.fd_table.get_mut(&fd).unwrap().kind
+                {
+                    *offset += n as u64;
+                }
                 n as i64
             }
             Err(e) => ipc_err_to_errno(e),
@@ -1543,7 +1583,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
 
         let (fid, file_offset) = match self.fd_table.get(&fd) {
-            Some(e) => (e.fid, e.offset),
+            Some(FdEntry {
+                kind: FdKind::File { fid, offset, .. },
+                ..
+            }) => (*fid, *offset),
+            Some(_) => return EBADF,
             None => return EBADF,
         };
 
@@ -1559,7 +1603,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
                     unsafe {
                         core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr as *mut u8, n);
                     }
-                    self.fd_table.get_mut(&fd).unwrap().offset += n as u64;
+                    if let FdKind::File { ref mut offset, .. } =
+                        self.fd_table.get_mut(&fd).unwrap().kind
+                    {
+                        *offset += n as u64;
+                    }
                 }
                 n as i64
             }
@@ -1583,7 +1631,20 @@ impl<B: SyscallBackend> Linuxulator<B> {
             Some(e) => e,
             None => return EBADF,
         };
-        self.release_fid(entry.fid);
+        match entry.kind {
+            FdKind::File { fid, .. } => self.release_fid(fid),
+            FdKind::PipeRead { pipe_id } | FdKind::PipeWrite { pipe_id } => {
+                // Clean up the pipe buffer if no other fd references this pipe.
+                let still_referenced = self
+                    .fd_table
+                    .values()
+                    .any(|e| matches!(&e.kind, FdKind::PipeRead { pipe_id: id } | FdKind::PipeWrite { pipe_id: id } if *id == pipe_id));
+                if !still_referenced {
+                    self.pipes.remove(&pipe_id);
+                }
+            }
+            FdKind::EventFd { .. } => { /* nothing to clean up */ }
+        }
         0
     }
 
@@ -1645,16 +1706,17 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// indirection table (future work).
     fn dup_fd_to(&mut self, oldfd: i32, newfd: i32, fd_flags: u32) {
         let entry = self.fd_table.get(&oldfd).unwrap();
-        let new_entry = FdEntry {
-            fid: entry.fid,
-            offset: entry.offset,
-            path: entry.path.clone(),
-            file_type: entry.file_type,
-            flags: fd_flags,
-        };
-        let fid = new_entry.fid;
-        self.fd_table.insert(newfd, new_entry);
-        *self.fid_refcount.get_mut(&fid).expect("refcount missing") += 1;
+        let new_kind = entry.kind.clone();
+        if let FdKind::File { fid, .. } = &new_kind {
+            *self.fid_refcount.get_mut(fid).expect("refcount missing") += 1;
+        }
+        self.fd_table.insert(
+            newfd,
+            FdEntry {
+                kind: new_kind,
+                flags: fd_flags,
+            },
+        );
     }
 
     fn sys_dup(&mut self, oldfd: i32) -> i64 {
@@ -1684,7 +1746,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
         // Close newfd if it's open
         if let Some(existing) = self.fd_table.remove(&newfd) {
-            self.release_fid(existing.fid);
+            if let FdKind::File { fid, .. } = existing.kind {
+                self.release_fid(fid);
+            }
         }
         self.dup_fd_to(oldfd, newfd, 0);
         newfd as i64
@@ -1714,7 +1778,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
         // Close newfd if it's open
         if let Some(existing) = self.fd_table.remove(&newfd) {
-            self.release_fid(existing.fid);
+            if let FdKind::File { fid, .. } = existing.kind {
+                self.release_fid(fid);
+            }
         }
         let fd_flags = if flags & O_CLOEXEC != 0 {
             FD_CLOEXEC
@@ -1731,7 +1797,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return EFAULT;
         }
         let fid = match self.fd_table.get(&fd) {
-            Some(e) => e.fid,
+            Some(FdEntry {
+                kind: FdKind::File { fid, .. },
+                ..
+            }) => *fid,
+            Some(_) => return EBADF,
             None => return EBADF,
         };
         match self.backend.stat(fid) {
@@ -1789,10 +1859,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.fd_table.insert(
             fd,
             FdEntry {
-                fid,
-                offset: 0,
-                path: Some(path),
-                file_type,
+                kind: FdKind::File {
+                    fid,
+                    offset: 0,
+                    path: Some(path),
+                    file_type,
+                },
                 flags: fd_flags,
             },
         );
@@ -1939,7 +2011,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
         // For file-backed mappings, validate the fd up front.
         let file_fid = if !is_anonymous {
             match self.fd_table.get(&fd) {
-                Some(entry) => Some(entry.fid),
+                Some(FdEntry {
+                    kind: FdKind::File { fid, .. },
+                    ..
+                }) => Some(*fid),
+                Some(_) => return EBADF,
                 None => return EBADF,
             }
         } else {
@@ -2269,7 +2345,17 @@ impl<B: SyscallBackend> Linuxulator<B> {
         const SEEK_END: i32 = 2;
 
         let (entry_fid, entry_offset, entry_file_type) = match self.fd_table.get(&fd) {
-            Some(e) => (e.fid, e.offset, e.file_type),
+            Some(FdEntry {
+                kind:
+                    FdKind::File {
+                        fid,
+                        offset,
+                        file_type,
+                        ..
+                    },
+                ..
+            }) => (*fid, *offset, *file_type),
+            Some(_) => return ESPIPE,
             None => return EBADF,
         };
 
@@ -2308,7 +2394,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return EINVAL;
         }
 
-        self.fd_table.get_mut(&fd).unwrap().offset = new_offset as u64;
+        if let FdKind::File { ref mut offset, .. } = self.fd_table.get_mut(&fd).unwrap().kind {
+            *offset = new_offset as u64;
+        }
         new_offset
     }
 
@@ -2487,13 +2575,16 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if dirp == 0 {
             return EFAULT;
         }
-        let entry = match self.fd_table.get(&fd) {
-            Some(e) => e.clone(),
+        let (dir_fid, start_idx) = match self.fd_table.get(&fd) {
+            Some(FdEntry {
+                kind: FdKind::File { fid, offset, .. },
+                ..
+            }) => (*fid, *offset as usize),
+            Some(_) => return ENOTDIR,
             None => return EBADF,
         };
-        let start_idx = entry.offset as usize;
 
-        let entries = match self.backend.readdir(entry.fid) {
+        let entries = match self.backend.readdir(dir_fid) {
             Ok(e) => e,
             Err(e) => return ipc_err_to_errno(e),
         };
@@ -2563,7 +2654,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         // Update the offset to track position.
         if let Some(entry) = self.fd_table.get_mut(&fd) {
-            entry.offset = idx as u64;
+            if let FdKind::File { ref mut offset, .. } = entry.kind {
+                *offset = idx as u64;
+            }
         }
 
         bytes_written as i64
@@ -2604,20 +2697,24 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux fchdir(2): change working directory to an open fd.
     fn sys_fchdir(&mut self, fd: i32) -> i64 {
-        let entry = match self.fd_table.get(&fd) {
-            Some(e) => e.clone(),
+        let (fid, path) = match self.fd_table.get(&fd) {
+            Some(FdEntry {
+                kind: FdKind::File { fid, path, .. },
+                ..
+            }) => (*fid, path.clone()),
+            Some(_) => return ENOTDIR,
             None => return EBADF,
         };
 
         // Verify it's a directory before checking path — a valid non-directory
         // fd (e.g. stdio) should return ENOTDIR, not EBADF.
-        match self.backend.stat(entry.fid) {
+        match self.backend.stat(fid) {
             Ok(stat) if stat.file_type == FileType::Directory => {}
             Ok(_) => return ENOTDIR,
             Err(e) => return ipc_err_to_errno(e),
         }
 
-        let path = match &entry.path {
+        let path = match &path {
             Some(p) => p.clone(),
             None => {
                 // fd is confirmed directory but has no tracked path —
@@ -2871,6 +2968,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    /// Extract the 9P fid from a File-backed fd (panics for non-File kinds).
+    fn test_fid(lx: &Linuxulator<impl SyscallBackend>, fd: i32) -> Fid {
+        match &lx.fd_table.get(&fd).unwrap().kind {
+            FdKind::File { fid, .. } => *fid,
+            _ => panic!("expected File fd for fd {fd}"),
+        }
+    }
 
     #[test]
     fn mock_backend_records_write() {
@@ -4472,6 +4577,14 @@ mod integration_tests {
     use harmony_microkernel::vm::{PhysAddr, PAGE_SIZE as VM_PAGE_SIZE};
     use harmony_unikernel::KernelEntropy;
 
+    /// Extract the 9P fid from a File-backed fd (panics for non-File kinds).
+    fn test_fid(lx: &Linuxulator<impl SyscallBackend>, fd: i32) -> Fid {
+        match &lx.fd_table.get(&fd).unwrap().kind {
+            FdKind::File { fid, .. } => *fid,
+            _ => panic!("expected File fd for fd {fd}"),
+        }
+    }
+
     /// Create a test VM manager with 64 frames.
     fn make_test_vm() -> AddressSpaceManager<MockPageTable> {
         let buddy = BuddyAllocator::new(PhysAddr(0x10_0000), 64).unwrap();
@@ -5069,10 +5182,12 @@ mod integration_tests {
         lx.insert_test_fd(
             3,
             FdEntry {
-                fid: dir_fid,
-                offset: 0,
-                path: Some(alloc::string::String::from("/test")),
-                file_type: FileType::Directory,
+                kind: FdKind::File {
+                    fid: dir_fid,
+                    offset: 0,
+                    path: Some(alloc::string::String::from("/test")),
+                    file_type: FileType::Directory,
+                },
                 flags: 0,
             },
         );
@@ -5114,10 +5229,12 @@ mod integration_tests {
         lx.insert_test_fd(
             3,
             FdEntry {
-                fid: dir_fid,
-                offset: 0,
-                path: Some(alloc::string::String::from("/empty")),
-                file_type: FileType::Directory,
+                kind: FdKind::File {
+                    fid: dir_fid,
+                    offset: 0,
+                    path: Some(alloc::string::String::from("/empty")),
+                    file_type: FileType::Directory,
+                },
                 flags: 0,
             },
         );
@@ -6099,10 +6216,10 @@ mod integration_tests {
     fn sys_dup_shares_fid() {
         let mut lx = Linuxulator::new(MockBackend::new());
         lx.init_stdio().unwrap();
-        let original_fid = lx.fd_table.get(&1).unwrap().fid;
+        let original_fid = test_fid(&lx, 1);
         let newfd = lx.dispatch_syscall(LinuxSyscall::Dup { oldfd: 1 });
         assert!(newfd >= 0);
-        let new_fid = lx.fd_table.get(&(newfd as i32)).unwrap().fid;
+        let new_fid = test_fid(&lx, newfd as i32);
         assert_eq!(original_fid, new_fid, "dup should share the same fid");
     }
 
@@ -6153,7 +6270,7 @@ mod integration_tests {
             flags: 0,
         }) as i32;
         assert_eq!(fd, 3);
-        let fid = lx.fd_table.get(&fd).unwrap().fid;
+        let fid = test_fid(&lx, fd);
 
         // dup fd 3 → fd 4
         let dup_fd = lx.dispatch_syscall(LinuxSyscall::Dup { oldfd: fd });
@@ -6181,7 +6298,7 @@ mod integration_tests {
             flags: 0,
         }) as i32;
         assert_eq!(fd, 3);
-        let fid = lx.fd_table.get(&fd).unwrap().fid;
+        let fid = test_fid(&lx, fd);
 
         // dup fd 3 → fd 4
         let dup_fd = lx.dispatch_syscall(LinuxSyscall::Dup { oldfd: fd }) as i32;
@@ -6216,14 +6333,14 @@ mod integration_tests {
             flags: 0,
         }) as i32;
         assert_eq!(fd, 3);
-        let fid_a = lx.fd_table.get(&fd).unwrap().fid;
+        let fid_a = test_fid(&lx, fd);
 
         // dup fd 3 → fd 10 (fid_a refcount: 1 → 2)
         lx.dispatch_syscall(LinuxSyscall::Dup2 {
             oldfd: fd,
             newfd: 10,
         });
-        assert_eq!(lx.fd_table.get(&10).unwrap().fid, fid_a);
+        assert_eq!(test_fid(&lx, 10), fid_a);
 
         // dup2 fd 3 → fd 10 again (replaces the previous dup)
         // The replaced fd 10's fid_a refcount should decrement (2 → 1)
@@ -6262,8 +6379,8 @@ mod integration_tests {
         });
         assert_eq!(result, 10);
         assert!(lx.has_fd(10));
-        let orig_fid = lx.fd_table.get(&1).unwrap().fid;
-        let dup_fid = lx.fd_table.get(&10).unwrap().fid;
+        let orig_fid = test_fid(&lx, 1);
+        let dup_fid = test_fid(&lx, 10);
         assert_eq!(orig_fid, dup_fid);
     }
 
@@ -6290,7 +6407,7 @@ mod integration_tests {
         let mut lx = Linuxulator::new(MockBackend::new());
         lx.init_stdio().unwrap();
         // fd 2 (stderr) is open. dup2(0, 2) should close stderr first.
-        let stderr_fid = lx.fd_table.get(&2).unwrap().fid;
+        let stderr_fid = test_fid(&lx, 2);
         let result = lx.dispatch_syscall(LinuxSyscall::Dup2 { oldfd: 0, newfd: 2 });
         assert_eq!(result, 2);
         // The old stderr fid should have been clunked
@@ -6299,8 +6416,8 @@ mod integration_tests {
             "dup2 should clunk the old fd's fid"
         );
         // fd 2 now shares fd 0's fid
-        let stdin_fid = lx.fd_table.get(&0).unwrap().fid;
-        let new_fd2_fid = lx.fd_table.get(&2).unwrap().fid;
+        let stdin_fid = test_fid(&lx, 0);
+        let new_fd2_fid = test_fid(&lx, 2);
         assert_eq!(stdin_fid, new_fd2_fid);
     }
 
@@ -6405,7 +6522,7 @@ mod integration_tests {
     fn sys_dup3_closes_existing_newfd() {
         let mut lx = Linuxulator::new(MockBackend::new());
         lx.init_stdio().unwrap();
-        let stderr_fid = lx.fd_table.get(&2).unwrap().fid;
+        let stderr_fid = test_fid(&lx, 2);
         let result = lx.dispatch_syscall(LinuxSyscall::Dup3 {
             oldfd: 0,
             newfd: 2,
@@ -6422,13 +6539,13 @@ mod integration_tests {
     fn sys_dup3_shares_fid() {
         let mut lx = Linuxulator::new(MockBackend::new());
         lx.init_stdio().unwrap();
-        let orig_fid = lx.fd_table.get(&1).unwrap().fid;
+        let orig_fid = test_fid(&lx, 1);
         lx.dispatch_syscall(LinuxSyscall::Dup3 {
             oldfd: 1,
             newfd: 10,
             flags: 0,
         });
-        let dup_fid = lx.fd_table.get(&10).unwrap().fid;
+        let dup_fid = test_fid(&lx, 10);
         assert_eq!(orig_fid, dup_fid);
     }
 
