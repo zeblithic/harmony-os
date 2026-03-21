@@ -17,13 +17,15 @@ const EPERM: i64 = -1;
 const ENOENT: i64 = -2;
 const ESRCH: i64 = -3;
 const EBADF: i64 = -9;
-const EFAULT: i64 = -14;
+const EAGAIN: i64 = -11;
 const ENOMEM: i64 = -12;
+const EFAULT: i64 = -14;
 const ENOTDIR: i64 = -20;
 const EINVAL: i64 = -22;
 const ENOTTY: i64 = -25;
 const ESPIPE: i64 = -29;
 const EROFS: i64 = -30;
+const EPIPE: i64 = -32;
 const ERANGE: i64 = -34;
 const ENOSYS: i64 = -38;
 const EOVERFLOW: i64 = -75;
@@ -1565,31 +1567,46 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return 0;
         }
 
-        let (fid, offset) = match self.fd_table.get(&fd) {
-            Some(FdEntry {
-                kind: FdKind::File { fid, offset, .. },
-                ..
-            }) => (*fid, *offset),
-            Some(_) => return EBADF,
+        let kind = match self.fd_table.get(&fd) {
+            Some(entry) => entry.kind.clone(),
             None => return EBADF,
         };
 
-        // In the MVP flat address space, we can directly read from the pointer.
-        // Safety: caller guarantees buf_ptr points to valid memory of at least
-        // `count` bytes. This is the same trust model as a real kernel reading
-        // from user space — except here there's no protection boundary.
-        let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
-
-        match self.backend.write(fid, offset, data) {
-            Ok(n) => {
-                if let FdKind::File { ref mut offset, .. } =
-                    self.fd_table.get_mut(&fd).unwrap().kind
-                {
-                    *offset += n as u64;
+        match kind {
+            FdKind::PipeWrite { pipe_id } => {
+                // Check that a reader still exists for this pipe.
+                let has_reader = self.fd_table.values().any(|e| {
+                    matches!(&e.kind, FdKind::PipeRead { pipe_id: id } if *id == pipe_id)
+                });
+                if !has_reader {
+                    return EPIPE;
                 }
-                n as i64
+                let data =
+                    unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
+                self.pipes.get_mut(&pipe_id).unwrap().extend_from_slice(data);
+                count as i64
             }
-            Err(e) => ipc_err_to_errno(e),
+            FdKind::PipeRead { .. } | FdKind::EventFd { .. } => EBADF,
+            FdKind::File { fid, offset, .. } => {
+                // In the MVP flat address space, we can directly read from the pointer.
+                // Safety: caller guarantees buf_ptr points to valid memory of at least
+                // `count` bytes. This is the same trust model as a real kernel reading
+                // from user space — except here there's no protection boundary.
+                let data =
+                    unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
+
+                match self.backend.write(fid, offset, data) {
+                    Ok(n) => {
+                        if let FdKind::File { ref mut offset, .. } =
+                            self.fd_table.get_mut(&fd).unwrap().kind
+                        {
+                            *offset += n as u64;
+                        }
+                        n as i64
+                    }
+                    Err(e) => ipc_err_to_errno(e),
+                }
+            }
         }
     }
 
@@ -1599,36 +1616,66 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return 0;
         }
 
-        let (fid, file_offset) = match self.fd_table.get(&fd) {
-            Some(FdEntry {
-                kind: FdKind::File { fid, offset, .. },
-                ..
-            }) => (*fid, *offset),
-            Some(_) => return EBADF,
+        let kind = match self.fd_table.get(&fd) {
+            Some(entry) => entry.kind.clone(),
             None => return EBADF,
         };
 
-        // 9P count is u32; cap to avoid silent truncation on large reads.
-        let capped = count.min(u32::MAX as usize) as u32;
-
-        match self.backend.read(fid, file_offset, capped) {
-            Ok(data) => {
-                let n = data.len().min(count);
-                if n > 0 {
-                    // Safety: caller guarantees buf_ptr points to valid memory of at
-                    // least `count` bytes. Same trust model as sys_write.
+        match kind {
+            FdKind::PipeRead { pipe_id } => {
+                let buf = self.pipes.get_mut(&pipe_id).unwrap();
+                if buf.is_empty() {
+                    // Check if any writer still exists.
+                    let has_writer = self.fd_table.values().any(|e| {
+                        matches!(&e.kind, FdKind::PipeWrite { pipe_id: id } if *id == pipe_id)
+                    });
+                    if has_writer {
+                        EAGAIN
+                    } else {
+                        0 // EOF — write end closed
+                    }
+                } else {
+                    let n = count.min(buf.len());
+                    let drained: Vec<u8> = buf.drain(..n).collect();
                     unsafe {
-                        core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr as *mut u8, n);
+                        core::ptr::copy_nonoverlapping(
+                            drained.as_ptr(),
+                            buf_ptr as *mut u8,
+                            n,
+                        );
                     }
-                    if let FdKind::File { ref mut offset, .. } =
-                        self.fd_table.get_mut(&fd).unwrap().kind
-                    {
-                        *offset += n as u64;
-                    }
+                    n as i64
                 }
-                n as i64
             }
-            Err(e) => ipc_err_to_errno(e),
+            FdKind::PipeWrite { .. } | FdKind::EventFd { .. } => EBADF,
+            FdKind::File { fid, offset: file_offset, .. } => {
+                // 9P count is u32; cap to avoid silent truncation on large reads.
+                let capped = count.min(u32::MAX as usize) as u32;
+
+                match self.backend.read(fid, file_offset, capped) {
+                    Ok(data) => {
+                        let n = data.len().min(count);
+                        if n > 0 {
+                            // Safety: caller guarantees buf_ptr points to valid memory of at
+                            // least `count` bytes. Same trust model as sys_write.
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    data.as_ptr(),
+                                    buf_ptr as *mut u8,
+                                    n,
+                                );
+                            }
+                            if let FdKind::File { ref mut offset, .. } =
+                                self.fd_table.get_mut(&fd).unwrap().kind
+                            {
+                                *offset += n as u64;
+                            }
+                        }
+                        n as i64
+                    }
+                    Err(e) => ipc_err_to_errno(e),
+                }
+            }
         }
     }
 
@@ -1866,20 +1913,62 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if statbuf_ptr == 0 {
             return EFAULT;
         }
-        let fid = match self.fd_table.get(&fd) {
-            Some(FdEntry {
-                kind: FdKind::File { fid, .. },
-                ..
-            }) => *fid,
-            Some(_) => return EBADF,
+        let kind = match self.fd_table.get(&fd) {
+            Some(entry) => entry.kind.clone(),
             None => return EBADF,
         };
-        match self.backend.stat(fid) {
-            Ok(stat) => {
-                write_linux_stat(statbuf_ptr, &stat);
+        match kind {
+            FdKind::PipeRead { .. } | FdKind::PipeWrite { .. } => {
+                // Synthetic stat with S_IFIFO — programs like bash use this to
+                // detect pipe fds. Bypass write_linux_stat (which maps FileType).
+                let mode: u32 = 0o010000 | 0o644; // S_IFIFO | rw-r--r--
+                let qpath = fd as u64;
+                write_linux_stat(
+                    statbuf_ptr,
+                    &FileStat {
+                        qpath,
+                        name: alloc::sync::Arc::from("pipe"),
+                        size: 0,
+                        file_type: FileType::Regular, // unused — we override mode below
+                    },
+                );
+                // Overwrite st_mode with S_IFIFO (write_linux_stat wrote S_IFREG).
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let buf = unsafe {
+                        core::slice::from_raw_parts_mut(statbuf_ptr as *mut u8, 144)
+                    };
+                    buf[24..28].copy_from_slice(&mode.to_le_bytes());
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    let buf = unsafe {
+                        core::slice::from_raw_parts_mut(statbuf_ptr as *mut u8, 128)
+                    };
+                    buf[16..20].copy_from_slice(&mode.to_le_bytes());
+                }
                 0
             }
-            Err(e) => ipc_err_to_errno(e),
+            FdKind::EventFd { .. } => {
+                // Synthetic stat with S_IFREG and size 0.
+                write_linux_stat(
+                    statbuf_ptr,
+                    &FileStat {
+                        qpath: fd as u64,
+                        name: alloc::sync::Arc::from("eventfd"),
+                        size: 0,
+                        file_type: FileType::Regular,
+                    },
+                );
+                0
+            }
+            FdKind::File { fid, .. } => match self.backend.stat(fid) {
+                Ok(stat) => {
+                    write_linux_stat(statbuf_ptr, &stat);
+                    0
+                }
+                Err(e) => ipc_err_to_errno(e),
+            },
         }
     }
 
@@ -6840,5 +6929,198 @@ mod integration_tests {
                 flags: 0o4000
             }
         ));
+    }
+
+    // ── Pipe read/write/close integration tests ─────────────────────
+
+    /// Helper: create a pipe and return (read_fd, write_fd).
+    fn create_pipe(lx: &mut Linuxulator<MockBackend>) -> (i32, i32) {
+        let mut fds = [0i32; 2];
+        let result = lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0,
+        });
+        assert_eq!(result, 0);
+        (fds[0], fds[1])
+    }
+
+    #[test]
+    fn test_pipe_write_then_read() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let (rfd, wfd) = create_pipe(&mut lx);
+
+        // Write "hello" to the pipe.
+        let data = b"hello";
+        let written = lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: wfd,
+            buf: data.as_ptr() as u64,
+            count: data.len() as u64,
+        });
+        assert_eq!(written, 5);
+
+        // Read it back.
+        let mut buf = [0u8; 16];
+        let read = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: rfd,
+            buf: buf.as_mut_ptr() as u64,
+            count: buf.len() as u64,
+        });
+        assert_eq!(read, 5);
+        assert_eq!(&buf[..5], b"hello");
+    }
+
+    #[test]
+    fn test_pipe_read_eof_after_write_close() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let (rfd, wfd) = create_pipe(&mut lx);
+
+        // Close the write end.
+        let result = lx.dispatch_syscall(LinuxSyscall::Close { fd: wfd });
+        assert_eq!(result, 0);
+
+        // Read should return 0 (EOF).
+        let mut buf = [0u8; 16];
+        let read = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: rfd,
+            buf: buf.as_mut_ptr() as u64,
+            count: buf.len() as u64,
+        });
+        assert_eq!(read, 0, "read from pipe with closed write end should return EOF");
+    }
+
+    #[test]
+    fn test_pipe_write_epipe_after_read_close() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let (rfd, wfd) = create_pipe(&mut lx);
+
+        // Close the read end.
+        let result = lx.dispatch_syscall(LinuxSyscall::Close { fd: rfd });
+        assert_eq!(result, 0);
+
+        // Write should return EPIPE.
+        let data = b"hello";
+        let written = lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: wfd,
+            buf: data.as_ptr() as u64,
+            count: data.len() as u64,
+        });
+        assert_eq!(written, EPIPE);
+    }
+
+    #[test]
+    fn test_pipe_partial_read() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let (rfd, wfd) = create_pipe(&mut lx);
+
+        // Write 10 bytes.
+        let data = b"0123456789";
+        lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: wfd,
+            buf: data.as_ptr() as u64,
+            count: 10,
+        });
+
+        // Read first 5.
+        let mut buf1 = [0u8; 5];
+        let r1 = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: rfd,
+            buf: buf1.as_mut_ptr() as u64,
+            count: 5,
+        });
+        assert_eq!(r1, 5);
+        assert_eq!(&buf1, b"01234");
+
+        // Read remaining 5.
+        let mut buf2 = [0u8; 5];
+        let r2 = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: rfd,
+            buf: buf2.as_mut_ptr() as u64,
+            count: 5,
+        });
+        assert_eq!(r2, 5);
+        assert_eq!(&buf2, b"56789");
+    }
+
+    #[test]
+    fn test_pipe_lseek_returns_espipe() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let (rfd, wfd) = create_pipe(&mut lx);
+
+        let result = lx.dispatch_syscall(LinuxSyscall::Lseek {
+            fd: rfd,
+            offset: 0,
+            whence: 0,
+        });
+        assert_eq!(result, ESPIPE);
+
+        let result = lx.dispatch_syscall(LinuxSyscall::Lseek {
+            fd: wfd,
+            offset: 0,
+            whence: 0,
+        });
+        assert_eq!(result, ESPIPE);
+    }
+
+    #[test]
+    fn test_pipe_dup_shares_buffer() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let (rfd, wfd) = create_pipe(&mut lx);
+
+        // Dup the write end.
+        let dup_wfd = lx.dispatch_syscall(LinuxSyscall::Dup { oldfd: wfd });
+        assert!(dup_wfd >= 0);
+
+        // Write from the dup'd fd.
+        let data = b"duped";
+        lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: dup_wfd as i32,
+            buf: data.as_ptr() as u64,
+            count: data.len() as u64,
+        });
+
+        // Read from the original read fd.
+        let mut buf = [0u8; 16];
+        let read = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: rfd,
+            buf: buf.as_mut_ptr() as u64,
+            count: buf.len() as u64,
+        });
+        assert_eq!(read, 5);
+        assert_eq!(&buf[..5], b"duped");
+    }
+
+    #[test]
+    fn test_pipe_fstat_returns_fifo() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let (rfd, _wfd) = create_pipe(&mut lx);
+
+        // fstat the read end — should return S_IFIFO.
+        let mut stat_buf = [0u8; 144]; // x86_64 stat size
+        let result = lx.dispatch_syscall(LinuxSyscall::Fstat {
+            fd: rfd,
+            buf: stat_buf.as_mut_ptr() as u64,
+        });
+        assert_eq!(result, 0);
+
+        // Read st_mode from the stat buffer.
+        #[cfg(target_arch = "x86_64")]
+        let mode = u32::from_le_bytes(stat_buf[24..28].try_into().unwrap());
+        #[cfg(not(target_arch = "x86_64"))]
+        let mode = u32::from_le_bytes(stat_buf[16..20].try_into().unwrap());
+
+        let s_ififo: u32 = 0o010000;
+        assert_eq!(
+            mode & 0o170000,
+            s_ififo,
+            "st_mode should have S_IFIFO type, got {:#o}",
+            mode
+        );
     }
 }
