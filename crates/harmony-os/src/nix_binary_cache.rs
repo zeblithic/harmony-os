@@ -126,6 +126,14 @@ impl BinaryCacheServer {
     }
 
     /// Drain recorded miss hashes for background fetch processing.
+    ///
+    /// Returns 32-character store hash strings (not full store path names).
+    /// These **cannot** be passed directly to `NixStoreFetcher::fetch_nar`,
+    /// which expects the full `<hash>-<name>` format. A consumer must:
+    ///
+    /// 1. Fetch `{cache_url}/{hash}.narinfo` to discover the full `StorePath`
+    /// 2. Fetch + decompress + verify the NAR via the existing fetcher logic
+    /// 3. Call [`Self::import_nar`] with the full name and NAR bytes
     pub fn drain_misses(&mut self) -> Vec<String> {
         core::mem::take(&mut self.misses).into_iter().collect()
     }

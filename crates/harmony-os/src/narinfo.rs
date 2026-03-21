@@ -66,9 +66,9 @@ impl NarInfo {
 /// Produces 5 fields: StorePath, URL, Compression, NarHash, NarSize.
 /// The NAR is served uncompressed (`Compression: none`).
 ///
-/// `nar_sha256` must be the raw 32-byte SHA-256 digest of the NAR blob.
+/// `nar_sha256` is the raw 32-byte SHA-256 digest of the NAR blob.
 #[cfg(feature = "std")]
-pub fn serialize_narinfo(store_path_name: &str, nar_sha256: &[u8], nar_size: u64) -> String {
+pub fn serialize_narinfo(store_path_name: &str, nar_sha256: &[u8; 32], nar_size: u64) -> String {
     use crate::nix_base32::encode_nix_base32;
 
     let hash_b32 = encode_nix_base32(nar_sha256);
@@ -167,7 +167,7 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
         #[test]
         fn serialize_minimal_narinfo() {
             let hash = sha2::Sha256::digest(b"test nar data");
-            let text = serialize_narinfo("abc123-hello", hash.as_slice(), 13);
+            let text = serialize_narinfo("abc123-hello", &hash.into(), 13);
 
             assert!(text.contains("StorePath: /nix/store/abc123-hello\n"));
             assert!(text.contains("URL: nar/abc123-hello.nar\n"));
@@ -180,7 +180,7 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
         fn serialize_round_trip() {
             let nar_data = b"some nar content for round trip";
             let hash = sha2::Sha256::digest(nar_data);
-            let text = serialize_narinfo("xyz789-world", hash.as_slice(), nar_data.len() as u64);
+            let text = serialize_narinfo("xyz789-world", &hash.into(), nar_data.len() as u64);
 
             // Parse it back with the existing parser.
             let parsed = NarInfo::parse(&text).unwrap();
@@ -193,7 +193,7 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
         #[test]
         fn serialize_store_path_format() {
             let hash = sha2::Sha256::digest(b"data");
-            let text = serialize_narinfo("test123-pkg", hash.as_slice(), 4);
+            let text = serialize_narinfo("test123-pkg", &hash.into(), 4);
             let store_line = text.lines().find(|l| l.starts_with("StorePath:")).unwrap();
             assert_eq!(store_line, "StorePath: /nix/store/test123-pkg");
         }
