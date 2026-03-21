@@ -1201,8 +1201,14 @@ enum FdKind {
     PipeRead { pipe_id: usize },
     /// Write end of a pipe.
     PipeWrite { pipe_id: usize },
-    /// eventfd descriptor.
-    EventFd { counter: u64, semaphore: bool },
+    /// eventfd descriptor (shared state via eventfd_id indirection).
+    EventFd { eventfd_id: usize },
+}
+
+/// Shared state for an eventfd instance.
+struct EventFdState {
+    counter: u64,
+    semaphore: bool,
 }
 
 /// Per-fd state: the kind of object and descriptor-level flags.
@@ -1251,6 +1257,8 @@ pub struct Linuxulator<B: SyscallBackend> {
     pipes: BTreeMap<usize, Vec<u8>>,
     /// Next pipe_id to allocate.
     next_pipe_id: usize,
+    eventfds: BTreeMap<usize, EventFdState>,
+    next_eventfd_id: usize,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -1277,6 +1285,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
             fid_refcount: BTreeMap::new(),
             pipes: BTreeMap::new(),
             next_pipe_id: 0,
+            eventfds: BTreeMap::new(),
+            next_eventfd_id: 0,
         }
     }
 
@@ -1604,11 +1614,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 count as i64
             }
             FdKind::PipeRead { .. } => EBADF,
-            FdKind::EventFd { counter, .. } => {
+            FdKind::EventFd { eventfd_id } => {
                 if count < 8 {
                     return EINVAL;
                 }
-                // Read the 8-byte LE u64 value from user buffer.
+
                 let val = {
                     let mut val_bytes = [0u8; 8];
                     unsafe {
@@ -1623,18 +1633,16 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 if val == u64::MAX {
                     return EINVAL;
                 }
-                if counter.checked_add(val).is_none() || counter + val > 0xFFFFFFFFFFFFFFFE {
+                let state = match self.eventfds.get(&eventfd_id) {
+                    Some(s) => s,
+                    None => return EBADF,
+                };
+                if state.counter.checked_add(val).is_none()
+                    || state.counter + val > 0xFFFFFFFFFFFFFFFE
+                {
                     return EAGAIN;
                 }
-                // Update counter.
-                if let Some(entry) = self.fd_table.get_mut(&fd) {
-                    if let FdKind::EventFd {
-                        counter: ref mut c, ..
-                    } = entry.kind
-                    {
-                        *c += val;
-                    }
-                }
+                self.eventfds.get_mut(&eventfd_id).unwrap().counter += val;
                 8
             }
             FdKind::File { fid, offset, .. } => {
@@ -1693,32 +1701,28 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 }
             }
             FdKind::PipeWrite { .. } => EBADF,
-            FdKind::EventFd { counter, semaphore } => {
+            FdKind::EventFd { eventfd_id } => {
                 if count < 8 {
                     return EINVAL;
                 }
-                if counter == 0 {
+
+                let state = match self.eventfds.get(&eventfd_id) {
+                    Some(s) => s,
+                    None => return EBADF,
+                };
+                if state.counter == 0 {
                     return EAGAIN;
                 }
-                let (val, new_counter) = if semaphore {
-                    (1u64, counter - 1)
+                let (val, new_counter) = if state.semaphore {
+                    (1u64, state.counter - 1)
                 } else {
-                    (counter, 0u64)
+                    (state.counter, 0u64)
                 };
-                // Write the 8-byte LE u64 to user buffer.
                 let val_bytes = val.to_le_bytes();
                 unsafe {
                     core::ptr::copy_nonoverlapping(val_bytes.as_ptr(), buf_ptr as *mut u8, 8);
                 }
-                // Update the counter in the fd table.
-                if let Some(entry) = self.fd_table.get_mut(&fd) {
-                    if let FdKind::EventFd {
-                        counter: ref mut c, ..
-                    } = entry.kind
-                    {
-                        *c = new_counter;
-                    }
-                }
+                self.eventfds.get_mut(&eventfd_id).unwrap().counter = new_counter;
                 8
             }
             FdKind::File {
@@ -1784,7 +1788,15 @@ impl<B: SyscallBackend> Linuxulator<B> {
                     self.pipes.remove(&pipe_id);
                 }
             }
-            FdKind::EventFd { .. } => { /* nothing to clean up */ }
+            FdKind::EventFd { eventfd_id } => {
+                // Clean up if no other fd references this eventfd.
+                let still_referenced = self.fd_table.values().any(
+                    |e| matches!(&e.kind, FdKind::EventFd { eventfd_id: id } if *id == eventfd_id),
+                );
+                if !still_referenced {
+                    self.eventfds.remove(&eventfd_id);
+                }
+            }
         }
         0
     }
@@ -1940,6 +1952,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
     ///
     /// `pipe(2)` is dispatched as `pipe2(fds, 0)`.
     fn sys_pipe2(&mut self, fds_ptr: u64, flags: i32) -> i64 {
+        if fds_ptr == 0 {
+            return EFAULT;
+        }
+        // NOTE: O_NONBLOCK is accepted to avoid EINVAL for callers that set it,
+        // but this synchronous emulator always returns EAGAIN when no data is
+        // available (true blocking is not yet supported).
         // Only O_CLOEXEC and O_NONBLOCK are valid flags.
         let valid_flags = O_CLOEXEC | O_NONBLOCK;
         if flags & !valid_flags != 0 {
@@ -2005,14 +2023,21 @@ impl<B: SyscallBackend> Linuxulator<B> {
         };
         let semaphore = flags & EFD_SEMAPHORE != 0;
 
+        let eventfd_id = self.next_eventfd_id;
+        self.next_eventfd_id += 1;
+        self.eventfds.insert(
+            eventfd_id,
+            EventFdState {
+                counter: initval as u64,
+                semaphore,
+            },
+        );
+
         let fd = self.alloc_fd();
         self.fd_table.insert(
             fd,
             FdEntry {
-                kind: FdKind::EventFd {
-                    counter: initval as u64,
-                    semaphore,
-                },
+                kind: FdKind::EventFd { eventfd_id },
                 flags: fd_flags,
             },
         );
@@ -3236,14 +3261,6 @@ impl<B: SyscallBackend> Linuxulator<B> {
 mod tests {
     use super::*;
     use alloc::vec;
-
-    /// Extract the 9P fid from a File-backed fd (panics for non-File kinds).
-    fn test_fid(lx: &Linuxulator<impl SyscallBackend>, fd: i32) -> Fid {
-        match &lx.fd_table.get(&fd).unwrap().kind {
-            FdKind::File { fid, .. } => *fid,
-            _ => panic!("expected File fd for fd {fd}"),
-        }
-    }
 
     #[test]
     fn mock_backend_records_write() {
