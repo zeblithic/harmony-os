@@ -167,6 +167,16 @@ impl NixStoreServer {
         core::mem::take(&mut self.misses).into_iter().collect()
     }
 
+    /// Retrieve the raw NAR blob for a store path.
+    pub fn get_nar_blob(&self, name: &str) -> Option<&[u8]> {
+        self.store_paths.get(name).map(|sp| sp.nar_blob.as_slice())
+    }
+
+    /// Iterate over all imported store path names.
+    pub fn store_path_names(&self) -> impl Iterator<Item = &Arc<str>> {
+        self.store_paths.keys()
+    }
+
     /// Build the full path string for qpath computation from a payload.
     fn full_path(payload: &NixFidPayload) -> String {
         match payload {
@@ -765,6 +775,31 @@ mod tests {
         // BTreeSet deduplicates at source.
         assert_eq!(misses.len(), 1);
         assert_eq!(&*misses[0], "same-pkg");
+    }
+
+    #[test]
+    fn get_nar_blob_returns_raw_bytes() {
+        let mut srv = NixStoreServer::new();
+        let nar = nar_regular_file(b"blob content", false);
+        srv.import_nar("abc123-hello", nar.clone()).unwrap();
+
+        let blob = srv.get_nar_blob("abc123-hello").unwrap();
+        assert_eq!(blob, &nar);
+
+        // Non-existent path returns None.
+        assert!(srv.get_nar_blob("nonexistent").is_none());
+    }
+
+    #[test]
+    fn store_path_names_iterates_all() {
+        let mut srv = NixStoreServer::new();
+        srv.import_nar("aaa-first", nar_regular_file(b"a", false))
+            .unwrap();
+        srv.import_nar("zzz-last", nar_regular_file(b"z", false))
+            .unwrap();
+
+        let names: Vec<&str> = srv.store_path_names().map(|n| n.as_ref()).collect();
+        assert_eq!(names, vec!["aaa-first", "zzz-last"]); // BTreeMap = sorted
     }
 
     #[test]
