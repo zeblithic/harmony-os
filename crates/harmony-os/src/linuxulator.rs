@@ -35,6 +35,7 @@ const CLOCK_MONOTONIC: i32 = 1;
 // File descriptor flags
 const FD_CLOEXEC: u32 = 1;
 const O_CLOEXEC: i32 = 0o2000000;
+const O_NONBLOCK: i32 = 0o4000;
 
 fn ipc_err_to_errno(e: IpcError) -> i64 {
     match e {
@@ -254,6 +255,13 @@ pub enum LinuxSyscall {
         newfd: i32,
         flags: i32,
     },
+    Pipe2 {
+        fds: u64,
+        flags: u64,
+    },
+    Pipe {
+        fds: u64,
+    },
     Unknown {
         nr: u64,
     },
@@ -312,6 +320,7 @@ impl LinuxSyscall {
                 iov: args[1],
                 iovcnt: args[2] as i32,
             },
+            22 => LinuxSyscall::Pipe { fds: args[0] },
             28 => LinuxSyscall::Madvise {
                 addr: args[0],
                 len: args[1],
@@ -429,6 +438,10 @@ impl LinuxSyscall {
                 newfd: args[1] as i32,
                 flags: args[2] as i32,
             },
+            293 => LinuxSyscall::Pipe2 {
+                fds: args[0],
+                flags: args[1],
+            },
             302 => LinuxSyscall::Prlimit64 {
                 pid: args[0] as i32,
                 resource: args[1] as i32,
@@ -495,6 +508,10 @@ impl LinuxSyscall {
                 flags: args[2] as i32,
             },
             57 => LinuxSyscall::Close { fd: args[0] as i32 },
+            59 => LinuxSyscall::Pipe2 {
+                fds: args[0],
+                flags: args[1],
+            },
             61 => LinuxSyscall::Getdents64 {
                 fd: args[0] as i32,
                 dirp: args[1],
@@ -1157,7 +1174,6 @@ fn prot_to_page_flags(prot: i32) -> PageFlags {
 
 /// What kind of object backs a file descriptor.
 #[derive(Clone)]
-#[allow(dead_code)] // PipeRead/PipeWrite/EventFd used by upcoming pipe/eventfd tasks
 enum FdKind {
     /// A 9P-backed file (regular, directory, char device, etc.).
     File {
@@ -1172,6 +1188,7 @@ enum FdKind {
     /// Write end of a pipe.
     PipeWrite { pipe_id: usize },
     /// eventfd descriptor.
+    #[allow(dead_code)] // constructed by upcoming eventfd task
     EventFd { counter: u64, semaphore: bool },
 }
 
@@ -1218,10 +1235,8 @@ pub struct Linuxulator<B: SyscallBackend> {
     /// (via dup/dup2/dup3). A fid is only clunked when its refcount reaches 0.
     fid_refcount: BTreeMap<Fid, u32>,
     /// Pipe buffers keyed by pipe_id.
-    #[allow(dead_code)] // used by upcoming pipe task
     pipes: BTreeMap<usize, Vec<u8>>,
     /// Next pipe_id to allocate.
-    #[allow(dead_code)] // used by upcoming pipe task
     next_pipe_id: usize,
 }
 
@@ -1537,6 +1552,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 newfd,
                 flags,
             } => self.sys_dup3(oldfd, newfd, flags),
+            LinuxSyscall::Pipe2 { fds, flags } => self.sys_pipe2(fds, flags as i32),
+            LinuxSyscall::Pipe { fds } => self.sys_pipe2(fds, 0),
             LinuxSyscall::Unknown { .. } => ENOSYS,
         }
     }
@@ -1789,6 +1806,59 @@ impl<B: SyscallBackend> Linuxulator<B> {
         };
         self.dup_fd_to(oldfd, newfd, fd_flags);
         newfd as i64
+    }
+
+    /// Linux pipe2(2): create a pipe with flags.
+    ///
+    /// Allocates a new pipe buffer and two fds (read end at `fds[0]`, write
+    /// end at `fds[1]`). Writes the fd pair as two `i32` values to user
+    /// memory at `fds_ptr`.
+    ///
+    /// `pipe(2)` is dispatched as `pipe2(fds, 0)`.
+    fn sys_pipe2(&mut self, fds_ptr: u64, flags: i32) -> i64 {
+        // Only O_CLOEXEC and O_NONBLOCK are valid flags.
+        let valid_flags = O_CLOEXEC | O_NONBLOCK;
+        if flags & !valid_flags != 0 {
+            return EINVAL;
+        }
+
+        let fd_flags = if flags & O_CLOEXEC != 0 {
+            FD_CLOEXEC
+        } else {
+            0
+        };
+
+        // Allocate pipe buffer.
+        let pipe_id = self.next_pipe_id;
+        self.next_pipe_id += 1;
+        self.pipes.insert(pipe_id, Vec::new());
+
+        // Allocate two fds: read end first, then write end.
+        let read_fd = self.alloc_fd();
+        self.fd_table.insert(
+            read_fd,
+            FdEntry {
+                kind: FdKind::PipeRead { pipe_id },
+                flags: fd_flags,
+            },
+        );
+
+        let write_fd = self.alloc_fd();
+        self.fd_table.insert(
+            write_fd,
+            FdEntry {
+                kind: FdKind::PipeWrite { pipe_id },
+                flags: fd_flags,
+            },
+        );
+
+        // Write the fd pair to user memory: [read_fd: i32, write_fd: i32].
+        let mut fd_buf = [0u8; 8];
+        fd_buf[0..4].copy_from_slice(&read_fd.to_le_bytes());
+        fd_buf[4..8].copy_from_slice(&write_fd.to_le_bytes());
+        self.backend.vm_write_bytes(fds_ptr, &fd_buf);
+
+        0
     }
 
     /// Linux fstat(2): get file status.
@@ -6676,6 +6746,98 @@ mod integration_tests {
                 fd: 3,
                 cmd: 2,
                 arg: 1
+            }
+        ));
+    }
+
+    // ── sys_pipe2 / sys_pipe tests ───────────────────────────────────
+
+    #[test]
+    fn test_pipe2_creates_fds() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // Stack buffer to receive the two i32 fds.
+        let mut fds = [0i32; 2];
+        let result = lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0,
+        });
+        assert_eq!(result, 0);
+        // Read back the fds written to our buffer.
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+        assert!(read_fd >= 0);
+        assert!(write_fd >= 0);
+        assert_ne!(read_fd, write_fd);
+        // Both fds should be in the fd table.
+        assert!(lx.has_fd(read_fd));
+        assert!(lx.has_fd(write_fd));
+    }
+
+    #[test]
+    fn test_pipe2_cloexec() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let mut fds = [0i32; 2];
+        let result = lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: O_CLOEXEC as u64,
+        });
+        assert_eq!(result, 0);
+        // Verify FD_CLOEXEC is set on both fds via fcntl F_GETFD.
+        let read_flags = lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: fds[0],
+            cmd: 1, // F_GETFD
+            arg: 0,
+        });
+        let write_flags = lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: fds[1],
+            cmd: 1, // F_GETFD
+            arg: 0,
+        });
+        assert_eq!(read_flags, FD_CLOEXEC as i64);
+        assert_eq!(write_flags, FD_CLOEXEC as i64);
+    }
+
+    #[test]
+    fn test_pipe2_invalid_flags() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let mut fds = [0i32; 2];
+        // Pass an invalid flag (0x1 is not O_CLOEXEC or O_NONBLOCK).
+        let result = lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0x1,
+        });
+        assert_eq!(result, EINVAL);
+    }
+
+    #[test]
+    fn from_x86_64_pipe() {
+        let syscall = LinuxSyscall::from_x86_64(22, [0x1000, 0, 0, 0, 0, 0]);
+        assert!(matches!(syscall, LinuxSyscall::Pipe { fds: 0x1000 }));
+    }
+
+    #[test]
+    fn from_x86_64_pipe2() {
+        let syscall = LinuxSyscall::from_x86_64(293, [0x2000, 0o2000000, 0, 0, 0, 0]);
+        assert!(matches!(
+            syscall,
+            LinuxSyscall::Pipe2 {
+                fds: 0x2000,
+                flags: 0o2000000
+            }
+        ));
+    }
+
+    #[test]
+    fn from_aarch64_pipe2() {
+        let syscall = LinuxSyscall::from_aarch64(59, [0x3000, 0o4000, 0, 0, 0, 0]);
+        assert!(matches!(
+            syscall,
+            LinuxSyscall::Pipe2 {
+                fds: 0x3000,
+                flags: 0o4000
             }
         ));
     }
