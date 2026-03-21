@@ -1129,12 +1129,20 @@ fn flags_to_open_mode(flags: i32) -> OpenMode {
 ///   60      4     __pad2
 ///   64      8     st_blocks
 ///   72-128        timestamps (zeroed for MVP)
+///
+/// If `mode_override` is `Some`, it replaces the mode derived from
+/// `stat.file_type`. Used by pipe fstat to set `S_IFIFO` without
+/// adding a `Fifo` variant to the microkernel's `FileType` enum.
 fn write_linux_stat(buf_ptr: usize, stat: &FileStat) {
-    let mode: u32 = match stat.file_type {
+    write_linux_stat_with_mode(buf_ptr, stat, None);
+}
+
+fn write_linux_stat_with_mode(buf_ptr: usize, stat: &FileStat, mode_override: Option<u32>) {
+    let mode: u32 = mode_override.unwrap_or(match stat.file_type {
         FileType::Regular => 0o100000 | 0o644,   // S_IFREG | rw-r--r--
         FileType::Directory => 0o040000 | 0o755, // S_IFDIR | rwxr-xr-x
         FileType::CharDev => 0o020000 | 0o666,   // S_IFCHR | rw-rw-rw-
-    };
+    });
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -2061,32 +2069,18 @@ impl<B: SyscallBackend> Linuxulator<B> {
         };
         match kind {
             FdKind::PipeRead { .. } | FdKind::PipeWrite { .. } => {
-                // Synthetic stat with S_IFIFO — programs like bash use this to
-                // detect pipe fds. Bypass write_linux_stat (which maps FileType).
-                let mode: u32 = 0o010000 | 0o644; // S_IFIFO | rw-r--r--
-                let qpath = fd as u64;
-                write_linux_stat(
+                // Synthetic stat with S_IFIFO — programs like bash use this
+                // to detect pipe fds.
+                write_linux_stat_with_mode(
                     statbuf_ptr,
                     &FileStat {
-                        qpath,
+                        qpath: fd as u64,
                         name: alloc::sync::Arc::from("pipe"),
                         size: 0,
-                        file_type: FileType::Regular, // unused — we override mode below
+                        file_type: FileType::Regular, // ignored — mode_override used
                     },
+                    Some(0o010000 | 0o644), // S_IFIFO | rw-r--r--
                 );
-                // Overwrite st_mode with S_IFIFO (write_linux_stat wrote S_IFREG).
-                #[cfg(target_arch = "x86_64")]
-                {
-                    let buf =
-                        unsafe { core::slice::from_raw_parts_mut(statbuf_ptr as *mut u8, 144) };
-                    buf[24..28].copy_from_slice(&mode.to_le_bytes());
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    let buf =
-                        unsafe { core::slice::from_raw_parts_mut(statbuf_ptr as *mut u8, 128) };
-                    buf[16..20].copy_from_slice(&mode.to_le_bytes());
-                }
                 0
             }
             FdKind::EventFd { .. } => {
