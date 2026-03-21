@@ -21,6 +21,8 @@ pub mod nar_publisher;
 pub mod narinfo;
 pub mod nix_base32;
 #[cfg(feature = "std")]
+pub mod nix_binary_cache;
+#[cfg(feature = "std")]
 pub mod nix_store_fetcher;
 #[cfg(feature = "std")]
 pub mod persistent_nar_store;

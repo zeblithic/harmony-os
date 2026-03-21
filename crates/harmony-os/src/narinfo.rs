@@ -61,6 +61,38 @@ impl NarInfo {
     }
 }
 
+/// Generate a minimal unsigned narinfo string.
+///
+/// Produces 5 fields: StorePath, URL, Compression, NarHash, NarSize.
+/// The NAR is served uncompressed (`Compression: none`).
+///
+/// `nar_sha256` is the raw 32-byte SHA-256 digest of the NAR blob.
+///
+/// # Panics
+///
+/// Panics if `store_path_name` contains `\n`, `\r`, or `\0` (would
+/// allow narinfo field injection).
+#[cfg(feature = "std")]
+pub fn serialize_narinfo(store_path_name: &str, nar_sha256: &[u8; 32], nar_size: u64) -> String {
+    use crate::nix_base32::encode_nix_base32;
+
+    assert!(
+        !store_path_name.contains('\n')
+            && !store_path_name.contains('\r')
+            && !store_path_name.contains('\0'),
+        "store_path_name must not contain control characters: {store_path_name:?}"
+    );
+
+    let hash_b32 = encode_nix_base32(nar_sha256);
+    format!(
+        "StorePath: /nix/store/{store_path_name}\n\
+         URL: nar/{store_path_name}.nar\n\
+         Compression: none\n\
+         NarHash: sha256:{hash_b32}\n\
+         NarSize: {nar_size}\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +169,52 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
         let input = "URL: nar/a.nar.zst\nCompression: zstd\nNarHash: sha256:abc\nNarSize: 10\n";
         let info = NarInfo::parse(input).unwrap();
         assert_eq!(info.compression, "zstd");
+    }
+
+    #[cfg(feature = "std")]
+    mod serialize_tests {
+        use super::super::*;
+        use sha2::Digest;
+
+        #[test]
+        fn serialize_minimal_narinfo() {
+            let hash = sha2::Sha256::digest(b"test nar data");
+            let text = serialize_narinfo("abc123-hello", &hash.into(), 13);
+
+            assert!(text.contains("StorePath: /nix/store/abc123-hello\n"));
+            assert!(text.contains("URL: nar/abc123-hello.nar\n"));
+            assert!(text.contains("Compression: none\n"));
+            assert!(text.contains("NarHash: sha256:"));
+            assert!(text.contains("NarSize: 13\n"));
+        }
+
+        #[test]
+        fn serialize_round_trip() {
+            let nar_data = b"some nar content for round trip";
+            let hash = sha2::Sha256::digest(nar_data);
+            let text = serialize_narinfo("xyz789-world", &hash.into(), nar_data.len() as u64);
+
+            // Parse it back with the existing parser.
+            let parsed = NarInfo::parse(&text).unwrap();
+            assert_eq!(parsed.url, "nar/xyz789-world.nar");
+            assert_eq!(parsed.compression, "none");
+            assert_eq!(parsed.nar_size, nar_data.len() as u64);
+            assert!(parsed.nar_hash.starts_with("sha256:"));
+        }
+
+        #[test]
+        fn serialize_store_path_format() {
+            let hash = sha2::Sha256::digest(b"data");
+            let text = serialize_narinfo("test123-pkg", &hash.into(), 4);
+            let store_line = text.lines().find(|l| l.starts_with("StorePath:")).unwrap();
+            assert_eq!(store_line, "StorePath: /nix/store/test123-pkg");
+        }
+
+        #[test]
+        #[should_panic(expected = "control characters")]
+        fn serialize_rejects_newline_injection() {
+            let hash = sha2::Sha256::digest(b"data");
+            serialize_narinfo("abc123-pkg\nURL: nar/fake.nar\njunk", &hash.into(), 4);
+        }
     }
 }

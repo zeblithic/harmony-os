@@ -49,6 +49,31 @@ pub fn decode_nix_base32(input: &str) -> Result<Vec<u8>, NixBase32Error> {
     Ok(out)
 }
 
+/// Encode bytes as a Nix base32 string.
+///
+/// Inverse of [`decode_nix_base32`]. Uses the same non-standard alphabet
+/// and LSB-first bit ordering within each 5-bit group.
+pub fn encode_nix_base32(bytes: &[u8]) -> alloc::string::String {
+    let hash_size = bytes.len();
+    if hash_size == 0 {
+        return alloc::string::String::new();
+    }
+    let nchar = (hash_size * 8).div_ceil(5);
+    let mut out = alloc::string::String::with_capacity(nchar);
+    for i in (0..nchar).rev() {
+        let mut digit: u8 = 0;
+        for j in (0..5).rev() {
+            let bit_pos = i * 5 + j;
+            digit <<= 1;
+            if bit_pos / 8 < hash_size {
+                digit |= (bytes[bit_pos / 8] >> (bit_pos % 8)) & 1;
+            }
+        }
+        out.push(NIX_BASE32_CHARS[digit as usize] as char);
+    }
+    out
+}
+
 /// Errors from Nix base32 decoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NixBase32Error {
@@ -91,5 +116,33 @@ mod tests {
     fn empty_input() {
         let decoded = decode_nix_base32("").unwrap();
         assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn encode_known_sha256() {
+        // SHA-256 of empty string — must match the decode test vector above.
+        let hash_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let hash_bytes: Vec<u8> = (0..32)
+            .map(|i| u8::from_str_radix(&hash_hex[i * 2..i * 2 + 2], 16).unwrap())
+            .collect();
+
+        let encoded = encode_nix_base32(&hash_bytes);
+        assert_eq!(
+            encoded,
+            "0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73"
+        );
+    }
+
+    #[test]
+    fn encode_decode_round_trip() {
+        let data = b"round trip test data for nix b32";
+        let encoded = encode_nix_base32(data);
+        let decoded = decode_nix_base32(&encoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn encode_empty() {
+        assert_eq!(encode_nix_base32(&[]), "");
     }
 }
