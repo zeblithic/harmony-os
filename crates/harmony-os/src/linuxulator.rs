@@ -31,8 +31,6 @@ const ERANGE: i64 = -34;
 const ENOSYS: i64 = -38;
 const EOVERFLOW: i64 = -75;
 const EAFNOSUPPORT: i64 = -97;
-// Reserved for Task 2 (socket lifecycle — bind/listen/accept/connect).
-#[allow(dead_code)]
 const ENOTSOCK: i64 = -88;
 #[allow(dead_code)]
 const EEXIST: i64 = -17;
@@ -280,6 +278,35 @@ pub enum LinuxSyscall {
         sock_type: i32,
         protocol: i32,
     },
+    Bind {
+        fd: i32,
+        addr: u64,
+        addrlen: u32,
+    },
+    Listen {
+        fd: i32,
+        backlog: i32,
+    },
+    Accept4 {
+        fd: i32,
+        addr: u64,
+        addrlen: u64,
+        flags: i32,
+    },
+    Accept {
+        fd: i32,
+        addr: u64,
+        addrlen: u64,
+    },
+    Connect {
+        fd: i32,
+        addr: u64,
+        addrlen: u32,
+    },
+    Shutdown {
+        fd: i32,
+        how: i32,
+    },
     Unknown {
         nr: u64,
     },
@@ -356,6 +383,35 @@ impl LinuxSyscall {
                 domain: args[0] as i32,
                 sock_type: args[1] as i32,
                 protocol: args[2] as i32,
+            },
+            42 => LinuxSyscall::Connect {
+                fd: args[0] as i32,
+                addr: args[1],
+                addrlen: args[2] as u32,
+            },
+            43 => LinuxSyscall::Accept {
+                fd: args[0] as i32,
+                addr: args[1],
+                addrlen: args[2],
+            },
+            48 => LinuxSyscall::Shutdown {
+                fd: args[0] as i32,
+                how: args[1] as i32,
+            },
+            49 => LinuxSyscall::Bind {
+                fd: args[0] as i32,
+                addr: args[1],
+                addrlen: args[2] as u32,
+            },
+            50 => LinuxSyscall::Listen {
+                fd: args[0] as i32,
+                backlog: args[1] as i32,
+            },
+            288 => LinuxSyscall::Accept4 {
+                fd: args[0] as i32,
+                addr: args[1],
+                addrlen: args[2],
+                flags: args[3] as i32,
             },
             60 => LinuxSyscall::Exit {
                 code: args[0] as i32,
@@ -634,6 +690,35 @@ impl LinuxSyscall {
                 domain: args[0] as i32,
                 sock_type: args[1] as i32,
                 protocol: args[2] as i32,
+            },
+            200 => LinuxSyscall::Bind {
+                fd: args[0] as i32,
+                addr: args[1],
+                addrlen: args[2] as u32,
+            },
+            201 => LinuxSyscall::Listen {
+                fd: args[0] as i32,
+                backlog: args[1] as i32,
+            },
+            202 => LinuxSyscall::Accept {
+                fd: args[0] as i32,
+                addr: args[1],
+                addrlen: args[2],
+            },
+            203 => LinuxSyscall::Connect {
+                fd: args[0] as i32,
+                addr: args[1],
+                addrlen: args[2] as u32,
+            },
+            210 => LinuxSyscall::Shutdown {
+                fd: args[0] as i32,
+                how: args[1] as i32,
+            },
+            242 => LinuxSyscall::Accept4 {
+                fd: args[0] as i32,
+                addr: args[1],
+                addrlen: args[2],
+                flags: args[3] as i32,
             },
             214 => LinuxSyscall::Brk { addr: args[0] },
             215 => LinuxSyscall::Munmap {
@@ -1244,8 +1329,6 @@ struct EventFdState {
 }
 
 /// Shared state for a socket instance.
-// Fields will be read by Task 2 (bind/listen/accept/connect).
-#[allow(dead_code)]
 struct SocketState {
     domain: i32,
     sock_type: i32,
@@ -1632,6 +1715,17 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 sock_type,
                 protocol,
             } => self.sys_socket(domain, sock_type, protocol),
+            LinuxSyscall::Bind { fd, addr, addrlen } => self.sys_bind(fd, addr, addrlen),
+            LinuxSyscall::Listen { fd, backlog } => self.sys_listen(fd, backlog),
+            LinuxSyscall::Accept4 {
+                fd,
+                addr,
+                addrlen,
+                flags,
+            } => self.sys_accept4(fd, addr, addrlen, flags),
+            LinuxSyscall::Accept { fd, addr, addrlen } => self.sys_accept4(fd, addr, addrlen, 0),
+            LinuxSyscall::Connect { fd, addr, addrlen } => self.sys_connect(fd, addr, addrlen),
+            LinuxSyscall::Shutdown { fd, how } => self.sys_shutdown(fd, how),
             LinuxSyscall::Unknown { .. } => ENOSYS,
         }
     }
@@ -2175,6 +2269,124 @@ impl<B: SyscallBackend> Linuxulator<B> {
             },
         );
         fd as i64
+    }
+
+    /// Helper: validate fd is a Socket, return ENOTSOCK/EBADF otherwise.
+    fn require_socket(&self, fd: i32) -> Result<usize, i64> {
+        match self.fd_table.get(&fd) {
+            Some(FdEntry {
+                kind: FdKind::Socket { socket_id },
+                ..
+            }) => Ok(*socket_id),
+            Some(_) => Err(ENOTSOCK),
+            None => Err(EBADF),
+        }
+    }
+
+    /// Linux bind(2): stub — no-op.
+    fn sys_bind(&self, fd: i32, _addr: u64, _addrlen: u32) -> i64 {
+        match self.require_socket(fd) {
+            Ok(_) => 0,
+            Err(e) => e,
+        }
+    }
+
+    /// Linux listen(2): mark socket as listening.
+    fn sys_listen(&mut self, fd: i32, _backlog: i32) -> i64 {
+        match self.require_socket(fd) {
+            Ok(socket_id) => {
+                if let Some(state) = self.sockets.get_mut(&socket_id) {
+                    state.listening = true;
+                }
+                0
+            }
+            Err(e) => e,
+        }
+    }
+
+    /// Linux accept4(2): create a new stub socket fd from a listening socket.
+    fn sys_accept4(&mut self, fd: i32, addr: u64, addrlen_ptr: u64, flags: i32) -> i64 {
+        let socket_id = match self.require_socket(fd) {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+
+        let listening = self.sockets.get(&socket_id).is_some_and(|s| s.listening);
+        if !listening {
+            return EINVAL;
+        }
+
+        let (domain, sock_type) = match self.sockets.get(&socket_id) {
+            Some(s) => (s.domain, s.sock_type),
+            None => return EINVAL,
+        };
+
+        // Zero the sockaddr if caller provided one.
+        if addr != 0 && addrlen_ptr != 0 {
+            let addrlen_bytes =
+                unsafe { core::slice::from_raw_parts(addrlen_ptr as usize as *const u8, 4) };
+            let addrlen = u32::from_ne_bytes([
+                addrlen_bytes[0],
+                addrlen_bytes[1],
+                addrlen_bytes[2],
+                addrlen_bytes[3],
+            ]) as usize;
+            let zero_len = addrlen.min(128);
+            if zero_len > 0 {
+                let addr_buf =
+                    unsafe { core::slice::from_raw_parts_mut(addr as usize as *mut u8, zero_len) };
+                addr_buf.fill(0);
+            }
+            let addrlen_out =
+                unsafe { core::slice::from_raw_parts_mut(addrlen_ptr as usize as *mut u8, 4) };
+            addrlen_out.copy_from_slice(&0u32.to_ne_bytes());
+        }
+
+        // Create new socket state.
+        let new_socket_id = self.next_socket_id;
+        self.next_socket_id += 1;
+        self.sockets.insert(
+            new_socket_id,
+            SocketState {
+                domain,
+                sock_type,
+                listening: false,
+            },
+        );
+
+        let new_fd = self.alloc_fd();
+        const SOCK_CLOEXEC: i32 = 0o2000000;
+        let fd_flags = if flags & SOCK_CLOEXEC != 0 {
+            FD_CLOEXEC
+        } else {
+            0
+        };
+        self.fd_table.insert(
+            new_fd,
+            FdEntry {
+                kind: FdKind::Socket {
+                    socket_id: new_socket_id,
+                },
+                flags: fd_flags,
+            },
+        );
+        new_fd as i64
+    }
+
+    /// Linux connect(2): stub — no-op.
+    fn sys_connect(&self, fd: i32, _addr: u64, _addrlen: u32) -> i64 {
+        match self.require_socket(fd) {
+            Ok(_) => 0,
+            Err(e) => e,
+        }
+    }
+
+    /// Linux shutdown(2): stub — no-op.
+    fn sys_shutdown(&self, fd: i32, _how: i32) -> i64 {
+        match self.require_socket(fd) {
+            Ok(_) => 0,
+            Err(e) => e,
+        }
     }
 
     /// Linux fstat(2): get file status.
@@ -7618,5 +7830,94 @@ mod integration_tests {
             protocol: 0,
         });
         assert_eq!(err, -97); // EAFNOSUPPORT
+    }
+
+    #[test]
+    fn test_socket_lifecycle() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Create socket
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 1,    // AF_UNIX
+            sock_type: 1, // SOCK_STREAM
+            protocol: 0,
+        });
+        assert!(fd >= 0);
+
+        // bind — no-op stub
+        let r = lx.dispatch_syscall(LinuxSyscall::Bind {
+            fd: fd as i32,
+            addr: 0,
+            addrlen: 0,
+        });
+        assert_eq!(r, 0);
+
+        // listen
+        let r = lx.dispatch_syscall(LinuxSyscall::Listen {
+            fd: fd as i32,
+            backlog: 128,
+        });
+        assert_eq!(r, 0);
+
+        // accept4 — creates new fd
+        let client_fd = lx.dispatch_syscall(LinuxSyscall::Accept4 {
+            fd: fd as i32,
+            addr: 0,
+            addrlen: 0,
+            flags: 0,
+        });
+        assert!(client_fd >= 0);
+        assert_ne!(client_fd, fd);
+        assert!(lx.has_fd(client_fd as i32));
+
+        // connect — no-op stub
+        let r = lx.dispatch_syscall(LinuxSyscall::Connect {
+            fd: client_fd as i32,
+            addr: 0,
+            addrlen: 0,
+        });
+        assert_eq!(r, 0);
+
+        // shutdown — no-op stub
+        let r = lx.dispatch_syscall(LinuxSyscall::Shutdown {
+            fd: client_fd as i32,
+            how: 2, // SHUT_RDWR
+        });
+        assert_eq!(r, 0);
+
+        // close both
+        assert_eq!(
+            lx.dispatch_syscall(LinuxSyscall::Close {
+                fd: client_fd as i32
+            }),
+            0
+        );
+        assert_eq!(
+            lx.dispatch_syscall(LinuxSyscall::Close { fd: fd as i32 }),
+            0
+        );
+    }
+
+    #[test]
+    fn test_socket_accept_not_listening() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,
+            sock_type: 1,
+            protocol: 0,
+        });
+        assert!(fd >= 0);
+
+        // accept without listen → EINVAL
+        let r = lx.dispatch_syscall(LinuxSyscall::Accept4 {
+            fd: fd as i32,
+            addr: 0,
+            addrlen: 0,
+            flags: 0,
+        });
+        assert_eq!(r, EINVAL);
     }
 }
