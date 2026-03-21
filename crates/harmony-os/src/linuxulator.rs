@@ -32,7 +32,6 @@ const ENOSYS: i64 = -38;
 const EOVERFLOW: i64 = -75;
 const EAFNOSUPPORT: i64 = -97;
 const ENOTSOCK: i64 = -88;
-#[allow(dead_code)]
 const EEXIST: i64 = -17;
 
 // Clock IDs (shared by clock_gettime and clock_getres)
@@ -2823,6 +2822,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         match op {
             EPOLL_CTL_ADD => {
+                if event_ptr == 0 {
+                    return EFAULT;
+                }
                 let (events, data) = self.read_epoll_event(event_ptr);
                 let state = match self.epolls.get_mut(&epoll_id) {
                     Some(s) => s,
@@ -2835,6 +2837,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 0
             }
             EPOLL_CTL_MOD => {
+                if event_ptr == 0 {
+                    return EFAULT;
+                }
                 let (events, data) = self.read_epoll_event(event_ptr);
                 let state = match self.epolls.get_mut(&epoll_id) {
                     Some(s) => s,
@@ -2938,6 +2943,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         if maxevents <= 0 {
             return EINVAL;
+        }
+
+        if events_ptr == 0 {
+            return EFAULT;
         }
 
         let state = match self.epolls.get(&epoll_id) {
@@ -8844,7 +8853,7 @@ mod integration_tests {
             ])
         }
 
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
         fn data(&self) -> u64 {
             u64::from_ne_bytes([
                 self.buf[8],
@@ -8858,14 +8867,33 @@ mod integration_tests {
             ])
         }
 
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        fn data(&self) -> u64 {
+            u64::from_ne_bytes([
+                self.buf[4],
+                self.buf[5],
+                self.buf[6],
+                self.buf[7],
+                self.buf[8],
+                self.buf[9],
+                self.buf[10],
+                self.buf[11],
+            ])
+        }
+
         #[cfg(target_arch = "x86_64")]
         fn set_data(&mut self, data: u64) {
             self.buf[4..12].copy_from_slice(&data.to_ne_bytes());
         }
 
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
         fn set_data(&mut self, data: u64) {
             self.buf[8..16].copy_from_slice(&data.to_ne_bytes());
+        }
+
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        fn set_data(&mut self, data: u64) {
+            self.buf[4..12].copy_from_slice(&data.to_ne_bytes());
         }
     }
 
