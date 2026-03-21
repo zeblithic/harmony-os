@@ -2792,11 +2792,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         const ENOTCONN: i64 = -107;
         match self.require_socket(fd) {
             Ok(socket_id) => {
-                if self
-                    .sockets
-                    .get(&socket_id)
-                    .is_some_and(|s| s.listening)
-                {
+                if self.sockets.get(&socket_id).is_some_and(|s| s.listening) {
                     return ENOTCONN;
                 }
                 self.zero_sockaddr(addr, addrlen_ptr);
