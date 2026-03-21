@@ -2674,7 +2674,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         _addrlen: u32,
     ) -> i64 {
         match self.require_socket(fd) {
-            Ok(_) => len as i64,
+            Ok(_) => len.min(i64::MAX as u64) as i64,
             Err(e) => e,
         }
     }
@@ -2686,11 +2686,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
         _buf: u64,
         _len: u64,
         _flags: i32,
-        _src: u64,
-        _addrlen: u64,
+        src: u64,
+        addrlen: u64,
     ) -> i64 {
         match self.require_socket(fd) {
-            Ok(_) => 0,
+            Ok(_) => {
+                self.zero_sockaddr(src, addrlen);
+                0
+            }
             Err(e) => e,
         }
     }
@@ -2721,7 +2724,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
     ) -> i64 {
         match self.require_socket(fd) {
             Ok(_) => {
-                if optval != 0 && optlen_ptr != 0 {
+                if optlen_ptr != 0 {
                     let optlen_bytes =
                         unsafe { core::slice::from_raw_parts(optlen_ptr as usize as *const u8, 4) };
                     let optlen = u32::from_ne_bytes([
@@ -2731,13 +2734,13 @@ impl<B: SyscallBackend> Linuxulator<B> {
                         optlen_bytes[3],
                     ]) as usize;
                     let optlen = optlen.min(128);
-                    if optlen > 0 {
+                    if optval != 0 && optlen > 0 {
                         let buf = unsafe {
                             core::slice::from_raw_parts_mut(optval as usize as *mut u8, optlen)
                         };
                         buf.fill(0);
                     }
-                    // Write back actual returned length.
+                    // Always write back actual returned length.
                     let out = unsafe {
                         core::slice::from_raw_parts_mut(optlen_ptr as usize as *mut u8, 4)
                     };
@@ -2784,9 +2787,18 @@ impl<B: SyscallBackend> Linuxulator<B> {
     }
 
     /// Linux getpeername(2): stub — return zeroed sockaddr.
+    /// Returns ENOTCONN for listening sockets (no peer).
     fn sys_getpeername(&self, fd: i32, addr: u64, addrlen_ptr: u64) -> i64 {
+        const ENOTCONN: i64 = -107;
         match self.require_socket(fd) {
-            Ok(_) => {
+            Ok(socket_id) => {
+                if self
+                    .sockets
+                    .get(&socket_id)
+                    .is_some_and(|s| s.listening)
+                {
+                    return ENOTCONN;
+                }
                 self.zero_sockaddr(addr, addrlen_ptr);
                 0
             }
