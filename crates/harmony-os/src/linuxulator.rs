@@ -1611,12 +1611,16 @@ impl<B: SyscallBackend> Linuxulator<B> {
                     return EPIPE;
                 }
                 let pipe_buf = self.pipes.get_mut(&pipe_id).unwrap();
-                if pipe_buf.len() + count > PIPE_BUF_CAP {
+                let avail = PIPE_BUF_CAP.saturating_sub(pipe_buf.len());
+                if avail == 0 {
                     return EAGAIN;
                 }
-                let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
+                // Partial write: clamp to available capacity.
+                let to_write = count.min(avail);
+                let data =
+                    unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, to_write) };
                 pipe_buf.extend_from_slice(data);
-                count as i64
+                to_write as i64
             }
             FdKind::PipeRead { .. } => EBADF,
             FdKind::EventFd { eventfd_id } => {
