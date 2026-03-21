@@ -23,7 +23,7 @@ use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
 
 /// Maximum concurrent ingest sessions. Each session can buffer up to
 /// `BOOK_MAX_SIZE` (1 MB), so steady-state ingest memory is capped at
-/// 4 MB. During finalization, `page_data_from_blob` allocates an
+/// 4 MB. During finalization, `page_data_from_book` allocates an
 /// additional page-buffer of the same size, so the transient peak can
 /// reach ~8 MB if all sessions finalize simultaneously.
 const MAX_CONCURRENT_INGESTS: usize = 4;
@@ -177,10 +177,10 @@ impl ContentServer {
                     return Ok(response);
                 }
 
-                // from_blob can fail with BookError::AllAlgorithmsCollide
+                // from_book can fail with BookError::AllAlgorithmsCollide
                 // (28-bit address space exhaustion). Size is enforced in write(),
                 // so ResourceExhausted maps to the remaining failure mode.
-                let book = match Book::from_blob(cid, &data) {
+                let book = match Book::from_book(cid, &data) {
                     Ok(book) => book,
                     Err(_) => {
                         // Restore buffer so the fid isn't poisoned.
@@ -200,11 +200,11 @@ impl ContentServer {
                 };
 
                 // Split blob into 4KB page buffers (zero-padded).
-                let page_bufs = book.page_data_from_blob(&data);
+                let page_bufs = book.page_data_from_book(&data);
                 debug_assert_eq!(
                     page_bufs.len(),
                     book.pages.len(),
-                    "page_data_from_blob must return exactly one buffer per page"
+                    "page_data_from_book must return exactly one buffer per page"
                 );
 
                 // Two-pass page commit: validate first, then insert.
@@ -258,23 +258,23 @@ impl ContentServer {
     /// ```text
     /// [0..32]  — 256-bit CID (raw bytes)
     /// [32..36] — page_count  as u32 little-endian
-    /// [36..40] — blob_size   as u32 little-endian
+    /// [36..40] — book_size   as u32 little-endian
     /// ```
     fn build_ingest_response(&self, cid: &[u8; 32], book: &Book) -> Result<Vec<u8>, IpcError> {
         let page_count =
             u32::try_from(book.page_count()).map_err(|_| IpcError::ResourceExhausted)?;
-        let blob_size: u32 = book.blob_size;
+        let book_size: u32 = book.book_size;
         let mut response = Vec::with_capacity(40);
         response.extend_from_slice(cid);
         response.extend_from_slice(&page_count.to_le_bytes());
-        response.extend_from_slice(&blob_size.to_le_bytes());
+        response.extend_from_slice(&book_size.to_le_bytes());
         Ok(response)
     }
 
     /// Read blob data by reassembling from stored pages.
     ///
     /// Note: reassembles the full blob on every call (O(N) page lookups,
-    /// O(blob_size) allocation). Callers reading large blobs in small
+    /// O(book_size) allocation). Callers reading large blobs in small
     /// pieces should prefer a single large read or cache locally.
     fn read_blob(&self, cid: &[u8; 32], offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
         let book = self.blobs.get(cid).ok_or(IpcError::NotFound)?;
@@ -536,7 +536,7 @@ impl FileServer for ContentServer {
                 Ok(FileStat {
                     qpath: Self::blob_qpath(cid),
                     name: Arc::from(format_cid_hex(cid).as_str()),
-                    size: book.blob_size as u64,
+                    size: book.book_size as u64,
                     file_type: FileType::Regular,
                 })
             }
@@ -835,11 +835,11 @@ mod tests {
 
         let cid: [u8; 32] = response[..32].try_into().unwrap();
         let page_count = u32::from_le_bytes(response[32..36].try_into().unwrap());
-        let blob_size = u32::from_le_bytes(response[36..40].try_into().unwrap());
+        let book_size = u32::from_le_bytes(response[36..40].try_into().unwrap());
 
         assert_eq!(cid, harmony_athenaeum::sha256_hash(&blob_data));
         assert_eq!(page_count, 1);
-        assert_eq!(blob_size, PAGE_SIZE as u32);
+        assert_eq!(book_size, PAGE_SIZE as u32);
         assert_eq!(server.blob_count(), 1);
         assert_eq!(server.page_count(), 1);
     }
@@ -886,13 +886,13 @@ mod tests {
         server.open(1, OpenMode::ReadWrite).unwrap();
         let blob_data = alloc::vec![0xCCu8; PAGE_SIZE];
         server.write(1, 0, &blob_data).unwrap();
-        // Read only bytes 32..40 (page_count + blob_size portion of response)
+        // Read only bytes 32..40 (page_count + book_size portion of response)
         let slice = server.read(1, 32, 8).unwrap();
         assert_eq!(slice.len(), 8);
         let page_count = u32::from_le_bytes(slice[0..4].try_into().unwrap());
-        let blob_size = u32::from_le_bytes(slice[4..8].try_into().unwrap());
+        let book_size = u32::from_le_bytes(slice[4..8].try_into().unwrap());
         assert_eq!(page_count, 1);
-        assert_eq!(blob_size, PAGE_SIZE as u32);
+        assert_eq!(book_size, PAGE_SIZE as u32);
     }
 
     #[test]
@@ -910,9 +910,9 @@ mod tests {
         assert_eq!(meta.len(), 8);
         // Verify metadata is consistent
         let page_count = u32::from_le_bytes(meta[0..4].try_into().unwrap());
-        let blob_size = u32::from_le_bytes(meta[4..8].try_into().unwrap());
+        let book_size = u32::from_le_bytes(meta[4..8].try_into().unwrap());
         assert_eq!(page_count, 1);
-        assert_eq!(blob_size, PAGE_SIZE as u32);
+        assert_eq!(book_size, PAGE_SIZE as u32);
     }
 
     #[test]
@@ -1043,7 +1043,7 @@ mod tests {
         // Determine what hash_bits a known blob's page would get.
         let blob_data = alloc::vec![0xFFu8; PAGE_SIZE];
         let cid = sha256_hash(&blob_data);
-        let book = Book::from_blob(cid, &blob_data).unwrap();
+        let book = Book::from_book(cid, &blob_data).unwrap();
         let addr = book.pages[0][0]; // algo 0
         let target_hb = addr.hash_bits();
 
@@ -1067,12 +1067,12 @@ mod tests {
         // a blob of exactly PAGE_SIZE bytes should produce exactly 1 page.
         let data = alloc::vec![0xAAu8; PAGE_SIZE];
         let cid = harmony_athenaeum::sha256_hash(&data);
-        let book = harmony_athenaeum::Book::from_blob(cid, &data).unwrap();
+        let book = harmony_athenaeum::Book::from_book(cid, &data).unwrap();
         assert_eq!(book.page_count(), 1);
         // A blob of PAGE_SIZE + 1 should produce exactly 2 pages.
         let data2 = alloc::vec![0xBBu8; PAGE_SIZE + 1];
         let cid2 = harmony_athenaeum::sha256_hash(&data2);
-        let book2 = harmony_athenaeum::Book::from_blob(cid2, &data2).unwrap();
+        let book2 = harmony_athenaeum::Book::from_book(cid2, &data2).unwrap();
         assert_eq!(book2.page_count(), 2);
     }
 

@@ -3,12 +3,12 @@
 //! NarPublisher — publish NAR archives into the Harmony mesh via content-addressed DAG.
 //!
 //! Chunks a NAR file into a Merkle DAG using [`harmony_content::dag::ingest`],
-//! announces the store-path-to-CID mapping and each blob's availability via a
+//! announces the store-path-to-CID mapping and each book's availability via a
 //! pluggable [`ContentAnnouncer`] trait (backed by Zenoh in production).
 
 use std::collections::HashMap;
 
-use harmony_content::blob::{BlobStore, MemoryBlobStore};
+use harmony_content::book::{BookStore, MemoryBookStore};
 use harmony_content::chunker::ChunkerConfig;
 use harmony_content::cid::{CidType, ContentId};
 use harmony_content::dag;
@@ -28,9 +28,9 @@ pub trait ContentAnnouncer {
 /// locally, and announces both the store-path mapping and individual blob
 /// availability via a [`ContentAnnouncer`].
 ///
-/// Generic over the book store backend: defaults to [`MemoryBlobStore`]
+/// Generic over the book store backend: defaults to [`MemoryBookStore`]
 /// for backward compatibility, but accepts [`DiskBookStore`](crate::disk_book_store::DiskBookStore)
-/// (or any `BlobStore` impl) for durable book storage across restarts.
+/// (or any `BookStore` impl) for durable book storage across restarts.
 ///
 /// **Persistence scope:** Only the underlying book chunks are persisted
 /// by the store backend. The in-memory `published_paths` map (store-path
@@ -39,27 +39,27 @@ pub trait ContentAnnouncer {
 /// re-publish paths or separately persist this mapping.
 /// [`PersistentNarStore`](crate::persistent_nar_store::PersistentNarStore)
 /// handles the NAR-level persistence independently.
-pub struct NarPublisher<A: ContentAnnouncer, S: BlobStore = MemoryBlobStore> {
+pub struct NarPublisher<A: ContentAnnouncer, S: BookStore = MemoryBookStore> {
     announcer: A,
     blob_store: S,
     chunker_config: ChunkerConfig,
     published_paths: HashMap<String, ContentId>,
 }
 
-impl<A: ContentAnnouncer> NarPublisher<A, MemoryBlobStore> {
-    /// Create a new publisher with the given announcer, in-memory blob store,
+impl<A: ContentAnnouncer> NarPublisher<A, MemoryBookStore> {
+    /// Create a new publisher with the given announcer, in-memory book store,
     /// and default chunker config.
     pub fn new(announcer: A) -> Self {
         Self {
             announcer,
-            blob_store: MemoryBlobStore::new(),
+            blob_store: MemoryBookStore::new(),
             chunker_config: ChunkerConfig::DEFAULT,
             published_paths: HashMap::new(),
         }
     }
 }
 
-impl<A: ContentAnnouncer, S: BlobStore> NarPublisher<A, S> {
+impl<A: ContentAnnouncer, S: BookStore> NarPublisher<A, S> {
     /// Create a new publisher with a caller-provided blob store.
     pub fn with_store(announcer: A, store: S) -> Self {
         Self {

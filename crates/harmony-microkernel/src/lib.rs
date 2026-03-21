@@ -77,7 +77,7 @@ pub enum IpcError {
     IsDirectory,
     ReadOnly,
     ResourceExhausted,
-    /// The operation conflicts with existing state (e.g. cross-blob chunk
+    /// The operation conflicts with existing state (e.g. cross-book page
     /// address collision — different content at the same 21-bit address).
     Conflict,
     NotSupported,

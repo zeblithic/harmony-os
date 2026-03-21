@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 
-use harmony_content::blob::{BlobStore, MemoryBlobStore};
+use harmony_content::book::{BookStore, MemoryBookStore};
 use harmony_content::bundle;
 use harmony_content::cid::{CidType, ContentId};
 use harmony_content::dag;
@@ -110,7 +110,7 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
         };
 
         // 5. Build a temporary store, populate with root data.
-        let mut store = MemoryBlobStore::new();
+        let mut store = MemoryBookStore::new();
         store.store(root_cid, root_data);
 
         // 6. Recursively fetch all children (with cycle guard).
@@ -131,7 +131,7 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
     fn fetch_children(
         &self,
         cid: &ContentId,
-        store: &mut MemoryBlobStore,
+        store: &mut MemoryBookStore,
         visited: &mut HashSet<ContentId>,
     ) -> Result<(), String> {
         if !visited.insert(*cid) {
@@ -139,7 +139,7 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
         }
 
         match cid.cid_type() {
-            CidType::Blob if !store.contains(cid) => {
+            CidType::Book if !store.contains(cid) => {
                 // Leaf node — fetch if not already present.
                 let cid_hex = hex::encode(cid.to_bytes());
                 let key = content::fetch_key(&cid_hex);
@@ -149,7 +149,7 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
                     .ok_or_else(|| format!("mesh missing blob {cid_hex}"))?;
                 store.store(*cid, data);
             }
-            CidType::Blob => { /* already in store */ }
+            CidType::Book => { /* already in store */ }
             CidType::Bundle(_) => {
                 // Interior node — parse children, fetch each, then recurse.
                 let bundle_data = store
@@ -243,10 +243,10 @@ mod tests {
 
     // ── Test helper: populate a MockQuerier with a NAR's DAG ────────
 
-    /// Ingest data into a MemoryBlobStore, then populate a MockQuerier
+    /// Ingest data into a [`MemoryBookStore`], then populate a MockQuerier
     /// with all the key-value pairs needed to fetch it from the mesh.
     fn populate_querier_from_data(data: &[u8], store_path_name: &str) -> MockQuerier {
-        let mut store = MemoryBlobStore::new();
+        let mut store = MemoryBookStore::new();
 
         // Use a small chunker config so even modest test data gets split.
         let config = ChunkerConfig {
@@ -278,11 +278,11 @@ mod tests {
     /// Recursively insert all DAG nodes into the map.
     fn insert_dag_nodes(
         cid: &ContentId,
-        store: &MemoryBlobStore,
+        store: &MemoryBookStore,
         map: &mut HashMap<String, Vec<u8>>,
     ) {
         match cid.cid_type() {
-            CidType::Blob => {
+            CidType::Book => {
                 if let Some(data) = store.get(cid) {
                     let hex_key = hex::encode(cid.to_bytes());
                     let fetch_key = content::fetch_key(&hex_key);
@@ -382,7 +382,7 @@ mod tests {
 
         // Create a valid CID mapping but don't populate the actual blob.
         let mut map = HashMap::new();
-        let fake_cid = ContentId::for_blob(b"phantom data", Default::default()).unwrap();
+        let fake_cid = ContentId::for_book(b"phantom data", Default::default()).unwrap();
         let fake_hex = hex::encode(fake_cid.to_bytes());
         let store_hash = &store_path_name[..32];
         map.insert(
