@@ -1602,6 +1602,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         match kind {
             FdKind::PipeWrite { pipe_id } => {
+                // POSIX: write with count == 0 is a no-op for pipes too.
+                if count == 0 {
+                    return 0;
+                }
                 // Linux default pipe capacity. Writes that would exceed
                 // this return EAGAIN (consistent with the always-nonblocking
                 // emulator model — see O_NONBLOCK note in sys_pipe2).
@@ -1687,6 +1691,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         match kind {
             FdKind::PipeRead { pipe_id } => {
+                // POSIX: read with count == 0 is a no-op for pipes too.
+                if count == 0 {
+                    return 0;
+                }
                 let buf = self.pipes.get_mut(&pipe_id).unwrap();
                 if buf.is_empty() {
                     // Check if any writer still exists.
