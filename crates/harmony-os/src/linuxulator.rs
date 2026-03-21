@@ -1587,11 +1587,6 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux write(2): write to a file descriptor.
     fn sys_write(&mut self, fd: i32, buf_ptr: usize, count: usize) -> i64 {
-        // POSIX: write with count == 0 is a no-op.
-        if count == 0 {
-            return 0;
-        }
-
         let kind = match self.fd_table.get(&fd) {
             Some(entry) => entry.kind.clone(),
             None => return EBADF,
@@ -1617,8 +1612,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 }
                 // Partial write: clamp to available capacity.
                 let to_write = count.min(avail);
-                let data =
-                    unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, to_write) };
+                let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, to_write) };
                 pipe_buf.extend_from_slice(data);
                 to_write as i64
             }
@@ -1655,10 +1649,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 8
             }
             FdKind::File { fid, offset, .. } => {
-                // In the MVP flat address space, we can directly read from the pointer.
-                // Safety: caller guarantees buf_ptr points to valid memory of at least
-                // `count` bytes. This is the same trust model as a real kernel reading
-                // from user space — except here there's no protection boundary.
+                // POSIX: write with count == 0 is a no-op for regular files.
+                if count == 0 {
+                    return 0;
+                }
                 let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
 
                 match self.backend.write(fid, offset, data) {
@@ -1678,10 +1672,6 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux read(2): read from a file descriptor.
     fn sys_read(&mut self, fd: i32, buf_ptr: usize, count: usize) -> i64 {
-        if count == 0 {
-            return 0;
-        }
-
         let kind = match self.fd_table.get(&fd) {
             Some(entry) => entry.kind.clone(),
             None => return EBADF,
@@ -1739,6 +1729,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 offset: file_offset,
                 ..
             } => {
+                // POSIX: read with count == 0 is a no-op for regular files.
+                if count == 0 {
+                    return 0;
+                }
                 // 9P count is u32; cap to avoid silent truncation on large reads.
                 let capped = count.min(u32::MAX as usize) as u32;
 
