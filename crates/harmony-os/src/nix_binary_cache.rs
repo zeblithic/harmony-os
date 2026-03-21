@@ -82,6 +82,17 @@ impl BinaryCacheServer {
             };
         }
 
+        if let Some(rest) = path.strip_prefix("/nar/") {
+            let name = match rest.strip_suffix(".nar") {
+                Some(n) => n,
+                None => return CacheResponse::NotFound,
+            };
+            return match self.server.get_nar_blob(name) {
+                Some(blob) => CacheResponse::NarData(blob.to_vec()),
+                None => CacheResponse::NotFound,
+            };
+        }
+
         CacheResponse::NotFound
     }
 
@@ -180,5 +191,27 @@ mod tests {
             srv.handle_request("/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.narinfo"),
             CacheResponse::BadRequest
         );
+    }
+
+    #[test]
+    fn handle_nar_data_request() {
+        let name = "abc12345678901234567890123456789-hello";
+        let content = b"nar file content";
+        let mut srv = build_server_with_nar(name, content);
+        let resp = srv.handle_request(&format!("/nar/{name}.nar"));
+        match resp {
+            CacheResponse::NarData(bytes) => {
+                assert!(!bytes.is_empty());
+                assert_eq!(bytes, build_test_nar(content));
+            }
+            other => panic!("expected NarData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_nar_not_found() {
+        let mut srv = build_server();
+        let resp = srv.handle_request("/nar/nonexistent-pkg.nar");
+        assert_eq!(resp, CacheResponse::NotFound);
     }
 }
