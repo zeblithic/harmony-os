@@ -2622,13 +2622,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 domain,
                 sock_type,
                 listening: false,
-                nonblock: false,
+                nonblock: flags & SOCK_NONBLOCK != 0,
                 accepted_once: false,
             },
         );
 
         let new_fd = self.alloc_fd();
         const SOCK_CLOEXEC: i32 = 0o2000000;
+        const SOCK_NONBLOCK: i32 = 0o4000;
         let fd_flags = if flags & SOCK_CLOEXEC != 0 {
             FD_CLOEXEC
         } else {
@@ -8680,13 +8681,27 @@ mod integration_tests {
         });
         assert_eq!(flags, FD_CLOEXEC as i64);
 
-        // SOCK_NONBLOCK accepted without error
+        // SOCK_NONBLOCK sets nonblock — verify via accept EAGAIN guard
         let fd2 = lx.dispatch_syscall(LinuxSyscall::Socket {
             domain: 1,
             sock_type: 1 | 0o4000, // SOCK_STREAM | SOCK_NONBLOCK
             protocol: 0,
-        });
+        }) as i32;
         assert!(fd2 >= 0);
+        // listen → accept → second accept should EAGAIN (nonblock guard)
+        lx.dispatch_syscall(LinuxSyscall::Listen { fd: fd2, backlog: 1 });
+        let a1 = lx.dispatch_syscall(LinuxSyscall::Accept {
+            fd: fd2,
+            addr: 0,
+            addrlen: 0,
+        });
+        assert!(a1 >= 0);
+        let a2 = lx.dispatch_syscall(LinuxSyscall::Accept {
+            fd: fd2,
+            addr: 0,
+            addrlen: 0,
+        });
+        assert_eq!(a2, EAGAIN);
     }
 
     #[test]
