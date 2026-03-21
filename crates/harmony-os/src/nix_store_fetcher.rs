@@ -306,8 +306,8 @@ impl NixStoreFetcher {
         let narinfo =
             NarInfo::parse(&narinfo_text).map_err(|e| FetchError::NarInfo(format!("{:?}", e)))?;
 
-        // 3. Check compression — we only support xz.
-        if narinfo.compression != "xz" {
+        // 3. Check compression — we support xz and none (identity).
+        if narinfo.compression != "xz" && narinfo.compression != "none" {
             return Err(FetchError::NarInfo(format!(
                 "unsupported compression: {}",
                 narinfo.compression
@@ -323,15 +323,20 @@ impl NixStoreFetcher {
             )));
         }
         let nar_url = format!("{}/{}", self.cache_url, narinfo.url);
-        let compressed_nar = self.http.get(&nar_url)?;
+        let raw_nar = self.http.get(&nar_url)?;
 
-        // 5. Decompress xz (bounded to nar_size + 1 to prevent decompression bombs).
-        let nar_bytes = decompress_xz(&compressed_nar, narinfo.nar_size)?;
+        // 5. Decompress if needed (bounded to nar_size + 1 to prevent decompression bombs).
+        let nar_bytes = if narinfo.compression == "xz" {
+            decompress_xz(&raw_nar, narinfo.nar_size)?
+        } else {
+            // Compression: none — raw NAR bytes, no decompression needed.
+            raw_nar
+        };
 
-        // 6. Validate decompressed size against NarSize.
+        // 6. Validate size against NarSize.
         if nar_bytes.len() as u64 != narinfo.nar_size {
             return Err(FetchError::Decompress(format!(
-                "decompressed size {} != expected NarSize {}",
+                "size {} != expected NarSize {}",
                 nar_bytes.len(),
                 narinfo.nar_size
             )));

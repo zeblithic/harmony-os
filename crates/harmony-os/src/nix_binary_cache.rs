@@ -162,9 +162,13 @@ impl BinaryCacheServer {
         self.server.has_store_path(name)
     }
 
-    /// Mutable access to the underlying NixStoreServer.
-    pub fn server_mut(&mut self) -> &mut NixStoreServer {
-        &mut self.server
+    /// Drain miss events from the underlying 9P server.
+    ///
+    /// These are full store-path-name misses recorded by `NixStoreServer`
+    /// when clients walk non-existent paths via the kernel's 9P layer —
+    /// distinct from the hash-only misses from [`Self::drain_misses`].
+    pub fn drain_store_misses(&mut self) -> Vec<Arc<str>> {
+        self.server.drain_misses()
     }
 }
 
