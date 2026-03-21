@@ -8298,4 +8298,180 @@ mod integration_tests {
         });
         assert_eq!(r, 32);
     }
+
+    #[test]
+    fn test_socket_flags() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // SOCK_CLOEXEC (0o2000000) should set FD_CLOEXEC
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,
+            sock_type: 1 | 0o2000000, // SOCK_STREAM | SOCK_CLOEXEC
+            protocol: 0,
+        }) as i32;
+
+        let flags = lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd,
+            cmd: 1, // F_GETFD
+            arg: 0,
+        });
+        assert_eq!(flags, FD_CLOEXEC as i64);
+
+        // SOCK_NONBLOCK accepted without error
+        let fd2 = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 1,
+            sock_type: 1 | 0o4000, // SOCK_STREAM | SOCK_NONBLOCK
+            protocol: 0,
+        });
+        assert!(fd2 >= 0);
+    }
+
+    #[test]
+    fn test_socket_fstat() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,
+            sock_type: 1,
+            protocol: 0,
+        }) as i32;
+
+        // 144 bytes for x86_64 stat struct
+        let mut stat_buf = [0u8; 144];
+        let r = lx.dispatch_syscall(LinuxSyscall::Fstat {
+            fd,
+            buf: stat_buf.as_mut_ptr() as u64,
+        });
+        assert_eq!(r, 0);
+
+        // st_mode field: S_IFSOCK | 0o644 = 0o140644 = 0xC1A4
+        #[cfg(target_arch = "x86_64")]
+        let mode = u32::from_le_bytes(stat_buf[24..28].try_into().unwrap());
+        #[cfg(not(target_arch = "x86_64"))]
+        let mode = u32::from_le_bytes(stat_buf[16..20].try_into().unwrap());
+
+        assert_eq!(mode, 0o140644);
+    }
+
+    #[test]
+    fn test_socket_lseek_espipe() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,
+            sock_type: 1,
+            protocol: 0,
+        }) as i32;
+
+        let r = lx.dispatch_syscall(LinuxSyscall::Lseek {
+            fd,
+            offset: 0,
+            whence: 0,
+        });
+        assert_eq!(r, ESPIPE);
+    }
+
+    #[test]
+    fn test_socket_ops_wrong_fd_type() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Create a pipe — use the read end as a non-socket fd.
+        let mut fds = [0i32; 2];
+        lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0,
+        });
+        let pipe_fd = fds[0];
+
+        // All socket ops should return ENOTSOCK on a pipe fd.
+        assert_eq!(
+            lx.dispatch_syscall(LinuxSyscall::Bind {
+                fd: pipe_fd,
+                addr: 0,
+                addrlen: 0
+            }),
+            ENOTSOCK
+        );
+        assert_eq!(
+            lx.dispatch_syscall(LinuxSyscall::Listen {
+                fd: pipe_fd,
+                backlog: 1
+            }),
+            ENOTSOCK
+        );
+        assert_eq!(
+            lx.dispatch_syscall(LinuxSyscall::Connect {
+                fd: pipe_fd,
+                addr: 0,
+                addrlen: 0
+            }),
+            ENOTSOCK
+        );
+        assert_eq!(
+            lx.dispatch_syscall(LinuxSyscall::Sendto {
+                fd: pipe_fd,
+                buf: 0,
+                len: 0,
+                flags: 0,
+                dest_addr: 0,
+                addrlen: 0
+            }),
+            ENOTSOCK
+        );
+        assert_eq!(
+            lx.dispatch_syscall(LinuxSyscall::Recvfrom {
+                fd: pipe_fd,
+                buf: 0,
+                len: 0,
+                flags: 0,
+                src_addr: 0,
+                addrlen: 0
+            }),
+            ENOTSOCK
+        );
+        assert_eq!(
+            lx.dispatch_syscall(LinuxSyscall::Shutdown {
+                fd: pipe_fd,
+                how: 0
+            }),
+            ENOTSOCK
+        );
+    }
+
+    #[test]
+    fn test_socket_dup() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,
+            sock_type: 1,
+            protocol: 0,
+        }) as i32;
+
+        let fd2 = lx.dispatch_syscall(LinuxSyscall::Dup { oldfd: fd }) as i32;
+        assert!(fd2 >= 0);
+        assert_ne!(fd, fd2);
+
+        // Both are valid
+        assert!(lx.has_fd(fd));
+        assert!(lx.has_fd(fd2));
+
+        // Close original — dup should still work
+        lx.dispatch_syscall(LinuxSyscall::Close { fd });
+        assert!(!lx.has_fd(fd));
+        assert!(lx.has_fd(fd2));
+
+        // Dup'd socket still accepts operations
+        let r = lx.dispatch_syscall(LinuxSyscall::Bind {
+            fd: fd2,
+            addr: 0,
+            addrlen: 0,
+        });
+        assert_eq!(r, 0);
+    }
 }
