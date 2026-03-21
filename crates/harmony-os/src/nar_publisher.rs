@@ -41,7 +41,7 @@ pub trait ContentAnnouncer {
 /// handles the NAR-level persistence independently.
 pub struct NarPublisher<A: ContentAnnouncer, S: BookStore = MemoryBookStore> {
     announcer: A,
-    blob_store: S,
+    book_store: S,
     chunker_config: ChunkerConfig,
     published_paths: HashMap<String, ContentId>,
 }
@@ -52,7 +52,7 @@ impl<A: ContentAnnouncer> NarPublisher<A, MemoryBookStore> {
     pub fn new(announcer: A) -> Self {
         Self {
             announcer,
-            blob_store: MemoryBookStore::new(),
+            book_store: MemoryBookStore::new(),
             chunker_config: ChunkerConfig::DEFAULT,
             published_paths: HashMap::new(),
         }
@@ -64,7 +64,7 @@ impl<A: ContentAnnouncer, S: BookStore> NarPublisher<A, S> {
     pub fn with_store(announcer: A, store: S) -> Self {
         Self {
             announcer,
-            blob_store: store,
+            book_store: store,
             chunker_config: ChunkerConfig::DEFAULT,
             published_paths: HashMap::new(),
         }
@@ -91,9 +91,9 @@ impl<A: ContentAnnouncer, S: BookStore> NarPublisher<A, S> {
         }
         let store_hash = &store_path_name[..32];
 
-        // Ingest into the DAG (blob_store mutation is harmless on error —
+        // Ingest into the DAG (book_store mutation is harmless on error —
         // content-addressed books are just cached data, not mappings).
-        let root_cid = dag::ingest(nar_bytes, &self.chunker_config, &mut self.blob_store)
+        let root_cid = dag::ingest(nar_bytes, &self.chunker_config, &mut self.book_store)
             .map_err(|e| format!("ingest failed: {e}"))?;
 
         // Announce store path mapping: key = harmony/nix/store/{store_hash},
@@ -104,16 +104,16 @@ impl<A: ContentAnnouncer, S: BookStore> NarPublisher<A, S> {
             .announce(&store_key, root_cid_hex.as_bytes())?;
 
         // Walk the DAG to collect all leaf book CIDs.
-        let blob_cids =
-            dag::walk(&root_cid, &self.blob_store).map_err(|e| format!("DAG walk failed: {e}"))?;
+        let book_cids =
+            dag::walk(&root_cid, &self.book_store).map_err(|e| format!("DAG walk failed: {e}"))?;
 
         // Announce each book.
-        for cid in &blob_cids {
+        for cid in &book_cids {
             let cid_hex = hex::encode(cid.to_bytes());
-            let blob_key = announce::key(&cid_hex);
+            let book_key = announce::key(&cid_hex);
             let size = cid.payload_size();
             let size_str = size.to_string();
-            self.announcer.announce(&blob_key, size_str.as_bytes())?;
+            self.announcer.announce(&book_key, size_str.as_bytes())?;
         }
 
         // If root is a bundle (multi-chunk), announce the bundle itself.
@@ -139,8 +139,8 @@ impl<A: ContentAnnouncer, S: BookStore> NarPublisher<A, S> {
     }
 
     /// Retrieve book data by CID from the local store.
-    pub fn get_blob(&self, cid: &ContentId) -> Option<&[u8]> {
-        self.blob_store.get(cid)
+    pub fn get_book(&self, cid: &ContentId) -> Option<&[u8]> {
+        self.book_store.get(cid)
     }
 
     /// Read-only view of all published store-path-to-CID mappings.
@@ -149,8 +149,8 @@ impl<A: ContentAnnouncer, S: BookStore> NarPublisher<A, S> {
     }
 
     /// Read-only access to the underlying book store.
-    pub fn blob_store(&self) -> &S {
-        &self.blob_store
+    pub fn book_store(&self) -> &S {
+        &self.book_store
     }
 }
 
@@ -238,7 +238,7 @@ mod tests {
 
         let announcements = log.borrow();
 
-        // At least 2 announcements: store path mapping + at least one blob.
+        // At least 2 announcements: store path mapping + at least one book.
         assert!(
             announcements.len() >= 2,
             "expected at least 2 announcements, got {}",
@@ -264,12 +264,12 @@ mod tests {
         // get_root_cid returns the same CID.
         assert_eq!(publisher.get_root_cid(store_path), Some(&root_cid));
 
-        // get_blob returns data for the root CID.
-        assert!(publisher.get_blob(&root_cid).is_some());
+        // get_book returns data for the root CID.
+        assert!(publisher.get_book(&root_cid).is_some());
     }
 
     #[test]
-    fn publish_blob_announcements_use_correct_key_format() {
+    fn publish_book_announcements_use_correct_key_format() {
         let (announcer, log) = MockAnnouncer::new();
         let mut publisher = NarPublisher::new(announcer);
 
@@ -284,7 +284,7 @@ mod tests {
         for (key, _) in announcements.iter().skip(1) {
             assert!(
                 key.starts_with("harmony/announce/"),
-                "blob announcement key should start with 'harmony/announce/', got: {key}"
+                "book announcement key should start with 'harmony/announce/', got: {key}"
             );
         }
     }
@@ -329,8 +329,8 @@ mod tests {
         let store_path = "rnd12345678901234567890123456789-round-pkg";
         let root_cid = publisher.publish(store_path, &nar).unwrap();
 
-        // Reassemble from the publisher's blob store should recover original NAR.
-        let recovered = dag::reassemble(&root_cid, publisher.blob_store()).unwrap();
+        // Reassemble from the publisher's book store should recover original NAR.
+        let recovered = dag::reassemble(&root_cid, publisher.book_store()).unwrap();
         assert_eq!(recovered, nar);
     }
 
@@ -387,12 +387,12 @@ mod tests {
         let store_path = "dsk12345678901234567890123456789-disk-pkg";
         let root_cid = publisher.publish(store_path, &nar).unwrap();
 
-        // Blobs should be on disk.
+        // Books should be on disk.
         let file_count = std::fs::read_dir(tmp.path()).unwrap().count();
-        assert!(file_count >= 1, "at least one blob file on disk");
+        assert!(file_count >= 1, "at least one book file on disk");
 
         // Round-trip: reassemble from persistent store.
-        let recovered = dag::reassemble(&root_cid, publisher.blob_store()).unwrap();
+        let recovered = dag::reassemble(&root_cid, publisher.book_store()).unwrap();
         assert_eq!(recovered, nar);
     }
 }

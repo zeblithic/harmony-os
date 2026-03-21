@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! /
-//! ├── blobs/       — one file per stored book, named by hex CID
+//! ├── books/       — one file per stored book, named by hex CID
 //! ├── pages/       — one file per stored page, named by hex hash_bits
 //! └── ingest       — ctl-file; write book bytes, read to finalize (returns CID + metadata)
 //! ```
@@ -31,14 +31,14 @@ const MAX_CONCURRENT_INGESTS: usize = 4;
 // ── QPath constants ─────────────────────────────────────────────────
 
 const ROOT: QPath = 0;
-const BLOBS_DIR: QPath = 1;
+const BOOKS_DIR: QPath = 1;
 const PAGES_DIR: QPath = 2;
 const INGEST: QPath = 3;
-/// Blob QPaths: `BLOB_QPATH_BASE | u64_from_cid[0..8] & 0x7FFF_FFFF_FFFF_FFFF`.
+/// Book QPaths: `BOOK_QPATH_BASE | u64_from_cid[0..8] & 0x7FFF_FFFF_FFFF_FFFF`.
 /// Bit 32 is always set (via OR), so minimum book QPath is `0x1_0000_0000`.
 /// Page QPaths: `0x1000_0000 + hash_bits` (hash_bits is 28 bits, max 0x0FFF_FFFF).
 /// These ranges are disjoint: pages top out at 0x1FFF_FFFF, books start at 0x1_0000_0000.
-const BLOB_QPATH_BASE: QPath = 0x1_0000_0000;
+const BOOK_QPATH_BASE: QPath = 0x1_0000_0000;
 const PAGE_QPATH_BASE: QPath = 0x1000_0000;
 
 // ── Node taxonomy ───────────────────────────────────────────────────
@@ -47,10 +47,10 @@ const PAGE_QPATH_BASE: QPath = 0x1000_0000;
 #[derive(Debug, Clone)]
 enum NodeKind {
     Root,
-    BlobsDir,
+    BooksDir,
     PagesDir,
     Ingest,
-    Blob([u8; 32]),
+    Book([u8; 32]),
     Page(PageAddr),
 }
 
@@ -81,8 +81,8 @@ pub struct ContentServer {
     /// Page data keyed by `hash_bits` (28-bit address).
     /// O(log n) lookups instead of linear scan through a Vec.
     pages: BTreeMap<u32, (PageAddr, Vec<u8>)>,
-    /// Blob manifests indexed by 256-bit CID.
-    blobs: BTreeMap<[u8; 32], Book>,
+    /// Book manifests indexed by 256-bit CID.
+    books: BTreeMap<[u8; 32], Book>,
     /// Active fid → state mapping.
     tracker: FidTracker<NodeKind>,
     /// Per-fid ingest buffers for the `/ingest` pseudo-file.
@@ -94,19 +94,19 @@ impl ContentServer {
     pub fn new() -> Self {
         Self {
             pages: BTreeMap::new(),
-            blobs: BTreeMap::new(),
+            books: BTreeMap::new(),
             tracker: FidTracker::new(ROOT, NodeKind::Root),
             ingest_buffers: BTreeMap::new(),
         }
     }
 
-    /// Compute the QPath for a blob given its CID.
+    /// Compute the QPath for a book given its CID.
     ///
     /// Uses 8 CID bytes (63 usable bits) to minimise collision probability.
-    /// With 32 bits the birthday bound was ~65K blobs; with 63 bits it's ~3 billion.
-    fn blob_qpath(cid: &[u8; 32]) -> QPath {
+    /// With 32 bits the birthday bound was ~65K books; with 63 bits it's ~3 billion.
+    fn book_qpath(cid: &[u8; 32]) -> QPath {
         let bits = u64::from_le_bytes(cid[0..8].try_into().unwrap());
-        BLOB_QPATH_BASE | (bits & 0x7FFF_FFFF_FFFF_FFFF)
+        BOOK_QPATH_BASE | (bits & 0x7FFF_FFFF_FFFF_FFFF)
     }
 
     /// Compute the QPath for a page given its address.
@@ -114,9 +114,9 @@ impl ContentServer {
         PAGE_QPATH_BASE + addr.hash_bits() as u64
     }
 
-    /// Number of blobs currently stored.
-    pub fn blob_count(&self) -> usize {
-        self.blobs.len()
+    /// Number of books currently stored.
+    pub fn book_count(&self) -> usize {
+        self.books.len()
     }
 
     /// Number of pages currently stored.
@@ -128,7 +128,7 @@ impl ContentServer {
     ///
     /// Returns the first page whose 28-bit `hash_bits` matches. Within a
     /// single `Book`, addresses are unique by construction (collision
-    /// resolution). Across independently ingested blobs a hash_bits collision
+    /// resolution). Across independently ingested books a hash_bits collision
     /// is theoretically possible; in that case the first stored match wins.
     /// The `/pages/<addr>` namespace inherits this: two pages sharing
     /// hash_bits would map to the same filename and only the first is reachable.
@@ -136,7 +136,7 @@ impl ContentServer {
         self.pages.get(&hash_bits).map(|(addr, _)| addr)
     }
 
-    /// Finalize an ingest: page the blob, store pages + metadata, return 40-byte response.
+    /// Finalize an ingest: page the book, store pages + metadata, return 40-byte response.
     fn finalize_ingest(&mut self, fid: Fid) -> Result<Vec<u8>, IpcError> {
         let buf = self
             .ingest_buffers
@@ -156,12 +156,12 @@ impl ContentServer {
             IngestState::Writing(data) => {
                 let cid = sha256_hash(&data);
 
-                // Dedup: skip if blob already exists.
-                if self.blobs.contains_key(&cid) {
-                    // Drop blob data early — only the CID is needed from here.
+                // Dedup: skip if book already exists.
+                if self.books.contains_key(&cid) {
+                    // Drop book data early — only the CID is needed from here.
                     // Avoids holding up to 1 MB during the response build.
                     drop(data);
-                    let book = &self.blobs[&cid];
+                    let book = &self.books[&cid];
                     let response = match self.build_ingest_response(&cid, book) {
                         Ok(r) => r,
                         Err(e) => {
@@ -199,7 +199,7 @@ impl ContentServer {
                     }
                 };
 
-                // Split blob into 4KB page buffers (zero-padded).
+                // Split book into 4KB page buffers (zero-padded).
                 let page_bufs = book.page_data_from_book(&data);
                 debug_assert_eq!(
                     page_bufs.len(),
@@ -208,8 +208,8 @@ impl ContentServer {
                 );
 
                 // Two-pass page commit: validate first, then insert.
-                // Detects cross-blob hash_bits collisions (different data at the
-                // same 28-bit address) that would corrupt blob reassembly.
+                // Detects cross-book hash_bits collisions (different data at the
+                // same 28-bit address) that would corrupt book reassembly.
                 // Uses algo 0 (Sha256Msb) as the default storage address.
                 let mut to_insert = Vec::new();
                 for (i, variants) in book.pages.iter().enumerate() {
@@ -219,32 +219,32 @@ impl ContentServer {
 
                     if let Some((_, existing)) = self.pages.get(&hb) {
                         if *existing != *page_data {
-                            // Cross-blob collision: same hash_bits, different content.
-                            // Storing would silently corrupt reassembly for this blob.
+                            // Cross-book collision: same hash_bits, different content.
+                            // Storing would silently corrupt reassembly for this book.
                             // Conflict (not ResourceExhausted) distinguishes this from
                             // capacity errors — callers know the data is valid but clashes
                             // with existing page state.
                             //
-                            // This is permanent for this blob on this server instance:
+                            // This is permanent for this book on this server instance:
                             // the colliding page at `hb` won't change. Retrying the
-                            // same blob data will always fail. The fid is restored to
+                            // same book data will always fail. The fid is restored to
                             // Writing so the caller can re-open for different data.
                             *self.ingest_buffers.get_mut(&fid).unwrap() =
                                 IngestState::Writing(data);
                             return Err(IpcError::Conflict);
                         }
-                        // Same content at same address — cross-blob dedup, skip.
+                        // Same content at same address — cross-book dedup, skip.
                     } else {
                         to_insert.push((hb, addr, page_data.clone()));
                     }
                 }
 
-                // All validated — commit pages and blob (infallible from here).
+                // All validated — commit pages and book (infallible from here).
                 for (hb, addr, page_data) in to_insert {
                     self.pages.insert(hb, (addr, page_data));
                 }
 
-                self.blobs.insert(cid, book);
+                self.books.insert(cid, book);
                 // Cache response so partial/multiple reads work.
                 *self.ingest_buffers.get_mut(&fid).unwrap() = IngestState::Done(response.clone());
                 Ok(response)
@@ -271,13 +271,13 @@ impl ContentServer {
         Ok(response)
     }
 
-    /// Read blob data by reassembling from stored pages.
+    /// Read book data by reassembling from stored pages.
     ///
     /// Note: reassembles the full book on every call (O(N) page lookups,
     /// O(book_size) allocation). Callers reading large books in small
     /// pieces should prefer a single large read or cache locally.
-    fn read_blob(&self, cid: &[u8; 32], offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
-        let book = self.blobs.get(cid).ok_or(IpcError::NotFound)?;
+    fn read_book(&self, cid: &[u8; 32], offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
+        let book = self.books.get(cid).ok_or(IpcError::NotFound)?;
         let pages = &self.pages;
         let data = book
             .reassemble(|idx| {
@@ -368,17 +368,17 @@ impl FileServer for ContentServer {
 
         let (qpath, node) = match &parent_node {
             NodeKind::Root => match name {
-                "blobs" => (BLOBS_DIR, NodeKind::BlobsDir),
+                "books" => (BOOKS_DIR, NodeKind::BooksDir),
                 "pages" => (PAGES_DIR, NodeKind::PagesDir),
                 "ingest" => (INGEST, NodeKind::Ingest),
                 _ => return Err(IpcError::NotFound),
             },
-            NodeKind::BlobsDir => {
+            NodeKind::BooksDir => {
                 let cid = parse_hex_cid(name).ok_or(IpcError::NotFound)?;
-                if !self.blobs.contains_key(&cid) {
+                if !self.books.contains_key(&cid) {
                     return Err(IpcError::NotFound);
                 }
-                (Self::blob_qpath(&cid), NodeKind::Blob(cid))
+                (Self::book_qpath(&cid), NodeKind::Book(cid))
             }
             NodeKind::PagesDir => {
                 if name.len() != 8 {
@@ -394,7 +394,7 @@ impl FileServer for ContentServer {
                 (Self::page_qpath(&addr), NodeKind::Page(addr))
             }
             // Leaf nodes are not directories — cannot walk into them.
-            NodeKind::Blob(_) | NodeKind::Page(_) | NodeKind::Ingest => {
+            NodeKind::Book(_) | NodeKind::Page(_) | NodeKind::Ingest => {
                 return Err(IpcError::NotDirectory);
             }
         };
@@ -406,18 +406,18 @@ impl FileServer for ContentServer {
     fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
         let entry = self.tracker.begin_open(fid)?;
         match &entry.payload {
-            NodeKind::Root | NodeKind::BlobsDir | NodeKind::PagesDir => {
+            NodeKind::Root | NodeKind::BooksDir | NodeKind::PagesDir => {
                 if matches!(mode, OpenMode::Write | OpenMode::ReadWrite) {
                     return Err(IpcError::IsDirectory);
                 }
             }
-            NodeKind::Blob(_) | NodeKind::Page(_) => {
+            NodeKind::Book(_) | NodeKind::Page(_) => {
                 if matches!(mode, OpenMode::Write | OpenMode::ReadWrite) {
                     return Err(IpcError::ReadOnly);
                 }
             }
             NodeKind::Ingest => {
-                // Ingest requires ReadWrite: writes accumulate blob data,
+                // Ingest requires ReadWrite: writes accumulate book data,
                 // then a read triggers finalization and returns the CID.
                 if !matches!(mode, OpenMode::ReadWrite) {
                     return Err(IpcError::PermissionDenied);
@@ -451,12 +451,12 @@ impl FileServer for ContentServer {
         }
         let node = entry.payload.clone();
         match &node {
-            NodeKind::Root | NodeKind::BlobsDir | NodeKind::PagesDir => Err(IpcError::IsDirectory),
+            NodeKind::Root | NodeKind::BooksDir | NodeKind::PagesDir => Err(IpcError::IsDirectory),
             NodeKind::Ingest => {
                 let response = self.finalize_ingest(fid)?;
                 Ok(slice_data(&response, offset, count))
             }
-            NodeKind::Blob(cid) => self.read_blob(cid, offset, count),
+            NodeKind::Book(cid) => self.read_book(cid, offset, count),
             NodeKind::Page(addr) => self.read_page_data(addr, offset, count),
         }
     }
@@ -474,8 +474,8 @@ impl FileServer for ContentServer {
         }
         let node = entry.payload.clone();
         match &node {
-            NodeKind::Root | NodeKind::BlobsDir | NodeKind::PagesDir => Err(IpcError::IsDirectory),
-            NodeKind::Blob(_) | NodeKind::Page(_) => Err(IpcError::ReadOnly),
+            NodeKind::Root | NodeKind::BooksDir | NodeKind::PagesDir => Err(IpcError::IsDirectory),
+            NodeKind::Book(_) | NodeKind::Page(_) => Err(IpcError::ReadOnly),
             NodeKind::Ingest => {
                 let buf = self
                     .ingest_buffers
@@ -513,9 +513,9 @@ impl FileServer for ContentServer {
                 size: 0,
                 file_type: FileType::Directory,
             }),
-            NodeKind::BlobsDir => Ok(FileStat {
-                qpath: BLOBS_DIR,
-                name: Arc::from("blobs"),
+            NodeKind::BooksDir => Ok(FileStat {
+                qpath: BOOKS_DIR,
+                name: Arc::from("books"),
                 size: 0,
                 file_type: FileType::Directory,
             }),
@@ -531,10 +531,10 @@ impl FileServer for ContentServer {
                 size: 0,
                 file_type: FileType::Regular,
             }),
-            NodeKind::Blob(cid) => {
-                let book = self.blobs.get(cid).ok_or(IpcError::NotFound)?;
+            NodeKind::Book(cid) => {
+                let book = self.books.get(cid).ok_or(IpcError::NotFound)?;
                 Ok(FileStat {
-                    qpath: Self::blob_qpath(cid),
+                    qpath: Self::book_qpath(cid),
                     name: Arc::from(format_cid_hex(cid).as_str()),
                     size: book.book_size as u64,
                     file_type: FileType::Regular,
@@ -576,7 +576,7 @@ mod tests {
     #[test]
     fn new_content_server_is_empty() {
         let server = ContentServer::new();
-        assert_eq!(server.blob_count(), 0);
+        assert_eq!(server.book_count(), 0);
         assert_eq!(server.page_count(), 0);
         assert!(server.ingest_buffers.is_empty());
     }
@@ -584,18 +584,18 @@ mod tests {
     #[test]
     fn default_matches_new() {
         let server = ContentServer::default();
-        assert_eq!(server.blob_count(), 0);
+        assert_eq!(server.book_count(), 0);
         assert_eq!(server.page_count(), 0);
         assert!(server.tracker.contains(0));
     }
 
     #[test]
-    fn blob_qpath_deterministic() {
+    fn book_qpath_deterministic() {
         let cid = [0xAB; 32];
-        let q1 = ContentServer::blob_qpath(&cid);
-        let q2 = ContentServer::blob_qpath(&cid);
+        let q1 = ContentServer::book_qpath(&cid);
+        let q2 = ContentServer::book_qpath(&cid);
         assert_eq!(q1, q2);
-        assert!(q1 >= BLOB_QPATH_BASE);
+        assert!(q1 >= BOOK_QPATH_BASE);
     }
 
     #[test]
@@ -611,18 +611,18 @@ mod tests {
         // Maximum page QPath assuming 28-bit hash_bits (max 0x0FFF_FFFF).
         let max_page_qpath = PAGE_QPATH_BASE + 0x0FFF_FFFF;
         assert!(
-            max_page_qpath < BLOB_QPATH_BASE,
-            "page and blob QPath ranges overlap"
+            max_page_qpath < BOOK_QPATH_BASE,
+            "page and book QPath ranges overlap"
         );
     }
 
     // ── walk() tests ────────────────────────────────────────────────
 
     #[test]
-    fn walk_root_to_blobs() {
+    fn walk_root_to_books() {
         let mut server = ContentServer::new();
-        let qpath = server.walk(0, 1, "blobs").unwrap();
-        assert_eq!(qpath, BLOBS_DIR);
+        let qpath = server.walk(0, 1, "books").unwrap();
+        assert_eq!(qpath, BOOKS_DIR);
     }
 
     #[test]
@@ -655,13 +655,13 @@ mod tests {
     #[test]
     fn walk_invalid_source_fid() {
         let mut server = ContentServer::new();
-        assert_eq!(server.walk(99, 1, "blobs"), Err(IpcError::InvalidFid));
+        assert_eq!(server.walk(99, 1, "books"), Err(IpcError::InvalidFid));
     }
 
     #[test]
     fn walk_duplicate_new_fid() {
         let mut server = ContentServer::new();
-        server.walk(0, 1, "blobs").unwrap();
+        server.walk(0, 1, "books").unwrap();
         assert_eq!(server.walk(0, 1, "pages"), Err(IpcError::InvalidFid));
     }
 
@@ -673,17 +673,17 @@ mod tests {
     }
 
     #[test]
-    fn walk_blobs_dir_missing_cid() {
+    fn walk_books_dir_missing_cid() {
         let mut server = ContentServer::new();
-        server.walk(0, 1, "blobs").unwrap();
+        server.walk(0, 1, "books").unwrap();
         let fake_cid = "aa".repeat(32); // 64 hex chars
         assert_eq!(server.walk(1, 2, &fake_cid), Err(IpcError::NotFound));
     }
 
     #[test]
-    fn walk_blobs_dir_multibyte_utf8_rejected() {
+    fn walk_books_dir_multibyte_utf8_rejected() {
         let mut server = ContentServer::new();
-        server.walk(0, 1, "blobs").unwrap();
+        server.walk(0, 1, "books").unwrap();
         // 62 ASCII chars + 'é' (2-byte UTF-8) = 64 bytes but not valid ASCII hex.
         // Must not panic — should return NotFound.
         let mut bad = "aa".repeat(31);
@@ -715,14 +715,14 @@ mod tests {
     #[test]
     fn open_directory_write_rejected() {
         let mut server = ContentServer::new();
-        server.walk(0, 1, "blobs").unwrap();
+        server.walk(0, 1, "books").unwrap();
         assert_eq!(server.open(1, OpenMode::Write), Err(IpcError::IsDirectory));
     }
 
     #[test]
     fn open_directory_read_ok() {
         let mut server = ContentServer::new();
-        server.walk(0, 1, "blobs").unwrap();
+        server.walk(0, 1, "books").unwrap();
         server.open(1, OpenMode::Read).unwrap();
     }
 
@@ -774,12 +774,12 @@ mod tests {
     }
 
     #[test]
-    fn stat_blobs_dir() {
+    fn stat_books_dir() {
         let mut server = ContentServer::new();
-        server.walk(0, 1, "blobs").unwrap();
+        server.walk(0, 1, "books").unwrap();
         let stat = server.stat(1).unwrap();
         assert_eq!(stat.file_type, FileType::Directory);
-        assert_eq!(&*stat.name, "blobs");
+        assert_eq!(&*stat.name, "books");
     }
 
     #[test]
@@ -807,7 +807,7 @@ mod tests {
     #[test]
     fn write_to_directory_rejected() {
         let mut server = ContentServer::new();
-        server.walk(0, 1, "blobs").unwrap();
+        server.walk(0, 1, "books").unwrap();
         server.open(1, OpenMode::Read).unwrap();
         // Mode check (Read) fires before node-type check (IsDirectory)
         assert_eq!(server.write(1, 0, b"data"), Err(IpcError::PermissionDenied));
@@ -840,7 +840,7 @@ mod tests {
         assert_eq!(cid, harmony_athenaeum::sha256_hash(&blob_data));
         assert_eq!(page_count, 1);
         assert_eq!(book_size, PAGE_SIZE as u32);
-        assert_eq!(server.blob_count(), 1);
+        assert_eq!(server.book_count(), 1);
         assert_eq!(server.page_count(), 1);
     }
 
@@ -916,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn read_blob_by_cid() {
+    fn read_book_by_cid() {
         let mut server = ContentServer::new();
         let blob_data = alloc::vec![0x42u8; 8000];
         server.walk(0, 1, "ingest").unwrap();
@@ -926,7 +926,7 @@ mod tests {
         let cid_hex = format_cid_hex(&response[..32].try_into().unwrap());
         server.clunk(1).unwrap();
 
-        server.walk(0, 2, "blobs").unwrap();
+        server.walk(0, 2, "books").unwrap();
         server.walk(2, 3, &cid_hex).unwrap();
         server.open(3, OpenMode::Read).unwrap();
         let read_back = server.read(3, 0, 16384).unwrap();
@@ -934,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn read_blob_with_offset() {
+    fn read_book_with_offset() {
         let mut server = ContentServer::new();
         let blob_data = alloc::vec![0xEFu8; PAGE_SIZE];
         server.walk(0, 1, "ingest").unwrap();
@@ -944,7 +944,7 @@ mod tests {
         let cid_hex = format_cid_hex(&response[..32].try_into().unwrap());
         server.clunk(1).unwrap();
 
-        server.walk(0, 2, "blobs").unwrap();
+        server.walk(0, 2, "books").unwrap();
         server.walk(2, 3, &cid_hex).unwrap();
         server.open(3, OpenMode::Read).unwrap();
         let slice = server.read(3, 100, 50).unwrap();
@@ -955,13 +955,13 @@ mod tests {
     #[test]
     fn read_directory_returns_is_directory() {
         let mut server = ContentServer::new();
-        server.walk(0, 1, "blobs").unwrap();
+        server.walk(0, 1, "books").unwrap();
         server.open(1, OpenMode::Read).unwrap();
         assert_eq!(server.read(1, 0, 256), Err(IpcError::IsDirectory));
     }
 
     #[test]
-    fn ingest_dedup_same_blob() {
+    fn ingest_dedup_same_book() {
         let mut server = ContentServer::new();
         let blob_data = alloc::vec![0xAAu8; PAGE_SIZE];
 
@@ -978,7 +978,7 @@ mod tests {
         server.read(2, 0, 256).unwrap();
         server.clunk(2).unwrap();
         assert_eq!(server.page_count(), 1); // No new pages
-        assert_eq!(server.blob_count(), 1); // No new blob
+        assert_eq!(server.book_count(), 1); // No new book
     }
 
     #[test]
@@ -1003,7 +1003,7 @@ mod tests {
     }
 
     #[test]
-    fn ingest_oversized_blob_rejected_at_write_time() {
+    fn ingest_oversized_book_rejected_at_write_time() {
         let mut server = ContentServer::new();
         server.walk(0, 1, "ingest").unwrap();
         server.open(1, OpenMode::ReadWrite).unwrap();
@@ -1037,10 +1037,10 @@ mod tests {
     }
 
     #[test]
-    fn ingest_detects_cross_blob_page_collision() {
+    fn ingest_detects_cross_book_page_collision() {
         let mut server = ContentServer::new();
 
-        // Determine what hash_bits a known blob's page would get.
+        // Determine what hash_bits a known book's page would get.
         let blob_data = alloc::vec![0xFFu8; PAGE_SIZE];
         let cid = sha256_hash(&blob_data);
         let book = Book::from_book(cid, &blob_data).unwrap();
@@ -1051,25 +1051,25 @@ mod tests {
         let conflict = alloc::vec![0x00u8; PAGE_SIZE];
         server.pages.insert(target_hb, (addr, conflict));
 
-        // Ingest the blob — should detect the collision and reject.
+        // Ingest the book — should detect the collision and reject.
         server.walk(0, 1, "ingest").unwrap();
         server.open(1, OpenMode::ReadWrite).unwrap();
         server.write(1, 0, &blob_data).unwrap();
         assert_eq!(server.read(1, 0, 256), Err(IpcError::Conflict));
 
-        // Blob was not stored (no side effects from the failed ingest).
-        assert_eq!(server.blob_count(), 0);
+        // Book was not stored (no side effects from the failed ingest).
+        assert_eq!(server.book_count(), 0);
     }
 
     #[test]
     fn page_size_matches_book() {
         // Validate that PAGE_SIZE matches Book's behavior:
-        // a blob of exactly PAGE_SIZE bytes should produce exactly 1 page.
+        // a book of exactly PAGE_SIZE bytes should produce exactly 1 page.
         let data = alloc::vec![0xAAu8; PAGE_SIZE];
         let cid = harmony_athenaeum::sha256_hash(&data);
         let book = harmony_athenaeum::Book::from_book(cid, &data).unwrap();
         assert_eq!(book.page_count(), 1);
-        // A blob of PAGE_SIZE + 1 should produce exactly 2 pages.
+        // A book of PAGE_SIZE + 1 should produce exactly 2 pages.
         let data2 = alloc::vec![0xBBu8; PAGE_SIZE + 1];
         let cid2 = harmony_athenaeum::sha256_hash(&data2);
         let book2 = harmony_athenaeum::Book::from_book(cid2, &data2).unwrap();
@@ -1102,7 +1102,7 @@ mod tests {
     }
 
     #[test]
-    fn stat_blob_after_ingest() {
+    fn stat_book_after_ingest() {
         let mut server = ContentServer::new();
         let blob_data = alloc::vec![0x55u8; PAGE_SIZE];
         server.walk(0, 1, "ingest").unwrap();
@@ -1112,7 +1112,7 @@ mod tests {
         let cid_hex = format_cid_hex(&response[..32].try_into().unwrap());
         server.clunk(1).unwrap();
 
-        server.walk(0, 2, "blobs").unwrap();
+        server.walk(0, 2, "books").unwrap();
         server.walk(2, 3, &cid_hex).unwrap();
         let stat = server.stat(3).unwrap();
         assert_eq!(stat.file_type, FileType::Regular);

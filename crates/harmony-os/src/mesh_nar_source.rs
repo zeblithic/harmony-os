@@ -265,7 +265,7 @@ mod tests {
         let mapping_key = format!("harmony/nix/store/{store_hash}");
         map.insert(mapping_key, root_cid_hex.as_bytes().to_vec());
 
-        // Insert root blob/bundle under its fetch key.
+        // Insert root book/bundle under its fetch key.
         let root_fetch_key = content::fetch_key(&root_cid_hex);
         map.insert(root_fetch_key, store.get(&root_cid).unwrap().to_vec());
 
@@ -377,10 +377,10 @@ mod tests {
     }
 
     #[test]
-    fn fetch_returns_none_when_root_blob_missing() {
+    fn fetch_returns_none_when_root_book_missing() {
         let store_path_name = "abc12345678901234567890123456789-ghost-pkg";
 
-        // Create a valid CID mapping but don't populate the actual blob.
+        // Create a valid CID mapping but don't populate the actual book.
         let mut map = HashMap::new();
         let fake_cid = ContentId::for_book(b"phantom data", Default::default()).unwrap();
         let fake_hex = hex::encode(fake_cid.to_bytes());
@@ -389,7 +389,7 @@ mod tests {
             format!("harmony/nix/store/{store_hash}"),
             fake_hex.as_bytes().to_vec(),
         );
-        // Intentionally do NOT insert the fetch key for the blob.
+        // Intentionally do NOT insert the fetch key for the book.
 
         let querier = MockQuerier { data: map };
         let source = MeshNarSource::new(querier);
@@ -426,7 +426,7 @@ mod tests {
         let mut publisher = NarPublisher::new(NoopAnnouncer);
         let root_cid = publisher.publish(store_path, &nar).unwrap();
 
-        // Populate mock querier with publisher's blob store data.
+        // Populate mock querier with publisher's book store data.
         let mut querier = MockQuerier::new();
         let store_hash = &store_path[..32];
         let root_cid_hex = hex::encode(root_cid.to_bytes());
@@ -437,19 +437,19 @@ mod tests {
             root_cid_hex.as_bytes().to_vec(),
         );
 
-        // Root blob/bundle.
+        // Root book/bundle.
         let root_fetch_key = content::fetch_key(&root_cid_hex);
         querier.insert(
             &root_fetch_key,
-            publisher.get_blob(&root_cid).unwrap().to_vec(),
+            publisher.get_book(&root_cid).unwrap().to_vec(),
         );
 
-        // All leaf blobs via dag::walk on publisher's blob store.
-        let blob_cids = dag::walk(&root_cid, publisher.blob_store()).unwrap();
-        for cid in &blob_cids {
+        // All leaf books via dag::walk on publisher's book store.
+        let book_cids = dag::walk(&root_cid, publisher.book_store()).unwrap();
+        for cid in &book_cids {
             let cid_hex = hex::encode(cid.to_bytes());
             let fetch_key = content::fetch_key(&cid_hex);
-            querier.insert(&fetch_key, publisher.get_blob(cid).unwrap().to_vec());
+            querier.insert(&fetch_key, publisher.get_book(cid).unwrap().to_vec());
         }
 
         // Fetch side.

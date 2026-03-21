@@ -1425,9 +1425,9 @@ mod tests {
         kernel.walk(client_pid, "/store/ingest", 0, 1, 0).unwrap();
         kernel.open(client_pid, 1, OpenMode::ReadWrite).unwrap();
 
-        // Write blob data
-        let blob_data = alloc::vec![0x42u8; 4096];
-        let written = kernel.write(client_pid, 1, 0, &blob_data).unwrap();
+        // Write book data
+        let book_data = alloc::vec![0x42u8; 4096];
+        let written = kernel.write(client_pid, 1, 0, &book_data).unwrap();
         assert_eq!(written, 4096);
 
         // Read to finalize — get back CID + metadata
@@ -1443,13 +1443,13 @@ mod tests {
 
         kernel.clunk(client_pid, 1).unwrap();
 
-        // Now walk to /store/blobs/<cid> and read the blob back
-        let blob_path = alloc::format!("/store/blobs/{}", cid_hex);
-        kernel.walk(client_pid, &blob_path, 0, 2, 0).unwrap();
+        // Now walk to /store/books/<cid> and read the book back
+        let book_path = alloc::format!("/store/books/{}", cid_hex);
+        kernel.walk(client_pid, &book_path, 0, 2, 0).unwrap();
         kernel.open(client_pid, 2, OpenMode::Read).unwrap();
 
         let read_back = kernel.read(client_pid, 2, 0, 16384).unwrap();
-        assert_eq!(read_back, blob_data);
+        assert_eq!(read_back, book_data);
 
         kernel.clunk(client_pid, 2).unwrap();
     }
