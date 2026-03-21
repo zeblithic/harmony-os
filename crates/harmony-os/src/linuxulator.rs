@@ -307,6 +307,46 @@ pub enum LinuxSyscall {
         fd: i32,
         how: i32,
     },
+    Sendto {
+        fd: i32,
+        buf: u64,
+        len: u64,
+        flags: i32,
+        dest_addr: u64,
+        addrlen: u32,
+    },
+    Recvfrom {
+        fd: i32,
+        buf: u64,
+        len: u64,
+        flags: i32,
+        src_addr: u64,
+        addrlen: u64,
+    },
+    Setsockopt {
+        fd: i32,
+        level: i32,
+        optname: i32,
+        optval: u64,
+        optlen: u32,
+    },
+    Getsockopt {
+        fd: i32,
+        level: i32,
+        optname: i32,
+        optval: u64,
+        optlen: u64,
+    },
+    Getsockname {
+        fd: i32,
+        addr: u64,
+        addrlen: u64,
+    },
+    Getpeername {
+        fd: i32,
+        addr: u64,
+        addrlen: u64,
+    },
     Unknown {
         nr: u64,
     },
@@ -394,6 +434,22 @@ impl LinuxSyscall {
                 addr: args[1],
                 addrlen: args[2],
             },
+            44 => LinuxSyscall::Sendto {
+                fd: args[0] as i32,
+                buf: args[1],
+                len: args[2],
+                flags: args[3] as i32,
+                dest_addr: args[4],
+                addrlen: args[5] as u32,
+            },
+            45 => LinuxSyscall::Recvfrom {
+                fd: args[0] as i32,
+                buf: args[1],
+                len: args[2],
+                flags: args[3] as i32,
+                src_addr: args[4],
+                addrlen: args[5],
+            },
             48 => LinuxSyscall::Shutdown {
                 fd: args[0] as i32,
                 how: args[1] as i32,
@@ -406,6 +462,30 @@ impl LinuxSyscall {
             50 => LinuxSyscall::Listen {
                 fd: args[0] as i32,
                 backlog: args[1] as i32,
+            },
+            51 => LinuxSyscall::Getsockname {
+                fd: args[0] as i32,
+                addr: args[1],
+                addrlen: args[2],
+            },
+            52 => LinuxSyscall::Getpeername {
+                fd: args[0] as i32,
+                addr: args[1],
+                addrlen: args[2],
+            },
+            54 => LinuxSyscall::Setsockopt {
+                fd: args[0] as i32,
+                level: args[1] as i32,
+                optname: args[2] as i32,
+                optval: args[3],
+                optlen: args[4] as u32,
+            },
+            55 => LinuxSyscall::Getsockopt {
+                fd: args[0] as i32,
+                level: args[1] as i32,
+                optname: args[2] as i32,
+                optval: args[3],
+                optlen: args[4],
             },
             288 => LinuxSyscall::Accept4 {
                 fd: args[0] as i32,
@@ -709,6 +789,46 @@ impl LinuxSyscall {
                 fd: args[0] as i32,
                 addr: args[1],
                 addrlen: args[2] as u32,
+            },
+            204 => LinuxSyscall::Getsockname {
+                fd: args[0] as i32,
+                addr: args[1],
+                addrlen: args[2],
+            },
+            205 => LinuxSyscall::Getpeername {
+                fd: args[0] as i32,
+                addr: args[1],
+                addrlen: args[2],
+            },
+            206 => LinuxSyscall::Sendto {
+                fd: args[0] as i32,
+                buf: args[1],
+                len: args[2],
+                flags: args[3] as i32,
+                dest_addr: args[4],
+                addrlen: args[5] as u32,
+            },
+            207 => LinuxSyscall::Recvfrom {
+                fd: args[0] as i32,
+                buf: args[1],
+                len: args[2],
+                flags: args[3] as i32,
+                src_addr: args[4],
+                addrlen: args[5],
+            },
+            208 => LinuxSyscall::Setsockopt {
+                fd: args[0] as i32,
+                level: args[1] as i32,
+                optname: args[2] as i32,
+                optval: args[3],
+                optlen: args[4] as u32,
+            },
+            209 => LinuxSyscall::Getsockopt {
+                fd: args[0] as i32,
+                level: args[1] as i32,
+                optname: args[2] as i32,
+                optval: args[3],
+                optlen: args[4],
             },
             210 => LinuxSyscall::Shutdown {
                 fd: args[0] as i32,
@@ -1726,6 +1846,42 @@ impl<B: SyscallBackend> Linuxulator<B> {
             LinuxSyscall::Accept { fd, addr, addrlen } => self.sys_accept4(fd, addr, addrlen, 0),
             LinuxSyscall::Connect { fd, addr, addrlen } => self.sys_connect(fd, addr, addrlen),
             LinuxSyscall::Shutdown { fd, how } => self.sys_shutdown(fd, how),
+            LinuxSyscall::Sendto {
+                fd,
+                buf,
+                len,
+                flags,
+                dest_addr,
+                addrlen,
+            } => self.sys_sendto(fd, buf, len, flags, dest_addr, addrlen),
+            LinuxSyscall::Recvfrom {
+                fd,
+                buf,
+                len,
+                flags,
+                src_addr,
+                addrlen,
+            } => self.sys_recvfrom(fd, buf, len, flags, src_addr, addrlen),
+            LinuxSyscall::Setsockopt {
+                fd,
+                level,
+                optname,
+                optval,
+                optlen,
+            } => self.sys_setsockopt(fd, level, optname, optval, optlen),
+            LinuxSyscall::Getsockopt {
+                fd,
+                level,
+                optname,
+                optval,
+                optlen,
+            } => self.sys_getsockopt(fd, level, optname, optval, optlen),
+            LinuxSyscall::Getsockname { fd, addr, addrlen } => {
+                self.sys_getsockname(fd, addr, addrlen)
+            }
+            LinuxSyscall::Getpeername { fd, addr, addrlen } => {
+                self.sys_getpeername(fd, addr, addrlen)
+            }
             LinuxSyscall::Unknown { .. } => ENOSYS,
         }
     }
@@ -2322,25 +2478,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         };
 
         // Zero the sockaddr if caller provided one.
-        if addr != 0 && addrlen_ptr != 0 {
-            let addrlen_bytes =
-                unsafe { core::slice::from_raw_parts(addrlen_ptr as usize as *const u8, 4) };
-            let addrlen = u32::from_ne_bytes([
-                addrlen_bytes[0],
-                addrlen_bytes[1],
-                addrlen_bytes[2],
-                addrlen_bytes[3],
-            ]) as usize;
-            let zero_len = addrlen.min(128);
-            if zero_len > 0 {
-                let addr_buf =
-                    unsafe { core::slice::from_raw_parts_mut(addr as usize as *mut u8, zero_len) };
-                addr_buf.fill(0);
-            }
-            let addrlen_out =
-                unsafe { core::slice::from_raw_parts_mut(addrlen_ptr as usize as *mut u8, 4) };
-            addrlen_out.copy_from_slice(&0u32.to_ne_bytes());
-        }
+        self.zero_sockaddr(addr, addrlen_ptr);
 
         // Create new socket state.
         let new_socket_id = self.next_socket_id;
@@ -2385,6 +2523,131 @@ impl<B: SyscallBackend> Linuxulator<B> {
     fn sys_shutdown(&self, fd: i32, _how: i32) -> i64 {
         match self.require_socket(fd) {
             Ok(_) => 0,
+            Err(e) => e,
+        }
+    }
+
+    /// Linux sendto(2): stub — pretend all bytes sent.
+    fn sys_sendto(
+        &self,
+        fd: i32,
+        _buf: u64,
+        len: u64,
+        _flags: i32,
+        _addr: u64,
+        _addrlen: u32,
+    ) -> i64 {
+        match self.require_socket(fd) {
+            Ok(_) => len as i64,
+            Err(e) => e,
+        }
+    }
+
+    /// Linux recvfrom(2): stub — return EOF (no data).
+    fn sys_recvfrom(
+        &self,
+        fd: i32,
+        _buf: u64,
+        _len: u64,
+        _flags: i32,
+        _src: u64,
+        _addrlen: u64,
+    ) -> i64 {
+        match self.require_socket(fd) {
+            Ok(_) => 0,
+            Err(e) => e,
+        }
+    }
+
+    /// Linux setsockopt(2): stub — no-op.
+    fn sys_setsockopt(
+        &self,
+        fd: i32,
+        _level: i32,
+        _optname: i32,
+        _optval: u64,
+        _optlen: u32,
+    ) -> i64 {
+        match self.require_socket(fd) {
+            Ok(_) => 0,
+            Err(e) => e,
+        }
+    }
+
+    /// Linux getsockopt(2): stub — write zeros to optval.
+    fn sys_getsockopt(
+        &self,
+        fd: i32,
+        _level: i32,
+        _optname: i32,
+        optval: u64,
+        optlen_ptr: u64,
+    ) -> i64 {
+        match self.require_socket(fd) {
+            Ok(_) => {
+                if optval != 0 && optlen_ptr != 0 {
+                    let optlen_bytes =
+                        unsafe { core::slice::from_raw_parts(optlen_ptr as usize as *const u8, 4) };
+                    let optlen = u32::from_ne_bytes([
+                        optlen_bytes[0],
+                        optlen_bytes[1],
+                        optlen_bytes[2],
+                        optlen_bytes[3],
+                    ]) as usize;
+                    if optlen > 0 {
+                        let buf = unsafe {
+                            core::slice::from_raw_parts_mut(optval as usize as *mut u8, optlen)
+                        };
+                        buf.fill(0);
+                    }
+                }
+                0
+            }
+            Err(e) => e,
+        }
+    }
+
+    /// Helper: zero a sockaddr buffer and set *addrlen to 0.
+    fn zero_sockaddr(&self, addr: u64, addrlen_ptr: u64) {
+        if addr != 0 && addrlen_ptr != 0 {
+            let addrlen_bytes =
+                unsafe { core::slice::from_raw_parts(addrlen_ptr as usize as *const u8, 4) };
+            let addrlen = u32::from_ne_bytes([
+                addrlen_bytes[0],
+                addrlen_bytes[1],
+                addrlen_bytes[2],
+                addrlen_bytes[3],
+            ]) as usize;
+            let zero_len = addrlen.min(128);
+            if zero_len > 0 {
+                let buf =
+                    unsafe { core::slice::from_raw_parts_mut(addr as usize as *mut u8, zero_len) };
+                buf.fill(0);
+            }
+            let out =
+                unsafe { core::slice::from_raw_parts_mut(addrlen_ptr as usize as *mut u8, 4) };
+            out.copy_from_slice(&0u32.to_ne_bytes());
+        }
+    }
+
+    /// Linux getsockname(2): stub — return zeroed sockaddr.
+    fn sys_getsockname(&self, fd: i32, addr: u64, addrlen_ptr: u64) -> i64 {
+        match self.require_socket(fd) {
+            Ok(_) => {
+                self.zero_sockaddr(addr, addrlen_ptr);
+                0
+            }
+            Err(e) => e,
+        }
+    }
+
+    /// Linux getpeername(2): stub — return zeroed sockaddr.
+    fn sys_getpeername(&self, fd: i32, addr: u64, addrlen_ptr: u64) -> i64 {
+        match self.require_socket(fd) {
+            Ok(_) => {
+                self.zero_sockaddr(addr, addrlen_ptr);
+                0
+            }
             Err(e) => e,
         }
     }
@@ -7919,5 +8182,120 @@ mod integration_tests {
             flags: 0,
         });
         assert_eq!(r, EINVAL);
+    }
+
+    #[test]
+    fn test_socket_sendto_recvfrom() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,
+            sock_type: 1,
+            protocol: 0,
+        }) as i32;
+        let buf = [0u8; 64];
+        let r = lx.dispatch_syscall(LinuxSyscall::Sendto {
+            fd,
+            buf: buf.as_ptr() as u64,
+            len: 64,
+            flags: 0,
+            dest_addr: 0,
+            addrlen: 0,
+        });
+        assert_eq!(r, 64);
+        let r = lx.dispatch_syscall(LinuxSyscall::Recvfrom {
+            fd,
+            buf: buf.as_ptr() as u64,
+            len: 64,
+            flags: 0,
+            src_addr: 0,
+            addrlen: 0,
+        });
+        assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn test_socket_setsockopt_getsockopt() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,
+            sock_type: 1,
+            protocol: 0,
+        }) as i32;
+        let r = lx.dispatch_syscall(LinuxSyscall::Setsockopt {
+            fd,
+            level: 1,
+            optname: 2,
+            optval: 0,
+            optlen: 0,
+        });
+        assert_eq!(r, 0);
+        let mut val = [0xFFu8; 4];
+        let mut optlen = 4u32;
+        let r = lx.dispatch_syscall(LinuxSyscall::Getsockopt {
+            fd,
+            level: 1,
+            optname: 2,
+            optval: val.as_mut_ptr() as u64,
+            optlen: &mut optlen as *mut u32 as u64,
+        });
+        assert_eq!(r, 0);
+        assert_eq!(val, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_socket_getsockname_getpeername() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,
+            sock_type: 1,
+            protocol: 0,
+        }) as i32;
+        let mut addr = [0xFFu8; 16];
+        let mut addrlen = 16u32;
+        let r = lx.dispatch_syscall(LinuxSyscall::Getsockname {
+            fd,
+            addr: addr.as_mut_ptr() as u64,
+            addrlen: &mut addrlen as *mut u32 as u64,
+        });
+        assert_eq!(r, 0);
+        assert_eq!(addrlen, 0);
+        assert!(addr.iter().all(|&b| b == 0));
+        addr.fill(0xFF);
+        addrlen = 16;
+        let r = lx.dispatch_syscall(LinuxSyscall::Getpeername {
+            fd,
+            addr: addr.as_mut_ptr() as u64,
+            addrlen: &mut addrlen as *mut u32 as u64,
+        });
+        assert_eq!(r, 0);
+        assert_eq!(addrlen, 0);
+        assert!(addr.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_socket_read_write() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,
+            sock_type: 1,
+            protocol: 0,
+        }) as i32;
+        let buf = [0u8; 32];
+        let r = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd,
+            buf: buf.as_ptr() as u64,
+            count: 32,
+        });
+        assert_eq!(r, 0);
+        let r = lx.dispatch_syscall(LinuxSyscall::Write {
+            fd,
+            buf: buf.as_ptr() as u64,
+            count: 32,
+        });
+        assert_eq!(r, 32);
     }
 }
