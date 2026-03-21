@@ -1517,6 +1517,11 @@ struct SocketState {
     domain: i32,
     sock_type: i32,
     listening: bool,
+    nonblock: bool,
+    /// Track whether accept4 has already returned a stub fd. Non-blocking
+    /// sockets return EAGAIN on subsequent calls to prevent infinite accept
+    /// loops in event-driven callers (epoll always reports ready).
+    accepted_once: bool,
 }
 
 /// Shared state for an epoll instance.
@@ -2520,6 +2525,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 domain,
                 sock_type: base_type,
                 listening: false,
+                nonblock: flags & SOCK_NONBLOCK != 0,
+                accepted_once: false,
             },
         );
 
@@ -2561,9 +2568,15 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux listen(2): mark socket as listening.
     fn sys_listen(&mut self, fd: i32, _backlog: i32) -> i64 {
+        const SOCK_STREAM: i32 = 1;
+        const SOCK_SEQPACKET: i32 = 5;
+        const EOPNOTSUPP: i64 = -95;
         match self.require_socket(fd) {
             Ok(socket_id) => {
                 if let Some(state) = self.sockets.get_mut(&socket_id) {
+                    if state.sock_type != SOCK_STREAM && state.sock_type != SOCK_SEQPACKET {
+                        return EOPNOTSUPP;
+                    }
                     state.listening = true;
                 }
                 0
@@ -2579,15 +2592,18 @@ impl<B: SyscallBackend> Linuxulator<B> {
             Err(e) => return e,
         };
 
-        let listening = self.sockets.get(&socket_id).is_some_and(|s| s.listening);
-        if !listening {
-            return EINVAL;
-        }
-
-        let (domain, sock_type) = match self.sockets.get(&socket_id) {
-            Some(s) => (s.domain, s.sock_type),
-            None => return EINVAL,
+        let state_snap = match self.sockets.get(&socket_id) {
+            Some(s) if s.listening => (s.domain, s.sock_type, s.nonblock, s.accepted_once),
+            Some(s) if !s.listening => return EINVAL,
+            _ => return EINVAL,
         };
+        let (domain, sock_type, nonblock, accepted_once) = state_snap;
+
+        // Non-blocking sockets return EAGAIN after the first accept to
+        // prevent infinite accept loops in always-ready epoll stubs.
+        if nonblock && accepted_once {
+            return EAGAIN;
+        }
 
         // Zero the sockaddr if caller provided one.
         self.zero_sockaddr(addr, addrlen_ptr);
@@ -2595,12 +2611,19 @@ impl<B: SyscallBackend> Linuxulator<B> {
         // Create new socket state.
         let new_socket_id = self.next_socket_id;
         self.next_socket_id += 1;
+        // Mark parent as having accepted once (for EAGAIN on non-blocking).
+        if let Some(parent) = self.sockets.get_mut(&socket_id) {
+            parent.accepted_once = true;
+        }
+
         self.sockets.insert(
             new_socket_id,
             SocketState {
                 domain,
                 sock_type,
                 listening: false,
+                nonblock: false,
+                accepted_once: false,
             },
         );
 
@@ -3019,9 +3042,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 );
                 0
             }
-            FdKind::Socket { .. } => {
+            FdKind::Socket { socket_id } => {
                 let stat = FileStat {
-                    qpath: 0,
+                    qpath: socket_id as u64,
                     name: alloc::sync::Arc::from("socket"),
                     size: 0,
                     file_type: FileType::Regular, // ignored — mode_override used
@@ -3030,9 +3053,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 write_linux_stat_with_mode(statbuf_ptr, &stat, Some(0o140644));
                 0
             }
-            FdKind::Epoll { .. } => {
+            FdKind::Epoll { epoll_id } => {
                 let stat = FileStat {
-                    qpath: 0,
+                    qpath: epoll_id as u64,
                     name: alloc::sync::Arc::from("epoll"),
                     size: 0,
                     file_type: FileType::Regular,
