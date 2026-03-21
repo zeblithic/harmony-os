@@ -5,9 +5,9 @@
 //!
 //! ```text
 //! /
-//! ├── blobs/       — one file per stored blob, named by hex CID
+//! ├── blobs/       — one file per stored book, named by hex CID
 //! ├── pages/       — one file per stored page, named by hex hash_bits
-//! └── ingest       — ctl-file; write blob bytes, read to finalize (returns CID + metadata)
+//! └── ingest       — ctl-file; write book bytes, read to finalize (returns CID + metadata)
 //! ```
 
 extern crate alloc;
@@ -35,9 +35,9 @@ const BLOBS_DIR: QPath = 1;
 const PAGES_DIR: QPath = 2;
 const INGEST: QPath = 3;
 /// Blob QPaths: `BLOB_QPATH_BASE | u64_from_cid[0..8] & 0x7FFF_FFFF_FFFF_FFFF`.
-/// Bit 32 is always set (via OR), so minimum blob QPath is `0x1_0000_0000`.
+/// Bit 32 is always set (via OR), so minimum book QPath is `0x1_0000_0000`.
 /// Page QPaths: `0x1000_0000 + hash_bits` (hash_bits is 28 bits, max 0x0FFF_FFFF).
-/// These ranges are disjoint: pages top out at 0x1FFF_FFFF, blobs start at 0x1_0000_0000.
+/// These ranges are disjoint: pages top out at 0x1FFF_FFFF, books start at 0x1_0000_0000.
 const BLOB_QPATH_BASE: QPath = 0x1_0000_0000;
 const PAGE_QPATH_BASE: QPath = 0x1000_0000;
 
@@ -56,7 +56,7 @@ enum NodeKind {
 
 // ── Ingest pipeline ─────────────────────────────────────────────────
 
-/// Tracks the state of an in-progress blob ingest via the `/ingest` file.
+/// Tracks the state of an in-progress book ingest via the `/ingest` file.
 #[derive(Debug)]
 enum IngestState {
     /// Accumulating bytes from successive writes.
@@ -71,11 +71,11 @@ enum IngestState {
 
 /// A content-addressed 9P file server backed by Book/PageAddr.
 ///
-/// Stores blobs (identified by 256-bit CID) and their constituent
+/// Stores books (identified by 256-bit CID) and their constituent
 /// pages (identified by `PageAddr`). New content enters via the
-/// `/ingest` pseudo-file: write the raw blob bytes, then **read** to
+/// `/ingest` pseudo-file: write the raw book bytes, then **read** to
 /// finalize. The server pages the data, computes the CID, and stores
-/// both the blob manifest and individual page data. Clunking the
+/// both the book manifest and individual page data. Clunking the
 /// ingest fid without reading first silently discards the buffer.
 pub struct ContentServer {
     /// Page data keyed by `hash_bits` (28-bit address).
@@ -273,8 +273,8 @@ impl ContentServer {
 
     /// Read blob data by reassembling from stored pages.
     ///
-    /// Note: reassembles the full blob on every call (O(N) page lookups,
-    /// O(book_size) allocation). Callers reading large blobs in small
+    /// Note: reassembles the full book on every call (O(N) page lookups,
+    /// O(book_size) allocation). Callers reading large books in small
     /// pieces should prefer a single large read or cache locally.
     fn read_blob(&self, cid: &[u8; 32], offset: u64, count: u32) -> Result<Vec<u8>, IpcError> {
         let book = self.blobs.get(cid).ok_or(IpcError::NotFound)?;

@@ -53,7 +53,7 @@ pub trait MeshNarFetch {
 ///
 /// # Trust model
 ///
-/// Every fetched blob is content-verified by its CID (the CID *is* the
+/// Every fetched book is content-verified by its CID (the CID *is* the
 /// hash of the data). However, the store-path → root-CID mapping is
 /// currently unauthenticated: a malicious peer could announce a
 /// different root CID for a given store hash. This is acceptable for
@@ -102,11 +102,11 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
             .map_err(|v: Vec<u8>| format!("root CID is {} bytes, expected 32", v.len()))?;
         let root_cid = ContentId::from_bytes(root_cid_bytes);
 
-        // 4. Fetch the root blob/bundle from the mesh.
+        // 4. Fetch the root book/bundle from the mesh.
         let fetch_key = content::fetch_key(&root_cid_hex);
         let root_data = match self.querier.query(&fetch_key)? {
             Some(data) => data,
-            None => return Ok(None), // Root blob missing from mesh.
+            None => return Ok(None), // Root book missing from mesh.
         };
 
         // 5. Build a temporary store, populate with root data.
@@ -146,7 +146,7 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
                 let data = self
                     .querier
                     .query(&key)?
-                    .ok_or_else(|| format!("mesh missing blob {cid_hex}"))?;
+                    .ok_or_else(|| format!("mesh missing book {cid_hex}"))?;
                 store.store(*cid, data);
             }
             CidType::Book => { /* already in store */ }

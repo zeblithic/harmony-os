@@ -24,8 +24,8 @@ pub trait ContentAnnouncer {
 
 /// Publishes NAR archives into the Harmony content mesh.
 ///
-/// Chunks NAR data into a content-addressed Merkle DAG, stores the blobs
-/// locally, and announces both the store-path mapping and individual blob
+/// Chunks NAR data into a content-addressed Merkle DAG, stores the books
+/// locally, and announces both the store-path mapping and individual book
 /// availability via a [`ContentAnnouncer`].
 ///
 /// Generic over the book store backend: defaults to [`MemoryBookStore`]
@@ -60,7 +60,7 @@ impl<A: ContentAnnouncer> NarPublisher<A, MemoryBookStore> {
 }
 
 impl<A: ContentAnnouncer, S: BookStore> NarPublisher<A, S> {
-    /// Create a new publisher with a caller-provided blob store.
+    /// Create a new publisher with a caller-provided book store.
     pub fn with_store(announcer: A, store: S) -> Self {
         Self {
             announcer,
@@ -75,7 +75,7 @@ impl<A: ContentAnnouncer, S: BookStore> NarPublisher<A, S> {
     /// 1. Chunks the NAR via `dag::ingest`
     /// 2. Records the store-path-to-root-CID mapping
     /// 3. Announces the store path mapping on `harmony/nix/store/{store_hash}`
-    /// 4. Walks the DAG and announces each blob on `harmony/announce/{cid_hex}`
+    /// 4. Walks the DAG and announces each book on `harmony/announce/{cid_hex}`
     /// 5. If the root is a bundle (multi-chunk), announces the bundle itself
     pub fn publish(
         &mut self,
@@ -92,7 +92,7 @@ impl<A: ContentAnnouncer, S: BookStore> NarPublisher<A, S> {
         let store_hash = &store_path_name[..32];
 
         // Ingest into the DAG (blob_store mutation is harmless on error —
-        // content-addressed blobs are just cached data, not mappings).
+        // content-addressed books are just cached data, not mappings).
         let root_cid = dag::ingest(nar_bytes, &self.chunker_config, &mut self.blob_store)
             .map_err(|e| format!("ingest failed: {e}"))?;
 
@@ -103,11 +103,11 @@ impl<A: ContentAnnouncer, S: BookStore> NarPublisher<A, S> {
         self.announcer
             .announce(&store_key, root_cid_hex.as_bytes())?;
 
-        // Walk the DAG to collect all leaf blob CIDs.
+        // Walk the DAG to collect all leaf book CIDs.
         let blob_cids =
             dag::walk(&root_cid, &self.blob_store).map_err(|e| format!("DAG walk failed: {e}"))?;
 
-        // Announce each blob.
+        // Announce each book.
         for cid in &blob_cids {
             let cid_hex = hex::encode(cid.to_bytes());
             let blob_key = announce::key(&cid_hex);
@@ -138,7 +138,7 @@ impl<A: ContentAnnouncer, S: BookStore> NarPublisher<A, S> {
         self.published_paths.get(store_path_name)
     }
 
-    /// Retrieve blob data by CID from the local store.
+    /// Retrieve book data by CID from the local store.
     pub fn get_blob(&self, cid: &ContentId) -> Option<&[u8]> {
         self.blob_store.get(cid)
     }
@@ -148,7 +148,7 @@ impl<A: ContentAnnouncer, S: BookStore> NarPublisher<A, S> {
         &self.published_paths
     }
 
-    /// Read-only access to the underlying blob store.
+    /// Read-only access to the underlying book store.
     pub fn blob_store(&self) -> &S {
         &self.blob_store
     }
