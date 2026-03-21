@@ -170,9 +170,16 @@ Future beads add `References` (harmony-os-yte) and `Sig`
 
 ```
 StoreDir: /nix/store
-WantMassQuery: 1
+WantMassQuery: 0
 Priority: 30
 ```
+
+`WantMassQuery: 0` because we don't implement the bulk path-validity
+POST endpoint. Setting `1` without a batch handler causes Nix to
+attempt batch requests that silently 404. Individual narinfo GETs
+are sub-millisecond for a local in-memory cache, so the performance
+impact is negligible. A future bead can add batch support and flip
+this to `1`.
 
 `Priority: 30` gives the local mesh cache higher priority than
 cache.nixos.org (priority 40). In Nix's substituter system, lower
