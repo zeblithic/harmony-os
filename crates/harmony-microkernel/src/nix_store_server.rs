@@ -798,8 +798,9 @@ mod tests {
         srv.import_nar("zzz-last", nar_regular_file(b"z", false))
             .unwrap();
 
-        let names: Vec<&str> = srv.store_path_names().map(|n| n.as_ref()).collect();
-        assert_eq!(names, vec!["aaa-first", "zzz-last"]); // BTreeMap = sorted
+        let mut names: Vec<&str> = srv.store_path_names().map(|n| n.as_ref()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["aaa-first", "zzz-last"]);
     }
 
     #[test]

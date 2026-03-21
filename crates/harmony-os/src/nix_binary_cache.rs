@@ -30,20 +30,51 @@ pub enum CacheResponse {
     BadRequest,
 }
 
+/// Entry in the hash index: full store path name + precomputed NAR SHA-256.
+struct IndexEntry {
+    name: Arc<str>,
+    nar_sha256: [u8; 32],
+    nar_size: u64,
+}
+
 /// Sans-I/O Nix binary cache protocol handler.
 pub struct BinaryCacheServer {
     server: NixStoreServer,
-    hash_index: HashMap<String, Arc<str>>,
+    /// 32-char store hash → precomputed narinfo data.
+    hash_index: HashMap<String, IndexEntry>,
     misses: BTreeSet<String>,
 }
 
+/// Validate that a hash string is 32 lowercase-alphanumeric characters.
+/// Nix store hashes use the nix base32 alphabet (subset of lowercase + digits).
+fn is_valid_store_hash(hash: &str) -> bool {
+    hash.len() == 32
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
 impl BinaryCacheServer {
+    /// Create a new binary cache server from an existing NixStoreServer.
+    ///
+    /// Builds the hash index (including precomputed SHA-256 digests) by
+    /// scanning existing store path names.
     pub fn new(server: NixStoreServer) -> Self {
         let mut hash_index = HashMap::new();
         for name in server.store_path_names() {
-            if name.len() >= 32 {
+            if name.len() >= 33 && name.as_bytes()[32] == b'-' {
                 let hash = name[..32].to_string();
-                hash_index.insert(hash, Arc::clone(name));
+                let nar_blob = server.get_nar_blob(name).unwrap();
+                let sha256: [u8; 32] = Sha256::digest(nar_blob).into();
+                let nar_size = nar_blob.len() as u64;
+                hash_index.insert(
+                    hash,
+                    IndexEntry {
+                        name: Arc::clone(name),
+                        nar_sha256: sha256,
+                        nar_size,
+                    },
+                );
             }
         }
         Self {
@@ -53,6 +84,7 @@ impl BinaryCacheServer {
         }
     }
 
+    /// Handle a binary cache request path.
     pub fn handle_request(&mut self, path: &str) -> CacheResponse {
         if path == "/nix-cache-info" {
             return CacheResponse::CacheInfo(
@@ -64,15 +96,12 @@ impl BinaryCacheServer {
             .strip_suffix(".narinfo")
             .and_then(|p| p.strip_prefix('/'))
         {
-            if hash.len() != 32 || !hash.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            if !is_valid_store_hash(hash) {
                 return CacheResponse::BadRequest;
             }
             return match self.hash_index.get(hash) {
-                Some(full_name) => {
-                    let nar_blob = self.server.get_nar_blob(full_name).unwrap();
-                    let sha256 = Sha256::digest(nar_blob);
-                    let text =
-                        serialize_narinfo(full_name, sha256.as_slice(), nar_blob.len() as u64);
+                Some(entry) => {
+                    let text = serialize_narinfo(&entry.name, &entry.nar_sha256, entry.nar_size);
                     CacheResponse::Narinfo(text)
                 }
                 None => {
@@ -85,7 +114,7 @@ impl BinaryCacheServer {
         if let Some(rest) = path.strip_prefix("/nar/") {
             let name = match rest.strip_suffix(".nar") {
                 Some(n) => n,
-                None => return CacheResponse::NotFound,
+                None => return CacheResponse::BadRequest,
             };
             return match self.server.get_nar_blob(name) {
                 Some(blob) => CacheResponse::NarData(blob.to_vec()),
@@ -96,23 +125,36 @@ impl BinaryCacheServer {
         CacheResponse::NotFound
     }
 
+    /// Drain recorded miss hashes for background fetch processing.
     pub fn drain_misses(&mut self) -> Vec<String> {
         core::mem::take(&mut self.misses).into_iter().collect()
     }
 
+    /// Import a NAR into the underlying server and update the hash index.
     pub fn import_nar(&mut self, name: &str, nar_bytes: Vec<u8>) -> Result<(), NarError> {
+        let sha256: [u8; 32] = Sha256::digest(&nar_bytes).into();
+        let nar_size = nar_bytes.len() as u64;
         self.server.import_nar(name, nar_bytes)?;
-        if name.len() >= 32 {
+        if name.len() >= 33 && name.as_bytes()[32] == b'-' {
             let hash = name[..32].to_string();
-            self.hash_index.insert(hash, Arc::from(name));
+            self.hash_index.insert(
+                hash,
+                IndexEntry {
+                    name: Arc::from(name),
+                    nar_sha256: sha256,
+                    nar_size,
+                },
+            );
         }
         Ok(())
     }
 
+    /// Check whether a store path is available.
     pub fn has_store_path(&self, name: &str) -> bool {
         self.server.has_store_path(name)
     }
 
+    /// Mutable access to the underlying NixStoreServer.
     pub fn server_mut(&mut self) -> &mut NixStoreServer {
         &mut self.server
     }
@@ -200,12 +242,19 @@ mod tests {
     #[test]
     fn handle_narinfo_bad_hash_length() {
         let mut srv = build_server();
+        // Too short.
         assert_eq!(
             srv.handle_request("/abc.narinfo"),
             CacheResponse::BadRequest
         );
+        // Non-alphanumeric chars.
         assert_eq!(
             srv.handle_request("/@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@.narinfo"),
+            CacheResponse::BadRequest
+        );
+        // Uppercase rejected (nix base32 is lowercase only).
+        assert_eq!(
+            srv.handle_request("/ABCDEF00ABCDEF00ABCDEF00ABCDEF00.narinfo"),
             CacheResponse::BadRequest
         );
     }
@@ -230,6 +279,16 @@ mod tests {
         let mut srv = build_server();
         let resp = srv.handle_request("/nar/nonexistent-pkg.nar");
         assert_eq!(resp, CacheResponse::NotFound);
+    }
+
+    #[test]
+    fn handle_nar_missing_suffix() {
+        let mut srv = build_server();
+        // Missing .nar suffix is a malformed request, not a lookup miss.
+        assert_eq!(
+            srv.handle_request("/nar/some-package"),
+            CacheResponse::BadRequest
+        );
     }
 
     #[test]
