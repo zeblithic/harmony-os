@@ -16,7 +16,7 @@ use harmony_microkernel::nix_store_server::NixStoreServer;
 use crate::narinfo::serialize_narinfo;
 
 /// Response from a binary cache request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum CacheResponse {
     /// narinfo text (Content-Type: text/x-nix-narinfo).
     Narinfo(String),
@@ -149,6 +149,7 @@ impl BinaryCacheServer {
         self.server.import_nar(name, nar_bytes)?;
         if name.len() >= 33 && name.as_bytes()[32] == b'-' {
             let hash = name[..32].to_string();
+            self.misses.remove(&hash);
             self.hash_index.insert(
                 hash,
                 IndexEntry {
@@ -337,6 +338,26 @@ mod tests {
             other => panic!("expected Narinfo after import, got {other:?}"),
         }
         assert!(srv.drain_misses().is_empty());
+    }
+
+    #[test]
+    fn import_clears_stale_miss() {
+        let mut srv = build_server();
+        let hash = "stl12345678901234567890123456789";
+        let name = format!("{hash}-stale");
+
+        // Miss recorded.
+        srv.handle_request(&format!("/{hash}.narinfo"));
+
+        // Import WITHOUT draining first — the miss should be cleared by import.
+        srv.import_nar(&name, build_test_nar(b"no longer missing"))
+            .unwrap();
+
+        // drain_misses must NOT return the now-imported hash.
+        assert!(
+            srv.drain_misses().is_empty(),
+            "import_nar should clear the stale miss"
+        );
     }
 
     #[test]
