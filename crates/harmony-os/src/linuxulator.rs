@@ -2701,6 +2701,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                         optlen_bytes[2],
                         optlen_bytes[3],
                     ]) as usize;
+                    let optlen = optlen.min(128);
                     if optlen > 0 {
                         let buf = unsafe {
                             core::slice::from_raw_parts_mut(optval as usize as *mut u8, optlen)
@@ -2814,6 +2815,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         if !self.fd_table.contains_key(&fd) {
             return EBADF;
+        }
+        if fd == epfd {
+            return EINVAL;
         }
 
         const EPOLL_CTL_ADD: i32 = 1;
