@@ -9142,4 +9142,26 @@ mod integration_tests {
         assert_eq!(out[0].data(), magic);
         assert_eq!(out[0].events(), 0x1);
     }
+
+    #[test]
+    fn test_socket_mmap_enodev() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,
+            sock_type: 1,
+            protocol: 0,
+        }) as i32;
+
+        let r = lx.dispatch_syscall(LinuxSyscall::Mmap {
+            addr: 0,
+            len: 4096,
+            prot: 1,  // PROT_READ
+            flags: 2, // MAP_PRIVATE (NOT MAP_ANONYMOUS)
+            fd,
+            offset: 0,
+        });
+        assert_eq!(r, ENODEV);
+    }
 }
