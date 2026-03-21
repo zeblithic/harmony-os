@@ -64,7 +64,7 @@ impl BinaryCacheServer {
             .strip_suffix(".narinfo")
             .and_then(|p| p.strip_prefix('/'))
         {
-            if hash.len() != 32 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if hash.len() != 32 || !hash.bytes().all(|b| b.is_ascii_alphanumeric()) {
                 return CacheResponse::BadRequest;
             }
             return match self.hash_index.get(hash) {
@@ -98,6 +98,23 @@ impl BinaryCacheServer {
 
     pub fn drain_misses(&mut self) -> Vec<String> {
         core::mem::take(&mut self.misses).into_iter().collect()
+    }
+
+    pub fn import_nar(&mut self, name: &str, nar_bytes: Vec<u8>) -> Result<(), NarError> {
+        self.server.import_nar(name, nar_bytes)?;
+        if name.len() >= 32 {
+            let hash = name[..32].to_string();
+            self.hash_index.insert(hash, Arc::from(name));
+        }
+        Ok(())
+    }
+
+    pub fn has_store_path(&self, name: &str) -> bool {
+        self.server.has_store_path(name)
+    }
+
+    pub fn server_mut(&mut self) -> &mut NixStoreServer {
+        &mut self.server
     }
 }
 
@@ -188,7 +205,7 @@ mod tests {
             CacheResponse::BadRequest
         );
         assert_eq!(
-            srv.handle_request("/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.narinfo"),
+            srv.handle_request("/@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@.narinfo"),
             CacheResponse::BadRequest
         );
     }
@@ -213,5 +230,56 @@ mod tests {
         let mut srv = build_server();
         let resp = srv.handle_request("/nar/nonexistent-pkg.nar");
         assert_eq!(resp, CacheResponse::NotFound);
+    }
+
+    #[test]
+    fn hash_index_populated_on_import() {
+        let mut srv = build_server();
+        let name = "imp12345678901234567890123456789-imported";
+        srv.import_nar(name, build_test_nar(b"imported data"))
+            .unwrap();
+        let resp = srv.handle_request("/imp12345678901234567890123456789.narinfo");
+        match resp {
+            CacheResponse::Narinfo(text) => assert!(text.contains(name)),
+            other => panic!("expected Narinfo after import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_after_miss() {
+        let mut srv = build_server();
+        let hash = "mis12345678901234567890123456789";
+        let name = format!("{hash}-recovered");
+        assert_eq!(
+            srv.handle_request(&format!("/{hash}.narinfo")),
+            CacheResponse::NotFound
+        );
+        let misses = srv.drain_misses();
+        assert_eq!(misses, vec![hash]);
+        srv.import_nar(&name, build_test_nar(b"recovered")).unwrap();
+        match srv.handle_request(&format!("/{hash}.narinfo")) {
+            CacheResponse::Narinfo(text) => assert!(text.contains(&name)),
+            other => panic!("expected Narinfo after import, got {other:?}"),
+        }
+        assert!(srv.drain_misses().is_empty());
+    }
+
+    #[test]
+    fn has_store_path() {
+        let name = "has12345678901234567890123456789-check";
+        let mut srv = build_server();
+        assert!(!srv.has_store_path(name));
+        srv.import_nar(name, build_test_nar(b"check")).unwrap();
+        assert!(srv.has_store_path(name));
+    }
+
+    #[test]
+    fn drain_misses_deduplicates() {
+        let mut srv = build_server();
+        let hash = "dup12345678901234567890123456789";
+        srv.handle_request(&format!("/{hash}.narinfo"));
+        srv.handle_request(&format!("/{hash}.narinfo"));
+        let misses = srv.drain_misses();
+        assert_eq!(misses.len(), 1);
     }
 }
