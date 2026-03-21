@@ -67,9 +67,21 @@ impl NarInfo {
 /// The NAR is served uncompressed (`Compression: none`).
 ///
 /// `nar_sha256` is the raw 32-byte SHA-256 digest of the NAR blob.
+///
+/// # Panics
+///
+/// Panics if `store_path_name` contains `\n`, `\r`, or `\0` (would
+/// allow narinfo field injection).
 #[cfg(feature = "std")]
 pub fn serialize_narinfo(store_path_name: &str, nar_sha256: &[u8; 32], nar_size: u64) -> String {
     use crate::nix_base32::encode_nix_base32;
+
+    assert!(
+        !store_path_name.contains('\n')
+            && !store_path_name.contains('\r')
+            && !store_path_name.contains('\0'),
+        "store_path_name must not contain control characters: {store_path_name:?}"
+    );
 
     let hash_b32 = encode_nix_base32(nar_sha256);
     format!(
@@ -196,6 +208,13 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
             let text = serialize_narinfo("test123-pkg", &hash.into(), 4);
             let store_line = text.lines().find(|l| l.starts_with("StorePath:")).unwrap();
             assert_eq!(store_line, "StorePath: /nix/store/test123-pkg");
+        }
+
+        #[test]
+        #[should_panic(expected = "control characters")]
+        fn serialize_rejects_newline_injection() {
+            let hash = sha2::Sha256::digest(b"data");
+            serialize_narinfo("abc123-pkg\nURL: nar/fake.nar\njunk", &hash.into(), 4);
         }
     }
 }
