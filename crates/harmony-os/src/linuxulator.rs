@@ -2081,7 +2081,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             }
             FdKind::Socket { .. } => {
                 // Stub: pretend all bytes written.
-                count as i64
+                count.min(i64::MAX as usize) as i64
             }
             FdKind::Epoll { .. } => EINVAL,
         }
