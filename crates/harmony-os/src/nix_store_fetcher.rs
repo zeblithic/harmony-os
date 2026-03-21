@@ -424,24 +424,7 @@ mod tests {
 
     // ── Nix base32 encoder (test helper) ─────────────────────────────
 
-    fn encode_nix_base32(bytes: &[u8]) -> String {
-        use crate::nix_base32::NIX_BASE32_CHARS;
-        let hash_size = bytes.len();
-        let nchar = (hash_size * 8).div_ceil(5);
-        let mut out = String::with_capacity(nchar);
-        for i in (0..nchar).rev() {
-            let mut digit: u8 = 0;
-            for j in (0..5).rev() {
-                let bit_pos = i * 5 + j;
-                digit <<= 1;
-                if bit_pos / 8 < hash_size {
-                    digit |= (bytes[bit_pos / 8] >> (bit_pos % 8)) & 1;
-                }
-            }
-            out.push(NIX_BASE32_CHARS[digit as usize] as char);
-        }
-        out
-    }
+    use crate::nix_base32::encode_nix_base32;
 
     // ── XZ compression helper ────────────────────────────────────────
 
