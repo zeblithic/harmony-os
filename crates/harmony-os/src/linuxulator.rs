@@ -988,17 +988,17 @@ impl LinuxSyscall {
                 flags: args[2] as u32,
             },
             293 => LinuxSyscall::Rseq,
-            221 => LinuxSyscall::Execve {
-                path: args[0],
-                argv: args[1],
-                envp: args[2],
-            },
             220 => LinuxSyscall::Clone {
                 flags: args[0],
                 child_stack: args[1],
                 parent_tid: args[2],
                 tls: args[3],
                 child_tid: args[4],
+            },
+            221 => LinuxSyscall::Execve {
+                path: args[0],
+                argv: args[1],
+                envp: args[2],
             },
             260 => LinuxSyscall::Wait4 {
                 pid: args[0] as i32,
@@ -1465,7 +1465,8 @@ unsafe fn read_c_string(ptr: usize) -> alloc::string::String {
 }
 
 /// Read a null-terminated array of string pointers from user memory.
-/// Returns empty vec if ptr is 0 (null).
+/// Returns empty vec if ptr is 0 (null). Returns at most `max_count`
+/// entries; any beyond that are silently dropped.
 fn read_string_array(ptr: u64, max_count: usize) -> Vec<alloc::string::String> {
     if ptr == 0 {
         return Vec::new();
@@ -2536,19 +2537,31 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         // Allocate 128 KiB stack from the fresh arena's mmap region.
         const STACK_SIZE: usize = 128 * 1024;
+        assert!(
+            self.arena.mmap_top >= STACK_SIZE,
+            "arena too small for execve stack (arena_size={}, need={})",
+            self.arena_size,
+            STACK_SIZE
+        );
         self.arena.mmap_top -= STACK_SIZE;
         let stack_base = self.arena.base + self.arena.mmap_top;
 
         // Generate deterministic random bytes for AT_RANDOM.
+        // Uses the same iterated LCG as sys_getrandom with a non-zero
+        // seed to avoid all-zero output when getrandom_counter is 0.
         let random_bytes: [u8; 16] = {
             let mut bytes = [0u8; 16];
             let counter = self.getrandom_counter;
             self.getrandom_counter += 1;
-            for (i, b) in bytes.iter_mut().enumerate() {
-                *b = ((counter
+            let mut state = counter
+                .wrapping_add(0xDEAD_BEEF_CAFE_BABE) // non-zero seed mixing
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            for b in bytes.iter_mut() {
+                state = state
                     .wrapping_mul(6364136223846793005)
-                    .wrapping_add(i as u64))
-                    >> 33) as u8;
+                    .wrapping_add(1442695040888963407);
+                *b = (state >> 33) as u8;
             }
             bytes
         };
