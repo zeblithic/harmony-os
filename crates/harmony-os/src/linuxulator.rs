@@ -33,6 +33,8 @@ const EOVERFLOW: i64 = -75;
 const EAFNOSUPPORT: i64 = -97;
 const ENOTSOCK: i64 = -88;
 const ECHILD: i64 = -10;
+#[allow(dead_code)]
+const ENOEXEC: i64 = -8;
 const EEXIST: i64 = -17;
 
 // Clock IDs (shared by clock_gettime and clock_getres)
@@ -389,6 +391,11 @@ pub enum LinuxSyscall {
         options: i32,
         rusage: u64,
     },
+    Execve {
+        path: u64,
+        argv: u64,
+        envp: u64,
+    },
     Unknown {
         nr: u64,
     },
@@ -691,6 +698,11 @@ impl LinuxSyscall {
             },
             57 => LinuxSyscall::Fork,
             58 => LinuxSyscall::Vfork,
+            59 => LinuxSyscall::Execve {
+                path: args[0],
+                argv: args[1],
+                envp: args[2],
+            },
             61 => LinuxSyscall::Wait4 {
                 pid: args[0] as i32,
                 wstatus: args[1],
@@ -976,6 +988,11 @@ impl LinuxSyscall {
                 flags: args[2] as u32,
             },
             293 => LinuxSyscall::Rseq,
+            221 => LinuxSyscall::Execve {
+                path: args[0],
+                argv: args[1],
+                envp: args[2],
+            },
             220 => LinuxSyscall::Clone {
                 flags: args[0],
                 child_stack: args[1],
@@ -1256,10 +1273,11 @@ impl SyscallBackend for MockBackend {
         } else {
             FileType::Regular
         };
+        let size = self.file_content.get(&fid).map_or(0, |c| c.len() as u64);
         Ok(FileStat {
             qpath: 0,
             name: alloc::sync::Arc::from("mock"),
-            size: 0,
+            size,
             file_type,
         })
     }
@@ -1611,6 +1629,14 @@ struct ChildProcess<B: SyscallBackend> {
     linuxulator: Linuxulator<B>,
 }
 
+/// Result of a successful execve — new entry point and stack pointer
+/// for the caller to jump to.
+#[allow(dead_code)]
+pub struct ExecveResult {
+    pub entry_point: u64,
+    pub stack_pointer: u64,
+}
+
 /// Per-fd state: the kind of object and descriptor-level flags.
 #[derive(Clone)]
 struct FdEntry {
@@ -1679,6 +1705,9 @@ pub struct Linuxulator<B: SyscallBackend> {
     exited_children: Vec<(i32, i32)>,
     /// Arena size used for this process (inherited by children on fork).
     arena_size: usize,
+    /// Set by sys_execve on success — caller should reset RIP/RSP.
+    #[allow(dead_code)]
+    pending_execve: Option<ExecveResult>,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -1717,6 +1746,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             children: Vec::new(),
             exited_children: Vec::new(),
             arena_size,
+            pending_execve: None,
         }
     }
 
@@ -1925,6 +1955,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
             }
         }
         None
+    }
+
+    /// Consume the pending execve result. If Some, the caller should
+    /// reset RIP to entry_point and RSP to stack_pointer.
+    pub fn pending_execve(&mut self) -> Option<ExecveResult> {
+        self.pending_execve.take()
     }
 
     /// Access the backend (for test assertions).
@@ -2160,6 +2196,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 options,
                 rusage,
             } => self.sys_wait4(pid, wstatus, options, rusage),
+            LinuxSyscall::Execve { path, argv, envp } => self.sys_execve(path, argv, envp),
             LinuxSyscall::Unknown { .. } => ENOSYS,
         }
     }
@@ -3224,6 +3261,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             children: Vec::new(),
             exited_children: Vec::new(),
             arena_size: self.arena_size,
+            pending_execve: None,
         };
         // Move shared pipe/eventfd state to child
         core::mem::swap(&mut self.pipes, &mut child.pipes);
@@ -3521,6 +3559,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// In our single-threaded model, this is equivalent to exit_group.
     fn sys_exit(&mut self, code: i32) -> i64 {
         self.sys_exit_group(code)
+    }
+
+    /// Linux execve(2): replace process image.
+    fn sys_execve(&mut self, _path: u64, _argv: u64, _envp: u64) -> i64 {
+        ENOSYS // placeholder — implemented in Task 2
     }
 
     /// Linux exit_group(2): terminate the process.
