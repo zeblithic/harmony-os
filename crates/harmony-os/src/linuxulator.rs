@@ -32,6 +32,7 @@ const ENOSYS: i64 = -38;
 const EOVERFLOW: i64 = -75;
 const EAFNOSUPPORT: i64 = -97;
 const ENOTSOCK: i64 = -88;
+const ECHILD: i64 = -10;
 const EEXIST: i64 = -17;
 
 // Clock IDs (shared by clock_gettime and clock_getres)
@@ -382,6 +383,12 @@ pub enum LinuxSyscall {
         args: u64,
         size: u64,
     },
+    Wait4 {
+        pid: i32,
+        wstatus: u64,
+        options: i32,
+        rusage: u64,
+    },
     Unknown {
         nr: u64,
     },
@@ -684,6 +691,12 @@ impl LinuxSyscall {
             },
             57 => LinuxSyscall::Fork,
             58 => LinuxSyscall::Vfork,
+            61 => LinuxSyscall::Wait4 {
+                pid: args[0] as i32,
+                wstatus: args[1],
+                options: args[2] as i32,
+                rusage: args[3],
+            },
             435 => LinuxSyscall::Clone3 {
                 args: args[0],
                 size: args[1],
@@ -969,6 +982,12 @@ impl LinuxSyscall {
                 parent_tid: args[2],
                 tls: args[3],
                 child_tid: args[4],
+            },
+            260 => LinuxSyscall::Wait4 {
+                pid: args[0] as i32,
+                wstatus: args[1],
+                options: args[2] as i32,
+                rusage: args[3],
             },
             435 => LinuxSyscall::Clone3 {
                 args: args[0],
@@ -1656,8 +1675,7 @@ pub struct Linuxulator<B: SyscallBackend> {
     next_child_pid: i32,
     /// Active children (running, not yet exited).
     children: Vec<ChildProcess<B>>,
-    /// Exited children: (pid, exit_code) pairs for future waitpid.
-    #[allow(dead_code)]
+    /// Exited children: (pid, exit_code) pairs consumed by waitpid/wait4.
     exited_children: Vec<(i32, i32)>,
     /// Arena size used for this process (inherited by children on fork).
     arena_size: usize,
@@ -2136,6 +2154,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
             LinuxSyscall::Vfork => self.sys_fork(),
             LinuxSyscall::Clone { flags, .. } => self.sys_clone(flags),
             LinuxSyscall::Clone3 { .. } => ENOSYS,
+            LinuxSyscall::Wait4 {
+                pid,
+                wstatus,
+                options,
+                ..
+            } => self.sys_wait4(pid, wstatus, options),
             LinuxSyscall::Unknown { .. } => ENOSYS,
         }
     }
@@ -3274,6 +3298,68 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
 
         self.sys_fork()
+    }
+
+    /// Linux wait4(2): wait for a child process to exit.
+    ///
+    /// In the sequential model, children run to completion before the
+    /// parent resumes, so exited children are always available in
+    /// `self.exited_children` by the time the parent calls wait4.
+    ///
+    /// pid semantics:
+    /// - pid > 0: wait for specific child
+    /// - pid == -1: wait for any child
+    /// - pid == 0 or pid < -1: not supported (ENOSYS)
+    ///
+    /// options:
+    /// - WNOHANG (1): return 0 immediately if no child has exited
+    /// - Without WNOHANG: return ECHILD if no exited children available
+    ///
+    /// wstatus format: (exit_code & 0xFF) << 8 (normal exit, no signal)
+    fn sys_wait4(&mut self, pid: i32, wstatus_ptr: u64, options: i32) -> i64 {
+        const WNOHANG: i32 = 1;
+
+        // Ensure any recently-exited child is recovered first.
+        self.recover_child_state();
+
+        if pid == 0 || pid < -1 {
+            return ENOSYS; // process group wait not supported
+        }
+
+        let idx = if pid == -1 {
+            // Any child
+            if self.exited_children.is_empty() {
+                None
+            } else {
+                Some(self.exited_children.len() - 1)
+            }
+        } else {
+            // Specific child
+            self.exited_children.iter().position(|&(p, _)| p == pid)
+        };
+
+        let idx = match idx {
+            Some(i) => i,
+            None => {
+                if options & WNOHANG != 0 {
+                    return 0; // no exited children, non-blocking
+                }
+                return ECHILD; // no children to wait for
+            }
+        };
+
+        let (child_pid, exit_code) = self.exited_children.remove(idx);
+
+        // Write wstatus if pointer is non-null.
+        // Linux wstatus format for normal exit: (code & 0xFF) << 8
+        if wstatus_ptr != 0 {
+            let wstatus = ((exit_code & 0xFF) as u32) << 8;
+            let buf =
+                unsafe { core::slice::from_raw_parts_mut(wstatus_ptr as usize as *mut u8, 4) };
+            buf.copy_from_slice(&wstatus.to_ne_bytes());
+        }
+
+        child_pid as i64
     }
 
     /// Linux fstat(2): get file status.
@@ -9842,5 +9928,160 @@ mod integration_tests {
         });
         assert_eq!(r, 4);
         assert_eq!(&buf, b"test");
+    }
+
+    // ── Wait4 tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_wait4_returns_child_pid_and_status() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Fork, child exits with code 42
+        let child_pid = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
+        {
+            let child = lx.active_process();
+            child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 42 });
+        }
+        // Recover child state
+        let _ = lx.active_process();
+
+        // wait4(-1, &wstatus, 0, NULL) — wait for any child
+        let mut wstatus = 0u32;
+        let r = lx.dispatch_syscall(LinuxSyscall::Wait4 {
+            pid: -1,
+            wstatus: &mut wstatus as *mut u32 as u64,
+            options: 0,
+            rusage: 0,
+        });
+        assert_eq!(r, child_pid as i64);
+        // wstatus: normal exit = (code & 0xFF) << 8
+        assert_eq!(wstatus, 42 << 8);
+    }
+
+    #[test]
+    fn test_wait4_specific_pid() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Fork child 1, exits with code 1
+        let pid1 = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
+        {
+            let child = lx.active_process();
+            child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 1 });
+        }
+        let _ = lx.active_process();
+
+        // Fork child 2, exits with code 2
+        let pid2 = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
+        {
+            let child = lx.active_process();
+            child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 2 });
+        }
+        let _ = lx.active_process();
+
+        // Wait for pid2 specifically
+        let mut wstatus = 0u32;
+        let r = lx.dispatch_syscall(LinuxSyscall::Wait4 {
+            pid: pid2,
+            wstatus: &mut wstatus as *mut u32 as u64,
+            options: 0,
+            rusage: 0,
+        });
+        assert_eq!(r, pid2 as i64);
+        assert_eq!(wstatus, 2 << 8);
+
+        // pid1 should still be in exited_children
+        let r = lx.dispatch_syscall(LinuxSyscall::Wait4 {
+            pid: pid1,
+            wstatus: &mut wstatus as *mut u32 as u64,
+            options: 0,
+            rusage: 0,
+        });
+        assert_eq!(r, pid1 as i64);
+        assert_eq!(wstatus, 1 << 8);
+    }
+
+    #[test]
+    fn test_wait4_wnohang_no_children() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // No children at all — WNOHANG returns 0
+        let r = lx.dispatch_syscall(LinuxSyscall::Wait4 {
+            pid: -1,
+            wstatus: 0,
+            options: 1, // WNOHANG
+            rusage: 0,
+        });
+        assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn test_wait4_echild_no_children() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // No children, blocking wait → ECHILD
+        let r = lx.dispatch_syscall(LinuxSyscall::Wait4 {
+            pid: -1,
+            wstatus: 0,
+            options: 0,
+            rusage: 0,
+        });
+        assert_eq!(r, ECHILD);
+    }
+
+    #[test]
+    fn test_wait4_null_wstatus() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let child_pid = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
+        {
+            let child = lx.active_process();
+            child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 0 });
+        }
+        let _ = lx.active_process();
+
+        // wstatus=0 (null) — should still return child pid without crashing
+        let r = lx.dispatch_syscall(LinuxSyscall::Wait4 {
+            pid: -1,
+            wstatus: 0,
+            options: 0,
+            rusage: 0,
+        });
+        assert_eq!(r, child_pid as i64);
+    }
+
+    #[test]
+    fn test_wait4_consumes_child() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let _child_pid = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
+        {
+            let child = lx.active_process();
+            child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 0 });
+        }
+        let _ = lx.active_process();
+
+        // First wait succeeds
+        let r = lx.dispatch_syscall(LinuxSyscall::Wait4 {
+            pid: -1,
+            wstatus: 0,
+            options: 0,
+            rusage: 0,
+        });
+        assert!(r > 0);
+
+        // Second wait — child already consumed → ECHILD
+        let r = lx.dispatch_syscall(LinuxSyscall::Wait4 {
+            pid: -1,
+            wstatus: 0,
+            options: 0,
+            rusage: 0,
+        });
+        assert_eq!(r, ECHILD);
     }
 }
