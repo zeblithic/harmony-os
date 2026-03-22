@@ -1859,11 +1859,13 @@ impl<B: SyscallBackend> Linuxulator<B> {
         let mut c = child.linuxulator;
         core::mem::swap(&mut self.pipes, &mut c.pipes);
         core::mem::swap(&mut self.eventfds, &mut c.eventfds);
-        // Take the max of parent and child allocators
+        // Recover shared-state allocators (pipes/eventfds are shared,
+        // so their ID counters must not collide after recovery).
         self.next_pipe_id = self.next_pipe_id.max(c.next_pipe_id);
         self.next_eventfd_id = self.next_eventfd_id.max(c.next_eventfd_id);
-        self.next_socket_id = self.next_socket_id.max(c.next_socket_id);
-        self.next_epoll_id = self.next_epoll_id.max(c.next_epoll_id);
+        // Sockets and epolls are cloned (not shared) — child's objects
+        // are dropped with the child, so counter recovery is not needed.
+        // next_child_pid must be recovered to keep the global PID space.
         self.next_child_pid = self.next_child_pid.max(c.next_child_pid);
     }
 
@@ -3208,6 +3210,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// parent. The caller should check `pending_fork_child()` and
     /// dispatch to the child with return value 0.
     fn sys_fork(&mut self) -> i64 {
+        // Recover any previously-exited child before creating a new one.
+        // This ensures pipes/eventfds are back with the parent before
+        // the next mem::swap in create_child.
+        self.recover_child_state();
+
         // Sequential model: only one active child at a time.
         if self
             .children
@@ -3250,7 +3257,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return ENOSYS;
         }
 
-        // Accept SIGCHLD with optional TID flags (stubbed)
+        // Accept SIGCHLD with optional TID flags. CLONE_CHILD_SETTID and
+        // CLONE_CHILD_CLEARTID are accepted but not acted upon — the TID
+        // writes are not performed. This is safe for fork() because musl's
+        // waitpid uses SIGCHLD-based waiting for child processes, not
+        // futex-based TID polling (which is only used for threads).
         let sig = flags & 0xFF;
         let known_flags = SIGCHLD | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
         if sig != SIGCHLD || (flags & !known_flags) != 0 {
