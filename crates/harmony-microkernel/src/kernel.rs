@@ -19,7 +19,7 @@ use crate::vm::cap_tracker::MemoryBudget;
 use crate::vm::manager::AddressSpaceManager;
 use crate::vm::page_table::PageTable;
 use crate::vm::{
-    ContentHash, FrameClassification, MemoryZone, PageFlags, PhysAddr, VirtAddr, VmError,
+    ContentHash, FrameClassification, MemoryZone, PageFlags, PhysAddr, VirtAddr, VmError, PAGE_SIZE,
 };
 use crate::{Fid, FileServer, IpcError, OpenMode, QPath};
 
@@ -726,20 +726,38 @@ impl<P: PageTable> Kernel<P> {
 
     /// Unmap a region previously mapped at `vaddr` for process `pid`.
     ///
-    /// Collects frame and classification info before unmapping, then
-    /// unregisters frames from the integrity guardians.
+    /// Delegates to [`vm_unmap_partial`](Self::vm_unmap_partial) with the full
+    /// region length, so guardian integration is handled uniformly.
     pub fn vm_unmap_region(&mut self, pid: u32, vaddr: VirtAddr) -> Result<(), VmError> {
-        // Collect frames and classification before unmapping (unmap removes the region).
-        let (frames, classification) = {
-            let space = self.vm.space(pid).ok_or(VmError::NoSuchProcess(pid))?;
-            let region = space.regions.get(&vaddr).ok_or(VmError::NotMapped(vaddr))?;
-            (region.frames.clone(), region.classification)
+        let space = self.vm.space(pid).ok_or(VmError::NoSuchProcess(pid))?;
+        let region = space.regions.get(&vaddr).ok_or(VmError::NotMapped(vaddr))?;
+        let len = region.len;
+        self.vm_unmap_partial(pid, vaddr, len)
+    }
+
+    /// Unmap a sub-range within a single region, with guardian integration.
+    pub fn vm_unmap_partial(
+        &mut self,
+        pid: u32,
+        vaddr: VirtAddr,
+        len: usize,
+    ) -> Result<(), VmError> {
+        // Identify which frames will be freed (before the unmap modifies state).
+        let (target_frames, classification) = {
+            let base = self.vm.find_containing_region(pid, vaddr, len)?;
+            let space = self.vm.space(pid).unwrap();
+            let region = space.regions.get(&base).unwrap();
+            let page_offset = ((vaddr.as_u64() - base.as_u64()) / PAGE_SIZE) as usize;
+            let page_count = len / PAGE_SIZE as usize;
+            let frames: Vec<PhysAddr> =
+                region.frames[page_offset..page_offset + page_count].to_vec();
+            (frames, region.classification)
         };
 
-        self.vm.unmap_region(pid, vaddr)?;
+        self.vm.unmap_partial(pid, vaddr, len)?;
 
-        // Unregister from guardians.
-        for &paddr in &frames {
+        // Unregister freed frames from guardians.
+        for &paddr in &target_frames {
             self.lyll.unregister_frame(paddr);
             if classification.contains(FrameClassification::ENCRYPTED) {
                 self.nakaiah.unregister_frame(paddr);
@@ -752,39 +770,47 @@ impl<P: PageTable> Kernel<P> {
 
     /// Change the permission flags on an existing region.
     ///
-    /// If the region gains WRITABLE, any CidBacked hash entries are promoted
-    /// to Snapshot so that write-barrier hash updates are not silently lost.
+    /// Delegates to [`vm_protect_partial`](Self::vm_protect_partial) with the
+    /// full region length, so guardian integration is handled uniformly.
     pub fn vm_protect_region(
         &mut self,
         pid: u32,
         vaddr: VirtAddr,
         new_flags: PageFlags,
     ) -> Result<(), VmError> {
-        // Check if this is a read-only → writable transition before mutating.
-        let was_writable = self
-            .vm
-            .space(pid)
-            .and_then(|s| s.regions.get(&vaddr))
-            .map(|r| r.flags.contains(PageFlags::WRITABLE))
-            .unwrap_or(false);
+        let space = self.vm.space(pid).ok_or(VmError::NoSuchProcess(pid))?;
+        let region = space.regions.get(&vaddr).ok_or(VmError::NotMapped(vaddr))?;
+        let len = region.len;
+        self.vm_protect_partial(pid, vaddr, len, new_flags)
+    }
 
-        self.vm.protect_region(pid, vaddr, new_flags)?;
+    /// Change permissions on a sub-range, with CidBacked→Snapshot promotion.
+    pub fn vm_protect_partial(
+        &mut self,
+        pid: u32,
+        vaddr: VirtAddr,
+        len: usize,
+        new_flags: PageFlags,
+    ) -> Result<(), VmError> {
+        // Check writable transition before mutating.
+        let was_writable = {
+            let base = self.vm.find_containing_region(pid, vaddr, len)?;
+            let space = self.vm.space(pid).unwrap();
+            let region = space.regions.get(&base).unwrap();
+            region.flags.contains(PageFlags::WRITABLE)
+        };
+
+        self.vm.protect_partial(pid, vaddr, len, new_flags)?;
 
         // Promote CidBacked → Snapshot for frames that just became writable.
         if !was_writable && new_flags.contains(PageFlags::WRITABLE) {
-            let frames: Vec<PhysAddr> = self
-                .vm
-                .space(pid)
-                .unwrap()
-                .regions
-                .get(&vaddr)
-                .unwrap()
-                .frames
-                .clone();
-            for paddr in frames {
-                self.lyll.promote_to_snapshot(paddr);
+            if let Some(region) = self.vm.space(pid).and_then(|s| s.regions.get(&vaddr)) {
+                let frames: Vec<PhysAddr> = region.frames.clone();
+                for paddr in frames {
+                    self.lyll.promote_to_snapshot(paddr);
+                }
+                self.sync_guardian_state_hashes();
             }
-            self.sync_guardian_state_hashes();
         }
 
         Ok(())

@@ -276,7 +276,7 @@ impl<P: PageTable> AddressSpaceManager<P> {
     }
 
     /// Find the region that fully contains `[vaddr, vaddr+len)`.
-    fn find_containing_region(
+    pub fn find_containing_region(
         &self,
         pid: u32,
         vaddr: VirtAddr,
