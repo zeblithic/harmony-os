@@ -9473,4 +9473,333 @@ mod integration_tests {
         });
         assert_eq!(r, ENODEV);
     }
+
+    // ── Fork tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_fork_returns_pid_and_zero() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        let result = lx.dispatch_syscall(LinuxSyscall::Fork);
+        assert!(
+            result > 0,
+            "fork should return child PID to parent, got {result}"
+        );
+        let child_pid = result as i32;
+
+        let (pid, _child) = lx.pending_fork_child().expect("should have pending child");
+        assert_eq!(pid, child_pid);
+    }
+
+    #[test]
+    fn test_fork_child_exit_resumes_parent() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        let parent_pid = lx.dispatch_syscall(LinuxSyscall::Getpid) as i32;
+        let child_pid = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
+        assert!(child_pid > parent_pid);
+
+        // Active process should be the child
+        {
+            let active = lx.active_process();
+            assert_eq!(
+                active.dispatch_syscall(LinuxSyscall::Getpid),
+                child_pid as i64
+            );
+        }
+
+        // Child exits
+        {
+            let active = lx.active_process();
+            active.dispatch_syscall(LinuxSyscall::ExitGroup { code: 42 });
+        }
+
+        // Active process should be parent again
+        {
+            let active = lx.active_process();
+            assert_eq!(
+                active.dispatch_syscall(LinuxSyscall::Getpid),
+                parent_pid as i64
+            );
+        }
+    }
+
+    #[test]
+    fn test_fork_child_inherits_fds() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        let mut fds = [0i32; 2];
+        lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0,
+        });
+
+        lx.dispatch_syscall(LinuxSyscall::Fork);
+
+        let child = lx.active_process();
+        assert!(child.has_fd(0)); // stdin
+        assert!(child.has_fd(1)); // stdout
+        assert!(child.has_fd(2)); // stderr
+        assert!(child.has_fd(fds[0])); // pipe read
+        assert!(child.has_fd(fds[1])); // pipe write
+    }
+
+    #[test]
+    fn test_fork_pipe_shared() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let mut fds = [0i32; 2];
+        lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0,
+        });
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+
+        lx.dispatch_syscall(LinuxSyscall::Fork);
+
+        // Child writes to pipe
+        let msg = b"hello from child";
+        {
+            let child = lx.active_process();
+            let r = child.dispatch_syscall(LinuxSyscall::Write {
+                fd: write_fd,
+                buf: msg.as_ptr() as u64,
+                count: msg.len() as u64,
+            });
+            assert_eq!(r, msg.len() as i64);
+            child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 0 });
+        }
+
+        // Parent reads from pipe — should see child's data
+        let mut buf = [0u8; 64];
+        let parent = lx.active_process();
+        let r = parent.dispatch_syscall(LinuxSyscall::Read {
+            fd: read_fd,
+            buf: buf.as_mut_ptr() as u64,
+            count: 64,
+        });
+        assert_eq!(r, msg.len() as i64);
+        assert_eq!(&buf[..msg.len()], msg);
+    }
+
+    #[test]
+    fn test_fork_child_gets_own_pid() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let parent_pid = lx.dispatch_syscall(LinuxSyscall::Getpid) as i32;
+        let child_pid = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
+
+        let child = lx.active_process();
+        assert_eq!(
+            child.dispatch_syscall(LinuxSyscall::Getpid),
+            child_pid as i64
+        );
+        assert_eq!(
+            child.dispatch_syscall(LinuxSyscall::Getppid),
+            parent_pid as i64
+        );
+        assert_eq!(
+            child.dispatch_syscall(LinuxSyscall::Gettid),
+            child_pid as i64
+        );
+    }
+
+    #[test]
+    fn test_fork_nested() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let parent_pid = lx.dispatch_syscall(LinuxSyscall::Getpid) as i32;
+
+        // Parent forks child
+        let child_pid = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
+
+        // Child forks grandchild
+        {
+            let child = lx.active_process();
+            assert_eq!(
+                child.dispatch_syscall(LinuxSyscall::Getpid),
+                child_pid as i64
+            );
+            let grandchild_pid = child.dispatch_syscall(LinuxSyscall::Fork) as i32;
+            assert!(grandchild_pid > child_pid);
+
+            // Grandchild runs
+            let gc = child.active_process();
+            assert_eq!(
+                gc.dispatch_syscall(LinuxSyscall::Getpid),
+                grandchild_pid as i64
+            );
+            assert_eq!(gc.dispatch_syscall(LinuxSyscall::Getppid), child_pid as i64);
+            gc.dispatch_syscall(LinuxSyscall::ExitGroup { code: 0 });
+        }
+
+        // Child should be active again (grandchild exited)
+        {
+            let child = lx.active_process();
+            assert_eq!(
+                child.dispatch_syscall(LinuxSyscall::Getpid),
+                child_pid as i64
+            );
+            child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 0 });
+        }
+
+        // Parent should be active again
+        let parent = lx.active_process();
+        assert_eq!(
+            parent.dispatch_syscall(LinuxSyscall::Getpid),
+            parent_pid as i64
+        );
+    }
+
+    #[test]
+    fn test_fork_clone_sigchld() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        const SIGCHLD: u64 = 17;
+        const CLONE_CHILD_SETTID: u64 = 0x01000000;
+        const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
+
+        let r = lx.dispatch_syscall(LinuxSyscall::Clone {
+            flags: SIGCHLD | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            child_stack: 0,
+            parent_tid: 0,
+            child_tid: 0,
+            tls: 0,
+        });
+        assert!(r > 0, "clone(SIGCHLD) should return child PID, got {r}");
+
+        let child = lx.active_process();
+        assert_eq!(child.dispatch_syscall(LinuxSyscall::Getpid), r);
+    }
+
+    #[test]
+    fn test_fork_clone_unsupported_flags() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        const CLONE_VM: u64 = 0x00000100;
+        const SIGCHLD: u64 = 17;
+
+        let r = lx.dispatch_syscall(LinuxSyscall::Clone {
+            flags: CLONE_VM | SIGCHLD,
+            child_stack: 0,
+            parent_tid: 0,
+            child_tid: 0,
+            tls: 0,
+        });
+        assert_eq!(r, ENOSYS);
+    }
+
+    #[test]
+    fn test_vfork_same_as_fork() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let child_pid = lx.dispatch_syscall(LinuxSyscall::Vfork) as i32;
+        assert!(child_pid > 0);
+
+        let child = lx.active_process();
+        assert_eq!(
+            child.dispatch_syscall(LinuxSyscall::Getpid),
+            child_pid as i64
+        );
+
+        child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 7 });
+
+        let parent = lx.active_process();
+        assert_eq!(parent.dispatch_syscall(LinuxSyscall::Getpid), 1);
+    }
+
+    #[test]
+    fn test_fork_eventfd_shared() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let efd = lx.dispatch_syscall(LinuxSyscall::EventFd2 {
+            initval: 0,
+            flags: 0,
+        }) as i32;
+        assert!(efd >= 0);
+
+        lx.dispatch_syscall(LinuxSyscall::Fork);
+
+        // Child writes value 42 to eventfd
+        {
+            let child = lx.active_process();
+            let val: u64 = 42;
+            let r = child.dispatch_syscall(LinuxSyscall::Write {
+                fd: efd,
+                buf: &val as *const u64 as u64,
+                count: 8,
+            });
+            assert_eq!(r, 8);
+            child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 0 });
+        }
+
+        // Parent reads from eventfd — should see 42
+        let mut val: u64 = 0;
+        let parent = lx.active_process();
+        let r = parent.dispatch_syscall(LinuxSyscall::Read {
+            fd: efd,
+            buf: &mut val as *mut u64 as u64,
+            count: 8,
+        });
+        assert_eq!(r, 8);
+        assert_eq!(val, 42);
+    }
+
+    #[test]
+    fn test_fork_parent_creates_pipe_after_child_exit() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let mut fds1 = [0i32; 2];
+        lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds1.as_mut_ptr() as u64,
+            flags: 0,
+        });
+
+        lx.dispatch_syscall(LinuxSyscall::Fork);
+        {
+            let child = lx.active_process();
+            child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 0 });
+        }
+
+        let parent = lx.active_process();
+        let mut fds2 = [0i32; 2];
+        let r = parent.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds2.as_mut_ptr() as u64,
+            flags: 0,
+        });
+        assert_eq!(r, 0);
+        assert!(parent.has_fd(fds2[0]));
+        assert!(parent.has_fd(fds2[1]));
+
+        // Original pipe should still work
+        let msg = b"test";
+        parent.dispatch_syscall(LinuxSyscall::Write {
+            fd: fds1[1],
+            buf: msg.as_ptr() as u64,
+            count: 4,
+        });
+        let mut buf = [0u8; 4];
+        let r = parent.dispatch_syscall(LinuxSyscall::Read {
+            fd: fds1[0],
+            buf: buf.as_mut_ptr() as u64,
+            count: 4,
+        });
+        assert_eq!(r, 4);
+        assert_eq!(&buf, b"test");
+    }
 }
