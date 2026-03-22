@@ -8,6 +8,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+use crate::elf_loader::{self, ElfLoader, InterpreterLoader};
 use harmony_microkernel::vm::{FrameClassification, PageFlags, VmError};
 use harmony_microkernel::{Fid, FileStat, FileType, IpcError, OpenMode, QPath};
 
@@ -33,6 +34,7 @@ const EOVERFLOW: i64 = -75;
 const EAFNOSUPPORT: i64 = -97;
 const ENOTSOCK: i64 = -88;
 const ECHILD: i64 = -10;
+const ENOEXEC: i64 = -8;
 const EEXIST: i64 = -17;
 
 // Clock IDs (shared by clock_gettime and clock_getres)
@@ -389,6 +391,11 @@ pub enum LinuxSyscall {
         options: i32,
         rusage: u64,
     },
+    Execve {
+        path: u64,
+        argv: u64,
+        envp: u64,
+    },
     Unknown {
         nr: u64,
     },
@@ -691,6 +698,11 @@ impl LinuxSyscall {
             },
             57 => LinuxSyscall::Fork,
             58 => LinuxSyscall::Vfork,
+            59 => LinuxSyscall::Execve {
+                path: args[0],
+                argv: args[1],
+                envp: args[2],
+            },
             61 => LinuxSyscall::Wait4 {
                 pid: args[0] as i32,
                 wstatus: args[1],
@@ -983,6 +995,11 @@ impl LinuxSyscall {
                 tls: args[3],
                 child_tid: args[4],
             },
+            221 => LinuxSyscall::Execve {
+                path: args[0],
+                argv: args[1],
+                envp: args[2],
+            },
             260 => LinuxSyscall::Wait4 {
                 pid: args[0] as i32,
                 wstatus: args[1],
@@ -1256,10 +1273,11 @@ impl SyscallBackend for MockBackend {
         } else {
             FileType::Regular
         };
+        let size = self.file_content.get(&fid).map_or(0, |c| c.len() as u64);
         Ok(FileStat {
             qpath: 0,
             name: alloc::sync::Arc::from("mock"),
-            size: 0,
+            size,
             file_type,
         })
     }
@@ -1385,6 +1403,8 @@ impl SyscallBackend for VmMockBackend {
 // ── Memory arena ──────────────────────────────────────────────────
 
 const PAGE_SIZE: usize = 4096;
+/// Stack size allocated for new process images (execve).
+const EXECVE_STACK_SIZE: usize = 128 * 1024;
 
 struct MemoryArena {
     /// Backing allocation — boxed slice so it cannot be accidentally
@@ -1444,6 +1464,36 @@ unsafe fn read_c_string(ptr: usize) -> alloc::string::String {
     alloc::string::String::from(core::str::from_utf8_unchecked(core::slice::from_raw_parts(
         p, len,
     )))
+}
+
+/// Read a null-terminated array of string pointers from user memory.
+/// Returns empty vec if ptr is 0 (null). Returns at most `max_count`
+/// entries; any beyond that are silently dropped.
+fn read_string_array(ptr: u64, max_count: usize) -> Vec<alloc::string::String> {
+    if ptr == 0 {
+        return Vec::new();
+    }
+    let mut result = Vec::new();
+    let mut addr = ptr as usize;
+    for _ in 0..max_count {
+        let str_ptr_bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, 8) };
+        let str_ptr = u64::from_ne_bytes([
+            str_ptr_bytes[0],
+            str_ptr_bytes[1],
+            str_ptr_bytes[2],
+            str_ptr_bytes[3],
+            str_ptr_bytes[4],
+            str_ptr_bytes[5],
+            str_ptr_bytes[6],
+            str_ptr_bytes[7],
+        ]);
+        if str_ptr == 0 {
+            break;
+        }
+        result.push(unsafe { read_c_string(str_ptr as usize) });
+        addr += 8;
+    }
+    result
 }
 
 /// Map Linux open(2) flags to 9P OpenMode.
@@ -1611,6 +1661,13 @@ struct ChildProcess<B: SyscallBackend> {
     linuxulator: Linuxulator<B>,
 }
 
+/// Result of a successful execve — new entry point and stack pointer
+/// for the caller to jump to.
+pub struct ExecveResult {
+    pub entry_point: u64,
+    pub stack_pointer: u64,
+}
+
 /// Per-fd state: the kind of object and descriptor-level flags.
 #[derive(Clone)]
 struct FdEntry {
@@ -1679,6 +1736,8 @@ pub struct Linuxulator<B: SyscallBackend> {
     exited_children: Vec<(i32, i32)>,
     /// Arena size used for this process (inherited by children on fork).
     arena_size: usize,
+    /// Set by sys_execve on success — caller should reset RIP/RSP.
+    pending_execve: Option<ExecveResult>,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -1717,6 +1776,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             children: Vec::new(),
             exited_children: Vec::new(),
             arena_size,
+            pending_execve: None,
         }
     }
 
@@ -1925,6 +1985,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
             }
         }
         None
+    }
+
+    /// Consume the pending execve result. If Some, the caller should
+    /// reset RIP to entry_point and RSP to stack_pointer.
+    pub fn pending_execve(&mut self) -> Option<ExecveResult> {
+        self.pending_execve.take()
     }
 
     /// Access the backend (for test assertions).
@@ -2160,6 +2226,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 options,
                 rusage,
             } => self.sys_wait4(pid, wstatus, options, rusage),
+            LinuxSyscall::Execve { path, argv, envp } => self.sys_execve(path, argv, envp),
             LinuxSyscall::Unknown { .. } => ENOSYS,
         }
     }
@@ -2420,6 +2487,103 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 }
             }
         }
+    }
+
+    /// Close all file descriptors with FD_CLOEXEC set (for execve).
+    fn close_cloexec_fds(&mut self) {
+        let cloexec_fds: Vec<i32> = self
+            .fd_table
+            .iter()
+            .filter(|(_, entry)| entry.flags & FD_CLOEXEC != 0)
+            .map(|(&fd, _)| fd)
+            .collect();
+
+        for fd in cloexec_fds {
+            if let Some(entry) = self.fd_table.remove(&fd) {
+                self.close_fd_entry(entry);
+            }
+        }
+
+        // Scrub closed fds from epoll interest lists.
+        for epoll in self.epolls.values_mut() {
+            epoll
+                .interests
+                .retain(|fd, _| self.fd_table.contains_key(fd));
+        }
+    }
+
+    /// Reset Linuxulator state for a new process image (execve).
+    fn reset_for_execve(&mut self) {
+        self.arena = MemoryArena::new(self.arena_size);
+        self.fs_base = 0;
+        self.vm_brk_base = 0;
+        self.vm_brk_current = 0;
+        self.getrandom_counter = 0;
+        self.exit_code = None;
+    }
+
+    /// Apply a successful execve: close CLOEXEC fds, reset state, build
+    /// stack, set pending_execve.
+    ///
+    /// Separated from sys_execve so tests can exercise the success path
+    /// with a synthetic LoadResult (MockBackend can't load real ELFs
+    /// because vm_mmap fails).
+    fn apply_execve(
+        &mut self,
+        load_result: &elf_loader::LoadResult,
+        argv: &[alloc::string::String],
+        envp: &[alloc::string::String],
+    ) {
+        // Capture pre-reset counter for AT_RANDOM seed mixing.
+        // This provides per-execve variation even though the counter
+        // is reset to 0 (matching spec: "fresh random sequence").
+        let pre_reset_counter = self.getrandom_counter;
+
+        self.close_cloexec_fds();
+        self.reset_for_execve();
+
+        // Allocate stack from the fresh arena's mmap region.
+        // Caller (sys_execve) must verify arena_size >= EXECVE_STACK_SIZE
+        // before calling apply_execve (before the point of no return).
+        self.arena.mmap_top -= EXECVE_STACK_SIZE;
+        let stack_base = self.arena.base + self.arena.mmap_top;
+
+        // Generate deterministic random bytes for AT_RANDOM.
+        // Uses the pre-reset counter as seed so each execve produces
+        // distinct output, while getrandom_counter itself is reset to 0.
+        let random_bytes: [u8; 16] = {
+            let mut bytes = [0u8; 16];
+            let mut state = pre_reset_counter
+                .wrapping_add(0xDEAD_BEEF_CAFE_BABE) // non-zero seed mixing
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            for b in bytes.iter_mut() {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *b = (state >> 33) as u8;
+            }
+            bytes
+        };
+
+        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        let envp_refs: Vec<&str> = envp.iter().map(|s| s.as_str()).collect();
+
+        let stack_slice =
+            unsafe { core::slice::from_raw_parts_mut(stack_base as *mut u8, EXECVE_STACK_SIZE) };
+        let sp = elf_loader::build_initial_stack(
+            stack_slice,
+            stack_base as u64,
+            &argv_refs,
+            &envp_refs,
+            &load_result.auxv,
+            &random_bytes,
+        );
+
+        self.pending_execve = Some(ExecveResult {
+            entry_point: load_result.entry_point,
+            stack_pointer: sp,
+        });
     }
 
     /// Linux close(2): close a file descriptor.
@@ -3224,6 +3388,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             children: Vec::new(),
             exited_children: Vec::new(),
             arena_size: self.arena_size,
+            pending_execve: None,
         };
         // Move shared pipe/eventfd state to child
         core::mem::swap(&mut self.pipes, &mut child.pipes);
@@ -3521,6 +3686,89 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// In our single-threaded model, this is equivalent to exit_group.
     fn sys_exit(&mut self, code: i32) -> i64 {
         self.sys_exit_group(code)
+    }
+
+    /// Linux execve(2): replace process image with a new ELF binary.
+    ///
+    /// On success: closes FD_CLOEXEC fds, resets memory state, loads
+    /// new ELF, builds initial stack, sets pending_execve for caller.
+    /// On failure: returns negative errno, no state is modified.
+    fn sys_execve(&mut self, path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
+        // NOTE: The full execve success path requires a VM-capable backend
+        // because InterpreterLoader::load calls vm_mmap for segment mapping.
+        // Arena-only backends fail at the ELF load step (vm_mmap returns
+        // PageTableError). VM backends are blocked because they need
+        // vm_reset_address_space (not yet implemented). A follow-up bead
+        // will resolve this by either adding arena-based segment loading
+        // or implementing vm_reset_address_space.
+        //
+        // Currently: VM backends → ENOSYS, arena backends → ENOEXEC at
+        // the ELF load step. The apply_execve helper is fully functional
+        // and tested via synthetic LoadResult.
+        if self.backend.has_vm_support() {
+            return ENOSYS;
+        }
+
+        if path_ptr == 0 {
+            return EFAULT;
+        }
+
+        // Read path, argv, envp from user memory.
+        let path = unsafe { read_c_string(path_ptr as usize) };
+        let path = self.resolve_path(&path);
+        let argv = read_string_array(argv_ptr, 256);
+        let envp = read_string_array(envp_ptr, 256);
+
+        // Read ELF binary from filesystem.
+        let fid = self.alloc_fid();
+        if let Err(e) = self.backend.walk(&path, fid) {
+            return ipc_err_to_errno(e);
+        }
+        if let Err(e) = self.backend.open(fid, OpenMode::Read) {
+            let _ = self.backend.clunk(fid);
+            return ipc_err_to_errno(e);
+        }
+
+        let file_size = match self.backend.stat(fid) {
+            Ok(stat) => stat.size,
+            Err(e) => {
+                let _ = self.backend.clunk(fid);
+                return ipc_err_to_errno(e);
+            }
+        };
+
+        const MAX_ELF_SIZE: u64 = 4 * 1024 * 1024; // 4 MiB
+        if file_size > MAX_ELF_SIZE {
+            let _ = self.backend.clunk(fid);
+            return ENOMEM;
+        }
+
+        let elf_bytes = match self.backend.read(fid, 0, file_size as u32) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let _ = self.backend.clunk(fid);
+                return ipc_err_to_errno(e);
+            }
+        };
+        let _ = self.backend.clunk(fid);
+
+        // Load ELF via InterpreterLoader.
+        let mut loader = InterpreterLoader::default();
+        let load_result = match loader.load(&elf_bytes, &mut self.backend) {
+            Ok(r) => r,
+            Err(_) => return ENOEXEC,
+        };
+
+        // Verify arena is large enough for the stack before the point
+        // of no return (close_cloexec_fds + reset_for_execve are irreversible).
+        if self.arena_size < EXECVE_STACK_SIZE {
+            return ENOMEM;
+        }
+
+        // Apply the execve (point of no return).
+        self.apply_execve(&load_result, &argv, &envp);
+
+        0 // success — caller checks pending_execve()
     }
 
     /// Linux exit_group(2): terminate the process.
@@ -10107,5 +10355,276 @@ mod integration_tests {
             rusage: 0,
         });
         assert_eq!(r, ECHILD);
+    }
+
+    // ── Execve tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_execve_closes_cloexec_fds() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        // Create a pipe — make write end CLOEXEC
+        let mut fds = [0i32; 2];
+        lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0,
+        });
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+
+        // Set CLOEXEC on write end
+        lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: write_fd,
+            cmd: 2, // F_SETFD
+            arg: FD_CLOEXEC as u64,
+        });
+
+        assert!(lx.has_fd(read_fd));
+        assert!(lx.has_fd(write_fd));
+
+        lx.close_cloexec_fds();
+
+        // Write end (CLOEXEC) gone, read end + stdio survive
+        assert!(lx.has_fd(read_fd));
+        assert!(!lx.has_fd(write_fd));
+        assert!(lx.has_fd(0));
+        assert!(lx.has_fd(1));
+        assert!(lx.has_fd(2));
+    }
+
+    #[test]
+    fn test_execve_cloexec_preserves_pipe_end() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let mut fds = [0i32; 2];
+        lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0,
+        });
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+
+        // Write data, then make write end CLOEXEC
+        let msg = b"survive";
+        lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: write_fd,
+            buf: msg.as_ptr() as u64,
+            count: msg.len() as u64,
+        });
+        lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: write_fd,
+            cmd: 2,
+            arg: FD_CLOEXEC as u64,
+        });
+
+        lx.close_cloexec_fds();
+
+        // Read end survives, pipe buffer intact
+        let mut buf = [0u8; 16];
+        let r = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: read_fd,
+            buf: buf.as_mut_ptr() as u64,
+            count: 16,
+        });
+        assert_eq!(r, msg.len() as i64);
+        assert_eq!(&buf[..msg.len()], msg);
+    }
+
+    #[test]
+    fn test_execve_resets_state() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Modify some state
+        lx.dispatch_syscall(LinuxSyscall::Getrandom {
+            buf: 0,
+            buflen: 0,
+            flags: 0,
+        });
+
+        lx.reset_for_execve();
+
+        // Arena is fresh — brk at base
+        let brk_result = lx.dispatch_syscall(LinuxSyscall::Brk { addr: 0 });
+        assert!(brk_result >= 0);
+    }
+
+    #[test]
+    fn test_execve_preserves_pid() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let pid_before = lx.dispatch_syscall(LinuxSyscall::Getpid);
+        let ppid_before = lx.dispatch_syscall(LinuxSyscall::Getppid);
+
+        lx.reset_for_execve();
+
+        assert_eq!(lx.dispatch_syscall(LinuxSyscall::Getpid), pid_before);
+        assert_eq!(lx.dispatch_syscall(LinuxSyscall::Getppid), ppid_before);
+    }
+
+    #[test]
+    fn test_execve_preserves_cwd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let mut buf1 = [0u8; 128];
+        let r1 = lx.dispatch_syscall(LinuxSyscall::Getcwd {
+            buf: buf1.as_mut_ptr() as u64,
+            size: 128,
+        });
+
+        lx.reset_for_execve();
+
+        let mut buf2 = [0u8; 128];
+        let r2 = lx.dispatch_syscall(LinuxSyscall::Getcwd {
+            buf: buf2.as_mut_ptr() as u64,
+            size: 128,
+        });
+
+        assert_eq!(r1, r2);
+        assert_eq!(buf1, buf2);
+    }
+
+    #[test]
+    fn test_execve_bad_path() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        let pid_before = lx.dispatch_syscall(LinuxSyscall::Getpid);
+
+        let mut fds = [0i32; 2];
+        lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0,
+        });
+
+        // MockBackend.walk always succeeds, but read returns empty
+        // bytes (no file_content registered) → ELF parse fails → ENOEXEC
+        let path = b"/nonexistent\0";
+        let argv: [u64; 1] = [0];
+        let envp: [u64; 1] = [0];
+        let r = lx.dispatch_syscall(LinuxSyscall::Execve {
+            path: path.as_ptr() as u64,
+            argv: argv.as_ptr() as u64,
+            envp: envp.as_ptr() as u64,
+        });
+        assert_eq!(r, ENOEXEC);
+
+        // State unchanged
+        assert_eq!(lx.dispatch_syscall(LinuxSyscall::Getpid), pid_before);
+        assert!(lx.has_fd(0));
+        assert!(lx.has_fd(fds[0]));
+        assert!(lx.has_fd(fds[1]));
+        assert!(lx.pending_execve().is_none());
+    }
+
+    #[test]
+    fn test_execve_null_path() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let r = lx.dispatch_syscall(LinuxSyscall::Execve {
+            path: 0,
+            argv: 0,
+            envp: 0,
+        });
+        assert_eq!(r, EFAULT);
+    }
+
+    #[test]
+    fn test_execve_argv_envp_reading() {
+        let s1 = b"hello\0";
+        let s2 = b"world\0";
+        let ptrs: [u64; 3] = [
+            s1.as_ptr() as u64,
+            s2.as_ptr() as u64,
+            0, // null terminator
+        ];
+
+        let result = read_string_array(ptrs.as_ptr() as u64, 256);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], "hello");
+        assert_eq!(result[1], "world");
+
+        // Null ptr → empty vec
+        let empty = read_string_array(0, 256);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_execve_pending_result() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        assert!(lx.pending_execve().is_none());
+
+        // Call apply_execve with synthetic LoadResult
+        let load_result = elf_loader::LoadResult {
+            entry_point: 0x400000,
+            auxv: alloc::vec![(6, 4096)], // AT_PAGESZ
+            exe_base: 0x400000,
+            interp_base: 0,
+        };
+        let argv = alloc::vec![alloc::string::String::from("/bin/test")];
+        let envp = alloc::vec![alloc::string::String::from("PATH=/usr/bin")];
+
+        lx.apply_execve(&load_result, &argv, &envp);
+
+        let result = lx.pending_execve().unwrap();
+        assert_eq!(result.entry_point, 0x400000);
+        assert!(result.stack_pointer > 0);
+
+        // Consumed
+        assert!(lx.pending_execve().is_none());
+    }
+
+    #[test]
+    fn test_execve_vm_backend_returns_enosys() {
+        let mock = VmMockBackend::new(1024);
+        let mut lx = Linuxulator::with_arena(mock, 64 * 1024);
+
+        let path = b"/bin/test\0";
+        let r = lx.dispatch_syscall(LinuxSyscall::Execve {
+            path: path.as_ptr() as u64,
+            argv: 0,
+            envp: 0,
+        });
+        assert_eq!(r, ENOSYS);
+    }
+
+    #[test]
+    fn test_execve_on_fork_child() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        let child_pid = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
+        assert!(child_pid > 0);
+
+        let child = lx.active_process();
+        assert_eq!(
+            child.dispatch_syscall(LinuxSyscall::Getpid),
+            child_pid as i64
+        );
+
+        // Child tries execve — fails (MockBackend) but mechanism works
+        let path = b"/bin/test\0";
+        let r = child.dispatch_syscall(LinuxSyscall::Execve {
+            path: path.as_ptr() as u64,
+            argv: 0,
+            envp: 0,
+        });
+        assert_eq!(r, ENOEXEC);
+
+        // PID unchanged after failed execve
+        assert_eq!(
+            child.dispatch_syscall(LinuxSyscall::Getpid),
+            child_pid as i64
+        );
     }
 }
