@@ -6567,24 +6567,13 @@ mod integration_tests {
 
         fn vm_munmap(&mut self, vaddr: u64, len: usize) -> Result<(), VmError> {
             use harmony_microkernel::vm::VirtAddr;
-            // TODO(harmony-qv2): partial unmap support. Currently unmaps the
-            // entire region regardless of `len`. Real Linux allows unmapping
-            // sub-ranges, splitting regions. Needed for ELF loaders.
-            let _ = len;
-            self.kernel.vm_unmap_region(self.pid, VirtAddr(vaddr))
+            self.kernel.vm_unmap_partial(self.pid, VirtAddr(vaddr), len)
         }
 
-        fn vm_mprotect(
-            &mut self,
-            vaddr: u64,
-            _len: usize,
-            flags: PageFlags,
-        ) -> Result<(), VmError> {
+        fn vm_mprotect(&mut self, vaddr: u64, len: usize, flags: PageFlags) -> Result<(), VmError> {
             use harmony_microkernel::vm::VirtAddr;
-            // TODO(harmony-qv2): partial mprotect support. Currently changes
-            // flags for the entire region regardless of `_len`.
             self.kernel
-                .vm_protect_region(self.pid, VirtAddr(vaddr), flags)
+                .vm_protect_partial(self.pid, VirtAddr(vaddr), len, flags)
         }
 
         fn vm_find_free_region(&self, len: usize) -> Result<u64, VmError> {
@@ -10626,5 +10615,54 @@ mod integration_tests {
             child.dispatch_syscall(LinuxSyscall::Getpid),
             child_pid as i64
         );
+    }
+
+    #[test]
+    fn test_mprotect_sub_range() {
+        let mock = VmMockBackend::new(1024);
+        let mut lx = Linuxulator::with_arena(mock, 256 * 1024);
+
+        // mmap 4 pages
+        let addr = lx.dispatch_syscall(LinuxSyscall::Mmap {
+            addr: 0,
+            len: PAGE_SIZE as u64 * 4,
+            prot: 3,     // PROT_READ | PROT_WRITE
+            flags: 0x22, // MAP_PRIVATE | MAP_ANONYMOUS
+            fd: -1,
+            offset: 0,
+        });
+        assert!(addr > 0);
+
+        // mprotect middle 2 pages to PROT_READ
+        let r = lx.dispatch_syscall(LinuxSyscall::Mprotect {
+            addr: addr as u64 + PAGE_SIZE as u64,
+            len: PAGE_SIZE as u64 * 2,
+            prot: 1, // PROT_READ
+        });
+        assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn test_munmap_sub_range() {
+        let mock = VmMockBackend::new(1024);
+        let mut lx = Linuxulator::with_arena(mock, 256 * 1024);
+
+        // mmap 4 pages
+        let addr = lx.dispatch_syscall(LinuxSyscall::Mmap {
+            addr: 0,
+            len: PAGE_SIZE as u64 * 4,
+            prot: 3,
+            flags: 0x22,
+            fd: -1,
+            offset: 0,
+        });
+        assert!(addr > 0);
+
+        // munmap middle 2 pages
+        let r = lx.dispatch_syscall(LinuxSyscall::Munmap {
+            addr: addr as u64 + PAGE_SIZE as u64,
+            len: PAGE_SIZE as u64 * 2,
+        });
+        assert_eq!(r, 0);
     }
 }
