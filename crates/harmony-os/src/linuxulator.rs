@@ -3694,7 +3694,17 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// new ELF, builds initial stack, sets pending_execve for caller.
     /// On failure: returns negative errno, no state is modified.
     fn sys_execve(&mut self, path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
-        // VM-backed execve not yet supported (needs vm_reset_address_space).
+        // NOTE: The full execve success path requires a VM-capable backend
+        // because InterpreterLoader::load calls vm_mmap for segment mapping.
+        // Arena-only backends fail at the ELF load step (vm_mmap returns
+        // PageTableError). VM backends are blocked because they need
+        // vm_reset_address_space (not yet implemented). A follow-up bead
+        // will resolve this by either adding arena-based segment loading
+        // or implementing vm_reset_address_space.
+        //
+        // Currently: VM backends → ENOSYS, arena backends → ENOEXEC at
+        // the ELF load step. The apply_execve helper is fully functional
+        // and tested via synthetic LoadResult.
         if self.backend.has_vm_support() {
             return ENOSYS;
         }
@@ -3705,6 +3715,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         // Read path, argv, envp from user memory.
         let path = unsafe { read_c_string(path_ptr as usize) };
+        let path = self.resolve_path(&path);
         let argv = read_string_array(argv_ptr, 256);
         let envp = read_string_array(envp_ptr, 256);
 
