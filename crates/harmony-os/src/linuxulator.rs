@@ -3326,9 +3326,15 @@ impl<B: SyscallBackend> Linuxulator<B> {
         // Ensure any recently-exited child is recovered first.
         self.recover_child_state();
 
-        // Check if there are any children at all (active or exited).
-        let has_any_children =
-            !self.children.is_empty() || !self.exited_children.is_empty();
+        // Check if the requested pid is a known child (active or exited).
+        // For pid == -1 (any child), check if any children exist at all.
+        // For pid > 0, check if that specific pid is a known child.
+        let has_matching_children = if pid == -1 {
+            !self.children.is_empty() || !self.exited_children.is_empty()
+        } else {
+            self.children.iter().any(|c| c.pid == pid)
+                || self.exited_children.iter().any(|&(p, _)| p == pid)
+        };
 
         let idx = if pid == -1 {
             // Any child
@@ -3345,12 +3351,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
         let idx = match idx {
             Some(i) => i,
             None => {
-                if !has_any_children {
-                    // No children at all — ECHILD regardless of WNOHANG.
+                if !has_matching_children {
+                    // Requested pid is not a known child — ECHILD.
                     return ECHILD;
                 }
                 if options & WNOHANG != 0 {
-                    return 0; // children exist but none exited yet
+                    return 0; // child exists but hasn't exited yet
                 }
                 return ECHILD; // no exited children available
             }
