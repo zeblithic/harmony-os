@@ -1657,7 +1657,10 @@ pub struct Linuxulator<B: SyscallBackend> {
     /// Active children (running, not yet exited).
     children: Vec<ChildProcess<B>>,
     /// Exited children: (pid, exit_code) pairs for future waitpid.
+    #[allow(dead_code)]
     exited_children: Vec<(i32, i32)>,
+    /// Arena size used for this process (inherited by children on fork).
+    arena_size: usize,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -1695,6 +1698,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             next_child_pid: 2,
             children: Vec::new(),
             exited_children: Vec::new(),
+            arena_size,
         }
     }
 
@@ -3172,7 +3176,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             fd_table: self.fd_table.clone(),
             next_fid: self.next_fid,
             exit_code: None,
-            arena: MemoryArena::new(1024 * 1024), // fresh 1 MiB arena
+            arena: MemoryArena::new(self.arena_size),
             fs_base: self.fs_base,
             vm_brk_base: 0,
             vm_brk_current: 0,
@@ -3195,6 +3199,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             next_child_pid: self.next_child_pid,
             children: Vec::new(),
             exited_children: Vec::new(),
+            arena_size: self.arena_size,
         };
         // Move shared pipe/eventfd state to child
         core::mem::swap(&mut self.pipes, &mut child.pipes);
