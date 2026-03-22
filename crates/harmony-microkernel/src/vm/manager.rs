@@ -256,42 +256,10 @@ impl<P: PageTable> AddressSpaceManager<P> {
     /// Removes page table mappings, frees physical frames, and updates
     /// the capability tracker.
     pub fn unmap_region(&mut self, pid: u32, vaddr: VirtAddr) -> Result<(), VmError> {
-        let space = self
-            .spaces
-            .get_mut(&pid)
-            .ok_or(VmError::NoSuchProcess(pid))?;
-
-        let region = space
-            .regions
-            .remove(&vaddr)
-            .ok_or(VmError::NotMapped(vaddr))?;
-
-        // Unmap each page from the page table.
-        let page_count = region.len / PAGE_SIZE as usize;
-        for i in 0..page_count {
-            let page_vaddr = VirtAddr(vaddr.as_u64() + (i as u64) * PAGE_SIZE);
-            let _ = space.page_table.unmap(page_vaddr);
-        }
-
-        // Remove from cap_tracker and free frames to the correct buddy.
-        let use_kernel = region
-            .classification
-            .contains(FrameClassification::ENCRYPTED)
-            && self.buddy_kernel.total_frame_count() > 0;
-        let buddy = if use_kernel {
-            &mut self.buddy_kernel
-        } else {
-            &mut self.buddy_public
-        };
-        for &paddr in &region.frames {
-            let _classification = self.cap_tracker.remove_mapping(paddr, pid);
-            // NOTE: If classification contains ENCRYPTED, the frame contents
-            // should be zeroized before freeing. Hardware page table impls
-            // will handle this; the mock does not model frame contents.
-            let _ = buddy.free_frame(paddr);
-        }
-
-        Ok(())
+        let space = self.spaces.get(&pid).ok_or(VmError::NoSuchProcess(pid))?;
+        let region = space.regions.get(&vaddr).ok_or(VmError::NotMapped(vaddr))?;
+        let len = region.len;
+        self.unmap_partial(pid, vaddr, len)
     }
 
     /// Change the permission flags on an existing region.
@@ -301,23 +269,174 @@ impl<P: PageTable> AddressSpaceManager<P> {
         vaddr: VirtAddr,
         new_flags: PageFlags,
     ) -> Result<(), VmError> {
-        let space = self
-            .spaces
-            .get_mut(&pid)
-            .ok_or(VmError::NoSuchProcess(pid))?;
+        let space = self.spaces.get(&pid).ok_or(VmError::NoSuchProcess(pid))?;
+        let region = space.regions.get(&vaddr).ok_or(VmError::NotMapped(vaddr))?;
+        let len = region.len;
+        self.protect_partial(pid, vaddr, len, new_flags)
+    }
 
-        let region = space
-            .regions
-            .get_mut(&vaddr)
-            .ok_or(VmError::NotMapped(vaddr))?;
+    /// Find the region that fully contains `[vaddr, vaddr+len)`.
+    pub(crate) fn find_containing_region(
+        &self,
+        pid: u32,
+        vaddr: VirtAddr,
+        len: usize,
+    ) -> Result<VirtAddr, VmError> {
+        if len == 0 || vaddr.as_u64() % PAGE_SIZE != 0 || (len as u64) % PAGE_SIZE != 0 {
+            return Err(VmError::Unaligned(vaddr.as_u64()));
+        }
+        let space = self.spaces.get(&pid).ok_or(VmError::NoSuchProcess(pid))?;
+        let range_end = vaddr.as_u64() + len as u64;
+        if let Some((&base, region)) = space.regions.range(..=vaddr).next_back() {
+            let region_end = base.as_u64() + region.len as u64;
+            if base.as_u64() <= vaddr.as_u64() && range_end <= region_end {
+                return Ok(base);
+            }
+        }
+        Err(VmError::NotMapped(vaddr))
+    }
 
-        let page_count = region.len / PAGE_SIZE as usize;
+    /// Unmap a sub-range `[vaddr, vaddr+len)` within an existing region.
+    ///
+    /// The containing region is split into up to two surviving regions
+    /// (before and after the unmapped range). Physical frames in the target
+    /// range are freed and removed from the capability tracker.
+    pub fn unmap_partial(&mut self, pid: u32, vaddr: VirtAddr, len: usize) -> Result<(), VmError> {
+        let region_base = self.find_containing_region(pid, vaddr, len)?;
+        let space = self.spaces.get_mut(&pid).unwrap();
+        let region = space.regions.remove(&region_base).unwrap();
+        let page_offset = ((vaddr.as_u64() - region_base.as_u64()) / PAGE_SIZE) as usize;
+        let page_count = len / PAGE_SIZE as usize;
+
+        // Unmap target pages from page table.
         for i in 0..page_count {
             let page_vaddr = VirtAddr(vaddr.as_u64() + (i as u64) * PAGE_SIZE);
-            space.page_table.set_flags(page_vaddr, new_flags)?;
+            let _ = space.page_table.unmap(page_vaddr);
         }
 
-        region.flags = new_flags;
+        // Partition frames: before | target | after
+        let mut all_frames = region.frames;
+        let after_frames = all_frames.split_off(page_offset + page_count);
+        let target_frames = all_frames.split_off(page_offset);
+        let before_frames = all_frames;
+
+        // Free target frames.
+        let use_kernel = region
+            .classification
+            .contains(FrameClassification::ENCRYPTED)
+            && self.buddy_kernel.total_frame_count() > 0;
+        let buddy = if use_kernel {
+            &mut self.buddy_kernel
+        } else {
+            &mut self.buddy_public
+        };
+        for &paddr in &target_frames {
+            let _ = self.cap_tracker.remove_mapping(paddr, pid);
+            // NOTE: If classification contains ENCRYPTED, the frame contents
+            // should be zeroized before freeing. Hardware page table impls
+            // will handle this; the mock does not model frame contents.
+            let _ = buddy.free_frame(paddr);
+        }
+
+        // Re-insert surviving region(s).
+        let space = self.spaces.get_mut(&pid).unwrap();
+        if !before_frames.is_empty() {
+            space.regions.insert(
+                region_base,
+                Region {
+                    len: before_frames.len() * PAGE_SIZE as usize,
+                    flags: region.flags,
+                    classification: region.classification,
+                    frames: before_frames,
+                },
+            );
+        }
+        if !after_frames.is_empty() {
+            let after_base = VirtAddr(vaddr.as_u64() + len as u64);
+            space.regions.insert(
+                after_base,
+                Region {
+                    len: after_frames.len() * PAGE_SIZE as usize,
+                    flags: region.flags,
+                    classification: region.classification,
+                    frames: after_frames,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Change the permission flags on a sub-range `[vaddr, vaddr+len)`.
+    ///
+    /// The containing region is split into up to three regions: the
+    /// before-range (unchanged flags), the target range (new flags), and
+    /// the after-range (unchanged flags).
+    pub fn protect_partial(
+        &mut self,
+        pid: u32,
+        vaddr: VirtAddr,
+        len: usize,
+        new_flags: PageFlags,
+    ) -> Result<(), VmError> {
+        let region_base = self.find_containing_region(pid, vaddr, len)?;
+
+        // Update page table entries BEFORE removing the region from the
+        // BTreeMap. If set_flags fails, the region remains intact.
+        {
+            let space = self.spaces.get_mut(&pid).unwrap();
+            let page_count = len / PAGE_SIZE as usize;
+            for i in 0..page_count {
+                let page_vaddr = VirtAddr(vaddr.as_u64() + (i as u64) * PAGE_SIZE);
+                space.page_table.set_flags(page_vaddr, new_flags)?;
+            }
+        }
+
+        // Now remove and split the region (point of no return — set_flags
+        // already succeeded for all target pages).
+        let space = self.spaces.get_mut(&pid).unwrap();
+        let region = space.regions.remove(&region_base).unwrap();
+        let page_offset = ((vaddr.as_u64() - region_base.as_u64()) / PAGE_SIZE) as usize;
+        let page_count = len / PAGE_SIZE as usize;
+
+        // Partition frames.
+        let mut all_frames = region.frames;
+        let after_frames = all_frames.split_off(page_offset + page_count);
+        let target_frames = all_frames.split_off(page_offset);
+        let before_frames = all_frames;
+
+        // Re-insert up to 3 regions.
+        if !before_frames.is_empty() {
+            space.regions.insert(
+                region_base,
+                Region {
+                    len: before_frames.len() * PAGE_SIZE as usize,
+                    flags: region.flags,
+                    classification: region.classification,
+                    frames: before_frames,
+                },
+            );
+        }
+        space.regions.insert(
+            vaddr,
+            Region {
+                len: target_frames.len() * PAGE_SIZE as usize,
+                flags: new_flags,
+                classification: region.classification,
+                frames: target_frames,
+            },
+        );
+        if !after_frames.is_empty() {
+            let after_base = VirtAddr(vaddr.as_u64() + len as u64);
+            space.regions.insert(
+                after_base,
+                Region {
+                    len: after_frames.len() * PAGE_SIZE as usize,
+                    flags: region.flags,
+                    classification: region.classification,
+                    frames: after_frames,
+                },
+            );
+        }
         Ok(())
     }
 
@@ -934,5 +1053,359 @@ mod tests {
         mgr.destroy_space(1).unwrap();
         assert_eq!(mgr.buddy_public().free_frame_count(), 8);
         assert_eq!(mgr.buddy_kernel().free_frame_count(), 4);
+    }
+
+    // ── Partial unmap/protect tests ──────────────────────────────────
+
+    fn rx_user_flags() -> PageFlags {
+        PageFlags::READABLE | PageFlags::EXECUTABLE | PageFlags::USER
+    }
+
+    /// Map 4 pages, unmap the middle 2, verify before/after regions remain and
+    /// exactly 2 frames are freed.
+    #[test]
+    fn unmap_partial_suffix_two_pages() {
+        let mut mgr = make_manager(16);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        let base = VirtAddr(0x1000);
+        let flags = rw_user_flags();
+        mgr.map_region(
+            1,
+            base,
+            PAGE_SIZE as usize * 4,
+            flags,
+            FrameClassification::empty(),
+        )
+        .unwrap();
+        let initial_free = mgr.buddy_public().free_frame_count();
+
+        // Unmap last 2 pages (0x3000 and 0x4000) from 4-page region.
+        let unmap_start = VirtAddr(0x3000);
+        mgr.unmap_partial(1, unmap_start, PAGE_SIZE as usize * 2)
+            .unwrap();
+
+        // 2 frames freed.
+        assert_eq!(mgr.buddy_public().free_frame_count(), initial_free + 2);
+
+        // Only the before region (0x1000..0x3000, 2 pages) should remain.
+        let regions = &mgr.space(1).unwrap().regions;
+        let before = regions.get(&base).expect("before region missing");
+        assert_eq!(before.len, PAGE_SIZE as usize * 2);
+        assert_eq!(regions.len(), 1);
+    }
+
+    /// Unmap only the first page of a 4-page region.
+    #[test]
+    fn unmap_partial_first_page() {
+        let mut mgr = make_manager(16);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        let base = VirtAddr(0x1000);
+        mgr.map_region(
+            1,
+            base,
+            PAGE_SIZE as usize * 4,
+            rw_user_flags(),
+            FrameClassification::empty(),
+        )
+        .unwrap();
+
+        mgr.unmap_partial(1, base, PAGE_SIZE as usize).unwrap();
+
+        let regions = &mgr.space(1).unwrap().regions;
+        // No before region; after region starts at 0x2000, 3 pages.
+        assert_eq!(regions.len(), 1);
+        let after_base = VirtAddr(0x2000);
+        let after = regions.get(&after_base).expect("after region missing");
+        assert_eq!(after.len, PAGE_SIZE as usize * 3);
+    }
+
+    /// Unmap only the last page of a 4-page region.
+    #[test]
+    fn unmap_partial_last_page() {
+        let mut mgr = make_manager(16);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        let base = VirtAddr(0x1000);
+        mgr.map_region(
+            1,
+            base,
+            PAGE_SIZE as usize * 4,
+            rw_user_flags(),
+            FrameClassification::empty(),
+        )
+        .unwrap();
+
+        let last_page = VirtAddr(0x4000);
+        mgr.unmap_partial(1, last_page, PAGE_SIZE as usize).unwrap();
+
+        let regions = &mgr.space(1).unwrap().regions;
+        // Before region 0x1000..0x4000, 3 pages; no after region.
+        assert_eq!(regions.len(), 1);
+        let before = regions.get(&base).expect("before region missing");
+        assert_eq!(before.len, PAGE_SIZE as usize * 3);
+    }
+
+    /// Unmap middle 2 pages of a 4-page region — produces both before and after.
+    #[test]
+    fn unmap_partial_middle_produces_two_regions() {
+        let mut mgr = make_manager(16);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        let base = VirtAddr(0x1000);
+        mgr.map_region(
+            1,
+            base,
+            PAGE_SIZE as usize * 4,
+            rw_user_flags(),
+            FrameClassification::empty(),
+        )
+        .unwrap();
+
+        // Unmap pages at 0x2000 and 0x3000.
+        let unmap_start = VirtAddr(0x2000);
+        mgr.unmap_partial(1, unmap_start, PAGE_SIZE as usize * 2)
+            .unwrap();
+
+        let regions = &mgr.space(1).unwrap().regions;
+        assert_eq!(regions.len(), 2, "expected before and after regions");
+
+        let before = regions.get(&base).expect("before region missing");
+        assert_eq!(before.len, PAGE_SIZE as usize);
+
+        let after_base = VirtAddr(0x4000);
+        let after = regions.get(&after_base).expect("after region missing");
+        assert_eq!(after.len, PAGE_SIZE as usize);
+    }
+
+    /// `unmap_partial` on an unaligned vaddr returns Unaligned.
+    #[test]
+    fn unmap_partial_unaligned_returns_error() {
+        let mut mgr = make_manager(16);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        let base = VirtAddr(0x1000);
+        mgr.map_region(
+            1,
+            base,
+            PAGE_SIZE as usize * 4,
+            rw_user_flags(),
+            FrameClassification::empty(),
+        )
+        .unwrap();
+
+        let err = mgr
+            .unmap_partial(1, VirtAddr(0x1001), PAGE_SIZE as usize)
+            .unwrap_err();
+        assert!(matches!(err, VmError::Unaligned(_)));
+    }
+
+    /// `unmap_partial` on a range that spans beyond the region returns NotMapped.
+    #[test]
+    fn unmap_partial_out_of_bounds_returns_not_mapped() {
+        let mut mgr = make_manager(16);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        let base = VirtAddr(0x1000);
+        // Map 2 pages (0x1000..0x3000).
+        mgr.map_region(
+            1,
+            base,
+            PAGE_SIZE as usize * 2,
+            rw_user_flags(),
+            FrameClassification::empty(),
+        )
+        .unwrap();
+
+        // Try to unmap 3 pages starting at 0x1000 — exceeds the region.
+        let err = mgr
+            .unmap_partial(1, base, PAGE_SIZE as usize * 3)
+            .unwrap_err();
+        assert!(matches!(err, VmError::NotMapped(_)));
+    }
+
+    /// `protect_partial` on the first page changes only that page's flags.
+    #[test]
+    fn protect_partial_first_page() {
+        let mut mgr = make_manager(16);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        let base = VirtAddr(0x1000);
+        let orig_flags = rw_user_flags();
+        mgr.map_region(
+            1,
+            base,
+            PAGE_SIZE as usize * 4,
+            orig_flags,
+            FrameClassification::empty(),
+        )
+        .unwrap();
+
+        let new_flags = rx_user_flags();
+        mgr.protect_partial(1, base, PAGE_SIZE as usize, new_flags)
+            .unwrap();
+
+        let regions = &mgr.space(1).unwrap().regions;
+        // Target at base (1 page), after at 0x2000 (3 pages), no before.
+        assert_eq!(regions.len(), 2);
+        let target = regions.get(&base).expect("target region missing");
+        assert_eq!(target.flags, new_flags);
+        assert_eq!(target.len, PAGE_SIZE as usize);
+
+        let after_base = VirtAddr(0x2000);
+        let after = regions.get(&after_base).expect("after region missing");
+        assert_eq!(after.flags, orig_flags);
+        assert_eq!(after.len, PAGE_SIZE as usize * 3);
+    }
+
+    /// `protect_partial` on the last page changes only that page's flags.
+    #[test]
+    fn protect_partial_last_page() {
+        let mut mgr = make_manager(16);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        let base = VirtAddr(0x1000);
+        let orig_flags = rw_user_flags();
+        mgr.map_region(
+            1,
+            base,
+            PAGE_SIZE as usize * 4,
+            orig_flags,
+            FrameClassification::empty(),
+        )
+        .unwrap();
+
+        let last_page = VirtAddr(0x4000);
+        let new_flags = rx_user_flags();
+        mgr.protect_partial(1, last_page, PAGE_SIZE as usize, new_flags)
+            .unwrap();
+
+        let regions = &mgr.space(1).unwrap().regions;
+        // Before at base (3 pages), target at 0x4000 (1 page), no after.
+        assert_eq!(regions.len(), 2);
+        let before = regions.get(&base).expect("before region missing");
+        assert_eq!(before.flags, orig_flags);
+        assert_eq!(before.len, PAGE_SIZE as usize * 3);
+
+        let target = regions.get(&last_page).expect("target region missing");
+        assert_eq!(target.flags, new_flags);
+        assert_eq!(target.len, PAGE_SIZE as usize);
+    }
+
+    /// `protect_partial` on the middle 2 pages produces 3 regions.
+    #[test]
+    fn protect_partial_middle_produces_three_regions() {
+        let mut mgr = make_manager(16);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        let base = VirtAddr(0x1000);
+        let orig_flags = rw_user_flags();
+        mgr.map_region(
+            1,
+            base,
+            PAGE_SIZE as usize * 4,
+            orig_flags,
+            FrameClassification::empty(),
+        )
+        .unwrap();
+
+        let target_start = VirtAddr(0x2000);
+        let new_flags = rx_user_flags();
+        mgr.protect_partial(1, target_start, PAGE_SIZE as usize * 2, new_flags)
+            .unwrap();
+
+        let regions = &mgr.space(1).unwrap().regions;
+        assert_eq!(
+            regions.len(),
+            3,
+            "expected before, target, and after regions"
+        );
+
+        let before = regions.get(&base).expect("before region missing");
+        assert_eq!(before.flags, orig_flags);
+        assert_eq!(before.len, PAGE_SIZE as usize);
+
+        let target = regions.get(&target_start).expect("target region missing");
+        assert_eq!(target.flags, new_flags);
+        assert_eq!(target.len, PAGE_SIZE as usize * 2);
+
+        let after_base = VirtAddr(0x4000);
+        let after = regions.get(&after_base).expect("after region missing");
+        assert_eq!(after.flags, orig_flags);
+        assert_eq!(after.len, PAGE_SIZE as usize);
+    }
+
+    /// `protect_partial` updates the page table flags for the target pages.
+    #[test]
+    fn protect_partial_updates_page_table() {
+        let mut mgr = make_manager(16);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        let base = VirtAddr(0x1000);
+        mgr.map_region(
+            1,
+            base,
+            PAGE_SIZE as usize * 4,
+            rw_user_flags(),
+            FrameClassification::empty(),
+        )
+        .unwrap();
+
+        let target = VirtAddr(0x2000);
+        let new_flags = rx_user_flags();
+        mgr.protect_partial(1, target, PAGE_SIZE as usize, new_flags)
+            .unwrap();
+
+        let space = mgr.space(1).unwrap();
+        // Target page should have new flags.
+        let (_, got_flags) = space.page_table.translate(target).unwrap();
+        assert_eq!(got_flags, new_flags);
+
+        // Other pages should still have original flags.
+        let (_, orig_got) = space.page_table.translate(base).unwrap();
+        assert_eq!(orig_got, rw_user_flags());
+    }
+
+    /// `protect_partial` on an unaligned vaddr returns Unaligned.
+    #[test]
+    fn protect_partial_unaligned_returns_error() {
+        let mut mgr = make_manager(16);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        let base = VirtAddr(0x1000);
+        mgr.map_region(
+            1,
+            base,
+            PAGE_SIZE as usize * 4,
+            rw_user_flags(),
+            FrameClassification::empty(),
+        )
+        .unwrap();
+
+        let err = mgr
+            .protect_partial(1, VirtAddr(0x1800), PAGE_SIZE as usize, rx_user_flags())
+            .unwrap_err();
+        assert!(matches!(err, VmError::Unaligned(_)));
+    }
+
+    /// `protect_partial` preserves `classification` on all split regions.
+    #[test]
+    fn protect_partial_preserves_classification() {
+        let mut mgr = make_manager(16);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        let base = VirtAddr(0x1000);
+        mgr.map_region(
+            1,
+            base,
+            PAGE_SIZE as usize * 4,
+            rw_user_flags(),
+            FrameClassification::EPHEMERAL,
+        )
+        .unwrap();
+
+        let target_start = VirtAddr(0x2000);
+        mgr.protect_partial(1, target_start, PAGE_SIZE as usize * 2, rx_user_flags())
+            .unwrap();
+
+        let regions = &mgr.space(1).unwrap().regions;
+        for (_, region) in regions.iter() {
+            assert!(
+                region
+                    .classification
+                    .contains(FrameClassification::EPHEMERAL),
+                "classification not preserved: {:?}",
+                region.classification
+            );
+        }
     }
 }
