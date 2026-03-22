@@ -160,8 +160,8 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
                     .map_err(|e| format!("failed to parse bundle: {e:?}"))?;
 
                 for child in children {
-                    if child.cid_type() == CidType::InlineMetadata {
-                        continue; // Metadata entries carry no data.
+                    if child.cid_type() == CidType::InlineData {
+                        continue; // Content embedded inline in CID — no separate fetch needed.
                     }
                     if !store.contains(child) {
                         let child_hex = hex::encode(child.to_bytes());
@@ -175,8 +175,8 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
                     self.fetch_children(child, store, visited)?;
                 }
             }
-            CidType::InlineMetadata => {
-                // Skip — metadata entries don't carry data.
+            CidType::InlineData => {
+                // Content embedded inline in CID — no separate fetch needed.
             }
             _ => {
                 // Reserved types — skip.
@@ -297,7 +297,7 @@ mod tests {
 
                     if let Ok(children) = bundle::parse_bundle(bundle_data) {
                         for child in children {
-                            if child.cid_type() != CidType::InlineMetadata {
+                            if child.cid_type() != CidType::InlineData {
                                 insert_dag_nodes(child, store, map);
                             }
                         }
