@@ -804,13 +804,16 @@ impl<P: PageTable> Kernel<P> {
 
         // Promote CidBacked → Snapshot for frames that just became writable.
         if !was_writable && new_flags.contains(PageFlags::WRITABLE) {
-            if let Some(region) = self.vm.space(pid).and_then(|s| s.regions.get(&vaddr)) {
-                let frames: Vec<PhysAddr> = region.frames.clone();
-                for paddr in frames {
-                    self.lyll.promote_to_snapshot(paddr);
-                }
-                self.sync_guardian_state_hashes();
+            let region = self
+                .vm
+                .space(pid)
+                .and_then(|s| s.regions.get(&vaddr))
+                .expect("target region must exist after successful protect_partial");
+            let frames: Vec<PhysAddr> = region.frames.clone();
+            for paddr in frames {
+                self.lyll.promote_to_snapshot(paddr);
             }
+            self.sync_guardian_state_hashes();
         }
 
         Ok(())

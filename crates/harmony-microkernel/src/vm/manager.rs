@@ -276,7 +276,7 @@ impl<P: PageTable> AddressSpaceManager<P> {
     }
 
     /// Find the region that fully contains `[vaddr, vaddr+len)`.
-    pub fn find_containing_region(
+    pub(crate) fn find_containing_region(
         &self,
         pid: u32,
         vaddr: VirtAddr,
@@ -332,6 +332,9 @@ impl<P: PageTable> AddressSpaceManager<P> {
         };
         for &paddr in &target_frames {
             let _ = self.cap_tracker.remove_mapping(paddr, pid);
+            // NOTE: If classification contains ENCRYPTED, the frame contents
+            // should be zeroized before freeing. Hardware page table impls
+            // will handle this; the mock does not model frame contents.
             let _ = buddy.free_frame(paddr);
         }
 
@@ -376,16 +379,24 @@ impl<P: PageTable> AddressSpaceManager<P> {
         new_flags: PageFlags,
     ) -> Result<(), VmError> {
         let region_base = self.find_containing_region(pid, vaddr, len)?;
+
+        // Update page table entries BEFORE removing the region from the
+        // BTreeMap. If set_flags fails, the region remains intact.
+        {
+            let space = self.spaces.get_mut(&pid).unwrap();
+            let page_count = len / PAGE_SIZE as usize;
+            for i in 0..page_count {
+                let page_vaddr = VirtAddr(vaddr.as_u64() + (i as u64) * PAGE_SIZE);
+                space.page_table.set_flags(page_vaddr, new_flags)?;
+            }
+        }
+
+        // Now remove and split the region (point of no return — set_flags
+        // already succeeded for all target pages).
         let space = self.spaces.get_mut(&pid).unwrap();
         let region = space.regions.remove(&region_base).unwrap();
         let page_offset = ((vaddr.as_u64() - region_base.as_u64()) / PAGE_SIZE) as usize;
         let page_count = len / PAGE_SIZE as usize;
-
-        // Update page table entries for target range.
-        for i in 0..page_count {
-            let page_vaddr = VirtAddr(vaddr.as_u64() + (i as u64) * PAGE_SIZE);
-            space.page_table.set_flags(page_vaddr, new_flags)?;
-        }
 
         // Partition frames.
         let mut all_frames = region.frames;
@@ -1053,7 +1064,7 @@ mod tests {
     /// Map 4 pages, unmap the middle 2, verify before/after regions remain and
     /// exactly 2 frames are freed.
     #[test]
-    fn unmap_partial_middle_two_pages() {
+    fn unmap_partial_suffix_two_pages() {
         let mut mgr = make_manager(16);
         mgr.create_space(1, default_budget(), mock_pt()).unwrap();
         let base = VirtAddr(0x1000);
@@ -1068,7 +1079,7 @@ mod tests {
         .unwrap();
         let initial_free = mgr.buddy_public().free_frame_count();
 
-        // Unmap pages 1 and 2 (0x2000..0x4000).
+        // Unmap last 2 pages (0x3000 and 0x4000) from 4-page region.
         let unmap_start = VirtAddr(0x3000);
         mgr.unmap_partial(1, unmap_start, PAGE_SIZE as usize * 2)
             .unwrap();
@@ -1076,16 +1087,11 @@ mod tests {
         // 2 frames freed.
         assert_eq!(mgr.buddy_public().free_frame_count(), initial_free + 2);
 
+        // Only the before region (0x1000..0x3000, 2 pages) should remain.
         let regions = &mgr.space(1).unwrap().regions;
-        // Before region: 0x1000..0x3000 (2 pages).
         let before = regions.get(&base).expect("before region missing");
         assert_eq!(before.len, PAGE_SIZE as usize * 2);
-        // After region: 0x5000..0x7000 (2 pages). Wait — base is 0x1000, 4 pages
-        // = 0x1000..0x5000. Unmap 0x3000..0x5000.
-        // Actually let's recalculate: base=0x1000, 4 pages → 0x1000, 0x2000, 0x3000, 0x4000.
-        // unmap_start=0x3000, 2 pages → unmaps 0x3000 and 0x4000.
-        // before = 0x1000..0x3000 (2 pages). after = nothing (0x5000 is beyond region end).
-        assert_eq!(regions.len(), 1, "only before region should remain");
+        assert_eq!(regions.len(), 1);
     }
 
     /// Unmap only the first page of a 4-page region.
