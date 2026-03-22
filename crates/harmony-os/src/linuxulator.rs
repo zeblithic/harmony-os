@@ -369,6 +369,19 @@ pub enum LinuxSyscall {
         sigmask: u64,
         sigsetsize: u64,
     },
+    Fork,
+    Vfork,
+    Clone {
+        flags: u64,
+        child_stack: u64,
+        parent_tid: u64,
+        child_tid: u64,
+        tls: u64,
+    },
+    Clone3 {
+        args: u64,
+        size: u64,
+    },
     Unknown {
         nr: u64,
     },
@@ -662,6 +675,19 @@ impl LinuxSyscall {
                 flags: args[2] as u32,
             },
             334 => LinuxSyscall::Rseq,
+            56 => LinuxSyscall::Clone {
+                flags: args[0],
+                child_stack: args[1],
+                parent_tid: args[2],
+                child_tid: args[3],
+                tls: args[4],
+            },
+            57 => LinuxSyscall::Fork,
+            58 => LinuxSyscall::Vfork,
+            435 => LinuxSyscall::Clone3 {
+                args: args[0],
+                size: args[1],
+            },
             _ => LinuxSyscall::Unknown { nr },
         }
     }
@@ -937,6 +963,17 @@ impl LinuxSyscall {
                 flags: args[2] as u32,
             },
             293 => LinuxSyscall::Rseq,
+            220 => LinuxSyscall::Clone {
+                flags: args[0],
+                child_stack: args[1],
+                parent_tid: args[2],
+                tls: args[3],
+                child_tid: args[4],
+            },
+            435 => LinuxSyscall::Clone3 {
+                args: args[0],
+                size: args[1],
+            },
             _ => LinuxSyscall::Unknown { nr },
         }
     }
@@ -1016,6 +1053,14 @@ pub trait SyscallBackend {
     /// expose a real filesystem override this.
     fn readdir(&mut self, _fid: Fid) -> Result<Vec<DirEntry>, IpcError> {
         Err(IpcError::NotDirectory)
+    }
+
+    /// Create a forked copy of this backend for a child process.
+    fn fork_backend(&self) -> Self
+    where
+        Self: Sized,
+    {
+        unimplemented!("fork not supported by this backend")
     }
 }
 
@@ -1205,6 +1250,10 @@ impl SyscallBackend for MockBackend {
             .cloned()
             .ok_or(IpcError::NotDirectory)
     }
+
+    fn fork_backend(&self) -> Self {
+        MockBackend::new()
+    }
 }
 
 #[cfg(test)]
@@ -1306,6 +1355,10 @@ impl SyscallBackend for VmMockBackend {
     fn vm_write_bytes(&mut self, addr: u64, data: &[u8]) {
         // Record but do NOT dereference — addresses are simulated.
         self.vm_writes.push((addr, data.to_vec()));
+    }
+
+    fn fork_backend(&self) -> Self {
+        VmMockBackend::new(self.budget_pages)
     }
 }
 
@@ -1513,6 +1566,7 @@ struct EventFdState {
 }
 
 /// Shared state for a socket instance.
+#[derive(Clone)]
 struct SocketState {
     domain: i32,
     sock_type: i32,
@@ -1525,9 +1579,19 @@ struct SocketState {
 }
 
 /// Shared state for an epoll instance.
+#[derive(Clone)]
 struct EpollState {
     /// Registered fds: fd → (event mask, user data).
     interests: BTreeMap<i32, (u32, u64)>,
+}
+
+/// A child process created by fork/clone.
+#[allow(dead_code)]
+struct ChildProcess<B: SyscallBackend> {
+    pid: i32,
+    /// None while the child is running, Some(code) after exit_group.
+    exit_code: Option<i32>,
+    linuxulator: Linuxulator<B>,
 }
 
 /// Per-fd state: the kind of object and descriptor-level flags.
@@ -1586,6 +1650,17 @@ pub struct Linuxulator<B: SyscallBackend> {
     epolls: BTreeMap<usize, EpollState>,
     /// Next epoll_id to allocate.
     next_epoll_id: usize,
+    /// This process's PID.
+    pid: i32,
+    /// Parent's PID (0 for init).
+    #[allow(dead_code)]
+    parent_pid: i32,
+    /// Next PID to assign to a child.
+    #[allow(dead_code)]
+    next_child_pid: i32,
+    /// Children created by fork (active or exited, awaiting waitpid).
+    #[allow(dead_code)]
+    children: Vec<ChildProcess<B>>,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -1618,6 +1693,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
             next_socket_id: 0,
             epolls: BTreeMap::new(),
             next_epoll_id: 0,
+            pid: 1,
+            parent_pid: 0,
+            next_child_pid: 2,
+            children: Vec::new(),
         }
     }
 
@@ -1758,6 +1837,16 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// The exit code, if the process has exited.
     pub fn exit_code(&self) -> Option<i32> {
         self.exit_code
+    }
+
+    /// Return the deepest actively-running Linuxulator in the process tree.
+    pub fn active_process(&mut self) -> &mut Linuxulator<B> {
+        self // placeholder — implemented in Task 3
+    }
+
+    /// Check for a newly-forked child that needs its first syscall dispatched.
+    pub fn pending_fork_child(&mut self) -> Option<(i32, &mut Linuxulator<B>)> {
+        None // placeholder — implemented in Task 3
     }
 
     /// Access the backend (for test assertions).
@@ -1983,6 +2072,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 timeout,
                 ..
             } => self.sys_epoll_wait(epfd, events, maxevents, timeout),
+            LinuxSyscall::Fork => self.sys_fork(),
+            LinuxSyscall::Vfork => self.sys_fork(),
+            LinuxSyscall::Clone { flags, .. } => self.sys_clone(flags),
+            LinuxSyscall::Clone3 { .. } => ENOSYS,
             LinuxSyscall::Unknown { .. } => ENOSYS,
         }
     }
@@ -3013,6 +3106,18 @@ impl<B: SyscallBackend> Linuxulator<B> {
         written
     }
 
+    // ── Process management ────────────────────────────────────────
+
+    /// Linux fork(2): create child process (sequential model).
+    fn sys_fork(&mut self) -> i64 {
+        ENOSYS // placeholder — implemented in Task 2
+    }
+
+    /// Linux clone(2): validate flags and delegate to fork.
+    fn sys_clone(&mut self, _flags: u64) -> i64 {
+        ENOSYS // placeholder — implemented in Task 2
+    }
+
     /// Linux fstat(2): get file status.
     fn sys_fstat(&mut self, fd: i32, statbuf_ptr: usize) -> i64 {
         if statbuf_ptr == 0 {
@@ -3509,7 +3614,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux set_tid_address(2): return TID = 1 (single-threaded).
     fn sys_set_tid_address(&self) -> i64 {
-        1
+        self.pid as i64
     }
 
     /// Linux set_robust_list(2): stub — no futex cleanup needed.
@@ -4016,24 +4121,20 @@ impl<B: SyscallBackend> Linuxulator<B> {
     }
 
     /// Linux getpid(2): return process ID.
-    ///
-    /// Single-user init process — always PID 1.
     fn sys_getpid(&self) -> i64 {
-        1
+        self.pid as i64
     }
 
     /// Linux getppid(2): return parent process ID.
-    ///
-    /// Init process has no parent — returns 0.
     fn sys_getppid(&self) -> i64 {
-        0
+        self.parent_pid as i64
     }
 
     /// Linux gettid(2): return thread ID.
     ///
-    /// Single-threaded init process — TID matches PID (1).
+    /// Single-threaded model — TID matches PID.
     fn sys_gettid(&self) -> i64 {
-        1
+        self.pid as i64
     }
 
     /// Linux getuid(2): return real user ID.
