@@ -1701,6 +1701,9 @@ struct SignalAction {
     handler: u64,
     mask: u64,
     flags: u64,
+    /// sa_restorer (x86_64 only; 0 on other arches). Needed for
+    /// signal stack frame construction in the delivery bead.
+    restorer: u64,
 }
 
 impl Default for SignalAction {
@@ -1709,6 +1712,7 @@ impl Default for SignalAction {
             handler: SIG_DFL,
             mask: 0,
             flags: 0,
+            restorer: 0,
         }
     }
 }
@@ -4211,19 +4215,30 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if !(1..=64).contains(&signum) {
             return EINVAL;
         }
-        if signum == SIGKILL as i32 || signum == SIGSTOP as i32 {
+        // SIGKILL/SIGSTOP: reject attempts to change the handler, but
+        // allow read-only queries (act_ptr == 0). Linux: do_sigaction
+        // checks `(act && sig_kernel_only(sig))`.
+        if (signum == SIGKILL as i32 || signum == SIGSTOP as i32) && act_ptr != 0 {
             return EINVAL;
         }
 
         let idx = (signum - 1) as usize;
+
+        // Read input BEFORE writing output (handles aliased pointers
+        // where act_ptr == oldact_ptr).
+        let new_action = if act_ptr != 0 {
+            Some(Self::read_sigaction(act_ptr))
+        } else {
+            None
+        };
 
         if oldact_ptr != 0 {
             let action = &self.signal_handlers[idx];
             Self::write_sigaction(oldact_ptr, action);
         }
 
-        if act_ptr != 0 {
-            self.signal_handlers[idx] = Self::read_sigaction(act_ptr);
+        if let Some(action) = new_action {
+            self.signal_handlers[idx] = action;
         }
 
         0
@@ -4244,10 +4259,17 @@ impl<B: SyscallBackend> Linuxulator<B> {
         );
 
         #[cfg(target_arch = "x86_64")]
-        let mask_offset = 24; // skip sa_restorer at offset 16
-        #[cfg(target_arch = "aarch64")]
-        let mask_offset = 16;
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let restorer = u64::from_ne_bytes(
+            unsafe { core::slice::from_raw_parts((addr + 16) as *const u8, 8) }
+                .try_into()
+                .unwrap(),
+        );
+        #[cfg(not(target_arch = "x86_64"))]
+        let restorer = 0u64;
+
+        #[cfg(target_arch = "x86_64")]
+        let mask_offset = 24;
+        #[cfg(not(target_arch = "x86_64"))]
         let mask_offset = 16;
 
         let mask = u64::from_ne_bytes(
@@ -4260,6 +4282,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             handler,
             mask,
             flags,
+            restorer,
         }
     }
 
@@ -4273,16 +4296,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         #[cfg(target_arch = "x86_64")]
         {
-            // Write 0 for sa_restorer at offset 16.
+            // Write sa_restorer at offset 16.
             unsafe { core::slice::from_raw_parts_mut((addr + 16) as *mut u8, 8) }
-                .copy_from_slice(&0u64.to_ne_bytes());
+                .copy_from_slice(&action.restorer.to_ne_bytes());
         }
 
         #[cfg(target_arch = "x86_64")]
         let mask_offset = 24;
-        #[cfg(target_arch = "aarch64")]
-        let mask_offset = 16;
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(not(target_arch = "x86_64"))]
         let mask_offset = 16;
 
         unsafe { core::slice::from_raw_parts_mut((addr + mask_offset) as *mut u8, 8) }
@@ -4301,10 +4322,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return EINVAL;
         }
 
-        if oldset_ptr != 0 {
-            let buf = unsafe { core::slice::from_raw_parts_mut(oldset_ptr as usize as *mut u8, 8) };
-            buf.copy_from_slice(&self.signal_mask.to_ne_bytes());
-        }
+        // Capture old mask and read input BEFORE writing output.
+        // Handles aliased pointers (set_ptr == oldset_ptr) and ensures
+        // oldset is only written after successful how validation
+        // (matches Linux kernel ordering).
+        let old_mask = self.signal_mask;
 
         if set_ptr != 0 {
             let set_bytes =
@@ -4320,6 +4342,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
             // SIGKILL (9) and SIGSTOP (19) can never be blocked.
             self.signal_mask &= !(1u64 << (SIGKILL - 1) | 1u64 << (SIGSTOP - 1));
+        }
+
+        // Write old mask only after successful operation.
+        if oldset_ptr != 0 {
+            let buf = unsafe { core::slice::from_raw_parts_mut(oldset_ptr as usize as *mut u8, 8) };
+            buf.copy_from_slice(&old_mask.to_ne_bytes());
         }
 
         0
