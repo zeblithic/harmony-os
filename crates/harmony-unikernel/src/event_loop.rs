@@ -113,6 +113,7 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
                         if let NodeAction::SendOnInterface {
                             interface_name,
                             raw,
+                            ..
                         } = aa
                         {
                             out.push(RuntimeAction::SendOnInterface {
@@ -125,6 +126,7 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
                 NodeAction::SendOnInterface {
                     interface_name,
                     raw,
+                    ..
                 } => {
                     out.push(RuntimeAction::SendOnInterface {
                         interface_name,
@@ -165,6 +167,7 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
                         if let NodeAction::SendOnInterface {
                             interface_name,
                             raw,
+                            ..
                         } = sa
                         {
                             out.push(RuntimeAction::SendOnInterface {
@@ -396,6 +399,7 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
                         if let NodeAction::SendOnInterface {
                             interface_name,
                             raw,
+                            ..
                         } = aa
                         {
                             out.push(RuntimeAction::SendOnInterface {
@@ -408,6 +412,7 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
                 NodeAction::SendOnInterface {
                     interface_name,
                     raw,
+                    ..
                 } => {
                     out.push(RuntimeAction::SendOnInterface {
                         interface_name,
