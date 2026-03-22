@@ -113,7 +113,7 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
                         if let NodeAction::SendOnInterface {
                             interface_name,
                             raw,
-                            ..
+                            .. // weight ignored — QoS scheduling not yet implemented
                         } = aa
                         {
                             out.push(RuntimeAction::SendOnInterface {
@@ -126,7 +126,7 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
                 NodeAction::SendOnInterface {
                     interface_name,
                     raw,
-                    ..
+                    .. // weight ignored — QoS scheduling not yet implemented
                 } => {
                     out.push(RuntimeAction::SendOnInterface {
                         interface_name,
@@ -167,7 +167,7 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
                         if let NodeAction::SendOnInterface {
                             interface_name,
                             raw,
-                            ..
+                            .. // weight ignored — QoS scheduling not yet implemented
                         } = sa
                         {
                             out.push(RuntimeAction::SendOnInterface {
@@ -399,7 +399,7 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
                         if let NodeAction::SendOnInterface {
                             interface_name,
                             raw,
-                            ..
+                            .. // weight ignored — QoS scheduling not yet implemented
                         } = aa
                         {
                             out.push(RuntimeAction::SendOnInterface {
@@ -412,7 +412,7 @@ impl<E: EntropySource + CryptoRngCore, P: PersistentState> UnikernelRuntime<E, P
                 NodeAction::SendOnInterface {
                     interface_name,
                     raw,
-                    ..
+                    .. // weight ignored — QoS scheduling not yet implemented
                 } => {
                     out.push(RuntimeAction::SendOnInterface {
                         interface_name,

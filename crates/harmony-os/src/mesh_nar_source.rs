@@ -161,7 +161,7 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
 
                 for child in children {
                     if child.cid_type() == CidType::InlineData {
-                        continue; // Metadata entries carry no data.
+                        continue; // Content embedded inline in CID — no separate fetch needed.
                     }
                     if !store.contains(child) {
                         let child_hex = hex::encode(child.to_bytes());
@@ -176,7 +176,7 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
                 }
             }
             CidType::InlineData => {
-                // Skip — metadata entries don't carry data.
+                // Content embedded inline in CID — no separate fetch needed.
             }
             _ => {
                 // Reserved types — skip.
