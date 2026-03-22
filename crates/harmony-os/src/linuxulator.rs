@@ -2158,8 +2158,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 pid,
                 wstatus,
                 options,
-                ..
-            } => self.sys_wait4(pid, wstatus, options),
+                rusage,
+            } => self.sys_wait4(pid, wstatus, options, rusage),
             LinuxSyscall::Unknown { .. } => ENOSYS,
         }
     }
@@ -3316,11 +3316,16 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// - Without WNOHANG: return ECHILD if no exited children available
     ///
     /// wstatus format: (exit_code & 0xFF) << 8 (normal exit, no signal)
-    fn sys_wait4(&mut self, pid: i32, wstatus_ptr: u64, options: i32) -> i64 {
+    fn sys_wait4(&mut self, pid: i32, wstatus_ptr: u64, options: i32, rusage_ptr: u64) -> i64 {
         const WNOHANG: i32 = 1;
 
         if pid == 0 || pid < -1 {
             return ENOSYS; // process group wait not supported
+        }
+
+        // Reject unsupported options (WUNTRACED, WCONTINUED, __WALL, etc.)
+        if options & !WNOHANG != 0 {
+            return EINVAL;
         }
 
         // Ensure any recently-exited child is recovered first.
@@ -3371,6 +3376,13 @@ impl<B: SyscallBackend> Linuxulator<B> {
             let buf =
                 unsafe { core::slice::from_raw_parts_mut(wstatus_ptr as usize as *mut u8, 4) };
             buf.copy_from_slice(&wstatus.to_ne_bytes());
+        }
+
+        // Zero rusage if provided — resource tracking not implemented.
+        if rusage_ptr != 0 {
+            let buf =
+                unsafe { core::slice::from_raw_parts_mut(rusage_ptr as usize as *mut u8, 144) };
+            buf.fill(0);
         }
 
         child_pid as i64
