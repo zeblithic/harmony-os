@@ -46,6 +46,22 @@ const FD_CLOEXEC: u32 = 1;
 const O_CLOEXEC: i32 = 0o2000000;
 const O_NONBLOCK: i32 = 0o4000;
 
+// Signal constants
+#[allow(dead_code)]
+const SIG_DFL: u64 = 0;
+#[allow(dead_code)]
+const SIG_IGN: u64 = 1;
+#[allow(dead_code)]
+const SIGKILL: u32 = 9;
+#[allow(dead_code)]
+const SIGSTOP: u32 = 19;
+#[allow(dead_code)]
+const SIG_BLOCK: i32 = 0;
+#[allow(dead_code)]
+const SIG_UNBLOCK: i32 = 1;
+#[allow(dead_code)]
+const SIG_SETMASK: i32 = 2;
+
 fn ipc_err_to_errno(e: IpcError) -> i64 {
     match e {
         IpcError::NotFound => ENOENT,
@@ -128,8 +144,18 @@ pub enum LinuxSyscall {
     Brk {
         addr: u64,
     },
-    RtSigaction,
-    RtSigprocmask,
+    RtSigaction {
+        signum: i32,
+        act: u64,
+        oldact: u64,
+        sigsetsize: u64,
+    },
+    RtSigprocmask {
+        how: i32,
+        set: u64,
+        oldset: u64,
+        sigsetsize: u64,
+    },
     Ioctl {
         fd: i32,
         request: u64,
@@ -443,8 +469,18 @@ impl LinuxSyscall {
                 len: args[1],
             },
             12 => LinuxSyscall::Brk { addr: args[0] },
-            13 => LinuxSyscall::RtSigaction,
-            14 => LinuxSyscall::RtSigprocmask,
+            13 => LinuxSyscall::RtSigaction {
+                signum: args[0] as i32,
+                act: args[1],
+                oldact: args[2],
+                sigsetsize: args[3],
+            },
+            14 => LinuxSyscall::RtSigprocmask {
+                how: args[0] as i32,
+                set: args[1],
+                oldset: args[2],
+                sigsetsize: args[3],
+            },
             16 => LinuxSyscall::Ioctl {
                 fd: args[0] as i32,
                 request: args[1],
@@ -869,8 +905,18 @@ impl LinuxSyscall {
                 cpusetsize: args[1],
                 mask: args[2],
             },
-            134 => LinuxSyscall::RtSigaction,
-            135 => LinuxSyscall::RtSigprocmask,
+            134 => LinuxSyscall::RtSigaction {
+                signum: args[0] as i32,
+                act: args[1],
+                oldact: args[2],
+                sigsetsize: args[3],
+            },
+            135 => LinuxSyscall::RtSigprocmask {
+                how: args[0] as i32,
+                set: args[1],
+                oldset: args[2],
+                sigsetsize: args[3],
+            },
             160 => LinuxSyscall::Uname { buf: args[0] },
             172 => LinuxSyscall::Getpid,
             173 => LinuxSyscall::Getppid,
@@ -1655,6 +1701,25 @@ struct EpollState {
     interests: BTreeMap<i32, (u32, u64)>,
 }
 
+/// Per-signal handler disposition, stored in a 64-element array.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct SignalAction {
+    handler: u64,
+    mask: u64,
+    flags: u64,
+}
+
+impl Default for SignalAction {
+    fn default() -> Self {
+        Self {
+            handler: SIG_DFL,
+            mask: 0,
+            flags: 0,
+        }
+    }
+}
+
 /// A child process created by fork/clone.
 struct ChildProcess<B: SyscallBackend> {
     pid: i32,
@@ -1738,6 +1803,10 @@ pub struct Linuxulator<B: SyscallBackend> {
     arena_size: usize,
     /// Set by sys_execve on success — caller should reset RIP/RSP.
     pending_execve: Option<ExecveResult>,
+    /// Per-signal handler disposition (signals 1-64, index 0 = signal 1).
+    signal_handlers: [SignalAction; 64],
+    /// Blocked signal mask (bit N = signal N+1 is blocked).
+    signal_mask: u64,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -1777,6 +1846,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
             exited_children: Vec::new(),
             arena_size,
             pending_execve: None,
+            signal_handlers: [SignalAction::default(); 64],
+            signal_mask: 0,
         }
     }
 
@@ -2060,8 +2131,18 @@ impl<B: SyscallBackend> Linuxulator<B> {
             LinuxSyscall::Mprotect { addr, len, prot } => self.sys_mprotect(addr, len, prot),
             LinuxSyscall::Munmap { addr, len } => self.sys_munmap(addr, len),
             LinuxSyscall::Brk { addr } => self.sys_brk(addr),
-            LinuxSyscall::RtSigaction => self.sys_rt_sigaction(),
-            LinuxSyscall::RtSigprocmask => self.sys_rt_sigprocmask(),
+            LinuxSyscall::RtSigaction {
+                signum,
+                act,
+                oldact,
+                sigsetsize,
+            } => self.sys_rt_sigaction(signum, act, oldact, sigsetsize),
+            LinuxSyscall::RtSigprocmask {
+                how,
+                set,
+                oldset,
+                sigsetsize,
+            } => self.sys_rt_sigprocmask(how, set, oldset, sigsetsize),
             LinuxSyscall::Ioctl { fd, request } => self.sys_ioctl(fd, request),
             LinuxSyscall::Exit { code } => self.sys_exit(code),
             #[cfg(target_arch = "x86_64")]
@@ -2520,6 +2601,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.vm_brk_current = 0;
         self.getrandom_counter = 0;
         self.exit_code = None;
+        self.signal_handlers = [SignalAction::default(); 64];
     }
 
     /// Apply a successful execve: close CLOEXEC fds, reset state, build
@@ -3389,6 +3471,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
             exited_children: Vec::new(),
             arena_size: self.arena_size,
             pending_execve: None,
+            signal_handlers: self.signal_handlers,
+            signal_mask: self.signal_mask,
         };
         // Move shared pipe/eventfd state to child
         core::mem::swap(&mut self.pipes, &mut child.pipes);
@@ -4120,14 +4204,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
     }
 
-    /// Linux rt_sigaction(2): stub — no signal support.
-    fn sys_rt_sigaction(&self) -> i64 {
-        0
+    /// Linux rt_sigaction(2): register signal handler.
+    fn sys_rt_sigaction(&mut self, _signum: i32, _act: u64, _oldact: u64, _sigsetsize: u64) -> i64 {
+        0 // stub — implemented in Task 2
     }
 
-    /// Linux rt_sigprocmask(2): stub — no signal support.
-    fn sys_rt_sigprocmask(&self) -> i64 {
-        0
+    /// Linux rt_sigprocmask(2): manage blocked signal mask.
+    fn sys_rt_sigprocmask(&mut self, _how: i32, _set: u64, _oldset: u64, _sigsetsize: u64) -> i64 {
+        0 // stub — implemented in Task 2
     }
 
     /// Linux set_tid_address(2): return TID = 1 (single-threaded).
