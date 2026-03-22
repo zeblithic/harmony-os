@@ -3319,12 +3319,16 @@ impl<B: SyscallBackend> Linuxulator<B> {
     fn sys_wait4(&mut self, pid: i32, wstatus_ptr: u64, options: i32) -> i64 {
         const WNOHANG: i32 = 1;
 
-        // Ensure any recently-exited child is recovered first.
-        self.recover_child_state();
-
         if pid == 0 || pid < -1 {
             return ENOSYS; // process group wait not supported
         }
+
+        // Ensure any recently-exited child is recovered first.
+        self.recover_child_state();
+
+        // Check if there are any children at all (active or exited).
+        let has_any_children =
+            !self.children.is_empty() || !self.exited_children.is_empty();
 
         let idx = if pid == -1 {
             // Any child
@@ -3341,10 +3345,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
         let idx = match idx {
             Some(i) => i,
             None => {
-                if options & WNOHANG != 0 {
-                    return 0; // no exited children, non-blocking
+                if !has_any_children {
+                    // No children at all — ECHILD regardless of WNOHANG.
+                    return ECHILD;
                 }
-                return ECHILD; // no children to wait for
+                if options & WNOHANG != 0 {
+                    return 0; // children exist but none exited yet
+                }
+                return ECHILD; // no exited children available
             }
         };
 
@@ -9943,10 +9951,8 @@ mod integration_tests {
             let child = lx.active_process();
             child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 42 });
         }
-        // Recover child state
-        let _ = lx.active_process();
-
         // wait4(-1, &wstatus, 0, NULL) — wait for any child
+        // (sys_wait4 calls recover_child_state internally)
         let mut wstatus = 0u32;
         let r = lx.dispatch_syscall(LinuxSyscall::Wait4 {
             pid: -1,
@@ -9970,17 +9976,17 @@ mod integration_tests {
             let child = lx.active_process();
             child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 1 });
         }
-        let _ = lx.active_process();
 
         // Fork child 2, exits with code 2
+        // (sys_fork calls recover_child_state internally)
         let pid2 = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
         {
             let child = lx.active_process();
             child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 2 });
         }
-        let _ = lx.active_process();
 
         // Wait for pid2 specifically
+        // (sys_wait4 calls recover_child_state internally)
         let mut wstatus = 0u32;
         let r = lx.dispatch_syscall(LinuxSyscall::Wait4 {
             pid: pid2,
@@ -10007,14 +10013,15 @@ mod integration_tests {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
 
-        // No children at all — WNOHANG returns 0
+        // No children at all — ECHILD even with WNOHANG (Linux spec:
+        // WNOHANG returns 0 only when children exist but none exited yet)
         let r = lx.dispatch_syscall(LinuxSyscall::Wait4 {
             pid: -1,
             wstatus: 0,
             options: 1, // WNOHANG
             rusage: 0,
         });
-        assert_eq!(r, 0);
+        assert_eq!(r, ECHILD);
     }
 
     #[test]
@@ -10042,9 +10049,9 @@ mod integration_tests {
             let child = lx.active_process();
             child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 0 });
         }
-        let _ = lx.active_process();
 
         // wstatus=0 (null) — should still return child pid without crashing
+        // (sys_wait4 calls recover_child_state internally)
         let r = lx.dispatch_syscall(LinuxSyscall::Wait4 {
             pid: -1,
             wstatus: 0,
@@ -10064,9 +10071,8 @@ mod integration_tests {
             let child = lx.active_process();
             child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 0 });
         }
-        let _ = lx.active_process();
 
-        // First wait succeeds
+        // First wait succeeds (sys_wait4 recovers child state internally)
         let r = lx.dispatch_syscall(LinuxSyscall::Wait4 {
             pid: -1,
             wstatus: 0,
