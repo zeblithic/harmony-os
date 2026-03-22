@@ -47,19 +47,13 @@ const O_CLOEXEC: i32 = 0o2000000;
 const O_NONBLOCK: i32 = 0o4000;
 
 // Signal constants
-#[allow(dead_code)]
 const SIG_DFL: u64 = 0;
 #[allow(dead_code)]
 const SIG_IGN: u64 = 1;
-#[allow(dead_code)]
 const SIGKILL: u32 = 9;
-#[allow(dead_code)]
 const SIGSTOP: u32 = 19;
-#[allow(dead_code)]
 const SIG_BLOCK: i32 = 0;
-#[allow(dead_code)]
 const SIG_UNBLOCK: i32 = 1;
-#[allow(dead_code)]
 const SIG_SETMASK: i32 = 2;
 
 fn ipc_err_to_errno(e: IpcError) -> i64 {
@@ -1703,7 +1697,6 @@ struct EpollState {
 
 /// Per-signal handler disposition, stored in a 64-element array.
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
 struct SignalAction {
     handler: u64,
     mask: u64,
@@ -4204,14 +4197,132 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
     }
 
-    /// Linux rt_sigaction(2): register signal handler.
-    fn sys_rt_sigaction(&mut self, _signum: i32, _act: u64, _oldact: u64, _sigsetsize: u64) -> i64 {
-        0 // stub — implemented in Task 2
+    /// Linux rt_sigaction(2): register or query a signal handler.
+    fn sys_rt_sigaction(
+        &mut self,
+        signum: i32,
+        act_ptr: u64,
+        oldact_ptr: u64,
+        sigsetsize: u64,
+    ) -> i64 {
+        if sigsetsize != 8 {
+            return EINVAL;
+        }
+        if !(1..=64).contains(&signum) {
+            return EINVAL;
+        }
+        if signum == SIGKILL as i32 || signum == SIGSTOP as i32 {
+            return EINVAL;
+        }
+
+        let idx = (signum - 1) as usize;
+
+        if oldact_ptr != 0 {
+            let action = &self.signal_handlers[idx];
+            Self::write_sigaction(oldact_ptr, action);
+        }
+
+        if act_ptr != 0 {
+            self.signal_handlers[idx] = Self::read_sigaction(act_ptr);
+        }
+
+        0
     }
 
-    /// Linux rt_sigprocmask(2): manage blocked signal mask.
-    fn sys_rt_sigprocmask(&mut self, _how: i32, _set: u64, _oldset: u64, _sigsetsize: u64) -> i64 {
-        0 // stub — implemented in Task 2
+    /// Read a kernel sigaction struct from user memory.
+    fn read_sigaction(ptr: u64) -> SignalAction {
+        let addr = ptr as usize;
+        let handler = u64::from_ne_bytes(
+            unsafe { core::slice::from_raw_parts(addr as *const u8, 8) }
+                .try_into()
+                .unwrap(),
+        );
+        let flags = u64::from_ne_bytes(
+            unsafe { core::slice::from_raw_parts((addr + 8) as *const u8, 8) }
+                .try_into()
+                .unwrap(),
+        );
+
+        #[cfg(target_arch = "x86_64")]
+        let mask_offset = 24; // skip sa_restorer at offset 16
+        #[cfg(target_arch = "aarch64")]
+        let mask_offset = 16;
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let mask_offset = 16;
+
+        let mask = u64::from_ne_bytes(
+            unsafe { core::slice::from_raw_parts((addr + mask_offset) as *const u8, 8) }
+                .try_into()
+                .unwrap(),
+        );
+
+        SignalAction {
+            handler,
+            mask,
+            flags,
+        }
+    }
+
+    /// Write a kernel sigaction struct to user memory.
+    fn write_sigaction(ptr: u64, action: &SignalAction) {
+        let addr = ptr as usize;
+        unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, 8) }
+            .copy_from_slice(&action.handler.to_ne_bytes());
+        unsafe { core::slice::from_raw_parts_mut((addr + 8) as *mut u8, 8) }
+            .copy_from_slice(&action.flags.to_ne_bytes());
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Write 0 for sa_restorer at offset 16.
+            unsafe { core::slice::from_raw_parts_mut((addr + 16) as *mut u8, 8) }
+                .copy_from_slice(&0u64.to_ne_bytes());
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        let mask_offset = 24;
+        #[cfg(target_arch = "aarch64")]
+        let mask_offset = 16;
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let mask_offset = 16;
+
+        unsafe { core::slice::from_raw_parts_mut((addr + mask_offset) as *mut u8, 8) }
+            .copy_from_slice(&action.mask.to_ne_bytes());
+    }
+
+    /// Linux rt_sigprocmask(2): manage the blocked signal mask.
+    fn sys_rt_sigprocmask(
+        &mut self,
+        how: i32,
+        set_ptr: u64,
+        oldset_ptr: u64,
+        sigsetsize: u64,
+    ) -> i64 {
+        if sigsetsize != 8 {
+            return EINVAL;
+        }
+
+        if oldset_ptr != 0 {
+            let buf = unsafe { core::slice::from_raw_parts_mut(oldset_ptr as usize as *mut u8, 8) };
+            buf.copy_from_slice(&self.signal_mask.to_ne_bytes());
+        }
+
+        if set_ptr != 0 {
+            let set_bytes =
+                unsafe { core::slice::from_raw_parts(set_ptr as usize as *const u8, 8) };
+            let set = u64::from_ne_bytes(set_bytes.try_into().unwrap());
+
+            match how {
+                SIG_BLOCK => self.signal_mask |= set,
+                SIG_UNBLOCK => self.signal_mask &= !set,
+                SIG_SETMASK => self.signal_mask = set,
+                _ => return EINVAL,
+            }
+
+            // SIGKILL (9) and SIGSTOP (19) can never be blocked.
+            self.signal_mask &= !(1u64 << (SIGKILL - 1) | 1u64 << (SIGSTOP - 1));
+        }
+
+        0
     }
 
     /// Linux set_tid_address(2): return TID = 1 (single-threaded).
@@ -5380,7 +5491,8 @@ mod tests {
     fn sys_rt_sigprocmask_returns_zero() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
-        let result = lx.handle_syscall(14, [0, 0, 0, 0, 0, 0]);
+        // how=SIG_BLOCK(0), set=0, oldset=0, sigsetsize=8 — no-op but valid
+        let result = lx.handle_syscall(14, [0, 0, 0, 8, 0, 0]);
         assert_eq!(result, 0);
     }
 
