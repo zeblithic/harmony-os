@@ -369,6 +369,19 @@ pub enum LinuxSyscall {
         sigmask: u64,
         sigsetsize: u64,
     },
+    Fork,
+    Vfork,
+    Clone {
+        flags: u64,
+        child_stack: u64,
+        parent_tid: u64,
+        child_tid: u64,
+        tls: u64,
+    },
+    Clone3 {
+        args: u64,
+        size: u64,
+    },
     Unknown {
         nr: u64,
     },
@@ -662,6 +675,19 @@ impl LinuxSyscall {
                 flags: args[2] as u32,
             },
             334 => LinuxSyscall::Rseq,
+            56 => LinuxSyscall::Clone {
+                flags: args[0],
+                child_stack: args[1],
+                parent_tid: args[2],
+                child_tid: args[3],
+                tls: args[4],
+            },
+            57 => LinuxSyscall::Fork,
+            58 => LinuxSyscall::Vfork,
+            435 => LinuxSyscall::Clone3 {
+                args: args[0],
+                size: args[1],
+            },
             _ => LinuxSyscall::Unknown { nr },
         }
     }
@@ -937,6 +963,17 @@ impl LinuxSyscall {
                 flags: args[2] as u32,
             },
             293 => LinuxSyscall::Rseq,
+            220 => LinuxSyscall::Clone {
+                flags: args[0],
+                child_stack: args[1],
+                parent_tid: args[2],
+                tls: args[3],
+                child_tid: args[4],
+            },
+            435 => LinuxSyscall::Clone3 {
+                args: args[0],
+                size: args[1],
+            },
             _ => LinuxSyscall::Unknown { nr },
         }
     }
@@ -1016,6 +1053,15 @@ pub trait SyscallBackend {
     /// expose a real filesystem override this.
     fn readdir(&mut self, _fid: Fid) -> Result<Vec<DirEntry>, IpcError> {
         Err(IpcError::NotDirectory)
+    }
+
+    /// Create a forked copy of this backend for a child process.
+    /// Returns None if fork is not supported by this backend.
+    fn fork_backend(&self) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        None
     }
 }
 
@@ -1205,6 +1251,10 @@ impl SyscallBackend for MockBackend {
             .cloned()
             .ok_or(IpcError::NotDirectory)
     }
+
+    fn fork_backend(&self) -> Option<Self> {
+        Some(MockBackend::new())
+    }
 }
 
 #[cfg(test)]
@@ -1306,6 +1356,10 @@ impl SyscallBackend for VmMockBackend {
     fn vm_write_bytes(&mut self, addr: u64, data: &[u8]) {
         // Record but do NOT dereference — addresses are simulated.
         self.vm_writes.push((addr, data.to_vec()));
+    }
+
+    fn fork_backend(&self) -> Option<Self> {
+        Some(VmMockBackend::new(self.budget_pages))
     }
 }
 
@@ -1513,6 +1567,7 @@ struct EventFdState {
 }
 
 /// Shared state for a socket instance.
+#[derive(Clone)]
 struct SocketState {
     domain: i32,
     sock_type: i32,
@@ -1525,9 +1580,16 @@ struct SocketState {
 }
 
 /// Shared state for an epoll instance.
+#[derive(Clone)]
 struct EpollState {
     /// Registered fds: fd → (event mask, user data).
     interests: BTreeMap<i32, (u32, u64)>,
+}
+
+/// A child process created by fork/clone.
+struct ChildProcess<B: SyscallBackend> {
+    pid: i32,
+    linuxulator: Linuxulator<B>,
 }
 
 /// Per-fd state: the kind of object and descriptor-level flags.
@@ -1586,6 +1648,19 @@ pub struct Linuxulator<B: SyscallBackend> {
     epolls: BTreeMap<usize, EpollState>,
     /// Next epoll_id to allocate.
     next_epoll_id: usize,
+    /// This process's PID.
+    pid: i32,
+    /// Parent's PID (0 for init).
+    parent_pid: i32,
+    /// Next PID to assign to a child.
+    next_child_pid: i32,
+    /// Active children (running, not yet exited).
+    children: Vec<ChildProcess<B>>,
+    /// Exited children: (pid, exit_code) pairs for future waitpid.
+    #[allow(dead_code)]
+    exited_children: Vec<(i32, i32)>,
+    /// Arena size used for this process (inherited by children on fork).
+    arena_size: usize,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -1618,6 +1693,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
             next_socket_id: 0,
             epolls: BTreeMap::new(),
             next_epoll_id: 0,
+            pid: 1,
+            parent_pid: 0,
+            next_child_pid: 2,
+            children: Vec::new(),
+            exited_children: Vec::new(),
+            arena_size,
         }
     }
 
@@ -1758,6 +1839,74 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// The exit code, if the process has exited.
     pub fn exit_code(&self) -> Option<i32> {
         self.exit_code
+    }
+
+    /// Recover shared state (pipes/eventfds) from an exited child.
+    fn recover_child_state(&mut self) {
+        let should_recover = self
+            .children
+            .last()
+            .is_some_and(|c| c.linuxulator.exit_code.is_some());
+        if !should_recover {
+            return;
+        }
+        // Pop the exited child so recover is called exactly once.
+        // The exit code is stored in exited_children for future waitpid.
+        let child = self.children.pop().unwrap();
+        let exit_code = child.linuxulator.exit_code.unwrap_or(0);
+        self.exited_children.push((child.pid, exit_code));
+
+        // Swap pipes/eventfds back from the (now dropped) child.
+        // We need to move them out before the child is dropped, so
+        // we must do this inline with a temporary.
+        // Actually, child is already moved out of the vec by pop().
+        let mut c = child.linuxulator;
+        core::mem::swap(&mut self.pipes, &mut c.pipes);
+        core::mem::swap(&mut self.eventfds, &mut c.eventfds);
+        // Recover shared-state allocators (pipes/eventfds are shared,
+        // so their ID counters must not collide after recovery).
+        self.next_pipe_id = self.next_pipe_id.max(c.next_pipe_id);
+        self.next_eventfd_id = self.next_eventfd_id.max(c.next_eventfd_id);
+        // Sockets and epolls are cloned (not shared) — child's objects
+        // are dropped with the child, so counter recovery is not needed.
+        // next_child_pid must be recovered to keep the global PID space.
+        self.next_child_pid = self.next_child_pid.max(c.next_child_pid);
+    }
+
+    /// Return the deepest actively-running Linuxulator in the process tree.
+    pub fn active_process(&mut self) -> &mut Linuxulator<B> {
+        // Determine which path to take using a shared borrow (dropped immediately).
+        let last_exited = self
+            .children
+            .last()
+            .map(|c| c.linuxulator.exit_code.is_some());
+
+        match last_exited {
+            // Child has exited: recover shared state and return self (the parent).
+            Some(true) => {
+                self.recover_child_state();
+                self
+            }
+            // Active child: recurse into it.
+            Some(false) => self
+                .children
+                .last_mut()
+                .unwrap()
+                .linuxulator
+                .active_process(),
+            // No children: this is the active process.
+            None => self,
+        }
+    }
+
+    /// Check for a newly-forked child that needs its first syscall dispatched.
+    pub fn pending_fork_child(&mut self) -> Option<(i32, &mut Linuxulator<B>)> {
+        if let Some(child) = self.children.last_mut() {
+            if child.linuxulator.exit_code.is_none() {
+                return Some((child.pid, &mut child.linuxulator));
+            }
+        }
+        None
     }
 
     /// Access the backend (for test assertions).
@@ -1983,6 +2132,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 timeout,
                 ..
             } => self.sys_epoll_wait(epfd, events, maxevents, timeout),
+            LinuxSyscall::Fork => self.sys_fork(),
+            LinuxSyscall::Vfork => self.sys_fork(),
+            LinuxSyscall::Clone { flags, .. } => self.sys_clone(flags),
+            LinuxSyscall::Clone3 { .. } => ENOSYS,
             LinuxSyscall::Unknown { .. } => ENOSYS,
         }
     }
@@ -3013,6 +3166,116 @@ impl<B: SyscallBackend> Linuxulator<B> {
         written
     }
 
+    // ── Process management ────────────────────────────────────────
+
+    /// Create a child Linuxulator with cloned state for fork.
+    fn create_child(&mut self, child_pid: i32) -> Option<Linuxulator<B>> {
+        let child_backend = self.backend.fork_backend()?;
+        let mut child = Linuxulator {
+            backend: child_backend,
+            fd_table: self.fd_table.clone(),
+            next_fid: self.next_fid,
+            exit_code: None,
+            arena: MemoryArena::new(self.arena_size),
+            fs_base: self.fs_base,
+            vm_brk_base: 0,
+            vm_brk_current: 0,
+            getrandom_counter: 0, // reset for distinct random output
+            cwd: self.cwd.clone(),
+            monotonic_ns: self.monotonic_ns,
+            realtime_ns: self.realtime_ns,
+            fid_refcount: self.fid_refcount.clone(),
+            // pipes and eventfds will be moved via mem::swap
+            pipes: BTreeMap::new(),
+            next_pipe_id: self.next_pipe_id,
+            eventfds: BTreeMap::new(),
+            next_eventfd_id: self.next_eventfd_id,
+            sockets: self.sockets.clone(),
+            next_socket_id: self.next_socket_id,
+            epolls: self.epolls.clone(),
+            next_epoll_id: self.next_epoll_id,
+            pid: child_pid,
+            parent_pid: self.pid,
+            next_child_pid: self.next_child_pid,
+            children: Vec::new(),
+            exited_children: Vec::new(),
+            arena_size: self.arena_size,
+        };
+        // Move shared pipe/eventfd state to child
+        core::mem::swap(&mut self.pipes, &mut child.pipes);
+        core::mem::swap(&mut self.eventfds, &mut child.eventfds);
+        Some(child)
+    }
+
+    /// Linux fork(2): create child process (sequential model).
+    ///
+    /// Creates a child Linuxulator and pushes it as an active child.
+    /// The child's pipes/eventfds are shared with the parent (moved
+    /// for the duration of child execution). Returns child_pid to the
+    /// parent. The caller should check `pending_fork_child()` and
+    /// dispatch to the child with return value 0.
+    fn sys_fork(&mut self) -> i64 {
+        // Recover any previously-exited child before creating a new one.
+        // This ensures pipes/eventfds are back with the parent before
+        // the next mem::swap in create_child.
+        self.recover_child_state();
+
+        // Sequential model: only one active child at a time.
+        if self
+            .children
+            .last()
+            .is_some_and(|c| c.linuxulator.exit_code.is_none())
+        {
+            return EAGAIN;
+        }
+
+        let child_pid = self.next_child_pid;
+        self.next_child_pid += 1;
+
+        let child = match self.create_child(child_pid) {
+            Some(c) => c,
+            None => return ENOSYS, // backend does not support fork
+        };
+        self.children.push(ChildProcess {
+            pid: child_pid,
+            linuxulator: child,
+        });
+
+        child_pid as i64
+    }
+
+    /// Linux clone(2): validate flags and delegate to fork.
+    ///
+    /// Accepts SIGCHLD (17) optionally combined with CLONE_CHILD_SETTID
+    /// and CLONE_CHILD_CLEARTID (musl's fork() wrapper). Threading
+    /// flags (CLONE_VM, CLONE_THREAD, CLONE_FILES) return ENOSYS.
+    fn sys_clone(&mut self, flags: u64) -> i64 {
+        const SIGCHLD: u64 = 17;
+        const CLONE_VM: u64 = 0x00000100;
+        const CLONE_FILES: u64 = 0x00000400;
+        const CLONE_THREAD: u64 = 0x00010000;
+        const CLONE_CHILD_SETTID: u64 = 0x01000000;
+        const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
+
+        // Reject threading flags
+        if flags & (CLONE_VM | CLONE_FILES | CLONE_THREAD) != 0 {
+            return ENOSYS;
+        }
+
+        // Accept SIGCHLD with optional TID flags. CLONE_CHILD_SETTID and
+        // CLONE_CHILD_CLEARTID are accepted but not acted upon — the TID
+        // writes are not performed. This is safe for fork() because musl's
+        // waitpid uses SIGCHLD-based waiting for child processes, not
+        // futex-based TID polling (which is only used for threads).
+        let sig = flags & 0xFF;
+        let known_flags = SIGCHLD | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
+        if sig != SIGCHLD || (flags & !known_flags) != 0 {
+            return ENOSYS;
+        }
+
+        self.sys_fork()
+    }
+
     /// Linux fstat(2): get file status.
     fn sys_fstat(&mut self, fd: i32, statbuf_ptr: usize) -> i64 {
         if statbuf_ptr == 0 {
@@ -3509,7 +3772,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux set_tid_address(2): return TID = 1 (single-threaded).
     fn sys_set_tid_address(&self) -> i64 {
-        1
+        self.pid as i64
     }
 
     /// Linux set_robust_list(2): stub — no futex cleanup needed.
@@ -4016,24 +4279,20 @@ impl<B: SyscallBackend> Linuxulator<B> {
     }
 
     /// Linux getpid(2): return process ID.
-    ///
-    /// Single-user init process — always PID 1.
     fn sys_getpid(&self) -> i64 {
-        1
+        self.pid as i64
     }
 
     /// Linux getppid(2): return parent process ID.
-    ///
-    /// Init process has no parent — returns 0.
     fn sys_getppid(&self) -> i64 {
-        0
+        self.parent_pid as i64
     }
 
     /// Linux gettid(2): return thread ID.
     ///
-    /// Single-threaded init process — TID matches PID (1).
+    /// Single-threaded model — TID matches PID.
     fn sys_gettid(&self) -> i64 {
-        1
+        self.pid as i64
     }
 
     /// Linux getuid(2): return real user ID.
@@ -9254,5 +9513,334 @@ mod integration_tests {
             offset: 0,
         });
         assert_eq!(r, ENODEV);
+    }
+
+    // ── Fork tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_fork_returns_pid_and_zero() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        let result = lx.dispatch_syscall(LinuxSyscall::Fork);
+        assert!(
+            result > 0,
+            "fork should return child PID to parent, got {result}"
+        );
+        let child_pid = result as i32;
+
+        let (pid, _child) = lx.pending_fork_child().expect("should have pending child");
+        assert_eq!(pid, child_pid);
+    }
+
+    #[test]
+    fn test_fork_child_exit_resumes_parent() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        let parent_pid = lx.dispatch_syscall(LinuxSyscall::Getpid) as i32;
+        let child_pid = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
+        assert!(child_pid > parent_pid);
+
+        // Active process should be the child
+        {
+            let active = lx.active_process();
+            assert_eq!(
+                active.dispatch_syscall(LinuxSyscall::Getpid),
+                child_pid as i64
+            );
+        }
+
+        // Child exits
+        {
+            let active = lx.active_process();
+            active.dispatch_syscall(LinuxSyscall::ExitGroup { code: 42 });
+        }
+
+        // Active process should be parent again
+        {
+            let active = lx.active_process();
+            assert_eq!(
+                active.dispatch_syscall(LinuxSyscall::Getpid),
+                parent_pid as i64
+            );
+        }
+    }
+
+    #[test]
+    fn test_fork_child_inherits_fds() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        let mut fds = [0i32; 2];
+        lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0,
+        });
+
+        lx.dispatch_syscall(LinuxSyscall::Fork);
+
+        let child = lx.active_process();
+        assert!(child.has_fd(0)); // stdin
+        assert!(child.has_fd(1)); // stdout
+        assert!(child.has_fd(2)); // stderr
+        assert!(child.has_fd(fds[0])); // pipe read
+        assert!(child.has_fd(fds[1])); // pipe write
+    }
+
+    #[test]
+    fn test_fork_pipe_shared() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let mut fds = [0i32; 2];
+        lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0,
+        });
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+
+        lx.dispatch_syscall(LinuxSyscall::Fork);
+
+        // Child writes to pipe
+        let msg = b"hello from child";
+        {
+            let child = lx.active_process();
+            let r = child.dispatch_syscall(LinuxSyscall::Write {
+                fd: write_fd,
+                buf: msg.as_ptr() as u64,
+                count: msg.len() as u64,
+            });
+            assert_eq!(r, msg.len() as i64);
+            child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 0 });
+        }
+
+        // Parent reads from pipe — should see child's data
+        let mut buf = [0u8; 64];
+        let parent = lx.active_process();
+        let r = parent.dispatch_syscall(LinuxSyscall::Read {
+            fd: read_fd,
+            buf: buf.as_mut_ptr() as u64,
+            count: 64,
+        });
+        assert_eq!(r, msg.len() as i64);
+        assert_eq!(&buf[..msg.len()], msg);
+    }
+
+    #[test]
+    fn test_fork_child_gets_own_pid() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let parent_pid = lx.dispatch_syscall(LinuxSyscall::Getpid) as i32;
+        let child_pid = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
+
+        let child = lx.active_process();
+        assert_eq!(
+            child.dispatch_syscall(LinuxSyscall::Getpid),
+            child_pid as i64
+        );
+        assert_eq!(
+            child.dispatch_syscall(LinuxSyscall::Getppid),
+            parent_pid as i64
+        );
+        assert_eq!(
+            child.dispatch_syscall(LinuxSyscall::Gettid),
+            child_pid as i64
+        );
+    }
+
+    #[test]
+    fn test_fork_nested() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let parent_pid = lx.dispatch_syscall(LinuxSyscall::Getpid) as i32;
+
+        // Parent forks child
+        let child_pid = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
+
+        // Child forks grandchild
+        {
+            let child = lx.active_process();
+            assert_eq!(
+                child.dispatch_syscall(LinuxSyscall::Getpid),
+                child_pid as i64
+            );
+            let grandchild_pid = child.dispatch_syscall(LinuxSyscall::Fork) as i32;
+            assert!(grandchild_pid > child_pid);
+
+            // Grandchild runs
+            let gc = child.active_process();
+            assert_eq!(
+                gc.dispatch_syscall(LinuxSyscall::Getpid),
+                grandchild_pid as i64
+            );
+            assert_eq!(gc.dispatch_syscall(LinuxSyscall::Getppid), child_pid as i64);
+            gc.dispatch_syscall(LinuxSyscall::ExitGroup { code: 0 });
+        }
+
+        // Child should be active again (grandchild exited)
+        {
+            let child = lx.active_process();
+            assert_eq!(
+                child.dispatch_syscall(LinuxSyscall::Getpid),
+                child_pid as i64
+            );
+            child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 0 });
+        }
+
+        // Parent should be active again
+        let parent = lx.active_process();
+        assert_eq!(
+            parent.dispatch_syscall(LinuxSyscall::Getpid),
+            parent_pid as i64
+        );
+    }
+
+    #[test]
+    fn test_fork_clone_sigchld() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        const SIGCHLD: u64 = 17;
+        const CLONE_CHILD_SETTID: u64 = 0x01000000;
+        const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
+
+        let r = lx.dispatch_syscall(LinuxSyscall::Clone {
+            flags: SIGCHLD | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            child_stack: 0,
+            parent_tid: 0,
+            child_tid: 0,
+            tls: 0,
+        });
+        assert!(r > 0, "clone(SIGCHLD) should return child PID, got {r}");
+
+        let child = lx.active_process();
+        assert_eq!(child.dispatch_syscall(LinuxSyscall::Getpid), r);
+    }
+
+    #[test]
+    fn test_fork_clone_unsupported_flags() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        const CLONE_VM: u64 = 0x00000100;
+        const SIGCHLD: u64 = 17;
+
+        let r = lx.dispatch_syscall(LinuxSyscall::Clone {
+            flags: CLONE_VM | SIGCHLD,
+            child_stack: 0,
+            parent_tid: 0,
+            child_tid: 0,
+            tls: 0,
+        });
+        assert_eq!(r, ENOSYS);
+    }
+
+    #[test]
+    fn test_vfork_same_as_fork() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let child_pid = lx.dispatch_syscall(LinuxSyscall::Vfork) as i32;
+        assert!(child_pid > 0);
+
+        let child = lx.active_process();
+        assert_eq!(
+            child.dispatch_syscall(LinuxSyscall::Getpid),
+            child_pid as i64
+        );
+
+        child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 7 });
+
+        let parent = lx.active_process();
+        assert_eq!(parent.dispatch_syscall(LinuxSyscall::Getpid), 1);
+    }
+
+    #[test]
+    fn test_fork_eventfd_shared() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let efd = lx.dispatch_syscall(LinuxSyscall::EventFd2 {
+            initval: 0,
+            flags: 0,
+        }) as i32;
+        assert!(efd >= 0);
+
+        lx.dispatch_syscall(LinuxSyscall::Fork);
+
+        // Child writes value 42 to eventfd
+        {
+            let child = lx.active_process();
+            let val: u64 = 42;
+            let r = child.dispatch_syscall(LinuxSyscall::Write {
+                fd: efd,
+                buf: &val as *const u64 as u64,
+                count: 8,
+            });
+            assert_eq!(r, 8);
+            child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 0 });
+        }
+
+        // Parent reads from eventfd — should see 42
+        let mut val: u64 = 0;
+        let parent = lx.active_process();
+        let r = parent.dispatch_syscall(LinuxSyscall::Read {
+            fd: efd,
+            buf: &mut val as *mut u64 as u64,
+            count: 8,
+        });
+        assert_eq!(r, 8);
+        assert_eq!(val, 42);
+    }
+
+    #[test]
+    fn test_fork_parent_creates_pipe_after_child_exit() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let mut fds1 = [0i32; 2];
+        lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds1.as_mut_ptr() as u64,
+            flags: 0,
+        });
+
+        lx.dispatch_syscall(LinuxSyscall::Fork);
+        {
+            let child = lx.active_process();
+            child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 0 });
+        }
+
+        let parent = lx.active_process();
+        let mut fds2 = [0i32; 2];
+        let r = parent.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds2.as_mut_ptr() as u64,
+            flags: 0,
+        });
+        assert_eq!(r, 0);
+        assert!(parent.has_fd(fds2[0]));
+        assert!(parent.has_fd(fds2[1]));
+
+        // Original pipe should still work
+        let msg = b"test";
+        parent.dispatch_syscall(LinuxSyscall::Write {
+            fd: fds1[1],
+            buf: msg.as_ptr() as u64,
+            count: 4,
+        });
+        let mut buf = [0u8; 4];
+        let r = parent.dispatch_syscall(LinuxSyscall::Read {
+            fd: fds1[0],
+            buf: buf.as_mut_ptr() as u64,
+            count: 4,
+        });
+        assert_eq!(r, 4);
+        assert_eq!(&buf, b"test");
     }
 }
