@@ -10861,4 +10861,437 @@ mod integration_tests {
         });
         assert_eq!(r, 0);
     }
+
+    // ── Signal state tests ──────────────────────────────────────────
+
+    #[cfg(target_arch = "x86_64")]
+    const SIGACTION_SIZE: usize = 32;
+    #[cfg(target_arch = "aarch64")]
+    const SIGACTION_SIZE: usize = 24;
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    const SIGACTION_SIZE: usize = 24;
+
+    /// Build a sigaction byte buffer with the given handler, flags, and mask.
+    /// Offsets match the kernel struct layout for the current architecture.
+    fn make_sigaction(handler: u64, flags: u64, mask: u64) -> [u8; 32] {
+        let mut buf = [0u8; 32];
+        buf[0..8].copy_from_slice(&handler.to_ne_bytes());
+        buf[8..16].copy_from_slice(&flags.to_ne_bytes());
+        #[cfg(target_arch = "x86_64")]
+        buf[24..32].copy_from_slice(&mask.to_ne_bytes());
+        #[cfg(not(target_arch = "x86_64"))]
+        buf[16..24].copy_from_slice(&mask.to_ne_bytes());
+        buf
+    }
+
+    /// Read the handler field from a sigaction byte buffer.
+    fn read_handler(buf: &[u8; 32]) -> u64 {
+        u64::from_ne_bytes(buf[0..8].try_into().unwrap())
+    }
+
+    /// Read the flags field from a sigaction byte buffer.
+    fn read_flags(buf: &[u8; 32]) -> u64 {
+        u64::from_ne_bytes(buf[8..16].try_into().unwrap())
+    }
+
+    #[test]
+    fn test_sigaction_set_and_get() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Set handler=0x400000, flags=SA_SIGINFO (0x04000000), mask=0x0000FFFF for SIGUSR1 (10)
+        let act = make_sigaction(0x400000, 0x04000000, 0x0000_FFFF);
+        let r = lx.dispatch_syscall(LinuxSyscall::RtSigaction {
+            signum: 10,
+            act: act.as_ptr() as u64,
+            oldact: 0,
+            sigsetsize: 8,
+        });
+        assert_eq!(r, 0);
+
+        // Read back via oldact
+        let mut oldact = [0u8; 32];
+        let r = lx.dispatch_syscall(LinuxSyscall::RtSigaction {
+            signum: 10,
+            act: 0,
+            oldact: oldact.as_mut_ptr() as u64,
+            sigsetsize: 8,
+        });
+        assert_eq!(r, 0);
+        assert_eq!(read_handler(&oldact), 0x400000);
+        assert_eq!(read_flags(&oldact), 0x04000000);
+    }
+
+    #[test]
+    fn test_sigaction_reject_sigkill() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let act = make_sigaction(0x400000, 0, 0);
+        let r = lx.dispatch_syscall(LinuxSyscall::RtSigaction {
+            signum: SIGKILL as i32,
+            act: act.as_ptr() as u64,
+            oldact: 0,
+            sigsetsize: 8,
+        });
+        assert_eq!(r, EINVAL);
+    }
+
+    #[test]
+    fn test_sigaction_reject_sigstop() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let act = make_sigaction(0x400000, 0, 0);
+        let r = lx.dispatch_syscall(LinuxSyscall::RtSigaction {
+            signum: SIGSTOP as i32,
+            act: act.as_ptr() as u64,
+            oldact: 0,
+            sigsetsize: 8,
+        });
+        assert_eq!(r, EINVAL);
+    }
+
+    #[test]
+    fn test_sigaction_null_act_reads_only() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Set handler to 0xBEEF for SIGUSR1 (10)
+        let act = make_sigaction(0xBEEF, 0, 0);
+        lx.dispatch_syscall(LinuxSyscall::RtSigaction {
+            signum: 10,
+            act: act.as_ptr() as u64,
+            oldact: 0,
+            sigsetsize: 8,
+        });
+
+        // Read with act=0 (null) — handler should be unchanged
+        let mut oldact = [0u8; 32];
+        let r = lx.dispatch_syscall(LinuxSyscall::RtSigaction {
+            signum: 10,
+            act: 0,
+            oldact: oldact.as_mut_ptr() as u64,
+            sigsetsize: 8,
+        });
+        assert_eq!(r, 0);
+        assert_eq!(read_handler(&oldact), 0xBEEF);
+
+        // Confirm handler still 0xBEEF after the read-only call
+        let mut verify = [0u8; 32];
+        lx.dispatch_syscall(LinuxSyscall::RtSigaction {
+            signum: 10,
+            act: 0,
+            oldact: verify.as_mut_ptr() as u64,
+            sigsetsize: 8,
+        });
+        assert_eq!(read_handler(&verify), 0xBEEF);
+    }
+
+    #[test]
+    fn test_sigaction_bad_sigsetsize() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let act = make_sigaction(0x400000, 0, 0);
+        let r = lx.dispatch_syscall(LinuxSyscall::RtSigaction {
+            signum: 10,
+            act: act.as_ptr() as u64,
+            oldact: 0,
+            sigsetsize: 4, // invalid — must be 8
+        });
+        assert_eq!(r, EINVAL);
+    }
+
+    #[test]
+    fn test_sigaction_invalid_signum() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let act = make_sigaction(0x400000, 0, 0);
+
+        // signum 0 is invalid
+        let r = lx.dispatch_syscall(LinuxSyscall::RtSigaction {
+            signum: 0,
+            act: act.as_ptr() as u64,
+            oldact: 0,
+            sigsetsize: 8,
+        });
+        assert_eq!(r, EINVAL);
+
+        // signum 65 is out of range
+        let r = lx.dispatch_syscall(LinuxSyscall::RtSigaction {
+            signum: 65,
+            act: act.as_ptr() as u64,
+            oldact: 0,
+            sigsetsize: 8,
+        });
+        assert_eq!(r, EINVAL);
+    }
+
+    #[test]
+    fn test_sigprocmask_block() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Capture old mask — should be 0
+        let mut oldset: u64 = 0xDEAD;
+        let set: u64 = 1u64 << 9; // bit 9 = signal 10 (SIGUSR1)
+        let r = lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_BLOCK,
+            set: &set as *const u64 as u64,
+            oldset: &mut oldset as *mut u64 as u64,
+            sigsetsize: 8,
+        });
+        assert_eq!(r, 0);
+        assert_eq!(oldset, 0, "initial mask should be 0");
+
+        // Verify new mask has bit 9 set
+        let mut current: u64 = 0;
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_BLOCK,
+            set: 0, // null set — no change
+            oldset: &mut current as *mut u64 as u64,
+            sigsetsize: 8,
+        });
+        assert_ne!(
+            current & (1u64 << 9),
+            0,
+            "bit 9 should be set after SIG_BLOCK"
+        );
+    }
+
+    #[test]
+    fn test_sigprocmask_unblock() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Set mask to bits 9 + 10 (signals 10 and 11)
+        let set: u64 = (1u64 << 9) | (1u64 << 10);
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_SETMASK,
+            set: &set as *const u64 as u64,
+            oldset: 0,
+            sigsetsize: 8,
+        });
+
+        // Unblock bit 9 only
+        let unblock: u64 = 1u64 << 9;
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_UNBLOCK,
+            set: &unblock as *const u64 as u64,
+            oldset: 0,
+            sigsetsize: 8,
+        });
+
+        // Verify only bit 10 remains
+        let mut current: u64 = 0;
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_BLOCK,
+            set: 0,
+            oldset: &mut current as *mut u64 as u64,
+            sigsetsize: 8,
+        });
+        assert_eq!(current & (1u64 << 9), 0, "bit 9 should be unblocked");
+        assert_ne!(current & (1u64 << 10), 0, "bit 10 should still be blocked");
+    }
+
+    #[test]
+    fn test_sigprocmask_setmask() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Set mask to 0xDEADBEEF — SIGKILL (bit 8) and SIGSTOP (bit 18) must be cleared
+        let set: u64 = 0xDEAD_BEEF;
+        let r = lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_SETMASK,
+            set: &set as *const u64 as u64,
+            oldset: 0,
+            sigsetsize: 8,
+        });
+        assert_eq!(r, 0);
+
+        let mut current: u64 = 0;
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_BLOCK,
+            set: 0,
+            oldset: &mut current as *mut u64 as u64,
+            sigsetsize: 8,
+        });
+        assert_eq!(
+            current & (1u64 << (SIGKILL - 1)),
+            0,
+            "SIGKILL bit must be 0"
+        );
+        assert_eq!(
+            current & (1u64 << (SIGSTOP - 1)),
+            0,
+            "SIGSTOP bit must be 0"
+        );
+    }
+
+    #[test]
+    fn test_sigprocmask_cannot_block_sigkill() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Attempt to block all signals including SIGKILL and SIGSTOP
+        let set: u64 = u64::MAX;
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_SETMASK,
+            set: &set as *const u64 as u64,
+            oldset: 0,
+            sigsetsize: 8,
+        });
+
+        let mut current: u64 = 0;
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_BLOCK,
+            set: 0,
+            oldset: &mut current as *mut u64 as u64,
+            sigsetsize: 8,
+        });
+        assert_eq!(
+            current & (1u64 << 8),
+            0,
+            "SIGKILL (bit 8) must never be blocked"
+        );
+        assert_eq!(
+            current & (1u64 << 18),
+            0,
+            "SIGSTOP (bit 18) must never be blocked"
+        );
+    }
+
+    #[test]
+    fn test_sigprocmask_bad_sigsetsize() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let set: u64 = 0;
+        let r = lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_BLOCK,
+            set: &set as *const u64 as u64,
+            oldset: 0,
+            sigsetsize: 16, // invalid — must be 8
+        });
+        assert_eq!(r, EINVAL);
+    }
+
+    #[test]
+    fn test_sigprocmask_invalid_how() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let set: u64 = 1;
+        let r = lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: 99, // invalid
+            set: &set as *const u64 as u64,
+            oldset: 0,
+            sigsetsize: 8,
+        });
+        assert_eq!(r, EINVAL);
+    }
+
+    #[test]
+    fn test_fork_inherits_signal_state() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Set a handler and mask on the parent
+        let act = make_sigaction(0x600000, 0x04000000, 0x00FF);
+        lx.dispatch_syscall(LinuxSyscall::RtSigaction {
+            signum: 10,
+            act: act.as_ptr() as u64,
+            oldact: 0,
+            sigsetsize: 8,
+        });
+        let set: u64 = 1u64 << 9;
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_SETMASK,
+            set: &set as *const u64 as u64,
+            oldset: 0,
+            sigsetsize: 8,
+        });
+
+        // Fork — active_process() is now the child
+        lx.dispatch_syscall(LinuxSyscall::Fork);
+        let child = lx.active_process();
+
+        // Child should have inherited the handler
+        let mut child_oldact = [0u8; 32];
+        let r = child.dispatch_syscall(LinuxSyscall::RtSigaction {
+            signum: 10,
+            act: 0,
+            oldact: child_oldact.as_mut_ptr() as u64,
+            sigsetsize: 8,
+        });
+        assert_eq!(r, 0);
+        assert_eq!(read_handler(&child_oldact), 0x600000);
+        assert_eq!(read_flags(&child_oldact), 0x04000000);
+
+        // Child should have inherited the mask
+        let mut child_mask: u64 = 0;
+        child.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_BLOCK,
+            set: 0,
+            oldset: &mut child_mask as *mut u64 as u64,
+            sigsetsize: 8,
+        });
+        assert_eq!(child_mask, set);
+    }
+
+    #[test]
+    fn test_execve_resets_handlers_preserves_mask() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Set handler for SIGUSR1 (10)
+        let act = make_sigaction(0x700000, 0, 0);
+        lx.dispatch_syscall(LinuxSyscall::RtSigaction {
+            signum: 10,
+            act: act.as_ptr() as u64,
+            oldact: 0,
+            sigsetsize: 8,
+        });
+
+        // Set a non-zero signal mask
+        let set: u64 = (1u64 << 2) | (1u64 << 3); // SIGQUIT + SIGILL bits
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_SETMASK,
+            set: &set as *const u64 as u64,
+            oldset: 0,
+            sigsetsize: 8,
+        });
+
+        // Simulate execve by calling reset_for_execve directly
+        lx.reset_for_execve();
+
+        // Handler should be reset to SIG_DFL (0)
+        let mut oldact = [0u8; 32];
+        lx.dispatch_syscall(LinuxSyscall::RtSigaction {
+            signum: 10,
+            act: 0,
+            oldact: oldact.as_mut_ptr() as u64,
+            sigsetsize: 8,
+        });
+        assert_eq!(
+            read_handler(&oldact),
+            SIG_DFL,
+            "handler must be reset to SIG_DFL after execve"
+        );
+
+        // Mask should be preserved
+        let mut current_mask: u64 = 0;
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_BLOCK,
+            set: 0,
+            oldset: &mut current_mask as *mut u64 as u64,
+            sigsetsize: 8,
+        });
+        assert_eq!(
+            current_mask, set,
+            "signal mask must be preserved across execve"
+        );
+    }
 }
