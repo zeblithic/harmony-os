@@ -1403,6 +1403,8 @@ impl SyscallBackend for VmMockBackend {
 // ── Memory arena ──────────────────────────────────────────────────
 
 const PAGE_SIZE: usize = 4096;
+/// Stack size allocated for new process images (execve).
+const EXECVE_STACK_SIZE: usize = 128 * 1024;
 
 struct MemoryArena {
     /// Backing allocation — boxed slice so it cannot be accidentally
@@ -2540,11 +2542,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.close_cloexec_fds();
         self.reset_for_execve();
 
-        // Allocate 128 KiB stack from the fresh arena's mmap region.
-        // Caller (sys_execve) must verify arena_size >= STACK_SIZE
+        // Allocate stack from the fresh arena's mmap region.
+        // Caller (sys_execve) must verify arena_size >= EXECVE_STACK_SIZE
         // before calling apply_execve (before the point of no return).
-        const STACK_SIZE: usize = 128 * 1024;
-        self.arena.mmap_top -= STACK_SIZE;
+        self.arena.mmap_top -= EXECVE_STACK_SIZE;
         let stack_base = self.arena.base + self.arena.mmap_top;
 
         // Generate deterministic random bytes for AT_RANDOM.
@@ -2569,7 +2570,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         let envp_refs: Vec<&str> = envp.iter().map(|s| s.as_str()).collect();
 
         let stack_slice =
-            unsafe { core::slice::from_raw_parts_mut(stack_base as *mut u8, STACK_SIZE) };
+            unsafe { core::slice::from_raw_parts_mut(stack_base as *mut u8, EXECVE_STACK_SIZE) };
         let sp = elf_loader::build_initial_stack(
             stack_slice,
             stack_base as u64,
@@ -3760,7 +3761,6 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         // Verify arena is large enough for the stack before the point
         // of no return (close_cloexec_fds + reset_for_execve are irreversible).
-        const EXECVE_STACK_SIZE: usize = 128 * 1024;
         if self.arena_size < EXECVE_STACK_SIZE {
             return ENOMEM;
         }
