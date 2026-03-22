@@ -48,7 +48,6 @@ const O_NONBLOCK: i32 = 0o4000;
 
 // Signal constants
 const SIG_DFL: u64 = 0;
-#[allow(dead_code)]
 const SIG_IGN: u64 = 1;
 const SIGKILL: u32 = 9;
 const SIGSTOP: u32 = 19;
@@ -2598,7 +2597,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.vm_brk_current = 0;
         self.getrandom_counter = 0;
         self.exit_code = None;
-        self.signal_handlers = [SignalAction::default(); 64];
+        // Reset signal handlers: SIG_IGN is preserved across exec (nohup
+        // relies on this), all other handlers reset to SIG_DFL. This
+        // matches Linux kernel's flush_signal_handlers(t, 0).
+        for action in &mut self.signal_handlers {
+            if action.handler != SIG_IGN {
+                *action = SignalAction::default();
+            }
+        }
     }
 
     /// Apply a successful execve: close CLOEXEC fds, reset state, build
@@ -10891,13 +10897,6 @@ mod integration_tests {
     }
 
     // ── Signal state tests ──────────────────────────────────────────
-
-    #[cfg(target_arch = "x86_64")]
-    const SIGACTION_SIZE: usize = 32;
-    #[cfg(target_arch = "aarch64")]
-    const SIGACTION_SIZE: usize = 24;
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    const SIGACTION_SIZE: usize = 24;
 
     /// Build a sigaction byte buffer with the given handler, flags, and mask.
     /// Offsets match the kernel struct layout for the current architecture.
