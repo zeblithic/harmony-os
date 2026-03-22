@@ -1586,8 +1586,6 @@ struct EpollState {
 }
 
 /// A child process created by fork/clone.
-// Fields are written in sys_fork/create_child; read access arrives in Task 3.
-#[allow(dead_code)]
 struct ChildProcess<B: SyscallBackend> {
     pid: i32,
     /// None while the child is running, Some(code) after exit_group.
@@ -1837,14 +1835,59 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.exit_code
     }
 
+    /// Recover shared state (pipes/eventfds) from an exited child.
+    fn recover_child_state(&mut self) {
+        if let Some(child) = self.children.last_mut() {
+            if child.linuxulator.exit_code.is_some() {
+                // Propagate exit code to ChildProcess record (for waitpid)
+                child.exit_code = child.linuxulator.exit_code;
+                let c = &mut child.linuxulator;
+                core::mem::swap(&mut self.pipes, &mut c.pipes);
+                core::mem::swap(&mut self.eventfds, &mut c.eventfds);
+                // Take the max of parent and child allocators
+                self.next_pipe_id = self.next_pipe_id.max(c.next_pipe_id);
+                self.next_eventfd_id = self.next_eventfd_id.max(c.next_eventfd_id);
+                self.next_socket_id = self.next_socket_id.max(c.next_socket_id);
+                self.next_epoll_id = self.next_epoll_id.max(c.next_epoll_id);
+                self.next_child_pid = self.next_child_pid.max(c.next_child_pid);
+            }
+        }
+    }
+
     /// Return the deepest actively-running Linuxulator in the process tree.
     pub fn active_process(&mut self) -> &mut Linuxulator<B> {
-        self // placeholder — implemented in Task 3
+        // Determine which path to take using a shared borrow (dropped immediately).
+        let last_exited = self
+            .children
+            .last()
+            .map(|c| c.linuxulator.exit_code.is_some());
+
+        match last_exited {
+            // Child has exited: recover shared state and return self (the parent).
+            Some(true) => {
+                self.recover_child_state();
+                self
+            }
+            // Active child: recurse into it.
+            Some(false) => self
+                .children
+                .last_mut()
+                .unwrap()
+                .linuxulator
+                .active_process(),
+            // No children: this is the active process.
+            None => self,
+        }
     }
 
     /// Check for a newly-forked child that needs its first syscall dispatched.
     pub fn pending_fork_child(&mut self) -> Option<(i32, &mut Linuxulator<B>)> {
-        None // placeholder — implemented in Task 3
+        if let Some(child) = self.children.last_mut() {
+            if child.linuxulator.exit_code.is_none() {
+                return Some((child.pid, &mut child.linuxulator));
+            }
+        }
+        None
     }
 
     /// Access the backend (for test assertions).
