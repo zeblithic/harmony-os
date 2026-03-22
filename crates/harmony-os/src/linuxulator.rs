@@ -2541,13 +2541,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.reset_for_execve();
 
         // Allocate 128 KiB stack from the fresh arena's mmap region.
+        // Caller (sys_execve) must verify arena_size >= STACK_SIZE
+        // before calling apply_execve (before the point of no return).
         const STACK_SIZE: usize = 128 * 1024;
-        assert!(
-            self.arena.mmap_top >= STACK_SIZE,
-            "arena too small for execve stack (arena_size={}, need={})",
-            self.arena_size,
-            STACK_SIZE
-        );
         self.arena.mmap_top -= STACK_SIZE;
         let stack_base = self.arena.base + self.arena.mmap_top;
 
@@ -3762,6 +3758,13 @@ impl<B: SyscallBackend> Linuxulator<B> {
             Ok(r) => r,
             Err(_) => return ENOEXEC,
         };
+
+        // Verify arena is large enough for the stack before the point
+        // of no return (close_cloexec_fds + reset_for_execve are irreversible).
+        const EXECVE_STACK_SIZE: usize = 128 * 1024;
+        if self.arena_size < EXECVE_STACK_SIZE {
+            return ENOMEM;
+        }
 
         // Apply the execve (point of no return).
         self.apply_execve(&load_result, &argv, &envp);
