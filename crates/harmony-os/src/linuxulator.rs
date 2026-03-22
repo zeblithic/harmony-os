@@ -8,6 +8,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+use crate::elf_loader::{self, ElfLoader, InterpreterLoader};
 use harmony_microkernel::vm::{FrameClassification, PageFlags, VmError};
 use harmony_microkernel::{Fid, FileStat, FileType, IpcError, OpenMode, QPath};
 
@@ -33,7 +34,6 @@ const EOVERFLOW: i64 = -75;
 const EAFNOSUPPORT: i64 = -97;
 const ENOTSOCK: i64 = -88;
 const ECHILD: i64 = -10;
-#[allow(dead_code)]
 const ENOEXEC: i64 = -8;
 const EEXIST: i64 = -17;
 
@@ -1464,6 +1464,35 @@ unsafe fn read_c_string(ptr: usize) -> alloc::string::String {
     )))
 }
 
+/// Read a null-terminated array of string pointers from user memory.
+/// Returns empty vec if ptr is 0 (null).
+fn read_string_array(ptr: u64, max_count: usize) -> Vec<alloc::string::String> {
+    if ptr == 0 {
+        return Vec::new();
+    }
+    let mut result = Vec::new();
+    let mut addr = ptr as usize;
+    for _ in 0..max_count {
+        let str_ptr_bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, 8) };
+        let str_ptr = u64::from_ne_bytes([
+            str_ptr_bytes[0],
+            str_ptr_bytes[1],
+            str_ptr_bytes[2],
+            str_ptr_bytes[3],
+            str_ptr_bytes[4],
+            str_ptr_bytes[5],
+            str_ptr_bytes[6],
+            str_ptr_bytes[7],
+        ]);
+        if str_ptr == 0 {
+            break;
+        }
+        result.push(unsafe { read_c_string(str_ptr as usize) });
+        addr += 8;
+    }
+    result
+}
+
 /// Map Linux open(2) flags to 9P OpenMode.
 fn flags_to_open_mode(flags: i32) -> OpenMode {
     let accmode = flags & 0x03;
@@ -1631,7 +1660,6 @@ struct ChildProcess<B: SyscallBackend> {
 
 /// Result of a successful execve — new entry point and stack pointer
 /// for the caller to jump to.
-#[allow(dead_code)]
 pub struct ExecveResult {
     pub entry_point: u64,
     pub stack_pointer: u64,
@@ -1706,7 +1734,6 @@ pub struct Linuxulator<B: SyscallBackend> {
     /// Arena size used for this process (inherited by children on fork).
     arena_size: usize,
     /// Set by sys_execve on success — caller should reset RIP/RSP.
-    #[allow(dead_code)]
     pending_execve: Option<ExecveResult>,
 }
 
@@ -2457,6 +2484,93 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 }
             }
         }
+    }
+
+    /// Close all file descriptors with FD_CLOEXEC set (for execve).
+    fn close_cloexec_fds(&mut self) {
+        let cloexec_fds: Vec<i32> = self
+            .fd_table
+            .iter()
+            .filter(|(_, entry)| entry.flags & FD_CLOEXEC != 0)
+            .map(|(&fd, _)| fd)
+            .collect();
+
+        for fd in cloexec_fds {
+            if let Some(entry) = self.fd_table.remove(&fd) {
+                self.close_fd_entry(entry);
+            }
+        }
+
+        // Scrub closed fds from epoll interest lists.
+        for epoll in self.epolls.values_mut() {
+            epoll
+                .interests
+                .retain(|fd, _| self.fd_table.contains_key(fd));
+        }
+    }
+
+    /// Reset Linuxulator state for a new process image (execve).
+    fn reset_for_execve(&mut self) {
+        self.arena = MemoryArena::new(self.arena_size);
+        self.fs_base = 0;
+        self.vm_brk_base = 0;
+        self.vm_brk_current = 0;
+        self.getrandom_counter = 0;
+        self.exit_code = None;
+    }
+
+    /// Apply a successful execve: close CLOEXEC fds, reset state, build
+    /// stack, set pending_execve.
+    ///
+    /// Separated from sys_execve so tests can exercise the success path
+    /// with a synthetic LoadResult (MockBackend can't load real ELFs
+    /// because vm_mmap fails).
+    fn apply_execve(
+        &mut self,
+        load_result: &elf_loader::LoadResult,
+        argv: &[alloc::string::String],
+        envp: &[alloc::string::String],
+    ) {
+        self.close_cloexec_fds();
+        self.reset_for_execve();
+
+        // Allocate 128 KiB stack from the fresh arena's mmap region.
+        const STACK_SIZE: usize = 128 * 1024;
+        self.arena.mmap_top -= STACK_SIZE;
+        let stack_base = self.arena.base + self.arena.mmap_top;
+
+        // Generate deterministic random bytes for AT_RANDOM.
+        let random_bytes: [u8; 16] = {
+            let mut bytes = [0u8; 16];
+            let counter = self.getrandom_counter;
+            self.getrandom_counter += 1;
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = ((counter
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(i as u64))
+                    >> 33) as u8;
+            }
+            bytes
+        };
+
+        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        let envp_refs: Vec<&str> = envp.iter().map(|s| s.as_str()).collect();
+
+        let stack_slice =
+            unsafe { core::slice::from_raw_parts_mut(stack_base as *mut u8, STACK_SIZE) };
+        let sp = elf_loader::build_initial_stack(
+            stack_slice,
+            stack_base as u64,
+            &argv_refs,
+            &envp_refs,
+            &load_result.auxv,
+            &random_bytes,
+        );
+
+        self.pending_execve = Some(ExecveResult {
+            entry_point: load_result.entry_point,
+            stack_pointer: sp,
+        });
     }
 
     /// Linux close(2): close a file descriptor.
@@ -3561,9 +3675,70 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.sys_exit_group(code)
     }
 
-    /// Linux execve(2): replace process image.
-    fn sys_execve(&mut self, _path: u64, _argv: u64, _envp: u64) -> i64 {
-        ENOSYS // placeholder — implemented in Task 2
+    /// Linux execve(2): replace process image with a new ELF binary.
+    ///
+    /// On success: closes FD_CLOEXEC fds, resets memory state, loads
+    /// new ELF, builds initial stack, sets pending_execve for caller.
+    /// On failure: returns negative errno, no state is modified.
+    fn sys_execve(&mut self, path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
+        // VM-backed execve not yet supported (needs vm_reset_address_space).
+        if self.backend.has_vm_support() {
+            return ENOSYS;
+        }
+
+        if path_ptr == 0 {
+            return EFAULT;
+        }
+
+        // Read path, argv, envp from user memory.
+        let path = unsafe { read_c_string(path_ptr as usize) };
+        let argv = read_string_array(argv_ptr, 256);
+        let envp = read_string_array(envp_ptr, 256);
+
+        // Read ELF binary from filesystem.
+        let fid = self.alloc_fid();
+        if let Err(e) = self.backend.walk(&path, fid) {
+            return ipc_err_to_errno(e);
+        }
+        if let Err(e) = self.backend.open(fid, OpenMode::Read) {
+            let _ = self.backend.clunk(fid);
+            return ipc_err_to_errno(e);
+        }
+
+        let file_size = match self.backend.stat(fid) {
+            Ok(stat) => stat.size,
+            Err(e) => {
+                let _ = self.backend.clunk(fid);
+                return ipc_err_to_errno(e);
+            }
+        };
+
+        const MAX_ELF_SIZE: u64 = 4 * 1024 * 1024; // 4 MiB
+        if file_size > MAX_ELF_SIZE {
+            let _ = self.backend.clunk(fid);
+            return ENOMEM;
+        }
+
+        let elf_bytes = match self.backend.read(fid, 0, file_size as u32) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let _ = self.backend.clunk(fid);
+                return ipc_err_to_errno(e);
+            }
+        };
+        let _ = self.backend.clunk(fid);
+
+        // Load ELF via InterpreterLoader.
+        let mut loader = InterpreterLoader::default();
+        let load_result = match loader.load(&elf_bytes, &mut self.backend) {
+            Ok(r) => r,
+            Err(_) => return ENOEXEC,
+        };
+
+        // Apply the execve (point of no return).
+        self.apply_execve(&load_result, &argv, &envp);
+
+        0 // success — caller checks pending_execve()
     }
 
     /// Linux exit_group(2): terminate the process.
