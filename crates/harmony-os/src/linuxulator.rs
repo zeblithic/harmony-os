@@ -2516,9 +2516,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.fs_base = 0;
         self.vm_brk_base = 0;
         self.vm_brk_current = 0;
-        // getrandom_counter is NOT reset — Linux doesn't reset kernel
-        // entropy state across exec, and the accumulated counter value
-        // provides per-execve variation for AT_RANDOM.
+        self.getrandom_counter = 0;
         self.exit_code = None;
     }
 
@@ -2534,6 +2532,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
         argv: &[alloc::string::String],
         envp: &[alloc::string::String],
     ) {
+        // Capture pre-reset counter for AT_RANDOM seed mixing.
+        // This provides per-execve variation even though the counter
+        // is reset to 0 (matching spec: "fresh random sequence").
+        let pre_reset_counter = self.getrandom_counter;
+
         self.close_cloexec_fds();
         self.reset_for_execve();
 
@@ -2549,13 +2552,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
         let stack_base = self.arena.base + self.arena.mmap_top;
 
         // Generate deterministic random bytes for AT_RANDOM.
-        // Uses the same iterated LCG as sys_getrandom with a non-zero
-        // seed to avoid all-zero output when getrandom_counter is 0.
+        // Uses the pre-reset counter as seed so each execve produces
+        // distinct output, while getrandom_counter itself is reset to 0.
         let random_bytes: [u8; 16] = {
             let mut bytes = [0u8; 16];
-            let counter = self.getrandom_counter;
             self.getrandom_counter += 1;
-            let mut state = counter
+            let mut state = pre_reset_counter
                 .wrapping_add(0xDEAD_BEEF_CAFE_BABE) // non-zero seed mixing
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
