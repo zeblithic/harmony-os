@@ -2516,7 +2516,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.fs_base = 0;
         self.vm_brk_base = 0;
         self.vm_brk_current = 0;
-        self.getrandom_counter = 0;
+        // getrandom_counter is NOT reset — Linux doesn't reset kernel
+        // entropy state across exec, and the accumulated counter value
+        // provides per-execve variation for AT_RANDOM.
         self.exit_code = None;
     }
 
