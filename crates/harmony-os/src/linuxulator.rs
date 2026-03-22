@@ -3342,11 +3342,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
         };
 
         let idx = if pid == -1 {
-            // Any child
+            // Any child — return oldest exited child (FIFO, matching Linux).
             if self.exited_children.is_empty() {
                 None
             } else {
-                Some(self.exited_children.len() - 1)
+                Some(0)
             }
         } else {
             // Specific child
