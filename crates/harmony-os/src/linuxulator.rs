@@ -1586,6 +1586,7 @@ struct EpollState {
 }
 
 /// A child process created by fork/clone.
+// Fields are written in sys_fork/create_child; read access arrives in Task 3.
 #[allow(dead_code)]
 struct ChildProcess<B: SyscallBackend> {
     pid: i32,
@@ -1653,13 +1654,10 @@ pub struct Linuxulator<B: SyscallBackend> {
     /// This process's PID.
     pid: i32,
     /// Parent's PID (0 for init).
-    #[allow(dead_code)]
     parent_pid: i32,
     /// Next PID to assign to a child.
-    #[allow(dead_code)]
     next_child_pid: i32,
     /// Children created by fork (active or exited, awaiting waitpid).
-    #[allow(dead_code)]
     children: Vec<ChildProcess<B>>,
 }
 
@@ -3108,14 +3106,90 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     // ── Process management ────────────────────────────────────────
 
+    /// Create a child Linuxulator with cloned state for fork.
+    fn create_child(&mut self, child_pid: i32) -> Linuxulator<B> {
+        let child_backend = self.backend.fork_backend();
+        let mut child = Linuxulator {
+            backend: child_backend,
+            fd_table: self.fd_table.clone(),
+            next_fid: self.next_fid,
+            exit_code: None,
+            arena: MemoryArena::new(1024 * 1024), // fresh 1 MiB arena
+            fs_base: self.fs_base,
+            vm_brk_base: 0,
+            vm_brk_current: 0,
+            getrandom_counter: 0, // reset for distinct random output
+            cwd: self.cwd.clone(),
+            monotonic_ns: self.monotonic_ns,
+            realtime_ns: self.realtime_ns,
+            fid_refcount: self.fid_refcount.clone(),
+            // pipes and eventfds will be moved via mem::swap
+            pipes: BTreeMap::new(),
+            next_pipe_id: self.next_pipe_id,
+            eventfds: BTreeMap::new(),
+            next_eventfd_id: self.next_eventfd_id,
+            sockets: self.sockets.clone(),
+            next_socket_id: self.next_socket_id,
+            epolls: self.epolls.clone(),
+            next_epoll_id: self.next_epoll_id,
+            pid: child_pid,
+            parent_pid: self.pid,
+            next_child_pid: self.next_child_pid,
+            children: Vec::new(),
+        };
+        // Move shared pipe/eventfd state to child
+        core::mem::swap(&mut self.pipes, &mut child.pipes);
+        core::mem::swap(&mut self.eventfds, &mut child.eventfds);
+        child
+    }
+
     /// Linux fork(2): create child process (sequential model).
+    ///
+    /// Creates a child Linuxulator and pushes it as an active child.
+    /// The child's pipes/eventfds are shared with the parent (moved
+    /// for the duration of child execution). Returns child_pid to the
+    /// parent. The caller should check `pending_fork_child()` and
+    /// dispatch to the child with return value 0.
     fn sys_fork(&mut self) -> i64 {
-        ENOSYS // placeholder — implemented in Task 2
+        let child_pid = self.next_child_pid;
+        self.next_child_pid += 1;
+
+        let child = self.create_child(child_pid);
+        self.children.push(ChildProcess {
+            pid: child_pid,
+            exit_code: None,
+            linuxulator: child,
+        });
+
+        child_pid as i64
     }
 
     /// Linux clone(2): validate flags and delegate to fork.
-    fn sys_clone(&mut self, _flags: u64) -> i64 {
-        ENOSYS // placeholder — implemented in Task 2
+    ///
+    /// Accepts SIGCHLD (17) optionally combined with CLONE_CHILD_SETTID
+    /// and CLONE_CHILD_CLEARTID (musl's fork() wrapper). Threading
+    /// flags (CLONE_VM, CLONE_THREAD, CLONE_FILES) return ENOSYS.
+    fn sys_clone(&mut self, flags: u64) -> i64 {
+        const SIGCHLD: u64 = 17;
+        const CLONE_VM: u64 = 0x00000100;
+        const CLONE_FILES: u64 = 0x00000400;
+        const CLONE_THREAD: u64 = 0x00010000;
+        const CLONE_CHILD_SETTID: u64 = 0x01000000;
+        const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
+
+        // Reject threading flags
+        if flags & (CLONE_VM | CLONE_FILES | CLONE_THREAD) != 0 {
+            return ENOSYS;
+        }
+
+        // Accept SIGCHLD with optional TID flags (stubbed)
+        let sig = flags & 0xFF;
+        let known_flags = SIGCHLD | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
+        if sig != SIGCHLD || (flags & !known_flags) != 0 {
+            return ENOSYS;
+        }
+
+        self.sys_fork()
     }
 
     /// Linux fstat(2): get file status.
