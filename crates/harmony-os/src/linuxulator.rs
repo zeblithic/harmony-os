@@ -1056,11 +1056,12 @@ pub trait SyscallBackend {
     }
 
     /// Create a forked copy of this backend for a child process.
-    fn fork_backend(&self) -> Self
+    /// Returns None if fork is not supported by this backend.
+    fn fork_backend(&self) -> Option<Self>
     where
         Self: Sized,
     {
-        unimplemented!("fork not supported by this backend")
+        None
     }
 }
 
@@ -1251,8 +1252,8 @@ impl SyscallBackend for MockBackend {
             .ok_or(IpcError::NotDirectory)
     }
 
-    fn fork_backend(&self) -> Self {
-        MockBackend::new()
+    fn fork_backend(&self) -> Option<Self> {
+        Some(MockBackend::new())
     }
 }
 
@@ -1357,8 +1358,8 @@ impl SyscallBackend for VmMockBackend {
         self.vm_writes.push((addr, data.to_vec()));
     }
 
-    fn fork_backend(&self) -> Self {
-        VmMockBackend::new(self.budget_pages)
+    fn fork_backend(&self) -> Option<Self> {
+        Some(VmMockBackend::new(self.budget_pages))
     }
 }
 
@@ -1588,8 +1589,6 @@ struct EpollState {
 /// A child process created by fork/clone.
 struct ChildProcess<B: SyscallBackend> {
     pid: i32,
-    /// None while the child is running, Some(code) after exit_group.
-    exit_code: Option<i32>,
     linuxulator: Linuxulator<B>,
 }
 
@@ -1655,8 +1654,10 @@ pub struct Linuxulator<B: SyscallBackend> {
     parent_pid: i32,
     /// Next PID to assign to a child.
     next_child_pid: i32,
-    /// Children created by fork (active or exited, awaiting waitpid).
+    /// Active children (running, not yet exited).
     children: Vec<ChildProcess<B>>,
+    /// Exited children: (pid, exit_code) pairs for future waitpid.
+    exited_children: Vec<(i32, i32)>,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -1693,6 +1694,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             parent_pid: 0,
             next_child_pid: 2,
             children: Vec::new(),
+            exited_children: Vec::new(),
         }
     }
 
@@ -1837,21 +1839,32 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Recover shared state (pipes/eventfds) from an exited child.
     fn recover_child_state(&mut self) {
-        if let Some(child) = self.children.last_mut() {
-            if child.linuxulator.exit_code.is_some() {
-                // Propagate exit code to ChildProcess record (for waitpid)
-                child.exit_code = child.linuxulator.exit_code;
-                let c = &mut child.linuxulator;
-                core::mem::swap(&mut self.pipes, &mut c.pipes);
-                core::mem::swap(&mut self.eventfds, &mut c.eventfds);
-                // Take the max of parent and child allocators
-                self.next_pipe_id = self.next_pipe_id.max(c.next_pipe_id);
-                self.next_eventfd_id = self.next_eventfd_id.max(c.next_eventfd_id);
-                self.next_socket_id = self.next_socket_id.max(c.next_socket_id);
-                self.next_epoll_id = self.next_epoll_id.max(c.next_epoll_id);
-                self.next_child_pid = self.next_child_pid.max(c.next_child_pid);
-            }
+        let should_recover = self
+            .children
+            .last()
+            .is_some_and(|c| c.linuxulator.exit_code.is_some());
+        if !should_recover {
+            return;
         }
+        // Pop the exited child so recover is called exactly once.
+        // The exit code is stored in exited_children for future waitpid.
+        let child = self.children.pop().unwrap();
+        let exit_code = child.linuxulator.exit_code.unwrap_or(0);
+        self.exited_children.push((child.pid, exit_code));
+
+        // Swap pipes/eventfds back from the (now dropped) child.
+        // We need to move them out before the child is dropped, so
+        // we must do this inline with a temporary.
+        // Actually, child is already moved out of the vec by pop().
+        let mut c = child.linuxulator;
+        core::mem::swap(&mut self.pipes, &mut c.pipes);
+        core::mem::swap(&mut self.eventfds, &mut c.eventfds);
+        // Take the max of parent and child allocators
+        self.next_pipe_id = self.next_pipe_id.max(c.next_pipe_id);
+        self.next_eventfd_id = self.next_eventfd_id.max(c.next_eventfd_id);
+        self.next_socket_id = self.next_socket_id.max(c.next_socket_id);
+        self.next_epoll_id = self.next_epoll_id.max(c.next_epoll_id);
+        self.next_child_pid = self.next_child_pid.max(c.next_child_pid);
     }
 
     /// Return the deepest actively-running Linuxulator in the process tree.
@@ -3150,8 +3163,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
     // ── Process management ────────────────────────────────────────
 
     /// Create a child Linuxulator with cloned state for fork.
-    fn create_child(&mut self, child_pid: i32) -> Linuxulator<B> {
-        let child_backend = self.backend.fork_backend();
+    fn create_child(&mut self, child_pid: i32) -> Option<Linuxulator<B>> {
+        let child_backend = self.backend.fork_backend()?;
         let mut child = Linuxulator {
             backend: child_backend,
             fd_table: self.fd_table.clone(),
@@ -3179,11 +3192,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
             parent_pid: self.pid,
             next_child_pid: self.next_child_pid,
             children: Vec::new(),
+            exited_children: Vec::new(),
         };
         // Move shared pipe/eventfd state to child
         core::mem::swap(&mut self.pipes, &mut child.pipes);
         core::mem::swap(&mut self.eventfds, &mut child.eventfds);
-        child
+        Some(child)
     }
 
     /// Linux fork(2): create child process (sequential model).
@@ -3194,13 +3208,24 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// parent. The caller should check `pending_fork_child()` and
     /// dispatch to the child with return value 0.
     fn sys_fork(&mut self) -> i64 {
+        // Sequential model: only one active child at a time.
+        if self
+            .children
+            .last()
+            .is_some_and(|c| c.linuxulator.exit_code.is_none())
+        {
+            return EAGAIN;
+        }
+
         let child_pid = self.next_child_pid;
         self.next_child_pid += 1;
 
-        let child = self.create_child(child_pid);
+        let child = match self.create_child(child_pid) {
+            Some(c) => c,
+            None => return ENOSYS, // backend does not support fork
+        };
         self.children.push(ChildProcess {
             pid: child_pid,
-            exit_code: None,
             linuxulator: child,
         });
 
