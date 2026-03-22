@@ -10326,4 +10326,275 @@ mod integration_tests {
         });
         assert_eq!(r, ECHILD);
     }
+
+    // ── Execve tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_execve_closes_cloexec_fds() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        // Create a pipe — make write end CLOEXEC
+        let mut fds = [0i32; 2];
+        lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0,
+        });
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+
+        // Set CLOEXEC on write end
+        lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: write_fd,
+            cmd: 2, // F_SETFD
+            arg: FD_CLOEXEC as u64,
+        });
+
+        assert!(lx.has_fd(read_fd));
+        assert!(lx.has_fd(write_fd));
+
+        lx.close_cloexec_fds();
+
+        // Write end (CLOEXEC) gone, read end + stdio survive
+        assert!(lx.has_fd(read_fd));
+        assert!(!lx.has_fd(write_fd));
+        assert!(lx.has_fd(0));
+        assert!(lx.has_fd(1));
+        assert!(lx.has_fd(2));
+    }
+
+    #[test]
+    fn test_execve_cloexec_preserves_pipe_end() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let mut fds = [0i32; 2];
+        lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0,
+        });
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+
+        // Write data, then make write end CLOEXEC
+        let msg = b"survive";
+        lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: write_fd,
+            buf: msg.as_ptr() as u64,
+            count: msg.len() as u64,
+        });
+        lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: write_fd,
+            cmd: 2,
+            arg: FD_CLOEXEC as u64,
+        });
+
+        lx.close_cloexec_fds();
+
+        // Read end survives, pipe buffer intact
+        let mut buf = [0u8; 16];
+        let r = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: read_fd,
+            buf: buf.as_mut_ptr() as u64,
+            count: 16,
+        });
+        assert_eq!(r, msg.len() as i64);
+        assert_eq!(&buf[..msg.len()], msg);
+    }
+
+    #[test]
+    fn test_execve_resets_state() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Modify some state
+        lx.dispatch_syscall(LinuxSyscall::Getrandom {
+            buf: 0,
+            buflen: 0,
+            flags: 0,
+        });
+
+        lx.reset_for_execve();
+
+        // Arena is fresh — brk at base
+        let brk_result = lx.dispatch_syscall(LinuxSyscall::Brk { addr: 0 });
+        assert!(brk_result >= 0);
+    }
+
+    #[test]
+    fn test_execve_preserves_pid() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let pid_before = lx.dispatch_syscall(LinuxSyscall::Getpid);
+        let ppid_before = lx.dispatch_syscall(LinuxSyscall::Getppid);
+
+        lx.reset_for_execve();
+
+        assert_eq!(lx.dispatch_syscall(LinuxSyscall::Getpid), pid_before);
+        assert_eq!(lx.dispatch_syscall(LinuxSyscall::Getppid), ppid_before);
+    }
+
+    #[test]
+    fn test_execve_preserves_cwd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let mut buf1 = [0u8; 128];
+        let r1 = lx.dispatch_syscall(LinuxSyscall::Getcwd {
+            buf: buf1.as_mut_ptr() as u64,
+            size: 128,
+        });
+
+        lx.reset_for_execve();
+
+        let mut buf2 = [0u8; 128];
+        let r2 = lx.dispatch_syscall(LinuxSyscall::Getcwd {
+            buf: buf2.as_mut_ptr() as u64,
+            size: 128,
+        });
+
+        assert_eq!(r1, r2);
+        assert_eq!(buf1, buf2);
+    }
+
+    #[test]
+    fn test_execve_bad_path() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        let pid_before = lx.dispatch_syscall(LinuxSyscall::Getpid);
+
+        let mut fds = [0i32; 2];
+        lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0,
+        });
+
+        // MockBackend.walk always succeeds, but read returns empty
+        // bytes (no file_content registered) → ELF parse fails → ENOEXEC
+        let path = b"/nonexistent\0";
+        let argv: [u64; 1] = [0];
+        let envp: [u64; 1] = [0];
+        let r = lx.dispatch_syscall(LinuxSyscall::Execve {
+            path: path.as_ptr() as u64,
+            argv: argv.as_ptr() as u64,
+            envp: envp.as_ptr() as u64,
+        });
+        assert_eq!(r, ENOEXEC);
+
+        // State unchanged
+        assert_eq!(lx.dispatch_syscall(LinuxSyscall::Getpid), pid_before);
+        assert!(lx.has_fd(0));
+        assert!(lx.has_fd(fds[0]));
+        assert!(lx.has_fd(fds[1]));
+        assert!(lx.pending_execve().is_none());
+    }
+
+    #[test]
+    fn test_execve_null_path() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let r = lx.dispatch_syscall(LinuxSyscall::Execve {
+            path: 0,
+            argv: 0,
+            envp: 0,
+        });
+        assert_eq!(r, EFAULT);
+    }
+
+    #[test]
+    fn test_execve_argv_envp_reading() {
+        let s1 = b"hello\0";
+        let s2 = b"world\0";
+        let ptrs: [u64; 3] = [
+            s1.as_ptr() as u64,
+            s2.as_ptr() as u64,
+            0, // null terminator
+        ];
+
+        let result = read_string_array(ptrs.as_ptr() as u64, 256);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], "hello");
+        assert_eq!(result[1], "world");
+
+        // Null ptr → empty vec
+        let empty = read_string_array(0, 256);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_execve_pending_result() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        assert!(lx.pending_execve().is_none());
+
+        // Call apply_execve with synthetic LoadResult
+        let load_result = elf_loader::LoadResult {
+            entry_point: 0x400000,
+            auxv: alloc::vec![(6, 4096)], // AT_PAGESZ
+            exe_base: 0x400000,
+            interp_base: 0,
+        };
+        let argv = alloc::vec![alloc::string::String::from("/bin/test")];
+        let envp = alloc::vec![alloc::string::String::from("PATH=/usr/bin")];
+
+        lx.apply_execve(&load_result, &argv, &envp);
+
+        let result = lx.pending_execve().unwrap();
+        assert_eq!(result.entry_point, 0x400000);
+        assert!(result.stack_pointer > 0);
+
+        // Consumed
+        assert!(lx.pending_execve().is_none());
+    }
+
+    #[test]
+    fn test_execve_vm_backend_returns_enosys() {
+        let mock = VmMockBackend::new(1024);
+        let mut lx = Linuxulator::with_arena(mock, 64 * 1024);
+
+        let path = b"/bin/test\0";
+        let r = lx.dispatch_syscall(LinuxSyscall::Execve {
+            path: path.as_ptr() as u64,
+            argv: 0,
+            envp: 0,
+        });
+        assert_eq!(r, ENOSYS);
+    }
+
+    #[test]
+    fn test_execve_on_fork_child() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        let child_pid = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
+        assert!(child_pid > 0);
+
+        let child = lx.active_process();
+        assert_eq!(
+            child.dispatch_syscall(LinuxSyscall::Getpid),
+            child_pid as i64
+        );
+
+        // Child tries execve — fails (MockBackend) but mechanism works
+        let path = b"/bin/test\0";
+        let r = child.dispatch_syscall(LinuxSyscall::Execve {
+            path: path.as_ptr() as u64,
+            argv: 0,
+            envp: 0,
+        });
+        assert_eq!(r, ENOEXEC);
+
+        // PID unchanged after failed execve
+        assert_eq!(
+            child.dispatch_syscall(LinuxSyscall::Getpid),
+            child_pid as i64
+        );
+    }
 }
