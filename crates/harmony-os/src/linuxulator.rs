@@ -2552,7 +2552,6 @@ impl<B: SyscallBackend> Linuxulator<B> {
         // distinct output, while getrandom_counter itself is reset to 0.
         let random_bytes: [u8; 16] = {
             let mut bytes = [0u8; 16];
-            self.getrandom_counter += 1;
             let mut state = pre_reset_counter
                 .wrapping_add(0xDEAD_BEEF_CAFE_BABE) // non-zero seed mixing
                 .wrapping_mul(6364136223846793005)
