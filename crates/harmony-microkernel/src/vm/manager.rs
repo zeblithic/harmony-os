@@ -303,15 +303,29 @@ impl<P: PageTable> AddressSpaceManager<P> {
     /// range are freed and removed from the capability tracker.
     pub fn unmap_partial(&mut self, pid: u32, vaddr: VirtAddr, len: usize) -> Result<(), VmError> {
         let region_base = self.find_containing_region(pid, vaddr, len)?;
-        let space = self.spaces.get_mut(&pid).unwrap();
-        let region = space.regions.remove(&region_base).unwrap();
+        let region = {
+            let space = self.spaces.get_mut(&pid).unwrap();
+            space.regions.remove(&region_base).unwrap()
+        };
         let page_offset = ((vaddr.as_u64() - region_base.as_u64()) / PAGE_SIZE) as usize;
         let page_count = len / PAGE_SIZE as usize;
 
-        // Unmap target pages from page table.
-        for i in 0..page_count {
-            let page_vaddr = VirtAddr(vaddr.as_u64() + (i as u64) * PAGE_SIZE);
-            let _ = space.page_table.unmap(page_vaddr, &mut |_| {});
+        // Unmap target pages from page table, freeing any intermediate
+        // page table frames (PDP/PD/PT levels) back to the public buddy.
+        // Split borrow: spaces and buddy_public are disjoint fields.
+        {
+            let Self {
+                spaces,
+                buddy_public,
+                ..
+            } = self;
+            let space = spaces.get_mut(&pid).unwrap();
+            for i in 0..page_count {
+                let page_vaddr = VirtAddr(vaddr.as_u64() + (i as u64) * PAGE_SIZE);
+                let _ = space.page_table.unmap(page_vaddr, &mut |frame| {
+                    let _ = buddy_public.free_frame(frame);
+                });
+            }
         }
 
         // Partition frames: before | target | after
@@ -453,13 +467,14 @@ impl<P: PageTable> AddressSpaceManager<P> {
         for (vaddr, region) in &space.regions {
             // Unmap each page from the page table. This clears leaf entries
             // so the page table is in a consistent state before drop.
-            // TODO(harmony-qv2): intermediate page table frames (PDP/PD/PT
-            // levels) are not freed by unmap — they need a dedicated
-            // PageTable::destroy() method to walk and reclaim.
+            // Intermediate page table frames (PDP/PD/PT levels) always come
+            // from the public buddy and are freed here via the callback.
             let page_count = region.len / PAGE_SIZE as usize;
             for i in 0..page_count {
                 let page_vaddr = VirtAddr(vaddr.as_u64() + (i as u64) * PAGE_SIZE);
-                let _ = space.page_table.unmap(page_vaddr, &mut |_| {});
+                let _ = space.page_table.unmap(page_vaddr, &mut |frame| {
+                    let _ = self.buddy_public.free_frame(frame);
+                });
             }
 
             let use_kernel = region
