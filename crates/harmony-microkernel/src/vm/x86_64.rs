@@ -271,9 +271,10 @@ impl PageTable for X86_64PageTable {
             }
             let child_table = self.table_mut(child_paddr);
             if Self::is_table_empty(child_table) {
-                frame_dealloc(child_paddr);
+                // Invalidate parent entry before freeing the child frame.
                 let parent_table = self.table_mut(parent_paddr);
                 parent_table[parent_idx] = 0;
+                frame_dealloc(child_paddr);
             } else {
                 break; // non-empty table; ancestors are also non-empty
             }
@@ -403,7 +404,10 @@ mod tests {
 
     impl TestAllocator {
         fn new(base: u64, count: usize) -> Self {
-            Self { next: base, limit: base + (count as u64) * 4096 }
+            Self {
+                next: base,
+                limit: base + (count as u64) * 4096,
+            }
         }
 
         fn alloc(&mut self) -> Option<PhysAddr> {
@@ -502,7 +506,8 @@ mod tests {
         let paddr = PhysAddr(0xDEAD_B000);
         let flags = PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::USER;
 
-        pt.map(vaddr, paddr, flags, &mut || allocator.alloc()).unwrap();
+        pt.map(vaddr, paddr, flags, &mut || allocator.alloc())
+            .unwrap();
 
         let translated = pt.translate(vaddr);
         assert!(translated.is_some(), "translate should find the mapping");
@@ -524,7 +529,8 @@ mod tests {
         let paddr = PhysAddr(0xBEEF_0000);
         let flags = PageFlags::READABLE | PageFlags::EXECUTABLE;
 
-        pt.map(vaddr, paddr, flags, &mut || allocator.alloc()).unwrap();
+        pt.map(vaddr, paddr, flags, &mut || allocator.alloc())
+            .unwrap();
         assert!(pt.translate(vaddr).is_some());
 
         let unmapped = pt.unmap(vaddr, &mut |_| {}).unwrap();
@@ -543,14 +549,22 @@ mod tests {
 
         let vaddr = VirtAddr(0x1000);
         let paddr = PhysAddr(0xBEEF_0000);
-        pt.map(vaddr, paddr, PageFlags::READABLE, &mut || alloc.alloc()).unwrap();
+        pt.map(vaddr, paddr, PageFlags::READABLE, &mut || alloc.alloc())
+            .unwrap();
 
         let intermediates_allocated = alloc.alloc_count;
-        assert_eq!(intermediates_allocated, 3, "mapping one page needs 3 intermediate tables");
+        assert_eq!(
+            intermediates_allocated, 3,
+            "mapping one page needs 3 intermediate tables"
+        );
 
         let result = pt.unmap(vaddr, &mut |frame| alloc.dealloc(frame)).unwrap();
         assert_eq!(result, paddr);
-        assert_eq!(alloc.freed.len(), 3, "all 3 intermediate tables should be freed");
+        assert_eq!(
+            alloc.freed.len(),
+            3,
+            "all 3 intermediate tables should be freed"
+        );
     }
 
     #[test]
@@ -564,13 +578,29 @@ mod tests {
 
         let vaddr1 = VirtAddr(0x1000);
         let vaddr2 = VirtAddr(0x2000);
-        pt.map(vaddr1, PhysAddr(0xA000_0000), PageFlags::READABLE, &mut || alloc.alloc()).unwrap();
-        pt.map(vaddr2, PhysAddr(0xB000_0000), PageFlags::READABLE, &mut || alloc.alloc()).unwrap();
+        pt.map(
+            vaddr1,
+            PhysAddr(0xA000_0000),
+            PageFlags::READABLE,
+            &mut || alloc.alloc(),
+        )
+        .unwrap();
+        pt.map(
+            vaddr2,
+            PhysAddr(0xB000_0000),
+            PageFlags::READABLE,
+            &mut || alloc.alloc(),
+        )
+        .unwrap();
 
         pt.unmap(vaddr1, &mut |frame| alloc.dealloc(frame)).unwrap();
         assert_eq!(alloc.freed.len(), 0, "sibling keeps intermediate alive");
 
         pt.unmap(vaddr2, &mut |frame| alloc.dealloc(frame)).unwrap();
-        assert_eq!(alloc.freed.len(), 3, "all intermediates freed after last sibling removed");
+        assert_eq!(
+            alloc.freed.len(),
+            3,
+            "all intermediates freed after last sibling removed"
+        );
     }
 }
