@@ -160,6 +160,11 @@ impl X86_64PageTable {
 
         flags
     }
+
+    /// Returns `true` if all 512 entries in the table are not present.
+    fn is_table_empty(table: &[u64; 512]) -> bool {
+        table.iter().all(|&e| e & PTE_PRESENT == 0)
+    }
 }
 
 impl PageTable for X86_64PageTable {
@@ -218,16 +223,20 @@ impl PageTable for X86_64PageTable {
         Ok(())
     }
 
-    fn unmap(&mut self, vaddr: VirtAddr) -> Result<PhysAddr, VmError> {
+    fn unmap(
+        &mut self,
+        vaddr: VirtAddr,
+        frame_dealloc: &mut dyn FnMut(PhysAddr),
+    ) -> Result<PhysAddr, VmError> {
         if !vaddr.is_page_aligned() {
             return Err(VmError::Unaligned(vaddr.as_u64()));
         }
 
-        // Walk levels 3 → 1; if any intermediate entry is not present, the
-        // page is not mapped.
+        // Walk levels 3 → 1, recording (parent_paddr, parent_idx) for pruning.
         let mut table_paddr = self.root;
+        let mut walk: [(PhysAddr, usize); 3] = [(PhysAddr(0), 0); 3];
 
-        for level in (1..=3).rev() {
+        for (i, level) in (1..=3).rev().enumerate() {
             let table = self.table_mut(table_paddr);
             let idx = Self::index(vaddr, level);
             let entry = table[idx];
@@ -235,11 +244,13 @@ impl PageTable for X86_64PageTable {
             if entry & PTE_PRESENT == 0 {
                 return Err(VmError::NotMapped(vaddr));
             }
+            walk[i] = (table_paddr, idx);
             table_paddr = PhysAddr(entry & PTE_ADDR_MASK);
         }
 
         // Level 0: clear the leaf entry.
-        let pt = self.table_mut(table_paddr);
+        let leaf_table_paddr = table_paddr;
+        let pt = self.table_mut(leaf_table_paddr);
         let idx = Self::index(vaddr, 0);
         let entry = pt[idx];
 
@@ -249,6 +260,26 @@ impl PageTable for X86_64PageTable {
 
         let old_paddr = PhysAddr(entry & PTE_ADDR_MASK);
         pt[idx] = 0;
+
+        // Bottom-up prune: walk was filled top-down as walk[0]=(root, idx→PDP),
+        // walk[1]=(PDP, idx→PD), walk[2]=(PD, idx→PT). Reverse so we process
+        // PT→PD→PDP direction. Root (PML4) is never freed.
+        let mut child_paddr = leaf_table_paddr;
+        for &(parent_paddr, parent_idx) in walk.iter().rev() {
+            if parent_paddr.as_u64() == 0 {
+                break;
+            }
+            let child_table = self.table_mut(child_paddr);
+            if Self::is_table_empty(child_table) {
+                // Invalidate parent entry before freeing the child frame.
+                let parent_table = self.table_mut(parent_paddr);
+                parent_table[parent_idx] = 0;
+                frame_dealloc(child_paddr);
+            } else {
+                break; // non-empty table; ancestors are also non-empty
+            }
+            child_paddr = parent_paddr;
+        }
 
         Ok(old_paddr)
     }
@@ -340,6 +371,88 @@ impl PageTable for X86_64PageTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    // ── Arena helpers ────────────────────────────────────────────────
+
+    /// Size of the test arena: enough frames for root + intermediates + extras.
+    const ARENA_TABLES: usize = 8;
+    const ARENA_SIZE: usize = ARENA_TABLES * 4096;
+
+    /// Create a test arena and return (arena_vec, base_address).
+    fn test_arena() -> (Vec<u8>, PhysAddr) {
+        let mut arena = vec![0u8; ARENA_SIZE + 4096];
+        let base = arena.as_mut_ptr() as u64;
+        let aligned_base = (base + 4095) & !4095;
+        let arena = arena.into_boxed_slice();
+        let arena = Vec::from(arena);
+        let aligned_base = PhysAddr(aligned_base);
+        (arena, aligned_base)
+    }
+
+    /// Identity phys_to_virt — works because test arena addresses are real heap addresses.
+    fn identity_phys_to_virt(paddr: PhysAddr) -> *mut u8 {
+        paddr.as_u64() as *mut u8
+    }
+
+    /// Simple allocator that hands out consecutive 4 KiB frames.
+    struct TestAllocator {
+        next: u64,
+        limit: u64,
+    }
+
+    impl TestAllocator {
+        fn new(base: u64, count: usize) -> Self {
+            Self {
+                next: base,
+                limit: base + (count as u64) * 4096,
+            }
+        }
+
+        fn alloc(&mut self) -> Option<PhysAddr> {
+            if self.next >= self.limit {
+                return None;
+            }
+            let addr = PhysAddr(self.next);
+            self.next += 4096;
+            Some(addr)
+        }
+    }
+
+    /// Allocator that tracks allocations and accepts frees.
+    struct TrackingAllocator {
+        next: u64,
+        limit: u64,
+        alloc_count: usize,
+        freed: Vec<PhysAddr>,
+    }
+
+    impl TrackingAllocator {
+        fn new(base: u64, count: usize) -> Self {
+            Self {
+                next: base,
+                limit: base + (count as u64) * 4096,
+                alloc_count: 0,
+                freed: Vec::new(),
+            }
+        }
+
+        fn alloc(&mut self) -> Option<PhysAddr> {
+            if self.next >= self.limit {
+                return None;
+            }
+            let addr = PhysAddr(self.next);
+            self.next += 4096;
+            unsafe { core::ptr::write_bytes(addr.as_u64() as *mut u8, 0, 4096) };
+            self.alloc_count += 1;
+            Some(addr)
+        }
+
+        fn dealloc(&mut self, frame: PhysAddr) {
+            self.freed.push(frame);
+        }
+    }
 
     #[test]
     fn flags_to_pte_always_sets_present() {
@@ -376,5 +489,118 @@ mod tests {
         );
         assert!(back.contains(PageFlags::WRITABLE));
         assert!(back.contains(PageFlags::EXECUTABLE));
+    }
+
+    // ── Integration tests using heap-backed page table arena ────────
+
+    #[test]
+    fn map_and_translate() {
+        let (_arena, arena_base) = test_arena();
+        let aligned = (arena_base.as_u64() + 4095) & !4095;
+        let root = PhysAddr(aligned);
+        unsafe { core::ptr::write_bytes(root.as_u64() as *mut u8, 0, 4096) };
+        let mut allocator = TestAllocator::new(aligned + 4096, ARENA_TABLES - 1);
+        let mut pt = unsafe { X86_64PageTable::new(root, identity_phys_to_virt) };
+
+        let vaddr = VirtAddr(0x1000);
+        let paddr = PhysAddr(0xDEAD_B000);
+        let flags = PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::USER;
+
+        pt.map(vaddr, paddr, flags, &mut || allocator.alloc())
+            .unwrap();
+
+        let translated = pt.translate(vaddr);
+        assert!(translated.is_some(), "translate should find the mapping");
+        let (got_paddr, got_flags) = translated.unwrap();
+        assert_eq!(got_paddr, paddr, "physical address must match");
+        assert_eq!(got_flags, flags, "flags must match");
+    }
+
+    #[test]
+    fn map_then_unmap() {
+        let (_arena, arena_base) = test_arena();
+        let aligned = (arena_base.as_u64() + 4095) & !4095;
+        let root = PhysAddr(aligned);
+        unsafe { core::ptr::write_bytes(root.as_u64() as *mut u8, 0, 4096) };
+        let mut allocator = TestAllocator::new(aligned + 4096, ARENA_TABLES - 1);
+        let mut pt = unsafe { X86_64PageTable::new(root, identity_phys_to_virt) };
+
+        let vaddr = VirtAddr(0x2000);
+        let paddr = PhysAddr(0xBEEF_0000);
+        let flags = PageFlags::READABLE | PageFlags::EXECUTABLE;
+
+        pt.map(vaddr, paddr, flags, &mut || allocator.alloc())
+            .unwrap();
+        assert!(pt.translate(vaddr).is_some());
+
+        let unmapped = pt.unmap(vaddr, &mut |_| {}).unwrap();
+        assert_eq!(unmapped, paddr, "unmap should return the original paddr");
+        assert!(pt.translate(vaddr).is_none(), "should be unmapped now");
+    }
+
+    #[test]
+    fn unmap_prunes_empty_intermediate() {
+        let (_arena, arena_base) = test_arena();
+        let aligned = (arena_base.as_u64() + 4095) & !4095;
+        let root = PhysAddr(aligned);
+        unsafe { core::ptr::write_bytes(root.as_u64() as *mut u8, 0, 4096) };
+        let mut alloc = TrackingAllocator::new(aligned + 4096, ARENA_TABLES - 1);
+        let mut pt = unsafe { X86_64PageTable::new(root, identity_phys_to_virt) };
+
+        let vaddr = VirtAddr(0x1000);
+        let paddr = PhysAddr(0xBEEF_0000);
+        pt.map(vaddr, paddr, PageFlags::READABLE, &mut || alloc.alloc())
+            .unwrap();
+
+        let intermediates_allocated = alloc.alloc_count;
+        assert_eq!(
+            intermediates_allocated, 3,
+            "mapping one page needs 3 intermediate tables"
+        );
+
+        let result = pt.unmap(vaddr, &mut |frame| alloc.dealloc(frame)).unwrap();
+        assert_eq!(result, paddr);
+        assert_eq!(
+            alloc.freed.len(),
+            3,
+            "all 3 intermediate tables should be freed"
+        );
+    }
+
+    #[test]
+    fn unmap_preserves_sibling_intermediates() {
+        let (_arena, arena_base) = test_arena();
+        let aligned = (arena_base.as_u64() + 4095) & !4095;
+        let root = PhysAddr(aligned);
+        unsafe { core::ptr::write_bytes(root.as_u64() as *mut u8, 0, 4096) };
+        let mut alloc = TrackingAllocator::new(aligned + 4096, ARENA_TABLES - 1);
+        let mut pt = unsafe { X86_64PageTable::new(root, identity_phys_to_virt) };
+
+        let vaddr1 = VirtAddr(0x1000);
+        let vaddr2 = VirtAddr(0x2000);
+        pt.map(
+            vaddr1,
+            PhysAddr(0xA000_0000),
+            PageFlags::READABLE,
+            &mut || alloc.alloc(),
+        )
+        .unwrap();
+        pt.map(
+            vaddr2,
+            PhysAddr(0xB000_0000),
+            PageFlags::READABLE,
+            &mut || alloc.alloc(),
+        )
+        .unwrap();
+
+        pt.unmap(vaddr1, &mut |frame| alloc.dealloc(frame)).unwrap();
+        assert_eq!(alloc.freed.len(), 0, "sibling keeps intermediate alive");
+
+        pt.unmap(vaddr2, &mut |frame| alloc.dealloc(frame)).unwrap();
+        assert_eq!(
+            alloc.freed.len(),
+            3,
+            "all intermediates freed after last sibling removed"
+        );
     }
 }
