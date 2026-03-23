@@ -475,4 +475,80 @@ mod tests {
         assert!(flags.contains(PageFlags::WRITABLE));
         assert!(!flags.contains(PageFlags::EXECUTABLE));
     }
+
+    #[test]
+    fn pe_parse_unaligned_section_rejected() {
+        let sections =
+            &[(".text", 0x1200, 0x1000, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE)];
+        let buf = build_pe_header(sections);
+        let result = parse_sections_from_bytes(&buf, 0, 0x10_0000);
+        assert_eq!(result.unwrap_err(), PeError::UnalignedSection);
+    }
+
+    #[test]
+    fn pe_parse_section_out_of_bounds_rejected() {
+        let sections =
+            &[(".text", 0x1000, 0x9000, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE)];
+        let buf = build_pe_header(sections);
+        // section ends at 0xA000 > image_size 0x9000
+        let result = parse_sections_from_bytes(&buf, 0, 0x9000);
+        assert_eq!(result.unwrap_err(), PeError::SectionOutOfBounds);
+    }
+
+    #[test]
+    fn pe_parse_overlapping_sections_rejected() {
+        // page_align_up of .text end (0x1000 + 0x1800 → 0x3000) overlaps .rdata start (0x2000)
+        let sections = &[
+            (".text", 0x1000, 0x1800, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE),
+            (".rdata", 0x2000, 0x1000, IMAGE_SCN_MEM_READ),
+        ];
+        let buf = build_pe_header(sections);
+        let result = parse_sections_from_bytes(&buf, 0, 0x10_0000);
+        assert_eq!(result.unwrap_err(), PeError::OverlappingSections);
+    }
+
+    #[test]
+    fn pe_parse_invalid_permissions_rejected() {
+        // Execute without read
+        assert_eq!(
+            characteristics_to_flags(IMAGE_SCN_MEM_EXECUTE).unwrap_err(),
+            PeError::InvalidPermissions
+        );
+        // Write without read
+        assert_eq!(
+            characteristics_to_flags(IMAGE_SCN_MEM_WRITE).unwrap_err(),
+            PeError::InvalidPermissions
+        );
+        // No permissions at all
+        assert_eq!(
+            characteristics_to_flags(0).unwrap_err(),
+            PeError::InvalidPermissions
+        );
+    }
+
+    #[test]
+    fn pe_parse_zero_virtual_size_rejected() {
+        let sections =
+            &[(".text", 0x1000, 0, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE)];
+        let buf = build_pe_header(sections);
+        let result = parse_sections_from_bytes(&buf, 0, 0x10_0000);
+        assert_eq!(result.unwrap_err(), PeError::TruncatedHeader);
+    }
+
+    #[test]
+    fn pe_header_area_is_read_only() {
+        let sections = &[
+            (".text", 0x1000, 0x2000, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE),
+            (".data", 0x4000, 0x1000, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE),
+        ];
+        let buf = build_pe_header(sections);
+        let base = 0x4000_0000u64;
+        let result = parse_sections_from_bytes(&buf, base, 0x8000).unwrap();
+
+        // PE header area (before first section at 0x1000) → RO
+        let flags = result.flags_for_addr(base).unwrap();
+        assert!(flags.contains(PageFlags::READABLE));
+        assert!(!flags.contains(PageFlags::WRITABLE));
+        assert!(!flags.contains(PageFlags::EXECUTABLE));
+    }
 }
