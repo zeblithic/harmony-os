@@ -54,7 +54,6 @@ const SIGSTOP: u32 = 19;
 const SIG_BLOCK: i32 = 0;
 const SIG_UNBLOCK: i32 = 1;
 const SIG_SETMASK: i32 = 2;
-#[allow(dead_code)]
 const SIGCHLD_NUM: u32 = 17;
 
 fn ipc_err_to_errno(e: IpcError) -> i64 {
@@ -1746,14 +1745,12 @@ impl Default for SignalAction {
 }
 
 /// Default action for a signal when SIG_DFL is the handler.
-#[allow(dead_code)]
 enum DefaultAction {
     Terminate,
     Ignore,
 }
 
 /// Return the default action for a signal number (1-64).
-#[allow(dead_code)]
 fn default_signal_action(signum: u32) -> DefaultAction {
     match signum {
         17 | 18 | 23 | 28 => DefaultAction::Ignore, // SIGCHLD, SIGCONT, SIGURG, SIGWINCH
@@ -2169,7 +2166,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// to process memory. In the MVP flat address space, this is a direct
     /// dereference.
     pub fn dispatch_syscall(&mut self, syscall: LinuxSyscall) -> i64 {
-        match syscall {
+        let result = match syscall {
             LinuxSyscall::Read { fd, buf, count } => {
                 self.sys_read(fd, buf as usize, count as usize)
             }
@@ -2369,7 +2366,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
             LinuxSyscall::Kill { pid, sig } => self.sys_kill(pid, sig),
             LinuxSyscall::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
             LinuxSyscall::Unknown { .. } => ENOSYS,
-        }
+        };
+        self.deliver_pending_signals();
+        result
     }
 
     /// Linux write(2): write to a file descriptor.
@@ -2677,6 +2676,51 @@ impl<B: SyscallBackend> Linuxulator<B> {
         // pending_signals preserved across exec (Linux semantics).
         self.pending_handler_signal = None;
         self.killed_by_signal = None;
+    }
+
+    /// Deliver one pending signal at syscall boundary.
+    ///
+    /// Called at the end of dispatch_syscall. Handles SIG_DFL and
+    /// SIG_IGN internally. Custom handlers are reported via
+    /// pending_handler_signal for the caller to invoke.
+    fn deliver_pending_signals(&mut self) {
+        if self.pending_signals == 0 {
+            return;
+        }
+
+        // SIGKILL (9) always delivered regardless of mask.
+        let sigkill_pending = self.pending_signals & (1u64 << (SIGKILL - 1)) != 0;
+        if sigkill_pending {
+            self.pending_signals &= !(1u64 << (SIGKILL - 1));
+            self.exit_code = Some(0);
+            self.killed_by_signal = Some(SIGKILL);
+            return;
+        }
+
+        // Find lowest deliverable signal (pending AND not blocked).
+        let deliverable = self.pending_signals & !self.signal_mask;
+        if deliverable == 0 {
+            return;
+        }
+
+        let bit = deliverable.trailing_zeros();
+        let signum = bit + 1;
+        self.pending_signals &= !(1u64 << bit);
+
+        let handler = self.signal_handlers[bit as usize].handler;
+        match handler {
+            SIG_IGN => {}
+            SIG_DFL => match default_signal_action(signum) {
+                DefaultAction::Terminate => {
+                    self.exit_code = Some(0);
+                    self.killed_by_signal = Some(signum);
+                }
+                DefaultAction::Ignore => {}
+            },
+            _ => {
+                self.pending_handler_signal = Some(signum);
+            }
+        }
     }
 
     /// Apply a successful execve: close CLOEXEC fds, reset state, build
