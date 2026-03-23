@@ -45,6 +45,8 @@ pub enum PeError {
     UnalignedSection,
     /// A section extends beyond the image size.
     SectionOutOfBounds,
+    /// Two sections' page-aligned ranges overlap.
+    OverlappingSections,
     /// A section has no permission bits, or execute without read.
     InvalidPermissions,
 }
@@ -68,7 +70,7 @@ impl ImageSections {
     /// Returns `None` if the address is outside the image range.
     /// If the address falls between sections (padding), returns RW.
     pub fn flags_for_addr(&self, addr: u64) -> Option<PageFlags> {
-        let image_end = page_align_up(self.image_base + self.image_size);
+        let image_end = page_align_up(self.image_base.saturating_add(self.image_size));
         if addr < self.image_base || addr >= image_end {
             return None;
         }
@@ -84,7 +86,7 @@ impl ImageSections {
 
     /// True if the address falls within the image range.
     pub fn contains(&self, addr: u64) -> bool {
-        let image_end = page_align_up(self.image_base + self.image_size);
+        let image_end = page_align_up(self.image_base.saturating_add(self.image_size));
         addr >= self.image_base && addr < image_end
     }
 }
@@ -215,15 +217,35 @@ pub fn parse_sections_from_bytes(
         if virtual_addr % PAGE_SIZE != 0 {
             return Err(PeError::UnalignedSection);
         }
-        // Reject sections that extend beyond the image.
-        if virtual_addr + virtual_size > image_size {
+        // Reject sections that extend beyond the image (overflow-safe).
+        let section_end = virtual_addr
+            .checked_add(virtual_size)
+            .ok_or(PeError::TruncatedHeader)?;
+        if section_end > image_size {
             return Err(PeError::SectionOutOfBounds);
         }
 
-        let start = page_align_down(image_base + virtual_addr);
-        let end = page_align_up(image_base + virtual_addr + virtual_size);
+        let abs_start = image_base
+            .checked_add(virtual_addr)
+            .ok_or(PeError::TruncatedHeader)?;
+        let abs_end = image_base
+            .checked_add(section_end)
+            .ok_or(PeError::TruncatedHeader)?;
+
+        let start = page_align_down(abs_start);
+        let end = page_align_up(abs_end);
 
         entries[i] = (start, end, flags);
+    }
+
+    // Verify no page-aligned ranges overlap. PE spec requires sections
+    // ordered by VirtualAddress, so adjacent-pair check is sufficient.
+    for i in 1..num_sections {
+        let (_, prev_end, _) = entries[i - 1];
+        let (cur_start, _, _) = entries[i];
+        if cur_start < prev_end {
+            return Err(PeError::OverlappingSections);
+        }
     }
 
     Ok(ImageSections {
