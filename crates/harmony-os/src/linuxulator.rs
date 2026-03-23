@@ -3991,6 +3991,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if interval_sec < 0 || !(0..1_000_000_000).contains(&interval_nsec) {
             return EINVAL;
         }
+        // Note: interval_sec == i64::MAX saturates to u64::MAX via saturating_mul;
+        // the resulting timer fires once and then effectively never repeats.
         let new_interval_ns = (interval_sec as u64)
             .saturating_mul(1_000_000_000)
             .saturating_add(interval_nsec as u64);
@@ -4008,15 +4010,35 @@ impl<B: SyscallBackend> Linuxulator<B> {
         };
 
         // Write old value if requested — BEFORE modifying state.
+        // Must match timerfd_gettime semantics: for expired repeating timers,
+        // report time until next tick, not 0.
         if old_value_ptr != 0 {
             let state = self.timerfds.get(&timerfd_id).unwrap();
             let now = match state.clockid {
                 CLOCK_REALTIME => self.realtime_ns,
                 _ => self.monotonic_ns,
             };
-            let remaining = state.expiration_ns.saturating_sub(now);
-            let old_val_sec = (remaining / 1_000_000_000) as i64;
-            let old_val_nsec = (remaining % 1_000_000_000) as i64;
+            let (old_val_sec, old_val_nsec) = if state.expiration_ns == 0 {
+                (0i64, 0i64)
+            } else if now < state.expiration_ns {
+                let remaining = state.expiration_ns - now;
+                (
+                    (remaining / 1_000_000_000) as i64,
+                    (remaining % 1_000_000_000) as i64,
+                )
+            } else if state.interval_ns == 0 {
+                (0i64, 0i64) // one-shot already expired
+            } else {
+                // Repeating expired: compute time to next tick.
+                let elapsed = now - state.expiration_ns;
+                let extra = elapsed / state.interval_ns;
+                let next = state.expiration_ns + (extra + 1) * state.interval_ns;
+                let to_next = next - now;
+                (
+                    (to_next / 1_000_000_000) as i64,
+                    (to_next % 1_000_000_000) as i64,
+                )
+            };
             let old_int_sec = (state.interval_ns / 1_000_000_000) as i64;
             let old_int_nsec = (state.interval_ns % 1_000_000_000) as i64;
             let buf =
