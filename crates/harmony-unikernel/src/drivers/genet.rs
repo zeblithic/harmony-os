@@ -408,6 +408,11 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
             GenetError::NoBuffers
         })?;
         let buf = tx_pool.get(buf_idx);
+        if frame.len() > tx_pool.buf_size() {
+            let _ = tx_pool.free(buf_idx);
+            self.stats.tx_errors += 1;
+            return Err(GenetError::FrameTooLarge);
+        }
         unsafe {
             core::ptr::copy_nonoverlapping(frame.as_ptr(), buf.virt, frame.len());
         }
@@ -530,6 +535,12 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         // Copy frame data from DMA buffer.
         let data = if let Some(buf_idx) = rx_pool.find_by_phys(buf_phys) {
             let buf = rx_pool.get(buf_idx);
+            // Clamp length to buffer size — descriptor could claim more than the buffer holds.
+            if length > rx_pool.buf_size() {
+                self.stats.rx_errors += 1;
+                let _ = rx_pool.free(buf_idx);
+                return None;
+            }
             let mut frame_data = alloc::vec![0u8; length];
             unsafe {
                 core::ptr::copy_nonoverlapping(buf.virt, frame_data.as_mut_ptr(), length);
@@ -627,10 +638,10 @@ mod tests {
             virt: core::ptr::null_mut(),
             phys: 0,
         }; N];
-        for i in 0..N {
-            let buf = alloc::vec![0u8; 2048].into_boxed_slice();
-            let ptr = Box::into_raw(buf) as *mut u8;
-            buffers[i] = DmaBuffer {
+        for buf in buffers.iter_mut() {
+            let heap_buf = alloc::vec![0u8; 2048].into_boxed_slice();
+            let ptr = Box::into_raw(heap_buf) as *mut u8;
+            *buf = DmaBuffer {
                 virt: ptr,
                 phys: ptr as u64,
             };

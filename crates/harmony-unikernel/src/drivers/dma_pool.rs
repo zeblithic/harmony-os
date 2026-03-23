@@ -76,8 +76,13 @@ impl<const N: usize> DmaPool<N> {
     }
 
     /// Find the buffer index for a given physical address. O(N) scan.
+    /// Only matches allocated (in-use) buffers.
     pub fn find_by_phys(&self, phys: u64) -> Option<usize> {
-        self.buffers.iter().position(|b| b.phys == phys)
+        self.buffers
+            .iter()
+            .enumerate()
+            .find(|(i, b)| !self.free[*i] && b.phys == phys)
+            .map(|(i, _)| i)
     }
 
     /// Buffer size in bytes.
@@ -96,11 +101,11 @@ mod tests {
             virt: core::ptr::null_mut(),
             phys: 0,
         }; N];
-        for i in 0..N {
+        for buf in buffers.iter_mut() {
             // Use heap allocation for test buffers.
-            let buf = vec![0u8; 2048].into_boxed_slice();
-            let ptr = Box::into_raw(buf) as *mut u8;
-            buffers[i] = DmaBuffer {
+            let heap_buf = vec![0u8; 2048].into_boxed_slice();
+            let ptr = Box::into_raw(heap_buf) as *mut u8;
+            *buf = DmaBuffer {
                 virt: ptr,
                 phys: ptr as u64, // identity-mapped in tests
             };
@@ -129,7 +134,7 @@ mod tests {
         for idx in [i0, i2, i3, i4] {
             let buf = pool.get(idx);
             unsafe {
-                let _ = Box::from_raw(core::slice::from_raw_parts_mut(buf.virt, 2048));
+                drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(buf.virt, 2048)));
             }
         }
     }
@@ -145,7 +150,7 @@ mod tests {
         for i in 0..2 {
             let buf = pool.get(i);
             unsafe {
-                let _ = Box::from_raw(core::slice::from_raw_parts_mut(buf.virt, 2048));
+                drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(buf.virt, 2048)));
             }
         }
     }
@@ -163,7 +168,7 @@ mod tests {
         for i in 0..4 {
             let buf = pool.get(i);
             unsafe {
-                let _ = Box::from_raw(core::slice::from_raw_parts_mut(buf.virt, 2048));
+                drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(buf.virt, 2048)));
             }
         }
     }
@@ -179,7 +184,7 @@ mod tests {
         for i in 0..2 {
             let buf = pool.get(i);
             unsafe {
-                let _ = Box::from_raw(core::slice::from_raw_parts_mut(buf.virt, 2048));
+                drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(buf.virt, 2048)));
             }
         }
     }
