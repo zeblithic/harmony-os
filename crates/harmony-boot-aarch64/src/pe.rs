@@ -80,8 +80,15 @@ impl ImageSections {
                 return Some(flags);
             }
         }
-        // Address is within image but not in any section (inter-section padding).
-        Some(PageFlags::READABLE | PageFlags::WRITABLE)
+        // Address is within image but not in any named section.
+        // Pages before the first section are the PE header area — map RO.
+        // True inter-section gaps are mapped RW.
+        let in_header_area = self.count == 0 || addr < self.entries[0].0;
+        if in_header_area {
+            Some(PageFlags::READABLE)
+        } else {
+            Some(PageFlags::READABLE | PageFlags::WRITABLE)
+        }
     }
 
     /// True if the address falls within the image range.
@@ -235,7 +242,10 @@ pub fn parse_sections_from_bytes(
             .checked_add(section_end)
             .ok_or(PeError::TruncatedHeader)?;
 
-        let start = page_align_down(abs_start);
+        // abs_start is page-aligned (image_base is UEFI page-aligned,
+        // virtual_addr is validated page-aligned above).
+        debug_assert_eq!(abs_start, page_align_down(abs_start));
+        let start = abs_start;
         let end = page_align_up(abs_end);
 
         entries[i] = (start, end, flags);

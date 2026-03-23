@@ -83,7 +83,18 @@ fn main() -> Status {
     // Must be done BEFORE ExitBootServices while UEFI protocols are still available.
     let image_sections: Option<pe::ImageSections> = {
         let handle = uefi::boot::image_handle();
-        match uefi::boot::open_protocol_exclusive::<LoadedImage>(handle) {
+        // Use GetProtocol (non-exclusive) instead of Exclusive — OEM firmware
+        // may already hold LoadedImage open, causing ACCESS_DENIED with exclusive.
+        match unsafe {
+            uefi::boot::open_protocol::<LoadedImage>(
+                uefi::boot::OpenProtocolParams {
+                    handle,
+                    agent: handle,
+                    controller: None,
+                },
+                uefi::boot::OpenProtocolAttributes::GetProtocol,
+            )
+        } {
             Ok(loaded_image) => {
                 let (base_ptr, size) = loaded_image.info();
                 let base = base_ptr as u64;
