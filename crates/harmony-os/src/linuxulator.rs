@@ -453,6 +453,20 @@ pub enum LinuxSyscall {
         sizemask: u64,
         flags: i32,
     },
+    TimerfdCreate {
+        clockid: i32,
+        flags: i32,
+    },
+    TimerfdSettime {
+        fd: i32,
+        flags: i32,
+        new_value: u64,
+        old_value: u64,
+    },
+    TimerfdGettime {
+        fd: i32,
+        curr_value: u64,
+    },
     Unknown {
         nr: u64,
     },
@@ -780,6 +794,20 @@ impl LinuxSyscall {
                 mask_ptr: args[1],
                 sizemask: args[2],
                 flags: args[3] as i32,
+            },
+            283 => LinuxSyscall::TimerfdCreate {
+                clockid: args[0] as i32,
+                flags: args[1] as i32,
+            },
+            286 => LinuxSyscall::TimerfdSettime {
+                fd: args[0] as i32,
+                flags: args[1] as i32,
+                new_value: args[2],
+                old_value: args[3],
+            },
+            287 => LinuxSyscall::TimerfdGettime {
+                fd: args[0] as i32,
+                curr_value: args[1],
             },
             302 => LinuxSyscall::Prlimit64 {
                 pid: args[0] as i32,
@@ -1132,6 +1160,20 @@ impl LinuxSyscall {
                 mask_ptr: args[1],
                 sizemask: args[2],
                 flags: args[3] as i32,
+            },
+            85 => LinuxSyscall::TimerfdCreate {
+                clockid: args[0] as i32,
+                flags: args[1] as i32,
+            },
+            86 => LinuxSyscall::TimerfdSettime {
+                fd: args[0] as i32,
+                flags: args[1] as i32,
+                new_value: args[2],
+                old_value: args[3],
+            },
+            87 => LinuxSyscall::TimerfdGettime {
+                fd: args[0] as i32,
+                curr_value: args[1],
             },
             293 => LinuxSyscall::Rseq,
             220 => LinuxSyscall::Clone {
@@ -1775,6 +1817,8 @@ enum FdKind {
     Epoll { epoll_id: usize },
     /// signalfd descriptor for reading pending signals.
     SignalFd { signalfd_id: usize },
+    /// timerfd descriptor for timer expiration.
+    TimerFd { timerfd_id: usize },
 }
 
 /// Shared state for an eventfd instance.
@@ -1808,6 +1852,16 @@ struct EpollState {
 struct SignalFdState {
     /// Which signals this fd monitors (bitmask).
     mask: u64,
+}
+
+/// State for a timerfd instance.
+#[derive(Clone)]
+struct TimerFdState {
+    clockid: i32,
+    /// Absolute expiration time in nanoseconds (0 = disarmed).
+    expiration_ns: u64,
+    /// Repeat interval in nanoseconds (0 = one-shot).
+    interval_ns: u64,
 }
 
 /// Per-signal handler disposition, stored in a 64-element array.
@@ -1946,6 +2000,10 @@ pub struct Linuxulator<B: SyscallBackend> {
     signalfds: BTreeMap<usize, SignalFdState>,
     /// Next signalfd_id to allocate.
     next_signalfd_id: usize,
+    /// timerfd state keyed by timerfd_id.
+    timerfds: BTreeMap<usize, TimerFdState>,
+    /// Next timerfd_id to allocate.
+    next_timerfd_id: usize,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -1993,6 +2051,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
             process_name: [0u8; 16],
             signalfds: BTreeMap::new(),
             next_signalfd_id: 0,
+            timerfds: BTreeMap::new(),
+            next_timerfd_id: 0,
         }
     }
 
@@ -2482,6 +2542,18 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 sizemask,
                 flags,
             } => self.sys_signalfd4(fd, mask_ptr, sizemask, flags),
+            LinuxSyscall::TimerfdCreate { clockid, flags } => {
+                self.sys_timerfd_create(clockid, flags)
+            }
+            LinuxSyscall::TimerfdSettime {
+                fd,
+                flags,
+                new_value,
+                old_value,
+            } => self.sys_timerfd_settime(fd, flags, new_value, old_value),
+            LinuxSyscall::TimerfdGettime { fd, curr_value } => {
+                self.sys_timerfd_gettime(fd, curr_value)
+            }
             LinuxSyscall::Unknown { .. } => ENOSYS,
         };
         self.deliver_pending_signals();
@@ -2586,6 +2658,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             }
             FdKind::Epoll { .. } => EINVAL,
             FdKind::SignalFd { .. } => EINVAL,
+            FdKind::TimerFd { .. } => EINVAL,
         }
     }
 
@@ -2721,6 +2794,42 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
                 128 // bytes read
             }
+            FdKind::TimerFd { timerfd_id } => {
+                if count < 8 {
+                    return EINVAL;
+                }
+                let state = match self.timerfds.get_mut(&timerfd_id) {
+                    Some(s) => s,
+                    None => return EINVAL,
+                };
+                if state.expiration_ns == 0 {
+                    return EAGAIN; // disarmed
+                }
+                let now = match state.clockid {
+                    CLOCK_REALTIME => self.realtime_ns,
+                    _ => self.monotonic_ns,
+                };
+                if now < state.expiration_ns {
+                    return EAGAIN; // not yet expired
+                }
+                // Compute expiration count.
+                let count_val = if state.interval_ns == 0 {
+                    // One-shot: disarm after reading.
+                    state.expiration_ns = 0;
+                    1u64
+                } else {
+                    // Repeating: count how many intervals passed.
+                    let elapsed = now - state.expiration_ns;
+                    let extra = elapsed / state.interval_ns;
+                    let count_val = 1 + extra;
+                    // Advance expiration past current time.
+                    state.expiration_ns += (extra + 1) * state.interval_ns;
+                    count_val
+                };
+                let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, 8) };
+                buf.copy_from_slice(&count_val.to_le_bytes());
+                8
+            }
         }
     }
 
@@ -2782,6 +2891,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 );
                 if !still_referenced {
                     self.signalfds.remove(&signalfd_id);
+                }
+            }
+            FdKind::TimerFd { timerfd_id } => {
+                let still_referenced = self.fd_table.values().any(
+                    |e| matches!(&e.kind, FdKind::TimerFd { timerfd_id: id } if *id == timerfd_id),
+                );
+                if !still_referenced {
+                    self.timerfds.remove(&timerfd_id);
                 }
             }
         }
@@ -3794,6 +3911,179 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
     }
 
+    // ── TimerFd ───────────────────────────────────────────────────
+
+    /// Linux timerfd_create(2): create a timer file descriptor.
+    fn sys_timerfd_create(&mut self, clockid: i32, flags: i32) -> i64 {
+        const TFD_CLOEXEC: i32 = 0x80000;
+        const TFD_NONBLOCK: i32 = 0x800;
+
+        if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
+            return EINVAL;
+        }
+        if flags & !(TFD_CLOEXEC | TFD_NONBLOCK) != 0 {
+            return EINVAL;
+        }
+
+        let timerfd_id = self.next_timerfd_id;
+        self.next_timerfd_id += 1;
+        self.timerfds.insert(
+            timerfd_id,
+            TimerFdState {
+                clockid,
+                expiration_ns: 0,
+                interval_ns: 0,
+            },
+        );
+
+        let fd = self.alloc_fd();
+        let fd_flags = if flags & TFD_CLOEXEC != 0 {
+            FD_CLOEXEC
+        } else {
+            0
+        };
+        self.fd_table.insert(
+            fd,
+            FdEntry {
+                kind: FdKind::TimerFd { timerfd_id },
+                flags: fd_flags,
+            },
+        );
+        fd as i64
+    }
+
+    /// Linux timerfd_settime(2): arm or disarm a timerfd.
+    fn sys_timerfd_settime(
+        &mut self,
+        fd: i32,
+        flags: i32,
+        new_value_ptr: u64,
+        old_value_ptr: u64,
+    ) -> i64 {
+        const TFD_TIMER_ABSTIME: i32 = 1;
+
+        if flags & !TFD_TIMER_ABSTIME != 0 {
+            return EINVAL;
+        }
+
+        let timerfd_id = match self.fd_table.get(&fd) {
+            Some(FdEntry {
+                kind: FdKind::TimerFd { timerfd_id },
+                ..
+            }) => *timerfd_id,
+            None => return EBADF,
+            Some(_) => return EINVAL,
+        };
+
+        // Write old value if requested (zeros for now).
+        if old_value_ptr != 0 {
+            let buf =
+                unsafe { core::slice::from_raw_parts_mut(old_value_ptr as usize as *mut u8, 32) };
+            buf.fill(0);
+        }
+
+        if new_value_ptr == 0 {
+            return EFAULT;
+        }
+
+        // Read struct itimerspec: { it_interval: timespec, it_value: timespec }
+        // Each timespec = { tv_sec: i64, tv_nsec: i64 } = 16 bytes. Total 32 bytes.
+        let its = unsafe { core::slice::from_raw_parts(new_value_ptr as usize as *const u8, 32) };
+        let interval_sec = i64::from_le_bytes(its[0..8].try_into().unwrap());
+        let interval_nsec = i64::from_le_bytes(its[8..16].try_into().unwrap());
+        let value_sec = i64::from_le_bytes(its[16..24].try_into().unwrap());
+        let value_nsec = i64::from_le_bytes(its[24..32].try_into().unwrap());
+
+        let state = match self.timerfds.get_mut(&timerfd_id) {
+            Some(s) => s,
+            None => return EINVAL,
+        };
+
+        // Compute interval in nanoseconds.
+        if interval_sec < 0 || !(0..1_000_000_000).contains(&interval_nsec) {
+            return EINVAL;
+        }
+        state.interval_ns = (interval_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(interval_nsec as u64);
+
+        // Compute expiration.
+        if value_sec == 0 && value_nsec == 0 {
+            // Disarm.
+            state.expiration_ns = 0;
+        } else {
+            if value_sec < 0 || !(0..1_000_000_000).contains(&value_nsec) {
+                return EINVAL;
+            }
+            let value_ns = (value_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(value_nsec as u64);
+
+            if flags & TFD_TIMER_ABSTIME != 0 {
+                // Absolute time.
+                state.expiration_ns = value_ns;
+            } else {
+                // Relative: add to current clock.
+                let now = match state.clockid {
+                    CLOCK_REALTIME => self.realtime_ns,
+                    _ => self.monotonic_ns,
+                };
+                state.expiration_ns = now.saturating_add(value_ns);
+            }
+        }
+
+        0
+    }
+
+    /// Linux timerfd_gettime(2): query the current timer settings.
+    fn sys_timerfd_gettime(&self, fd: i32, curr_value_ptr: u64) -> i64 {
+        let timerfd_id = match self.fd_table.get(&fd) {
+            Some(FdEntry {
+                kind: FdKind::TimerFd { timerfd_id },
+                ..
+            }) => *timerfd_id,
+            None => return EBADF,
+            Some(_) => return EINVAL,
+        };
+
+        if curr_value_ptr == 0 {
+            return EFAULT;
+        }
+
+        let state = match self.timerfds.get(&timerfd_id) {
+            Some(s) => s,
+            None => return EINVAL,
+        };
+
+        // Compute remaining time.
+        let (value_sec, value_nsec) = if state.expiration_ns == 0 {
+            (0i64, 0i64)
+        } else {
+            let now = match state.clockid {
+                CLOCK_REALTIME => self.realtime_ns,
+                _ => self.monotonic_ns,
+            };
+            let remaining = state.expiration_ns.saturating_sub(now);
+            (
+                (remaining / 1_000_000_000) as i64,
+                (remaining % 1_000_000_000) as i64,
+            )
+        };
+
+        let interval_sec = (state.interval_ns / 1_000_000_000) as i64;
+        let interval_nsec = (state.interval_ns % 1_000_000_000) as i64;
+
+        // Write struct itimerspec.
+        let buf =
+            unsafe { core::slice::from_raw_parts_mut(curr_value_ptr as usize as *mut u8, 32) };
+        buf[0..8].copy_from_slice(&interval_sec.to_le_bytes());
+        buf[8..16].copy_from_slice(&interval_nsec.to_le_bytes());
+        buf[16..24].copy_from_slice(&value_sec.to_le_bytes());
+        buf[24..32].copy_from_slice(&value_nsec.to_le_bytes());
+
+        0
+    }
+
     // ── Process management ────────────────────────────────────────
 
     /// Create a child Linuxulator with cloned state for fork.
@@ -3837,6 +4127,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
             process_name: self.process_name,
             signalfds: self.signalfds.clone(),
             next_signalfd_id: self.next_signalfd_id,
+            timerfds: self.timerfds.clone(),
+            next_timerfd_id: self.next_timerfd_id,
         };
         // Move shared pipe/eventfd state to child
         core::mem::swap(&mut self.pipes, &mut child.pipes);
@@ -4234,6 +4526,16 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 let stat = FileStat {
                     qpath: signalfd_id as u64,
                     name: alloc::sync::Arc::from("signalfd"),
+                    size: 0,
+                    file_type: FileType::Regular,
+                };
+                write_linux_stat(statbuf_ptr, &stat);
+                0
+            }
+            FdKind::TimerFd { timerfd_id } => {
+                let stat = FileStat {
+                    qpath: timerfd_id as u64,
+                    name: alloc::sync::Arc::from("timerfd"),
                     size: 0,
                     file_type: FileType::Regular,
                 };
@@ -12456,6 +12758,217 @@ mod integration_tests {
 
         let flags = lx.dispatch_syscall(LinuxSyscall::Fcntl {
             fd: sfd,
+            cmd: 1, // F_GETFD
+            arg: 0,
+        });
+        assert_eq!(flags, FD_CLOEXEC as i64);
+    }
+
+    // ── TimerFd tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_timerfd_create() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let fd = lx.dispatch_syscall(LinuxSyscall::TimerfdCreate {
+            clockid: 1, // CLOCK_MONOTONIC
+            flags: 0,
+        });
+        assert!(fd >= 0);
+        assert!(lx.has_fd(fd as i32));
+    }
+
+    #[test]
+    fn test_timerfd_read_disarmed_eagain() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let fd = lx.dispatch_syscall(LinuxSyscall::TimerfdCreate {
+            clockid: 1,
+            flags: 0,
+        }) as i32;
+        let mut buf = [0u8; 8];
+        let r = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd,
+            buf: buf.as_mut_ptr() as u64,
+            count: 8,
+        });
+        assert_eq!(r, EAGAIN);
+    }
+
+    #[test]
+    fn test_timerfd_arm_and_expire() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let fd = lx.dispatch_syscall(LinuxSyscall::TimerfdCreate {
+            clockid: 1, // CLOCK_MONOTONIC
+            flags: 0,
+        }) as i32;
+
+        // Arm: expire after 1 second (relative)
+        let mut its = [0u8; 32];
+        // it_interval = 0 (one-shot)
+        // it_value = { tv_sec=1, tv_nsec=0 }
+        its[16..24].copy_from_slice(&1i64.to_le_bytes());
+        lx.dispatch_syscall(LinuxSyscall::TimerfdSettime {
+            fd,
+            flags: 0,
+            new_value: its.as_ptr() as u64,
+            old_value: 0,
+        });
+
+        // Advance monotonic clock past 1 second via nanosleep
+        let mut sleep_req = [0u8; 16];
+        sleep_req[0..8].copy_from_slice(&2i64.to_le_bytes()); // sleep 2 seconds
+        lx.dispatch_syscall(LinuxSyscall::Nanosleep {
+            req: sleep_req.as_ptr() as u64,
+            rem: 0,
+        });
+
+        // Read — should return count=1
+        let mut buf = [0u8; 8];
+        let r = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd,
+            buf: buf.as_mut_ptr() as u64,
+            count: 8,
+        });
+        assert_eq!(r, 8);
+        let count = u64::from_le_bytes(buf);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_timerfd_not_yet_expired() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let fd = lx.dispatch_syscall(LinuxSyscall::TimerfdCreate {
+            clockid: 1,
+            flags: 0,
+        }) as i32;
+
+        // Arm: expire after 10 seconds
+        let mut its = [0u8; 32];
+        its[16..24].copy_from_slice(&10i64.to_le_bytes());
+        lx.dispatch_syscall(LinuxSyscall::TimerfdSettime {
+            fd,
+            flags: 0,
+            new_value: its.as_ptr() as u64,
+            old_value: 0,
+        });
+
+        // Advance clock only 1 second
+        let mut sleep_req = [0u8; 16];
+        sleep_req[0..8].copy_from_slice(&1i64.to_le_bytes());
+        lx.dispatch_syscall(LinuxSyscall::Nanosleep {
+            req: sleep_req.as_ptr() as u64,
+            rem: 0,
+        });
+
+        // Read — not expired yet
+        let mut buf = [0u8; 8];
+        let r = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd,
+            buf: buf.as_mut_ptr() as u64,
+            count: 8,
+        });
+        assert_eq!(r, EAGAIN);
+    }
+
+    #[test]
+    fn test_timerfd_repeating() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let fd = lx.dispatch_syscall(LinuxSyscall::TimerfdCreate {
+            clockid: 1,
+            flags: 0,
+        }) as i32;
+
+        // Arm: expire after 1s, repeat every 1s
+        let mut its = [0u8; 32];
+        its[0..8].copy_from_slice(&1i64.to_le_bytes()); // it_interval.tv_sec = 1
+        its[16..24].copy_from_slice(&1i64.to_le_bytes()); // it_value.tv_sec = 1
+        lx.dispatch_syscall(LinuxSyscall::TimerfdSettime {
+            fd,
+            flags: 0,
+            new_value: its.as_ptr() as u64,
+            old_value: 0,
+        });
+
+        // Advance clock 3.5 seconds (should fire 3 times)
+        let mut sleep_req = [0u8; 16];
+        sleep_req[0..8].copy_from_slice(&3i64.to_le_bytes());
+        sleep_req[8..16].copy_from_slice(&500_000_000i64.to_le_bytes());
+        lx.dispatch_syscall(LinuxSyscall::Nanosleep {
+            req: sleep_req.as_ptr() as u64,
+            rem: 0,
+        });
+
+        let mut buf = [0u8; 8];
+        let r = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd,
+            buf: buf.as_mut_ptr() as u64,
+            count: 8,
+        });
+        assert_eq!(r, 8);
+        let count = u64::from_le_bytes(buf);
+        assert!(count >= 3, "expected at least 3 expirations, got {count}");
+    }
+
+    #[test]
+    fn test_timerfd_settime_disarm() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let fd = lx.dispatch_syscall(LinuxSyscall::TimerfdCreate {
+            clockid: 1,
+            flags: 0,
+        }) as i32;
+
+        // Arm
+        let mut its = [0u8; 32];
+        its[16..24].copy_from_slice(&1i64.to_le_bytes());
+        lx.dispatch_syscall(LinuxSyscall::TimerfdSettime {
+            fd,
+            flags: 0,
+            new_value: its.as_ptr() as u64,
+            old_value: 0,
+        });
+
+        // Disarm (it_value = 0,0)
+        let disarm = [0u8; 32];
+        lx.dispatch_syscall(LinuxSyscall::TimerfdSettime {
+            fd,
+            flags: 0,
+            new_value: disarm.as_ptr() as u64,
+            old_value: 0,
+        });
+
+        // Advance clock and read — should EAGAIN
+        let mut sleep_req = [0u8; 16];
+        sleep_req[0..8].copy_from_slice(&5i64.to_le_bytes());
+        lx.dispatch_syscall(LinuxSyscall::Nanosleep {
+            req: sleep_req.as_ptr() as u64,
+            rem: 0,
+        });
+
+        let mut buf = [0u8; 8];
+        let r = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd,
+            buf: buf.as_mut_ptr() as u64,
+            count: 8,
+        });
+        assert_eq!(r, EAGAIN);
+    }
+
+    #[test]
+    fn test_timerfd_cloexec() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let fd = lx.dispatch_syscall(LinuxSyscall::TimerfdCreate {
+            clockid: 1,
+            flags: 0x80000, // TFD_CLOEXEC
+        }) as i32;
+
+        let flags = lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd,
             cmd: 1, // F_GETFD
             arg: 0,
         });
