@@ -3889,24 +3889,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
     ///
     /// In the sans-I/O model, sleep advances the monotonic clock by the
     /// requested duration and returns immediately (no real blocking).
-    fn sys_nanosleep(&mut self, req_ptr: u64, _rem_ptr: u64) -> i64 {
-        if req_ptr == 0 {
-            return EFAULT;
-        }
-        // Read struct timespec { tv_sec: i64, tv_nsec: i64 } from user memory.
-        let req_bytes = unsafe { core::slice::from_raw_parts(req_ptr as usize as *const u8, 16) };
-        let tv_sec = i64::from_le_bytes(req_bytes[0..8].try_into().unwrap());
-        let tv_nsec = i64::from_le_bytes(req_bytes[8..16].try_into().unwrap());
-
-        if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
-            return EINVAL;
-        }
-
-        // Advance monotonic clock by the sleep duration.
-        let duration_ns = (tv_sec as u64) * 1_000_000_000 + (tv_nsec as u64);
-        self.monotonic_ns = self.monotonic_ns.wrapping_add(duration_ns);
-
-        0
+    fn sys_nanosleep(&mut self, req_ptr: u64, rem_ptr: u64) -> i64 {
+        // nanosleep always sleeps on CLOCK_MONOTONIC with relative time.
+        self.sys_clock_nanosleep(CLOCK_MONOTONIC, 0, req_ptr, rem_ptr)
     }
 
     /// Linux clock_nanosleep(2): sleep on a specific clock.
