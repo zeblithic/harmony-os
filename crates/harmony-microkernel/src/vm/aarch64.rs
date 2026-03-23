@@ -210,6 +210,11 @@ impl Aarch64PageTable {
     fn is_valid(desc: u64) -> bool {
         desc & 0b11 != DESC_INVALID
     }
+
+    /// Returns `true` if all 512 entries in the table are invalid.
+    fn is_table_empty(table: &[u64; 512]) -> bool {
+        table.iter().all(|&e| !Self::is_valid(e))
+    }
 }
 
 impl PageTable for Aarch64PageTable {
@@ -271,17 +276,17 @@ impl PageTable for Aarch64PageTable {
     fn unmap(
         &mut self,
         vaddr: VirtAddr,
-        _frame_dealloc: &mut dyn FnMut(PhysAddr),
+        frame_dealloc: &mut dyn FnMut(PhysAddr),
     ) -> Result<PhysAddr, VmError> {
         if !vaddr.is_page_aligned() {
             return Err(VmError::Unaligned(vaddr.as_u64()));
         }
 
-        // Walk levels 3 → 1; if any intermediate descriptor is invalid, the
-        // page is not mapped.
+        // Walk levels 3 → 1, recording (parent_paddr, parent_idx) for pruning.
         let mut table_paddr = self.root;
+        let mut walk: [(PhysAddr, usize); 3] = [(PhysAddr(0), 0); 3];
 
-        for level in (1..=3).rev() {
+        for (i, level) in (1..=3).rev().enumerate() {
             let table = self.table_mut(table_paddr);
             let idx = Self::index(vaddr, level);
             let entry = table[idx];
@@ -289,11 +294,13 @@ impl PageTable for Aarch64PageTable {
             if !Self::is_valid(entry) {
                 return Err(VmError::NotMapped(vaddr));
             }
+            walk[i] = (table_paddr, idx);
             table_paddr = PhysAddr(entry & ADDR_MASK);
         }
 
         // Level 0: clear the leaf descriptor.
-        let pt = self.table_mut(table_paddr);
+        let leaf_table_paddr = table_paddr;
+        let pt = self.table_mut(leaf_table_paddr);
         let idx = Self::index(vaddr, 0);
         let entry = pt[idx];
 
@@ -303,6 +310,25 @@ impl PageTable for Aarch64PageTable {
 
         let old_paddr = PhysAddr(entry & ADDR_MASK);
         pt[idx] = 0;
+
+        // Bottom-up prune: walk was filled top-down as walk[0]=(root, idx→L1),
+        // walk[1]=(L1, idx→L2), walk[2]=(L2, idx→leaf). Reverse so we process
+        // leaf→L2→L1 direction. Root is never freed.
+        let mut child_paddr = leaf_table_paddr;
+        for &(parent_paddr, parent_idx) in walk.iter().rev() {
+            if parent_paddr.as_u64() == 0 {
+                break;
+            }
+            let child_table = self.table_mut(child_paddr);
+            if Self::is_table_empty(child_table) {
+                frame_dealloc(child_paddr);
+                let parent_table = self.table_mut(parent_paddr);
+                parent_table[parent_idx] = 0;
+            } else {
+                break; // non-empty table; ancestors are also non-empty
+            }
+            child_paddr = parent_paddr;
+        }
 
         Ok(old_paddr)
     }
@@ -766,5 +792,81 @@ mod tests {
         let root = PhysAddr(aligned);
         let pt = unsafe { Aarch64PageTable::new(root, identity_phys_to_virt) };
         assert_eq!(pt.root_paddr(), root);
+    }
+
+    /// Allocator that tracks allocations and accepts frees.
+    struct TrackingAllocator {
+        next: u64,
+        limit: u64,
+        alloc_count: usize,
+        freed: Vec<PhysAddr>,
+    }
+
+    impl TrackingAllocator {
+        fn new(base: u64, count: usize) -> Self {
+            Self {
+                next: base,
+                limit: base + (count as u64) * 4096,
+                alloc_count: 0,
+                freed: Vec::new(),
+            }
+        }
+
+        fn alloc(&mut self) -> Option<PhysAddr> {
+            if self.next >= self.limit {
+                return None;
+            }
+            let addr = PhysAddr(self.next);
+            self.next += 4096;
+            unsafe { core::ptr::write_bytes(addr.as_u64() as *mut u8, 0, 4096) };
+            self.alloc_count += 1;
+            Some(addr)
+        }
+
+        fn dealloc(&mut self, frame: PhysAddr) {
+            self.freed.push(frame);
+        }
+    }
+
+    #[test]
+    fn unmap_prunes_empty_intermediate() {
+        let (_arena, arena_base) = test_arena();
+        let aligned = (arena_base.as_u64() + 4095) & !4095;
+        let root = PhysAddr(aligned);
+        unsafe { core::ptr::write_bytes(root.as_u64() as *mut u8, 0, 4096) };
+        let mut alloc = TrackingAllocator::new(aligned + 4096, ARENA_TABLES - 1);
+        let mut pt = unsafe { Aarch64PageTable::new(root, identity_phys_to_virt) };
+
+        let vaddr = VirtAddr(0x1000);
+        let paddr = PhysAddr(0xBEEF_0000);
+        pt.map(vaddr, paddr, PageFlags::READABLE, &mut || alloc.alloc()).unwrap();
+
+        let intermediates_allocated = alloc.alloc_count;
+        assert_eq!(intermediates_allocated, 3, "mapping one page needs 3 intermediate tables");
+
+        let result = pt.unmap(vaddr, &mut |frame| alloc.dealloc(frame)).unwrap();
+        assert_eq!(result, paddr);
+        assert_eq!(alloc.freed.len(), 3, "all 3 intermediate tables should be freed");
+    }
+
+    #[test]
+    fn unmap_preserves_sibling_intermediates() {
+        let (_arena, arena_base) = test_arena();
+        let aligned = (arena_base.as_u64() + 4095) & !4095;
+        let root = PhysAddr(aligned);
+        unsafe { core::ptr::write_bytes(root.as_u64() as *mut u8, 0, 4096) };
+        let mut alloc = TrackingAllocator::new(aligned + 4096, ARENA_TABLES - 1);
+        let mut pt = unsafe { Aarch64PageTable::new(root, identity_phys_to_virt) };
+
+        let vaddr1 = VirtAddr(0x1000);
+        let vaddr2 = VirtAddr(0x2000);
+        pt.map(vaddr1, PhysAddr(0xA000_0000), PageFlags::READABLE, &mut || alloc.alloc()).unwrap();
+        pt.map(vaddr2, PhysAddr(0xB000_0000), PageFlags::READABLE, &mut || alloc.alloc()).unwrap();
+
+        pt.unmap(vaddr1, &mut |frame| alloc.dealloc(frame)).unwrap();
+        assert_eq!(alloc.freed.len(), 0, "sibling keeps intermediate alive");
+
+        pt.unmap(vaddr2, &mut |frame| alloc.dealloc(frame)).unwrap();
+        assert_eq!(alloc.freed.len(), 3, "all intermediates freed after last sibling removed");
     }
 }
