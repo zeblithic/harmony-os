@@ -59,7 +59,7 @@ pub struct MmioRegisterBank {
 }
 
 impl MmioRegisterBank {
-    pub const fn new(base: usize) -> Self { Self { base } }
+    pub const unsafe fn new(base: usize) -> Self { Self { base } }
     pub fn base(&self) -> usize { self.base }
 }
 
