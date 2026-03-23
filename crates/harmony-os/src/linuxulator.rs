@@ -11488,4 +11488,254 @@ mod integration_tests {
             "signal mask must be preserved across execve"
         );
     }
+
+    // ── Signal delivery tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_kill_self_terminate() {
+        // kill(1, 10) — SIGUSR1 with default action Terminate → process exits.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+        assert_eq!(r, 0);
+        assert!(
+            lx.exited(),
+            "SIGUSR1 with SIG_DFL should terminate the process"
+        );
+    }
+
+    #[test]
+    fn test_kill_sigchld_default_ignored() {
+        // kill(1, 17) — SIGCHLD with default action Ignore → process NOT exited.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 17 });
+        assert_eq!(r, 0);
+        assert!(
+            !lx.exited(),
+            "SIGCHLD with SIG_DFL should be ignored, not terminate"
+        );
+    }
+
+    #[test]
+    fn test_kill_sig_ign() {
+        // Install SIG_IGN for sig 10, then kill(1, 10) → NOT exited.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let act = make_sigaction(SIG_IGN, 0, 0);
+        lx.dispatch_syscall(LinuxSyscall::RtSigaction {
+            signum: 10,
+            act: act.as_ptr() as u64,
+            oldact: 0,
+            sigsetsize: 8,
+        });
+        let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+        assert_eq!(r, 0);
+        assert!(!lx.exited(), "SIG_IGN should prevent termination");
+    }
+
+    #[test]
+    fn test_kill_blocked_stays_pending() {
+        // Block sig 10, send it → not exited; unblock → exited.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Block SIGUSR1 (signal 10 → bit 9 in the 64-bit mask).
+        let mask: u64 = 1u64 << 9;
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_SETMASK,
+            set: &mask as *const u64 as u64,
+            oldset: 0,
+            sigsetsize: 8,
+        });
+
+        // Send signal while blocked.
+        let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+        assert_eq!(r, 0);
+        assert!(!lx.exited(), "blocked signal should not terminate yet");
+
+        // Unblock — pending signal should fire immediately (deliver_pending_signals
+        // runs at the end of dispatch_syscall).
+        let empty: u64 = 0;
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_SETMASK,
+            set: &empty as *const u64 as u64,
+            oldset: 0,
+            sigsetsize: 8,
+        });
+        assert!(
+            lx.exited(),
+            "unblocking should deliver pending SIGUSR1 and terminate"
+        );
+    }
+
+    #[test]
+    fn test_kill_invalid_sig() {
+        // kill(1, 65) — signal number out of range → EINVAL.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 65 });
+        assert_eq!(r, EINVAL);
+        assert!(!lx.exited());
+    }
+
+    #[test]
+    fn test_kill_null_signal() {
+        // kill(1, 0) — null signal, existence check only → 0, NOT exited.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 0 });
+        assert_eq!(r, 0);
+        assert!(!lx.exited(), "null signal must not terminate the process");
+    }
+
+    #[test]
+    fn test_kill_no_such_process() {
+        // kill(999, 10) — PID does not exist → ESRCH.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 999, sig: 10 });
+        assert_eq!(r, ESRCH);
+        assert!(!lx.exited());
+    }
+
+    #[test]
+    fn test_tgkill_self() {
+        // tgkill(1, 1, 10) — send SIGUSR1 to self → exited.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let r = lx.dispatch_syscall(LinuxSyscall::Tgkill {
+            tgid: 1,
+            tid: 1,
+            sig: 10,
+        });
+        assert_eq!(r, 0);
+        assert!(lx.exited(), "tgkill to self with SIGUSR1 should terminate");
+    }
+
+    #[test]
+    fn test_sigchld_on_child_exit() {
+        // Fork a child, child exits → parent receives SIGCHLD (default=Ignore)
+        // → parent NOT exited.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.dispatch_syscall(LinuxSyscall::Fork);
+        {
+            let child = lx.active_process();
+            child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 0 });
+        }
+        // active_process() triggers recover_child_state which delivers SIGCHLD.
+        let _ = lx.active_process();
+        assert!(
+            !lx.exited(),
+            "SIGCHLD default=Ignore must not terminate parent"
+        );
+    }
+
+    #[test]
+    fn test_kill_custom_handler_reported() {
+        // Install custom handler 0x400000 for sig 10, kill → pending_handler_signal == Some(10).
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let act = make_sigaction(0x400000, 0, 0);
+        lx.dispatch_syscall(LinuxSyscall::RtSigaction {
+            signum: 10,
+            act: act.as_ptr() as u64,
+            oldact: 0,
+            sigsetsize: 8,
+        });
+        let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+        assert_eq!(r, 0);
+        assert!(
+            !lx.exited(),
+            "custom handler should not terminate the process"
+        );
+        assert_eq!(
+            lx.pending_handler_signal(),
+            Some(10),
+            "custom handler signal must be reported via pending_handler_signal"
+        );
+    }
+
+    #[test]
+    fn test_sigkill_bypasses_mask() {
+        // Block all signals, then kill(1, 9) — SIGKILL always terminates.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Set mask to all-ones (block everything, though SIGKILL cannot be masked).
+        let mask: u64 = u64::MAX;
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_SETMASK,
+            set: &mask as *const u64 as u64,
+            oldset: 0,
+            sigsetsize: 8,
+        });
+
+        let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 9 });
+        assert_eq!(r, 0);
+        assert!(
+            lx.exited(),
+            "SIGKILL must terminate even when all signals are blocked"
+        );
+    }
+
+    #[test]
+    fn test_kill_process_group_enosys() {
+        // kill(-1, 10) and kill(-2, 10) — negative PID (process group) → ENOSYS.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let r1 = lx.dispatch_syscall(LinuxSyscall::Kill { pid: -1, sig: 10 });
+        assert_eq!(r1, ENOSYS, "kill(-1, sig) should return ENOSYS");
+        let r2 = lx.dispatch_syscall(LinuxSyscall::Kill { pid: -2, sig: 10 });
+        assert_eq!(r2, ENOSYS, "kill(-2, sig) should return ENOSYS");
+        assert!(!lx.exited());
+    }
+
+    #[test]
+    fn test_fork_clears_pending_signals() {
+        // Block sig 10, send kill to queue it pending, fork → child inherits
+        // mask (signal still blocked in child). Unblock in child → child exits.
+        // Parent remains not exited because signal was only queued to parent.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Block SIGUSR1 in parent so the kill queues rather than terminates.
+        let mask: u64 = 1u64 << 9;
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_SETMASK,
+            set: &mask as *const u64 as u64,
+            oldset: 0,
+            sigsetsize: 8,
+        });
+
+        // Queue SIGUSR1 to parent.
+        let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+        assert_eq!(r, 0);
+        assert!(
+            !lx.exited(),
+            "signal blocked in parent, should not exit yet"
+        );
+
+        // Fork — child inherits mask (SIGUSR1 still blocked). Child should NOT
+        // have inherited the pending signal (pending signals are not inherited
+        // across fork per POSIX).
+        lx.dispatch_syscall(LinuxSyscall::Fork);
+        {
+            let child = lx.active_process();
+            // Unblock SIGUSR1 in child. Because pending signals are cleared on
+            // fork, unblocking should not deliver anything.
+            let empty: u64 = 0;
+            child.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+                how: SIG_SETMASK,
+                set: &empty as *const u64 as u64,
+                oldset: 0,
+                sigsetsize: 8,
+            });
+            assert!(
+                !child.exited(),
+                "child must not exit — pending signals cleared on fork"
+            );
+        }
+    }
 }
