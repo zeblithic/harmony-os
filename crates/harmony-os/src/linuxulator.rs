@@ -5584,13 +5584,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
     ///
     /// Returns `RLIM_INFINITY` (u64::MAX) for both `rlim_cur` and `rlim_max`
     /// for all resources. Writes 16 bytes (`struct rlimit`) to `rlim_ptr`.
-    fn sys_getrlimit(&self, _resource: i32, rlim_ptr: usize) -> i64 {
+    fn sys_getrlimit(&mut self, _resource: i32, rlim_ptr: usize) -> i64 {
         if rlim_ptr != 0 {
-            unsafe {
-                core::ptr::write_unaligned(rlim_ptr as *mut u64, u64::MAX); // rlim_cur
-                core::ptr::write_unaligned((rlim_ptr + 8) as *mut u64, u64::MAX);
-                // rlim_max
-            }
+            let mut buf = [0u8; 16];
+            buf[0..8].copy_from_slice(&u64::MAX.to_le_bytes()); // rlim_cur
+            buf[8..16].copy_from_slice(&u64::MAX.to_le_bytes()); // rlim_max
+            self.backend.vm_write_bytes(rlim_ptr as u64, &buf);
         }
         0
     }
@@ -13562,9 +13561,8 @@ mod integration_tests {
 
         // Open a regular file to get a File fd.
         let path = b"/data/file.txt\0";
-        let at_fdcwd = (-100i32) as u64;
         let fd = lx.dispatch_syscall(LinuxSyscall::Openat {
-            dirfd: -100,
+            dirfd: -100, // AT_FDCWD
             pathname: path.as_ptr() as u64,
             flags: 0,
         });
@@ -13575,7 +13573,6 @@ mod integration_tests {
             length: 42,
         });
         assert_eq!(r, 0); // stub success
-        let _ = at_fdcwd; // suppress unused warning
     }
 
     #[test]
