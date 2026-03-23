@@ -59,7 +59,11 @@ impl PageTable for MockPageTable {
         Ok(())
     }
 
-    fn unmap(&mut self, vaddr: VirtAddr) -> Result<PhysAddr, VmError> {
+    fn unmap(
+        &mut self,
+        vaddr: VirtAddr,
+        _frame_dealloc: &mut dyn FnMut(PhysAddr),
+    ) -> Result<PhysAddr, VmError> {
         if !vaddr.is_page_aligned() {
             return Err(VmError::Unaligned(vaddr.as_u64()));
         }
@@ -136,7 +140,7 @@ mod tests {
 
         pt.map(vaddr, paddr, rw_flags(), &mut noop_alloc()).unwrap();
 
-        let returned = pt.unmap(vaddr).unwrap();
+        let returned = pt.unmap(vaddr, &mut |_| {}).unwrap();
         assert_eq!(returned, paddr);
         assert!(pt.translate(vaddr).is_none());
     }
@@ -144,7 +148,7 @@ mod tests {
     #[test]
     fn unmap_unmapped_returns_error() {
         let mut pt = MockPageTable::new(PhysAddr(0x10_0000));
-        let result = pt.unmap(VirtAddr(PAGE));
+        let result = pt.unmap(VirtAddr(PAGE), &mut |_| {});
         assert_eq!(result, Err(VmError::NotMapped(VirtAddr(PAGE))));
     }
 

@@ -206,7 +206,7 @@ impl<P: PageTable> AddressSpaceManager<P> {
                     // Roll back page table mappings already done.
                     for j in 0..i {
                         let rollback_vaddr = VirtAddr(vaddr.as_u64() + (j as u64) * PAGE_SIZE);
-                        let _ = space.page_table.unmap(rollback_vaddr);
+                        let _ = space.page_table.unmap(rollback_vaddr, &mut |_| {});
                     }
                     // Free intermediate page table frames.
                     for frame in &intermediate_frames {
@@ -311,7 +311,7 @@ impl<P: PageTable> AddressSpaceManager<P> {
         // Unmap target pages from page table.
         for i in 0..page_count {
             let page_vaddr = VirtAddr(vaddr.as_u64() + (i as u64) * PAGE_SIZE);
-            let _ = space.page_table.unmap(page_vaddr);
+            let _ = space.page_table.unmap(page_vaddr, &mut |_| {});
         }
 
         // Partition frames: before | target | after
@@ -459,7 +459,7 @@ impl<P: PageTable> AddressSpaceManager<P> {
             let page_count = region.len / PAGE_SIZE as usize;
             for i in 0..page_count {
                 let page_vaddr = VirtAddr(vaddr.as_u64() + (i as u64) * PAGE_SIZE);
-                let _ = space.page_table.unmap(page_vaddr);
+                let _ = space.page_table.unmap(page_vaddr, &mut |_| {});
             }
 
             let use_kernel = region

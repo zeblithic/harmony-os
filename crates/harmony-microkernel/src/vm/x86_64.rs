@@ -218,7 +218,11 @@ impl PageTable for X86_64PageTable {
         Ok(())
     }
 
-    fn unmap(&mut self, vaddr: VirtAddr) -> Result<PhysAddr, VmError> {
+    fn unmap(
+        &mut self,
+        vaddr: VirtAddr,
+        _frame_dealloc: &mut dyn FnMut(PhysAddr),
+    ) -> Result<PhysAddr, VmError> {
         if !vaddr.is_page_aligned() {
             return Err(VmError::Unaligned(vaddr.as_u64()));
         }

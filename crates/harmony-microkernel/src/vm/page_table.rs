@@ -24,7 +24,14 @@ pub trait PageTable {
     ) -> Result<(), VmError>;
 
     /// Remove the mapping at `vaddr`, returning the physical address that was mapped.
-    fn unmap(&mut self, vaddr: VirtAddr) -> Result<PhysAddr, VmError>;
+    ///
+    /// `frame_dealloc` is called for each intermediate page table frame that
+    /// becomes empty after the leaf is removed. Mock implementations may ignore it.
+    fn unmap(
+        &mut self,
+        vaddr: VirtAddr,
+        frame_dealloc: &mut dyn FnMut(PhysAddr),
+    ) -> Result<PhysAddr, VmError>;
 
     /// Update the permission flags on an existing mapping at `vaddr`.
     fn set_flags(&mut self, vaddr: VirtAddr, flags: PageFlags) -> Result<(), VmError>;

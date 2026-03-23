@@ -268,7 +268,11 @@ impl PageTable for Aarch64PageTable {
         Ok(())
     }
 
-    fn unmap(&mut self, vaddr: VirtAddr) -> Result<PhysAddr, VmError> {
+    fn unmap(
+        &mut self,
+        vaddr: VirtAddr,
+        _frame_dealloc: &mut dyn FnMut(PhysAddr),
+    ) -> Result<PhysAddr, VmError> {
         if !vaddr.is_page_aligned() {
             return Err(VmError::Unaligned(vaddr.as_u64()));
         }
@@ -652,7 +656,7 @@ mod tests {
             .unwrap();
         assert!(pt.translate(vaddr).is_some());
 
-        let unmapped = pt.unmap(vaddr).unwrap();
+        let unmapped = pt.unmap(vaddr, &mut |_| {}).unwrap();
         assert_eq!(unmapped, paddr, "unmap should return the original paddr");
         assert!(pt.translate(vaddr).is_none(), "should be unmapped now");
     }
@@ -725,7 +729,7 @@ mod tests {
 
         let vaddr = VirtAddr(0x5000);
         assert_eq!(
-            pt.unmap(vaddr),
+            pt.unmap(vaddr, &mut |_| {}),
             Err(VmError::NotMapped(vaddr)),
             "unmap of unmapped address must fail"
         );
@@ -748,7 +752,7 @@ mod tests {
             pt.map(unaligned, PhysAddr(0x2000), flags, &mut || None),
             Err(VmError::Unaligned(0x1001))
         );
-        assert_eq!(pt.unmap(unaligned), Err(VmError::Unaligned(0x1001)));
+        assert_eq!(pt.unmap(unaligned, &mut |_| {}), Err(VmError::Unaligned(0x1001)));
         assert_eq!(
             pt.set_flags(unaligned, flags),
             Err(VmError::Unaligned(0x1001))
