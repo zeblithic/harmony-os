@@ -479,6 +479,38 @@ pub enum LinuxSyscall {
         sigmask: u64,
         sigsetsize: u64,
     },
+    Readv {
+        fd: i32,
+        iov: u64,
+        iovcnt: i32,
+    },
+    Socketpair {
+        domain: i32,
+        sock_type: i32,
+        protocol: i32,
+        sv: u64,
+    },
+    Getrlimit {
+        resource: i32,
+        rlim: u64,
+    },
+    Setrlimit {
+        resource: i32,
+        rlim: u64,
+    },
+    Umask {
+        mask: u32,
+    },
+    Ftruncate {
+        fd: i32,
+        length: u64,
+    },
+    Renameat {
+        olddirfd: i32,
+        oldpath: u64,
+        newdirfd: i32,
+        newpath: u64,
+    },
     Unknown {
         nr: u64,
     },
@@ -546,6 +578,11 @@ impl LinuxSyscall {
             16 => LinuxSyscall::Ioctl {
                 fd: args[0] as i32,
                 request: args[1],
+            },
+            19 => LinuxSyscall::Readv {
+                fd: args[0] as i32,
+                iov: args[1],
+                iovcnt: args[2] as i32,
             },
             20 => LinuxSyscall::Writev {
                 fd: args[0] as i32,
@@ -624,6 +661,12 @@ impl LinuxSyscall {
                 addr: args[1],
                 addrlen: args[2],
             },
+            53 => LinuxSyscall::Socketpair {
+                domain: args[0] as i32,
+                sock_type: args[1] as i32,
+                protocol: args[2] as i32,
+                sv: args[3],
+            },
             54 => LinuxSyscall::Setsockopt {
                 fd: args[0] as i32,
                 level: args[1] as i32,
@@ -657,6 +700,10 @@ impl LinuxSyscall {
                 cmd: args[1] as i32,
                 arg: args[2],
             },
+            77 => LinuxSyscall::Ftruncate {
+                fd: args[0] as i32,
+                length: args[1],
+            },
             79 => LinuxSyscall::Getcwd {
                 buf: args[0],
                 size: args[1],
@@ -667,6 +714,13 @@ impl LinuxSyscall {
                 pathname: args[0],
                 buf: args[1],
                 bufsiz: args[2],
+            },
+            95 => LinuxSyscall::Umask {
+                mask: args[0] as u32,
+            },
+            97 => LinuxSyscall::Getrlimit {
+                resource: args[0] as i32,
+                rlim: args[1],
             },
             102 => LinuxSyscall::Getuid,
             104 => LinuxSyscall::Getgid,
@@ -683,6 +737,10 @@ impl LinuxSyscall {
             158 => LinuxSyscall::ArchPrctl {
                 code: args[0] as i32,
                 addr: args[1],
+            },
+            160 => LinuxSyscall::Setrlimit {
+                resource: args[0] as i32,
+                rlim: args[1],
             },
             186 => LinuxSyscall::Gettid,
             202 => LinuxSyscall::Futex {
@@ -738,6 +796,12 @@ impl LinuxSyscall {
                 dirfd: args[0] as i32,
                 pathname: args[1],
                 flags: args[2] as i32,
+            },
+            264 => LinuxSyscall::Renameat {
+                olddirfd: args[0] as i32,
+                oldpath: args[1],
+                newdirfd: args[2] as i32,
+                newpath: args[3],
             },
             // x86_64 nr 267 is readlinkat(dirfd, pathname, buf, bufsiz).
             // Only AT_FDCWD is supported; explicit dirfds return ENOSYS
@@ -931,6 +995,16 @@ impl LinuxSyscall {
                 pathname: args[1],
                 flags: args[2] as i32,
             },
+            38 => LinuxSyscall::Renameat {
+                olddirfd: args[0] as i32,
+                oldpath: args[1],
+                newdirfd: args[2] as i32,
+                newpath: args[3],
+            },
+            46 => LinuxSyscall::Ftruncate {
+                fd: args[0] as i32,
+                length: args[1],
+            },
             48 => LinuxSyscall::Faccessat {
                 dirfd: args[0] as i32,
                 pathname: args[1],
@@ -967,6 +1041,11 @@ impl LinuxSyscall {
                 fd: args[0] as i32,
                 buf: args[1],
                 count: args[2],
+            },
+            65 => LinuxSyscall::Readv {
+                fd: args[0] as i32,
+                iov: args[1],
+                iovcnt: args[2] as i32,
             },
             66 => LinuxSyscall::Writev {
                 fd: args[0] as i32,
@@ -1057,6 +1136,9 @@ impl LinuxSyscall {
                 sigsetsize: args[3],
             },
             160 => LinuxSyscall::Uname { buf: args[0] },
+            166 => LinuxSyscall::Umask {
+                mask: args[0] as u32,
+            },
             167 => LinuxSyscall::Prctl {
                 option: args[0] as i32,
                 arg2: args[1],
@@ -1075,6 +1157,12 @@ impl LinuxSyscall {
                 domain: args[0] as i32,
                 sock_type: args[1] as i32,
                 protocol: args[2] as i32,
+            },
+            199 => LinuxSyscall::Socketpair {
+                domain: args[0] as i32,
+                sock_type: args[1] as i32,
+                protocol: args[2] as i32,
+                sv: args[3],
             },
             200 => LinuxSyscall::Bind {
                 fd: args[0] as i32,
@@ -2035,6 +2123,8 @@ pub struct Linuxulator<B: SyscallBackend> {
     timerfds: BTreeMap<usize, TimerFdState>,
     /// Next timerfd_id to allocate.
     next_timerfd_id: usize,
+    /// File creation mask (umask). Default 0o022.
+    umask_val: u32,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -2084,6 +2174,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             next_signalfd_id: 0,
             timerfds: BTreeMap::new(),
             next_timerfd_id: 0,
+            umask_val: 0o022,
         }
     }
 
@@ -2587,6 +2678,20 @@ impl<B: SyscallBackend> Linuxulator<B> {
             }
             LinuxSyscall::Poll { fds, nfds, .. } => self.sys_poll(fds, nfds),
             LinuxSyscall::Ppoll { fds, nfds, .. } => self.sys_poll(fds, nfds),
+            LinuxSyscall::Readv { fd, iov, iovcnt } => self.sys_readv(fd, iov as usize, iovcnt),
+            LinuxSyscall::Socketpair {
+                domain,
+                sock_type,
+                protocol,
+                sv,
+            } => self.sys_socketpair(domain, sock_type, protocol, sv),
+            LinuxSyscall::Getrlimit { resource, rlim } => {
+                self.sys_getrlimit(resource, rlim as usize)
+            }
+            LinuxSyscall::Setrlimit { .. } => self.sys_setrlimit(),
+            LinuxSyscall::Umask { mask } => self.sys_umask(mask),
+            LinuxSyscall::Ftruncate { fd, .. } => self.sys_ftruncate(fd),
+            LinuxSyscall::Renameat { .. } => self.sys_renameat(),
             LinuxSyscall::Unknown { .. } => ENOSYS,
         };
         self.deliver_pending_signals();
@@ -4202,6 +4307,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             next_signalfd_id: self.next_signalfd_id,
             timerfds: self.timerfds.clone(),
             next_timerfd_id: self.next_timerfd_id,
+            umask_val: self.umask_val,
         };
         // Move shared pipe/eventfd state to child
         core::mem::swap(&mut self.pipes, &mut child.pipes);
@@ -5372,6 +5478,160 @@ impl<B: SyscallBackend> Linuxulator<B> {
             total = total.saturating_add(result);
         }
         total
+    }
+
+    /// Linux readv(2): scatter read — read into multiple buffers.
+    ///
+    /// Mirrors `sys_writev`: iterates `iovcnt` iovec structs at `iov_ptr`,
+    /// calling `sys_read` for each non-zero buffer and accumulating the total
+    /// bytes read. On the first error, returns that error if nothing has been
+    /// read yet, otherwise returns the partial total (POSIX partial read).
+    fn sys_readv(&mut self, fd: i32, iov_ptr: usize, iovcnt: i32) -> i64 {
+        const IOV_MAX: i32 = 1024;
+        if iovcnt == 0 {
+            return 0;
+        }
+        if !(1..=IOV_MAX).contains(&iovcnt) {
+            return EINVAL;
+        }
+        if !self.fd_table.contains_key(&fd) {
+            return EBADF;
+        }
+
+        let mut total: i64 = 0;
+        for i in 0..iovcnt as usize {
+            let iov_addr = iov_ptr + i * 16;
+            let base = unsafe { core::ptr::read_unaligned(iov_addr as *const u64) } as usize;
+            let len = unsafe { core::ptr::read_unaligned((iov_addr + 8) as *const u64) } as usize;
+
+            if len == 0 {
+                continue;
+            }
+            let result = self.sys_read(fd, base, len);
+            if result < 0 {
+                return if total == 0 { result } else { total };
+            }
+            total = total.saturating_add(result);
+        }
+        total
+    }
+
+    /// Linux socketpair(2): create a pair of connected socket stubs.
+    ///
+    /// Creates two socket fds backed by the same `SocketState`. Only
+    /// `AF_UNIX` (domain 1) is accepted. `SOCK_CLOEXEC` / `SOCK_NONBLOCK`
+    /// flags are honoured. Writes the two fds as `[i32; 2]` to `sv`.
+    fn sys_socketpair(&mut self, domain: i32, sock_type: i32, _protocol: i32, sv: u64) -> i64 {
+        const AF_UNIX: i32 = 1;
+        const SOCK_CLOEXEC: i32 = 0o2000000;
+        const SOCK_NONBLOCK: i32 = 0o4000;
+
+        if domain != AF_UNIX {
+            return EAFNOSUPPORT;
+        }
+        if sv == 0 {
+            return EFAULT;
+        }
+
+        let flags = sock_type & (SOCK_CLOEXEC | SOCK_NONBLOCK);
+        let base_type = sock_type & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
+        let fd_flags = if flags & SOCK_CLOEXEC != 0 {
+            FD_CLOEXEC
+        } else {
+            0
+        };
+
+        // Both ends share a single SocketState (same socket_id).
+        let socket_id = self.next_socket_id;
+        self.next_socket_id += 1;
+        self.sockets.insert(
+            socket_id,
+            SocketState {
+                domain,
+                sock_type: base_type,
+                listening: false,
+                nonblock: flags & SOCK_NONBLOCK != 0,
+                accepted_once: false,
+            },
+        );
+
+        let fd0 = self.alloc_fd();
+        self.fd_table.insert(
+            fd0,
+            FdEntry {
+                kind: FdKind::Socket { socket_id },
+                flags: fd_flags,
+            },
+        );
+        let fd1 = self.alloc_fd();
+        self.fd_table.insert(
+            fd1,
+            FdEntry {
+                kind: FdKind::Socket { socket_id },
+                flags: fd_flags,
+            },
+        );
+
+        let mut buf = [0u8; 8];
+        buf[0..4].copy_from_slice(&fd0.to_le_bytes());
+        buf[4..8].copy_from_slice(&fd1.to_le_bytes());
+        self.backend.vm_write_bytes(sv, &buf);
+
+        0
+    }
+
+    /// Linux getrlimit(2): query resource limit.
+    ///
+    /// Returns `RLIM_INFINITY` (u64::MAX) for both `rlim_cur` and `rlim_max`
+    /// for all resources. Writes 16 bytes (`struct rlimit`) to `rlim_ptr`.
+    fn sys_getrlimit(&self, _resource: i32, rlim_ptr: usize) -> i64 {
+        if rlim_ptr != 0 {
+            unsafe {
+                core::ptr::write_unaligned(rlim_ptr as *mut u64, u64::MAX); // rlim_cur
+                core::ptr::write_unaligned((rlim_ptr + 8) as *mut u64, u64::MAX);
+                // rlim_max
+            }
+        }
+        0
+    }
+
+    /// Linux setrlimit(2): set resource limit — stub, always succeeds.
+    ///
+    /// We do not enforce resource limits; accept and ignore the request.
+    fn sys_setrlimit(&self) -> i64 {
+        0
+    }
+
+    /// Linux umask(2): set file creation mask.
+    ///
+    /// Stores the new mask and returns the old mask.
+    fn sys_umask(&mut self, mask: u32) -> i64 {
+        let old = self.umask_val;
+        self.umask_val = mask & 0o777;
+        old as i64
+    }
+
+    /// Linux ftruncate(2): truncate a file to a specified length — stub.
+    ///
+    /// Validates that `fd` is an open regular file fd. Returns 0 (stub
+    /// success) — our files are read-only or 9P-backed; truncation is not
+    /// implemented, but returning 0 avoids breaking programs that probe.
+    fn sys_ftruncate(&self, fd: i32) -> i64 {
+        match self.fd_table.get(&fd) {
+            Some(FdEntry {
+                kind: FdKind::File { .. },
+                ..
+            }) => 0,
+            Some(_) => EINVAL,
+            None => EBADF,
+        }
+    }
+
+    /// Linux renameat(2): rename a file relative to directory fds.
+    ///
+    /// Returns EROFS — the Linuxulator filesystem is read-only.
+    fn sys_renameat(&self) -> i64 {
+        EROFS
     }
 
     /// Linux lseek(2): reposition file offset.
@@ -13200,5 +13460,137 @@ mod integration_tests {
         });
         assert_eq!(r, 0); // negative fd ignored, revents=0
         assert_eq!(fds[0].revents, 0);
+    }
+
+    // ── readv / socketpair / getrlimit / umask / ftruncate / renameat ──
+
+    #[test]
+    fn test_readv_basic() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // Create a pipe and write 10 bytes to it.
+        let mut pipe_fds = [0i32; 2];
+        let r = lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: pipe_fds.as_mut_ptr() as u64,
+            flags: 0,
+        });
+        assert_eq!(r, 0);
+        let (rfd, wfd) = (pipe_fds[0], pipe_fds[1]);
+
+        let data = b"helloworld";
+        lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: wfd,
+            buf: data.as_ptr() as u64,
+            count: data.len() as u64,
+        });
+
+        // readv into two 5-byte buffers.
+        let mut buf0 = [0u8; 5];
+        let mut buf1 = [0u8; 5];
+        let mut iov = [0u8; 32]; // 2 × 16-byte iovec
+        iov[0..8].copy_from_slice(&(buf0.as_mut_ptr() as u64).to_le_bytes());
+        iov[8..16].copy_from_slice(&5u64.to_le_bytes());
+        iov[16..24].copy_from_slice(&(buf1.as_mut_ptr() as u64).to_le_bytes());
+        iov[24..32].copy_from_slice(&5u64.to_le_bytes());
+
+        let total = lx.dispatch_syscall(LinuxSyscall::Readv {
+            fd: rfd,
+            iov: iov.as_ptr() as u64,
+            iovcnt: 2,
+        });
+        assert_eq!(total, 10);
+        assert_eq!(&buf0, b"hello");
+        assert_eq!(&buf1, b"world");
+    }
+
+    #[test]
+    fn test_socketpair_creates_two_fds() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let mut sv = [0i32; 2];
+        let r = lx.dispatch_syscall(LinuxSyscall::Socketpair {
+            domain: 1,    // AF_UNIX
+            sock_type: 1, // SOCK_STREAM
+            protocol: 0,
+            sv: sv.as_mut_ptr() as u64,
+        });
+        assert_eq!(r, 0);
+        let fd0 = sv[0];
+        let fd1 = sv[1];
+        assert!(fd0 >= 0);
+        assert!(fd1 >= 0);
+        assert_ne!(fd0, fd1);
+        assert!(lx.has_fd(fd0));
+        assert!(lx.has_fd(fd1));
+    }
+
+    #[test]
+    fn test_getrlimit_returns_infinity() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let mut rlim = [0u64; 2]; // { rlim_cur, rlim_max }
+        let r = lx.dispatch_syscall(LinuxSyscall::Getrlimit {
+            resource: 7, // RLIMIT_NOFILE
+            rlim: rlim.as_mut_ptr() as u64,
+        });
+        assert_eq!(r, 0);
+        assert_eq!(rlim[0], u64::MAX); // rlim_cur = RLIM_INFINITY
+        assert_eq!(rlim[1], u64::MAX); // rlim_max = RLIM_INFINITY
+    }
+
+    #[test]
+    fn test_umask_returns_old_and_sets_new() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Default umask is 0o022; first call returns 0o022 and sets 0o077.
+        let old = lx.dispatch_syscall(LinuxSyscall::Umask { mask: 0o077 });
+        assert_eq!(old, 0o022);
+
+        // Second call returns 0o077 and restores 0o022.
+        let prev = lx.dispatch_syscall(LinuxSyscall::Umask { mask: 0o022 });
+        assert_eq!(prev, 0o077);
+    }
+
+    #[test]
+    fn test_ftruncate_stub() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        // Open a regular file to get a File fd.
+        let path = b"/data/file.txt\0";
+        let at_fdcwd = (-100i32) as u64;
+        let fd = lx.dispatch_syscall(LinuxSyscall::Openat {
+            dirfd: -100,
+            pathname: path.as_ptr() as u64,
+            flags: 0,
+        });
+        assert!(fd >= 0);
+
+        let r = lx.dispatch_syscall(LinuxSyscall::Ftruncate {
+            fd: fd as i32,
+            length: 42,
+        });
+        assert_eq!(r, 0); // stub success
+        let _ = at_fdcwd; // suppress unused warning
+    }
+
+    #[test]
+    fn test_renameat_returns_erofs() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let old = b"/foo\0";
+        let new = b"/bar\0";
+        let r = lx.dispatch_syscall(LinuxSyscall::Renameat {
+            olddirfd: -100,
+            oldpath: old.as_ptr() as u64,
+            newdirfd: -100,
+            newpath: new.as_ptr() as u64,
+        });
+        assert_eq!(r, EROFS);
     }
 }
