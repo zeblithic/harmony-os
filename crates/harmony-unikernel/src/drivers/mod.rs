@@ -11,5 +11,6 @@ pub mod gpio;
 pub mod pl011;
 pub mod register_bank;
 pub mod sdhci;
+pub mod dma_pool;
 
 pub use register_bank::RegisterBank;
