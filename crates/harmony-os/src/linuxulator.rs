@@ -2731,6 +2731,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 DefaultAction::Ignore => {}
             },
             _ => {
+                debug_assert!(
+                    self.pending_handler_signal.is_none(),
+                    "pending_handler_signal overwritten: caller must consume after each dispatch_syscall"
+                );
                 self.pending_handler_signal = Some(signum);
             }
         }
