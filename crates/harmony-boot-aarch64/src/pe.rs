@@ -132,9 +132,12 @@ fn characteristics_to_flags(chars: u32) -> Result<PageFlags, PeError> {
     if flags.contains(PageFlags::WRITABLE | PageFlags::EXECUTABLE) {
         return Err(PeError::WriteExecuteSection);
     }
-    // Reject execute-without-read (AArch64 instruction fetch needs readable pages)
-    // and completely empty permissions.
-    if flags.contains(PageFlags::EXECUTABLE) && !flags.contains(PageFlags::READABLE) {
+    // Reject execute-without-read and write-without-read — AArch64 has no
+    // truly non-readable AP encoding; both cause undefined hardware behaviour
+    // or silent permission widening.
+    if !flags.contains(PageFlags::READABLE)
+        && (flags.contains(PageFlags::EXECUTABLE) || flags.contains(PageFlags::WRITABLE))
+    {
         return Err(PeError::InvalidPermissions);
     }
     if flags.is_empty() {
