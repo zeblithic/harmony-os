@@ -3791,8 +3791,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
         // pid == 0: send to own process group — treat as self-signal
         // (matches libc raise() which uses kill(0, sig)).
+        // Cross-process signalling (parent→child, child→parent) is not
+        // yet implemented. Returns ENOSYS rather than ESRCH to avoid
+        // falsely claiming the process doesn't exist.
         if pid != 0 && pid != self.pid {
-            return ESRCH;
+            return ENOSYS;
         }
         if sig == 0 {
             return 0; // null signal — process exists check
@@ -11602,12 +11605,12 @@ mod integration_tests {
     }
 
     #[test]
-    fn test_kill_no_such_process() {
-        // kill(999, 10) — PID does not exist → ESRCH.
+    fn test_kill_other_pid_returns_enosys() {
+        // kill(999, 10) — cross-process signaling not supported → ENOSYS.
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
         let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 999, sig: 10 });
-        assert_eq!(r, ESRCH);
+        assert_eq!(r, ENOSYS);
         assert!(!lx.exited());
     }
 
@@ -11636,11 +11639,16 @@ mod integration_tests {
             let child = lx.active_process();
             child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 0 });
         }
-        // active_process() triggers recover_child_state which delivers SIGCHLD.
+        // active_process() triggers recover_child_state which queues SIGCHLD.
         let _ = lx.active_process();
+
+        // Dispatch a no-op syscall to trigger deliver_pending_signals,
+        // which must apply SIGCHLD's default Ignore disposition.
+        lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 0 });
+
         assert!(
             !lx.exited(),
-            "SIGCHLD default=Ignore must not terminate parent"
+            "SIGCHLD default=Ignore must not terminate parent after delivery"
         );
     }
 
