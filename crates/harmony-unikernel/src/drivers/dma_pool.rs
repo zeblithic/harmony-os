@@ -134,7 +134,9 @@ mod tests {
         for idx in [i0, i2, i3, i4] {
             let buf = pool.get(idx);
             unsafe {
-                drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(buf.virt, 2048)));
+                drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(
+                    buf.virt, 2048,
+                )));
             }
         }
     }
@@ -150,7 +152,9 @@ mod tests {
         for i in 0..2 {
             let buf = pool.get(i);
             unsafe {
-                drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(buf.virt, 2048)));
+                drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(
+                    buf.virt, 2048,
+                )));
             }
         }
     }
@@ -168,7 +172,9 @@ mod tests {
         for i in 0..4 {
             let buf = pool.get(i);
             unsafe {
-                drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(buf.virt, 2048)));
+                drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(
+                    buf.virt, 2048,
+                )));
             }
         }
     }
@@ -184,7 +190,9 @@ mod tests {
         for i in 0..2 {
             let buf = pool.get(i);
             unsafe {
-                drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(buf.virt, 2048)));
+                drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(
+                    buf.virt, 2048,
+                )));
             }
         }
     }

@@ -232,6 +232,9 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
         let qpath = entry.qpath; // Copy before match to avoid borrow conflict
         match qpath {
             QPATH_DATA => {
+                // Reclaim completed TX buffers before sending — without this,
+                // the TX pool would exhaust after all buffers are in-flight.
+                self.driver.reclaim_tx(&self.bank, &mut self.tx_pool);
                 self.driver
                     .send(&mut self.bank, data, &mut self.tx_pool)
                     .map_err(|e| match e {
@@ -635,7 +638,10 @@ mod tests {
         bank.on_read(RDMA_OFF + DMA_STATUS, alloc::vec![DMA_STATUS_DISABLED]);
         let driver = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
         let (tx_pool, _) = make_pool::<256>();
-        let (rx_pool, rx_buf0_phys) = make_pool::<256>();
+        let (mut rx_pool, rx_buf0_phys) = make_pool::<256>();
+
+        // Mark buffer 0 as allocated (simulates arm_rx_descriptors having armed it).
+        let _ = rx_pool.alloc(); // index 0 → in-use
 
         // Set up RX ring with one frame (prod index = 1, cons index = 0)
         let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
@@ -688,7 +694,10 @@ mod tests {
         bank.on_read(RDMA_OFF + DMA_STATUS, alloc::vec![DMA_STATUS_DISABLED]);
         let driver = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
         let (tx_pool, _) = make_pool::<256>();
-        let (rx_pool, rx_buf0_phys) = make_pool::<256>();
+        let (mut rx_pool, rx_buf0_phys) = make_pool::<256>();
+
+        // Mark buffer 0 as allocated (simulates arm_rx_descriptors).
+        let _ = rx_pool.alloc();
 
         // Prod index stays at 1 across both reads (frame not yet consumed by zero-read)
         let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;

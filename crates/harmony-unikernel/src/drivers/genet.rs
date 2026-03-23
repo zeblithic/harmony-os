@@ -551,6 +551,10 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
                 let new_buf = rx_pool.get(new_idx);
                 bank.write(desc_base + DMA_DESC_ADDRESS_LO, new_buf.phys as u32);
                 bank.write(desc_base + DMA_DESC_ADDRESS_HI, (new_buf.phys >> 32) as u32);
+            } else {
+                // Pool exhausted — descriptor left without a valid buffer.
+                // Hardware may write to the stale address on next receive.
+                self.stats.rx_errors += 1;
             }
             frame_data
         } else {
@@ -566,6 +570,8 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
     /// Pre-arm all RX descriptors with DMA buffer addresses.
     ///
     /// Called once after `init()`. Each descriptor gets a fresh buffer from the pool.
+    /// The pool must have at least `RX_RING` available buffers; if it is too small,
+    /// returns `NoBuffers` with previously allocated buffers leaked (no rollback).
     pub fn arm_rx_descriptors<const N: usize>(
         &mut self,
         bank: &mut impl RegisterBank,
