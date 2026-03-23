@@ -5479,6 +5479,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 return if total == 0 { result } else { total };
             }
             total = total.saturating_add(result);
+            if (result as usize) < len {
+                break; // short write — stop, matching POSIX writev semantics
+            }
         }
         total
     }
@@ -5518,6 +5521,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 return if total == 0 { result } else { total };
             }
             total = total.saturating_add(result);
+            if (result as usize) < len {
+                break; // short read — stop, matching Linux readv semantics
+            }
         }
         total
     }
