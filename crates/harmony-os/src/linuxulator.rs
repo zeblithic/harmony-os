@@ -2822,7 +2822,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                     }
                     Some(extra) => {
                         // Repeating: count how many intervals passed.
-                        let count_val = 1 + extra;
+                        let count_val = 1u64.saturating_add(extra);
                         // Advance expiration past current time.
                         state.expiration_ns = state.expiration_ns.saturating_add(
                             extra.saturating_add(1).saturating_mul(state.interval_ns),
