@@ -4019,9 +4019,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
             let old_val_nsec = (remaining % 1_000_000_000) as i64;
             let old_int_sec = (state.interval_ns / 1_000_000_000) as i64;
             let old_int_nsec = (state.interval_ns % 1_000_000_000) as i64;
-            let buf = unsafe {
-                core::slice::from_raw_parts_mut(old_value_ptr as usize as *mut u8, 32)
-            };
+            let buf =
+                unsafe { core::slice::from_raw_parts_mut(old_value_ptr as usize as *mut u8, 32) };
             buf[0..8].copy_from_slice(&old_int_sec.to_le_bytes());
             buf[8..16].copy_from_slice(&old_int_nsec.to_le_bytes());
             buf[16..24].copy_from_slice(&old_val_sec.to_le_bytes());
@@ -4092,8 +4091,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 // Repeating: compute time to next tick (without mutating state).
                 let elapsed = now - state.expiration_ns;
                 let extra = elapsed / state.interval_ns;
-                let next_expiration =
-                    state.expiration_ns + (extra + 1) * state.interval_ns;
+                let next_expiration = state.expiration_ns + (extra + 1) * state.interval_ns;
                 let to_next = next_expiration - now;
                 (
                     (to_next / 1_000_000_000) as i64,
