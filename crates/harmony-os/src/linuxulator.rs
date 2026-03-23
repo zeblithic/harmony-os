@@ -3927,7 +3927,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
             if abs_sec < 0 || !(0..1_000_000_000).contains(&abs_nsec) {
                 return EINVAL;
             }
-            let abs_ns = (abs_sec as u64).saturating_mul(1_000_000_000).saturating_add(abs_nsec as u64);
+            let abs_ns = (abs_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(abs_nsec as u64);
             let now = match clockid {
                 CLOCK_REALTIME => self.realtime_ns,
                 _ => self.monotonic_ns,
@@ -3956,7 +3958,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
             return EINVAL;
         }
-        let duration_ns = (tv_sec as u64).saturating_mul(1_000_000_000).saturating_add(tv_nsec as u64);
+        let duration_ns = (tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(tv_nsec as u64);
         match clockid {
             CLOCK_REALTIME => {
                 self.realtime_ns = self.realtime_ns.wrapping_add(duration_ns);
@@ -11983,7 +11987,7 @@ mod integration_tests {
         // Sleep for 1 second
         let req = [0u8; 16];
         let mut req_buf = req;
-        req_buf[0..8].copy_from_slice(&1i64.to_ne_bytes()); // tv_sec = 1
+        req_buf[0..8].copy_from_slice(&1i64.to_le_bytes()); // tv_sec = 1
         let r = lx.dispatch_syscall(LinuxSyscall::Nanosleep {
             req: req_buf.as_ptr() as u64,
             rem: 0,
@@ -12011,7 +12015,7 @@ mod integration_tests {
 
         // Negative tv_sec
         let mut req = [0u8; 16];
-        req[0..8].copy_from_slice(&(-1i64).to_ne_bytes());
+        req[0..8].copy_from_slice(&(-1i64).to_le_bytes());
         let r = lx.dispatch_syscall(LinuxSyscall::Nanosleep {
             req: req.as_ptr() as u64,
             rem: 0,
@@ -12020,7 +12024,7 @@ mod integration_tests {
 
         // tv_nsec >= 1_000_000_000
         let mut req2 = [0u8; 16];
-        req2[8..16].copy_from_slice(&1_000_000_000i64.to_ne_bytes());
+        req2[8..16].copy_from_slice(&1_000_000_000i64.to_le_bytes());
         let r = lx.dispatch_syscall(LinuxSyscall::Nanosleep {
             req: req2.as_ptr() as u64,
             rem: 0,
@@ -12038,7 +12042,7 @@ mod integration_tests {
         let mut lx = Linuxulator::new(mock);
 
         let mut req = [0u8; 16];
-        req[0..8].copy_from_slice(&0i64.to_ne_bytes());
+        req[0..8].copy_from_slice(&0i64.to_le_bytes());
         let r = lx.dispatch_syscall(LinuxSyscall::ClockNanosleep {
             clockid: 99, // invalid
             flags: 0,
