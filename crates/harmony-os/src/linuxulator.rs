@@ -2813,18 +2813,20 @@ impl<B: SyscallBackend> Linuxulator<B> {
                     return EAGAIN; // not yet expired
                 }
                 // Compute expiration count.
-                let count_val = if state.interval_ns == 0 {
-                    // One-shot: disarm after reading.
-                    state.expiration_ns = 0;
-                    1u64
-                } else {
-                    // Repeating: count how many intervals passed.
-                    let elapsed = now - state.expiration_ns;
-                    let extra = elapsed / state.interval_ns;
-                    let count_val = 1 + extra;
-                    // Advance expiration past current time.
-                    state.expiration_ns += (extra + 1) * state.interval_ns;
-                    count_val
+                let elapsed = now - state.expiration_ns;
+                let count_val = match elapsed.checked_div(state.interval_ns) {
+                    None => {
+                        // interval_ns == 0: one-shot, disarm after reading.
+                        state.expiration_ns = 0;
+                        1u64
+                    }
+                    Some(extra) => {
+                        // Repeating: count how many intervals passed.
+                        let count_val = 1 + extra;
+                        // Advance expiration past current time.
+                        state.expiration_ns += (extra + 1) * state.interval_ns;
+                        count_val
+                    }
                 };
                 let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, 8) };
                 buf.copy_from_slice(&count_val.to_le_bytes());
@@ -3975,61 +3977,74 @@ impl<B: SyscallBackend> Linuxulator<B> {
             Some(_) => return EINVAL,
         };
 
-        // Write old value if requested (zeros for now).
-        if old_value_ptr != 0 {
-            let buf =
-                unsafe { core::slice::from_raw_parts_mut(old_value_ptr as usize as *mut u8, 32) };
-            buf.fill(0);
-        }
-
         if new_value_ptr == 0 {
             return EFAULT;
         }
 
-        // Read struct itimerspec: { it_interval: timespec, it_value: timespec }
-        // Each timespec = { tv_sec: i64, tv_nsec: i64 } = 16 bytes. Total 32 bytes.
+        // Read and validate ALL fields BEFORE mutating state.
         let its = unsafe { core::slice::from_raw_parts(new_value_ptr as usize as *const u8, 32) };
         let interval_sec = i64::from_le_bytes(its[0..8].try_into().unwrap());
         let interval_nsec = i64::from_le_bytes(its[8..16].try_into().unwrap());
         let value_sec = i64::from_le_bytes(its[16..24].try_into().unwrap());
         let value_nsec = i64::from_le_bytes(its[24..32].try_into().unwrap());
 
+        if interval_sec < 0 || !(0..1_000_000_000).contains(&interval_nsec) {
+            return EINVAL;
+        }
+        let new_interval_ns = (interval_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(interval_nsec as u64);
+
+        let is_disarm = value_sec == 0 && value_nsec == 0;
+        if !is_disarm && (value_sec < 0 || !(0..1_000_000_000).contains(&value_nsec)) {
+            return EINVAL;
+        }
+        let value_ns = if is_disarm {
+            0
+        } else {
+            (value_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(value_nsec as u64)
+        };
+
+        // Write old value if requested — BEFORE modifying state.
+        if old_value_ptr != 0 {
+            let state = self.timerfds.get(&timerfd_id).unwrap();
+            let now = match state.clockid {
+                CLOCK_REALTIME => self.realtime_ns,
+                _ => self.monotonic_ns,
+            };
+            let remaining = state.expiration_ns.saturating_sub(now);
+            let old_val_sec = (remaining / 1_000_000_000) as i64;
+            let old_val_nsec = (remaining % 1_000_000_000) as i64;
+            let old_int_sec = (state.interval_ns / 1_000_000_000) as i64;
+            let old_int_nsec = (state.interval_ns % 1_000_000_000) as i64;
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(old_value_ptr as usize as *mut u8, 32)
+            };
+            buf[0..8].copy_from_slice(&old_int_sec.to_le_bytes());
+            buf[8..16].copy_from_slice(&old_int_nsec.to_le_bytes());
+            buf[16..24].copy_from_slice(&old_val_sec.to_le_bytes());
+            buf[24..32].copy_from_slice(&old_val_nsec.to_le_bytes());
+        }
+
+        // Now apply the new timer settings (point of no return).
         let state = match self.timerfds.get_mut(&timerfd_id) {
             Some(s) => s,
             None => return EINVAL,
         };
+        state.interval_ns = new_interval_ns;
 
-        // Compute interval in nanoseconds.
-        if interval_sec < 0 || !(0..1_000_000_000).contains(&interval_nsec) {
-            return EINVAL;
-        }
-        state.interval_ns = (interval_sec as u64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add(interval_nsec as u64);
-
-        // Compute expiration.
-        if value_sec == 0 && value_nsec == 0 {
-            // Disarm.
+        if is_disarm {
             state.expiration_ns = 0;
+        } else if flags & TFD_TIMER_ABSTIME != 0 {
+            state.expiration_ns = value_ns;
         } else {
-            if value_sec < 0 || !(0..1_000_000_000).contains(&value_nsec) {
-                return EINVAL;
-            }
-            let value_ns = (value_sec as u64)
-                .saturating_mul(1_000_000_000)
-                .saturating_add(value_nsec as u64);
-
-            if flags & TFD_TIMER_ABSTIME != 0 {
-                // Absolute time.
-                state.expiration_ns = value_ns;
-            } else {
-                // Relative: add to current clock.
-                let now = match state.clockid {
-                    CLOCK_REALTIME => self.realtime_ns,
-                    _ => self.monotonic_ns,
-                };
-                state.expiration_ns = now.saturating_add(value_ns);
-            }
+            let now = match state.clockid {
+                CLOCK_REALTIME => self.realtime_ns,
+                _ => self.monotonic_ns,
+            };
+            state.expiration_ns = now.saturating_add(value_ns);
         }
 
         0
@@ -4055,7 +4070,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             None => return EINVAL,
         };
 
-        // Compute remaining time.
+        // Compute remaining time until next expiration.
         let (value_sec, value_nsec) = if state.expiration_ns == 0 {
             (0i64, 0i64)
         } else {
@@ -4063,11 +4078,28 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 CLOCK_REALTIME => self.realtime_ns,
                 _ => self.monotonic_ns,
             };
-            let remaining = state.expiration_ns.saturating_sub(now);
-            (
-                (remaining / 1_000_000_000) as i64,
-                (remaining % 1_000_000_000) as i64,
-            )
+            if now < state.expiration_ns {
+                // Not yet expired — return remaining time.
+                let remaining = state.expiration_ns - now;
+                (
+                    (remaining / 1_000_000_000) as i64,
+                    (remaining % 1_000_000_000) as i64,
+                )
+            } else if state.interval_ns == 0 {
+                // One-shot that has already expired — report as disarmed.
+                (0i64, 0i64)
+            } else {
+                // Repeating: compute time to next tick (without mutating state).
+                let elapsed = now - state.expiration_ns;
+                let extra = elapsed / state.interval_ns;
+                let next_expiration =
+                    state.expiration_ns + (extra + 1) * state.interval_ns;
+                let to_next = next_expiration - now;
+                (
+                    (to_next / 1_000_000_000) as i64,
+                    (to_next % 1_000_000_000) as i64,
+                )
+            }
         };
 
         let interval_sec = (state.interval_ns / 1_000_000_000) as i64;
