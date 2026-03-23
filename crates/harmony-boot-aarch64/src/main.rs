@@ -17,6 +17,7 @@ mod platform;
 
 mod syscall;
 mod vectors;
+mod cache;
 mod pe;
 
 #[cfg(not(test))]
