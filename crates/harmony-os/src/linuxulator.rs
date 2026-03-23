@@ -5455,6 +5455,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if !(1..=IOV_MAX).contains(&iovcnt) {
             return EINVAL;
         }
+        if iov_ptr == 0 {
+            return EFAULT;
+        }
         if !self.fd_table.contains_key(&fd) {
             return EBADF;
         }
@@ -5493,6 +5496,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
         if !(1..=IOV_MAX).contains(&iovcnt) {
             return EINVAL;
+        }
+        if iov_ptr == 0 {
+            return EFAULT;
         }
         if !self.fd_table.contains_key(&fd) {
             return EBADF;
@@ -5585,12 +5591,13 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Returns `RLIM_INFINITY` (u64::MAX) for both `rlim_cur` and `rlim_max`
     /// for all resources. Writes 16 bytes (`struct rlimit`) to `rlim_ptr`.
     fn sys_getrlimit(&mut self, _resource: i32, rlim_ptr: usize) -> i64 {
-        if rlim_ptr != 0 {
-            let mut buf = [0u8; 16];
-            buf[0..8].copy_from_slice(&u64::MAX.to_le_bytes()); // rlim_cur
-            buf[8..16].copy_from_slice(&u64::MAX.to_le_bytes()); // rlim_max
-            self.backend.vm_write_bytes(rlim_ptr as u64, &buf);
+        if rlim_ptr == 0 {
+            return EFAULT;
         }
+        let mut buf = [0u8; 16];
+        buf[0..8].copy_from_slice(&u64::MAX.to_le_bytes()); // rlim_cur
+        buf[8..16].copy_from_slice(&u64::MAX.to_le_bytes()); // rlim_max
+        self.backend.vm_write_bytes(rlim_ptr as u64, &buf);
         0
     }
 
@@ -5618,9 +5625,15 @@ impl<B: SyscallBackend> Linuxulator<B> {
     fn sys_ftruncate(&self, fd: i32) -> i64 {
         match self.fd_table.get(&fd) {
             Some(FdEntry {
-                kind: FdKind::File { .. },
+                kind: FdKind::File { file_type, .. },
                 ..
-            }) => 0,
+            }) => {
+                if *file_type == FileType::CharDev || *file_type == FileType::Directory {
+                    EINVAL
+                } else {
+                    0
+                }
+            }
             Some(_) => EINVAL,
             None => EBADF,
         }
