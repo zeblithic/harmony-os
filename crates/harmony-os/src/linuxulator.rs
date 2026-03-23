@@ -2690,7 +2690,13 @@ impl<B: SyscallBackend> Linuxulator<B> {
             }
             LinuxSyscall::Setrlimit { .. } => self.sys_setrlimit(),
             LinuxSyscall::Umask { mask } => self.sys_umask(mask),
-            LinuxSyscall::Ftruncate { fd, .. } => self.sys_ftruncate(fd),
+            LinuxSyscall::Ftruncate { fd, length } => {
+                if (length as i64) < 0 {
+                    EINVAL
+                } else {
+                    self.sys_ftruncate(fd)
+                }
+            }
             LinuxSyscall::Renameat { .. } => self.sys_renameat(),
             LinuxSyscall::Unknown { .. } => ENOSYS,
         };
@@ -5594,15 +5600,22 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux getrlimit(2): query resource limit.
     ///
-    /// Returns `RLIM_INFINITY` (u64::MAX) for both `rlim_cur` and `rlim_max`
-    /// for all resources. Writes 16 bytes (`struct rlimit`) to `rlim_ptr`.
-    fn sys_getrlimit(&mut self, _resource: i32, rlim_ptr: usize) -> i64 {
+    /// Consistent with prlimit64: RLIMIT_STACK (3) returns 8 MiB,
+    /// all other resources return RLIM_INFINITY.
+    fn sys_getrlimit(&mut self, resource: i32, rlim_ptr: usize) -> i64 {
         if rlim_ptr == 0 {
             return EFAULT;
         }
+        const RLIMIT_STACK: i32 = 3;
+        const STACK_SIZE: u64 = 8 * 1024 * 1024; // 8 MiB, matches prlimit64
+        let (cur, max) = if resource == RLIMIT_STACK {
+            (STACK_SIZE, STACK_SIZE)
+        } else {
+            (u64::MAX, u64::MAX)
+        };
         let mut buf = [0u8; 16];
-        buf[0..8].copy_from_slice(&u64::MAX.to_le_bytes()); // rlim_cur
-        buf[8..16].copy_from_slice(&u64::MAX.to_le_bytes()); // rlim_max
+        buf[0..8].copy_from_slice(&cur.to_le_bytes());
+        buf[8..16].copy_from_slice(&max.to_le_bytes());
         self.backend.vm_write_bytes(rlim_ptr as u64, &buf);
         0
     }
@@ -5619,7 +5632,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Stores the new mask and returns the old mask.
     fn sys_umask(&mut self, mask: u32) -> i64 {
         let old = self.umask_val;
-        self.umask_val = mask & 0o777;
+        self.umask_val = mask & 0o7777; // full 12 bits (incl setuid/setgid/sticky)
         old as i64
     }
 
