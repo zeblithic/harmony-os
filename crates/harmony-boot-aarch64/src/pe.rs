@@ -54,7 +54,7 @@ pub enum PeError {
 pub struct ImageSections {
     /// Physical address where UEFI loaded the image.
     pub image_base: u64,
-    /// Total image size.
+    /// Total image size (as reported by UEFI, not rounded).
     pub image_size: u64,
     /// (page_start, page_end_exclusive, flags) for each section.
     entries: [(u64, u64, PageFlags); MAX_SECTIONS],
@@ -68,7 +68,8 @@ impl ImageSections {
     /// Returns `None` if the address is outside the image range.
     /// If the address falls between sections (padding), returns RW.
     pub fn flags_for_addr(&self, addr: u64) -> Option<PageFlags> {
-        if addr < self.image_base || addr >= self.image_base + self.image_size {
+        let image_end = page_align_up(self.image_base + self.image_size);
+        if addr < self.image_base || addr >= image_end {
             return None;
         }
         for i in 0..self.count {
@@ -83,7 +84,8 @@ impl ImageSections {
 
     /// True if the address falls within the image range.
     pub fn contains(&self, addr: u64) -> bool {
-        addr >= self.image_base && addr < self.image_base + self.image_size
+        let image_end = page_align_up(self.image_base + self.image_size);
+        addr >= self.image_base && addr < image_end
     }
 }
 
@@ -221,7 +223,7 @@ pub fn parse_sections_from_bytes(
 
     Ok(ImageSections {
         image_base,
-        image_size: page_align_up(image_size),
+        image_size,
         entries,
         count: num_sections,
     })
@@ -399,7 +401,7 @@ mod tests {
     #[test]
     fn outside_image_returns_none() {
         // Simulates MMU behavior: pages outside the image get None,
-        // and the MMU maps them as RW (default_rw).
+        // and the MMU maps them as RWX (default_outside) until vm_mprotect is implemented.
         let sections = &[
             (".text", 0x1000, 0x1000, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE),
         ];
