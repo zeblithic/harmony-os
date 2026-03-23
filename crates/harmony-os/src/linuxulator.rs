@@ -3791,11 +3791,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
         // pid == 0: send to own process group — treat as self-signal
         // (matches libc raise() which uses kill(0, sig)).
-        // Cross-process signalling (parent→child, child→parent) is not
-        // yet implemented. Returns ENOSYS rather than ESRCH to avoid
-        // falsely claiming the process doesn't exist.
+        // Non-self PIDs return ESRCH (standard "no such process" —
+        // callers like systemd use kill(pid, 0) for alive-checks and
+        // expect ESRCH). Cross-process signaling is not yet implemented.
         if pid != 0 && pid != self.pid {
-            return ENOSYS;
+            return ESRCH;
         }
         if sig == 0 {
             return 0; // null signal — process exists check
@@ -11605,12 +11605,12 @@ mod integration_tests {
     }
 
     #[test]
-    fn test_kill_other_pid_returns_enosys() {
-        // kill(999, 10) — cross-process signaling not supported → ENOSYS.
+    fn test_kill_unknown_pid_returns_esrch() {
+        // kill(999, 10) — PID not in process table → ESRCH.
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
         let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 999, sig: 10 });
-        assert_eq!(r, ENOSYS);
+        assert_eq!(r, ESRCH);
         assert!(!lx.exited());
     }
 
