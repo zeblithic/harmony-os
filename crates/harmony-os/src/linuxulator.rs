@@ -5839,6 +5839,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
     ///
     /// FUTEX_WAKE (cmd 1) returns 0 (no waiters woken — single-threaded).
     /// All other operations return ENOSYS.
+    /// Linux futex(2): fast userspace locking.
+    ///
+    /// FUTEX_WAKE (cmd 1): returns 0 (no waiters — single-threaded).
+    /// FUTEX_WAIT (cmd 0): returns EAGAIN (can't block in single-threaded model).
+    /// All other operations return ENOSYS.
     fn sys_futex(&self, uaddr: u64, op: i32, val: u32) -> i64 {
         // The op field's lower bits encode the command; upper bits are
         // flags (FUTEX_PRIVATE_FLAG, etc.).  Mask to the command bits.
@@ -5873,6 +5878,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// pollfd array, set revents to the requested events. Invalid fds
     /// get POLLNVAL. Returns the number of fds with non-zero revents.
     fn sys_poll(&self, fds_ptr: u64, nfds: u64) -> i64 {
+        const POLL_MAX_FDS: u64 = 1 << 20; // cap to prevent DoS / overflow
+        if nfds > POLL_MAX_FDS {
+            return EINVAL;
+        }
         if fds_ptr == 0 && nfds > 0 {
             return EFAULT;
         }
@@ -5883,8 +5892,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             let base = fds_ptr as usize + (i as usize) * 8;
             let fd_bytes = unsafe { core::slice::from_raw_parts(base as *const u8, 4) };
             let fd = i32::from_ne_bytes(fd_bytes.try_into().unwrap());
-            let events_bytes =
-                unsafe { core::slice::from_raw_parts((base + 4) as *const u8, 2) };
+            let events_bytes = unsafe { core::slice::from_raw_parts((base + 4) as *const u8, 2) };
             let events = i16::from_ne_bytes(events_bytes.try_into().unwrap());
 
             let revents = if fd < 0 {
@@ -5898,8 +5906,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             if revents != 0 {
                 ready_count += 1;
             }
-            let revents_out =
-                unsafe { core::slice::from_raw_parts_mut((base + 6) as *mut u8, 2) };
+            let revents_out = unsafe { core::slice::from_raw_parts_mut((base + 6) as *mut u8, 2) };
             revents_out.copy_from_slice(&revents.to_ne_bytes());
         }
         ready_count
