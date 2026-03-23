@@ -6,6 +6,7 @@
 //! Uses the [`RegisterBank`] trait for all register access, enabling
 //! full unit testing without hardware.
 
+use super::dma_pool::DmaPool;
 use super::register_bank::RegisterBank;
 
 // ── Block base offsets (GENET v5, BCM2712 / RPi5) ─────────────────
@@ -87,8 +88,8 @@ const TBUF_64B_EN: u32 = 1 << 0;
 
 // ── DMA descriptor fields ─────────────────────────────────────────
 const DMA_DESC_LENGTH_STATUS: usize = 0x00;
-const _DMA_DESC_ADDRESS_LO: usize = 0x04;
-const _DMA_DESC_ADDRESS_HI: usize = 0x08;
+const DMA_DESC_ADDRESS_LO: usize = 0x04;
+const DMA_DESC_ADDRESS_HI: usize = 0x08;
 const DMA_DESC_SIZE: usize = 12; // 3 words × 4 bytes per descriptor (v5)
 const DMA_DESC_NUM_WORDS: usize = 3; // words per descriptor (for end_ptr register)
 
@@ -182,6 +183,8 @@ pub enum GenetError {
     MdioTimeout,
     /// MDIO read completed but PHY did not acknowledge (NACK).
     MdioReadFail,
+    /// No DMA buffers available in the pool.
+    NoBuffers,
 }
 
 /// Statistics counters for the GENET interface.
@@ -215,6 +218,8 @@ pub struct GenetDriver<const RX_RING: usize, const TX_RING: usize> {
     mac: [u8; 6],
     link_up: bool,
     stats: GenetStats,
+    /// TX descriptor → buffer index mapping for reclaim.
+    tx_buf_indices: [Option<usize>; TX_RING],
 }
 
 impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
@@ -356,6 +361,7 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
             mac,
             link_up: false,
             stats: GenetStats::default(),
+            tx_buf_indices: [None; TX_RING],
         })
     }
 
@@ -377,7 +383,12 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
     /// Writes the frame data to a TX descriptor and advances the
     /// producer index. The frame must include the Ethernet header
     /// but not the FCS (hardware appends CRC).
-    pub fn send(&mut self, bank: &mut impl RegisterBank, frame: &[u8]) -> Result<(), GenetError> {
+    pub fn send<const N: usize>(
+        &mut self,
+        bank: &mut impl RegisterBank,
+        frame: &[u8],
+        tx_pool: &mut DmaPool<N>,
+    ) -> Result<(), GenetError> {
         if frame.len() < ENET_MIN_FRAME {
             self.stats.tx_errors += 1;
             return Err(GenetError::FrameTooSmall);
@@ -391,15 +402,32 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
             return Err(GenetError::TxRingFull);
         }
 
+        // Allocate a DMA buffer and copy frame data.
+        let buf_idx = tx_pool.alloc().ok_or_else(|| {
+            self.stats.tx_errors += 1;
+            GenetError::NoBuffers
+        })?;
+        let buf = tx_pool.get(buf_idx);
+        if frame.len() > tx_pool.buf_size() {
+            let _ = tx_pool.free(buf_idx);
+            self.stats.tx_errors += 1;
+            return Err(GenetError::FrameTooLarge);
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(frame.as_ptr(), buf.virt, frame.len());
+        }
+
         let desc_idx = (self.tx_prod_index as usize) % TX_RING;
 
-        // Write the length/status descriptor word.
-        // In real hardware the frame bytes live in a DMA-mapped buffer
-        // whose physical address goes into DMA_DESC_ADDRESS_LO/HI. In this
-        // sans-I/O model those registers are not written and the frame bytes
-        // are not stored — DMA buffer management is left to the MMIO
-        // integration layer.
         let desc_base = TDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET + desc_idx * DMA_DESC_SIZE;
+
+        // Write descriptor address fields (before LENGTH_STATUS for correct ordering).
+        bank.write(desc_base + DMA_DESC_ADDRESS_LO, buf.phys as u32);
+        bank.write(desc_base + DMA_DESC_ADDRESS_HI, (buf.phys >> 32) as u32);
+
+        // Track buffer index for TX completion reclaim.
+        self.tx_buf_indices[desc_idx] = Some(buf_idx);
+
         let len_status =
             ((frame.len() as u32) << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP | DMA_TX_APPEND_CRC;
         bank.write(desc_base + DMA_DESC_LENGTH_STATUS, len_status);
@@ -423,11 +451,22 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
     /// Check for completed TX descriptors and reclaim them.
     ///
     /// Returns the number of descriptors freed since last call.
-    pub fn tx_complete(&mut self, bank: &impl RegisterBank) -> usize {
+    pub fn reclaim_tx<const N: usize>(
+        &mut self,
+        bank: &impl RegisterBank,
+        tx_pool: &mut DmaPool<N>,
+    ) -> usize {
         let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         let hw_cons = bank.read(tx_ring_base + RING_CONS_INDEX) & DMA_C_INDEX_MASK;
-        let freed = hw_cons.wrapping_sub(self.tx_cons_index) & DMA_C_INDEX_MASK;
-        self.tx_cons_index = hw_cons;
+        let mut freed = 0u32;
+        while self.tx_cons_index != hw_cons {
+            let desc_idx = (self.tx_cons_index as usize) % TX_RING;
+            if let Some(buf_idx) = self.tx_buf_indices[desc_idx].take() {
+                let _ = tx_pool.free(buf_idx);
+            }
+            self.tx_cons_index = (self.tx_cons_index + 1) & DMA_C_INDEX_MASK;
+            freed += 1;
+        }
         freed as usize
     }
 
@@ -438,7 +477,11 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
     /// pending or if the frame had errors (which are counted in stats).
     ///
     /// Caller should call this in a loop until it returns `None`.
-    pub fn poll_rx(&mut self, bank: &mut impl RegisterBank) -> Option<RxFrame> {
+    pub fn poll_rx<const N: usize>(
+        &mut self,
+        bank: &mut impl RegisterBank,
+        rx_pool: &mut DmaPool<N>,
+    ) -> Option<RxFrame> {
         let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         let prod = bank.read(rx_ring_base + RING_PROD_INDEX) & DMA_P_INDEX_MASK;
 
@@ -452,6 +495,10 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
         let len_status = bank.read(desc_base + DMA_DESC_LENGTH_STATUS);
         let length = ((len_status >> DMA_BUFLENGTH_SHIFT) & DMA_BUFLENGTH_MASK) as usize;
         let status = len_status & 0xFFFF;
+
+        let addr_lo = bank.read(desc_base + DMA_DESC_ADDRESS_LO) as u64;
+        let addr_hi = bank.read(desc_base + DMA_DESC_ADDRESS_HI) as u64;
+        let buf_phys = addr_lo | (addr_hi << 32);
 
         // Advance read pointer (word units) and consumer index.
         // READ_PTR points past the consumed descriptor, matching TX WRITE_PTR
@@ -485,15 +532,60 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
             return None;
         }
 
-        // TODO(mmio): In real hardware, frame data lives in DMA buffers at
-        // the physical address stored in DMA_DESC_ADDRESS_LO/HI. In this
-        // sans-I/O model we return a zero-filled placeholder of the correct
-        // length. The MmioRegisterBank integration layer will copy actual
-        // frame bytes from the DMA buffer.
-        let data = alloc::vec![0u8; length];
+        // Copy frame data from DMA buffer.
+        let data = if let Some(buf_idx) = rx_pool.find_by_phys(buf_phys) {
+            let buf = rx_pool.get(buf_idx);
+            // Clamp length to buffer size — descriptor could claim more than the buffer holds.
+            if length > rx_pool.buf_size() {
+                self.stats.rx_errors += 1;
+                let _ = rx_pool.free(buf_idx);
+                return None;
+            }
+            let mut frame_data = alloc::vec![0u8; length];
+            unsafe {
+                core::ptr::copy_nonoverlapping(buf.virt, frame_data.as_mut_ptr(), length);
+            }
+            // Return consumed buffer and re-arm with a fresh one.
+            let _ = rx_pool.free(buf_idx);
+            if let Some(new_idx) = rx_pool.alloc() {
+                let new_buf = rx_pool.get(new_idx);
+                bank.write(desc_base + DMA_DESC_ADDRESS_LO, new_buf.phys as u32);
+                bank.write(desc_base + DMA_DESC_ADDRESS_HI, (new_buf.phys >> 32) as u32);
+            } else {
+                // Pool exhausted — descriptor left without a valid buffer.
+                // Hardware may write to the stale address on next receive.
+                self.stats.rx_errors += 1;
+            }
+            frame_data
+        } else {
+            // Buffer not found in pool — hardware error or corruption.
+            self.stats.rx_errors += 1;
+            return None;
+        };
 
         self.stats.rx_packets += 1;
         Some(RxFrame { data, status })
+    }
+
+    /// Pre-arm all RX descriptors with DMA buffer addresses.
+    ///
+    /// Called once after `init()`. Each descriptor gets a fresh buffer from the pool.
+    /// The pool must have at least `RX_RING` available buffers; if it is too small,
+    /// returns `NoBuffers` with previously allocated buffers leaked (no rollback).
+    pub fn arm_rx_descriptors<const N: usize>(
+        &mut self,
+        bank: &mut impl RegisterBank,
+        rx_pool: &mut DmaPool<N>,
+    ) -> Result<(), GenetError> {
+        for desc_idx in 0..RX_RING {
+            let buf_idx = rx_pool.alloc().ok_or(GenetError::NoBuffers)?;
+            let buf = rx_pool.get(buf_idx);
+            let desc_base =
+                RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET + desc_idx * DMA_DESC_SIZE;
+            bank.write(desc_base + DMA_DESC_ADDRESS_LO, buf.phys as u32);
+            bank.write(desc_base + DMA_DESC_ADDRESS_HI, (buf.phys >> 32) as u32);
+        }
+        Ok(())
     }
 
     /// Read PHY link status via MDIO.
@@ -543,8 +635,25 @@ impl<const RX_RING: usize, const TX_RING: usize> GenetDriver<RX_RING, TX_RING> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drivers::dma_pool::{DmaBuffer, DmaPool};
     use crate::drivers::register_bank::mock::MockRegisterBank;
     use alloc::vec;
+
+    fn make_test_pool<const N: usize>() -> DmaPool<N> {
+        let mut buffers = [DmaBuffer {
+            virt: core::ptr::null_mut(),
+            phys: 0,
+        }; N];
+        for buf in buffers.iter_mut() {
+            let heap_buf = alloc::vec![0u8; 2048].into_boxed_slice();
+            let ptr = Box::into_raw(heap_buf) as *mut u8;
+            *buf = DmaBuffer {
+                virt: ptr,
+                phys: ptr as u64,
+            };
+        }
+        DmaPool::new(buffers, 2048)
+    }
 
     fn init_bank() -> MockRegisterBank {
         let mut bank = MockRegisterBank::new();
@@ -753,13 +862,14 @@ mod tests {
     fn send_frame_advances_prod_index() {
         let mut bank = init_bank();
         let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut tx_pool = make_test_pool::<256>();
 
         // Consumer has caught up — ring is empty
         let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![0]);
 
         let frame = [0u8; 64]; // minimum Ethernet frame
-        driver.send(&mut bank, &frame).unwrap();
+        driver.send(&mut bank, &frame, &mut tx_pool).unwrap();
 
         assert_eq!(driver.tx_prod_index, 1);
         assert_eq!(driver.stats.tx_packets, 1);
@@ -769,15 +879,16 @@ mod tests {
     fn send_writes_descriptor() {
         let mut bank = init_bank();
         let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut tx_pool = make_test_pool::<256>();
 
         let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![0]);
 
         let frame = [0xAA; 64];
         bank.writes.clear(); // clear init writes for easier assertion
-        driver.send(&mut bank, &frame).unwrap();
+        driver.send(&mut bank, &frame, &mut tx_pool).unwrap();
 
-        // First write after clear should be the descriptor length_status.
+        // Descriptor writes: ADDRESS_LO, ADDRESS_HI, then LENGTH_STATUS last (ownership transfer).
         // Descriptor base = TDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET + desc_idx * DMA_DESC_SIZE
         let desc_base = TDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
         let len_status_writes: Vec<(usize, u32)> = bank
@@ -799,13 +910,14 @@ mod tests {
     fn send_updates_write_ptr() {
         let mut bank = init_bank();
         let mut driver: GenetDriver<4, 4> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut tx_pool = make_test_pool::<4>();
 
         let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![0, 0]);
         bank.writes.clear();
 
         // First send: desc_idx=0, write_ptr points to NEXT slot = (0+1)%4 * 3 = 3
-        driver.send(&mut bank, &[0u8; 64]).unwrap();
+        driver.send(&mut bank, &[0u8; 64], &mut tx_pool).unwrap();
         let wp0: Vec<u32> = bank
             .writes
             .iter()
@@ -817,7 +929,7 @@ mod tests {
         bank.writes.clear();
 
         // Second send: desc_idx=1, write_ptr = (1+1)%4 * 3 = 6
-        driver.send(&mut bank, &[0u8; 64]).unwrap();
+        driver.send(&mut bank, &[0u8; 64], &mut tx_pool).unwrap();
         let wp1: Vec<u32> = bank
             .writes
             .iter()
@@ -831,13 +943,14 @@ mod tests {
     fn send_rejects_oversized_frame() {
         let mut bank = init_bank();
         let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut tx_pool = make_test_pool::<256>();
 
         let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![0]);
 
         let frame = [0u8; 2048]; // way too big
         assert_eq!(
-            driver.send(&mut bank, &frame),
+            driver.send(&mut bank, &frame, &mut tx_pool),
             Err(GenetError::FrameTooLarge)
         );
     }
@@ -846,19 +959,24 @@ mod tests {
     fn send_returns_error_when_ring_full() {
         let mut bank = init_bank();
         let mut driver: GenetDriver<4, 4> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut tx_pool = make_test_pool::<4>();
 
         driver.tx_prod_index = 4;
         let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![0]);
 
         let frame = [0u8; 64];
-        assert_eq!(driver.send(&mut bank, &frame), Err(GenetError::TxRingFull));
+        assert_eq!(
+            driver.send(&mut bank, &frame, &mut tx_pool),
+            Err(GenetError::TxRingFull)
+        );
     }
 
     #[test]
     fn tx_complete_reclaims_descriptors() {
         let mut bank = init_bank();
         let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut tx_pool = make_test_pool::<256>();
 
         // Simulate: we sent 3 frames (prod=3), hardware consumed 2 (cons=2)
         driver.tx_prod_index = 3;
@@ -867,7 +985,7 @@ mod tests {
         let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![2]);
 
-        let freed = driver.tx_complete(&bank);
+        let freed = driver.reclaim_tx(&bank, &mut tx_pool);
         assert_eq!(freed, 2);
         assert_eq!(driver.tx_cons_index, 2);
     }
@@ -878,17 +996,23 @@ mod tests {
     fn poll_rx_returns_none_when_empty() {
         let mut bank = init_bank();
         let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut rx_pool = make_test_pool::<256>();
 
         // RX prod index = cons index = 0 — nothing to read
         let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         bank.on_read(rx_ring_base + RING_PROD_INDEX, vec![0]);
-        assert!(driver.poll_rx(&mut bank).is_none());
+        assert!(driver.poll_rx(&mut bank, &mut rx_pool).is_none());
     }
 
     #[test]
     fn poll_rx_returns_frame() {
         let mut bank = init_bank();
         let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut rx_pool = make_test_pool::<256>();
+
+        // Pre-allocate a buffer and set up the descriptor address reads.
+        let buf_idx = rx_pool.alloc().unwrap();
+        let buf_phys = rx_pool.get(buf_idx).phys;
 
         // Hardware has produced 1 frame (prod=1, cons=0)
         let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
@@ -898,8 +1022,15 @@ mod tests {
         let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
         let len_status = (64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP;
         bank.on_read(desc_base + DMA_DESC_LENGTH_STATUS, vec![len_status]);
+        bank.on_read(desc_base + DMA_DESC_ADDRESS_LO, vec![buf_phys as u32]);
+        bank.on_read(
+            desc_base + DMA_DESC_ADDRESS_HI,
+            vec![(buf_phys >> 32) as u32],
+        );
 
-        let frame = driver.poll_rx(&mut bank);
+        // Mark the buffer as in-use (allocated) so poll_rx can find and free it.
+        // (Already allocated above — pool tracks it as in-use.)
+        let frame = driver.poll_rx(&mut bank, &mut rx_pool);
         assert!(frame.is_some());
         let frame = frame.unwrap();
         assert_eq!(frame.data.len(), 64);
@@ -911,6 +1042,7 @@ mod tests {
     fn poll_rx_rejects_zero_length_descriptor() {
         let mut bank = init_bank();
         let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut rx_pool = make_test_pool::<256>();
 
         let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         bank.on_read(rx_ring_base + RING_PROD_INDEX, vec![1]);
@@ -919,8 +1051,11 @@ mod tests {
         let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
         let len_status = DMA_SOP | DMA_EOP; // length field = 0
         bank.on_read(desc_base + DMA_DESC_LENGTH_STATUS, vec![len_status]);
+        // Addresses are read before the zero-length check — provide defaults.
+        bank.on_read(desc_base + DMA_DESC_ADDRESS_LO, vec![0]);
+        bank.on_read(desc_base + DMA_DESC_ADDRESS_HI, vec![0]);
 
-        let frame = driver.poll_rx(&mut bank);
+        let frame = driver.poll_rx(&mut bank, &mut rx_pool);
         assert!(frame.is_none());
         assert_eq!(driver.stats.rx_errors, 1);
         assert_eq!(driver.stats.rx_packets, 0);
@@ -931,6 +1066,13 @@ mod tests {
     fn poll_rx_updates_read_ptr() {
         let mut bank = init_bank();
         let mut driver: GenetDriver<4, 4> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut rx_pool = make_test_pool::<4>();
+
+        // Pre-allocate 2 buffers and record their physical addresses.
+        let buf0_idx = rx_pool.alloc().unwrap();
+        let buf0_phys = rx_pool.get(buf0_idx).phys;
+        let buf1_idx = rx_pool.alloc().unwrap();
+        let buf1_phys = rx_pool.get(buf1_idx).phys;
 
         let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         bank.on_read(rx_ring_base + RING_PROD_INDEX, vec![2, 2]);
@@ -938,14 +1080,27 @@ mod tests {
         let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
         let len_status = (64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP;
         bank.on_read(desc_base + DMA_DESC_LENGTH_STATUS, vec![len_status]);
+        bank.on_read(desc_base + DMA_DESC_ADDRESS_LO, vec![buf0_phys as u32]);
+        bank.on_read(
+            desc_base + DMA_DESC_ADDRESS_HI,
+            vec![(buf0_phys >> 32) as u32],
+        );
         bank.on_read(
             desc_base + DMA_DESC_SIZE + DMA_DESC_LENGTH_STATUS,
             vec![len_status],
         );
+        bank.on_read(
+            desc_base + DMA_DESC_SIZE + DMA_DESC_ADDRESS_LO,
+            vec![buf1_phys as u32],
+        );
+        bank.on_read(
+            desc_base + DMA_DESC_SIZE + DMA_DESC_ADDRESS_HI,
+            vec![(buf1_phys >> 32) as u32],
+        );
         bank.writes.clear();
 
         // First poll: desc_idx=0, read_ptr = (0+1)%4 * 3 = 3 (word units, next slot)
-        driver.poll_rx(&mut bank);
+        driver.poll_rx(&mut bank, &mut rx_pool);
         let rp0: Vec<u32> = bank
             .writes
             .iter()
@@ -957,7 +1112,7 @@ mod tests {
         bank.writes.clear();
 
         // Second poll: desc_idx=1, read_ptr = (1+1)%4 * 3 = 6
-        driver.poll_rx(&mut bank);
+        driver.poll_rx(&mut bank, &mut rx_pool);
         let rp1: Vec<u32> = bank
             .writes
             .iter()
@@ -971,6 +1126,7 @@ mod tests {
     fn poll_rx_rejects_fragmented_frame() {
         let mut bank = init_bank();
         let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut rx_pool = make_test_pool::<256>();
 
         let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         bank.on_read(rx_ring_base + RING_PROD_INDEX, vec![1]);
@@ -979,8 +1135,11 @@ mod tests {
         let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
         let len_status = (64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP; // missing EOP
         bank.on_read(desc_base + DMA_DESC_LENGTH_STATUS, vec![len_status]);
+        // Addresses are read before the SOP|EOP check — provide defaults.
+        bank.on_read(desc_base + DMA_DESC_ADDRESS_LO, vec![0]);
+        bank.on_read(desc_base + DMA_DESC_ADDRESS_HI, vec![0]);
 
-        let frame = driver.poll_rx(&mut bank);
+        let frame = driver.poll_rx(&mut bank, &mut rx_pool);
         assert!(frame.is_none());
         assert_eq!(driver.stats.rx_errors, 1);
         assert_eq!(driver.stats.rx_packets, 0);
@@ -991,6 +1150,7 @@ mod tests {
     fn poll_rx_detects_error_frames() {
         let mut bank = init_bank();
         let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut rx_pool = make_test_pool::<256>();
 
         let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         bank.on_read(rx_ring_base + RING_PROD_INDEX, vec![1]);
@@ -999,8 +1159,11 @@ mod tests {
         let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
         let len_status = (64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP | DMA_RX_CRC_ERROR;
         bank.on_read(desc_base + DMA_DESC_LENGTH_STATUS, vec![len_status]);
+        // Addresses are read before the error check — provide defaults.
+        bank.on_read(desc_base + DMA_DESC_ADDRESS_LO, vec![0]);
+        bank.on_read(desc_base + DMA_DESC_ADDRESS_HI, vec![0]);
 
-        let frame = driver.poll_rx(&mut bank);
+        let frame = driver.poll_rx(&mut bank, &mut rx_pool);
         // Error frames are skipped (consumed but not returned)
         assert!(frame.is_none());
         assert_eq!(driver.stats.rx_errors, 1);
@@ -1011,6 +1174,13 @@ mod tests {
     fn poll_rx_advances_cons_index() {
         let mut bank = init_bank();
         let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut rx_pool = make_test_pool::<256>();
+
+        // Pre-allocate 2 buffers for the 2 frames.
+        let buf0_idx = rx_pool.alloc().unwrap();
+        let buf0_phys = rx_pool.get(buf0_idx).phys;
+        let buf1_idx = rx_pool.alloc().unwrap();
+        let buf1_phys = rx_pool.get(buf1_idx).phys;
 
         // Two frames available
         let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
@@ -1019,15 +1189,28 @@ mod tests {
         let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
         let len_status = (64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP;
         bank.on_read(desc_base + DMA_DESC_LENGTH_STATUS, vec![len_status]);
+        bank.on_read(desc_base + DMA_DESC_ADDRESS_LO, vec![buf0_phys as u32]);
+        bank.on_read(
+            desc_base + DMA_DESC_ADDRESS_HI,
+            vec![(buf0_phys >> 32) as u32],
+        );
         bank.on_read(
             desc_base + DMA_DESC_SIZE + DMA_DESC_LENGTH_STATUS,
             vec![len_status],
         );
+        bank.on_read(
+            desc_base + DMA_DESC_SIZE + DMA_DESC_ADDRESS_LO,
+            vec![buf1_phys as u32],
+        );
+        bank.on_read(
+            desc_base + DMA_DESC_SIZE + DMA_DESC_ADDRESS_HI,
+            vec![(buf1_phys >> 32) as u32],
+        );
 
-        driver.poll_rx(&mut bank);
+        driver.poll_rx(&mut bank, &mut rx_pool);
         assert_eq!(driver.rx_cons_index, 1);
 
-        driver.poll_rx(&mut bank);
+        driver.poll_rx(&mut bank, &mut rx_pool);
         assert_eq!(driver.rx_cons_index, 2);
         assert_eq!(driver.stats.rx_packets, 2);
     }
@@ -1113,11 +1296,17 @@ mod tests {
     fn stats_tracks_tx_and_rx() {
         let mut bank = init_bank();
         let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut tx_pool = make_test_pool::<256>();
+        let mut rx_pool = make_test_pool::<256>();
 
         // Send a frame
         let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![0]);
-        driver.send(&mut bank, &[0u8; 64]).unwrap();
+        driver.send(&mut bank, &[0u8; 64], &mut tx_pool).unwrap();
+
+        // Pre-allocate an RX buffer and set up the address reads.
+        let rx_buf_idx = rx_pool.alloc().unwrap();
+        let rx_buf_phys = rx_pool.get(rx_buf_idx).phys;
 
         // Receive a frame
         let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
@@ -1127,7 +1316,12 @@ mod tests {
             desc_base + DMA_DESC_LENGTH_STATUS,
             vec![(64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP],
         );
-        driver.poll_rx(&mut bank);
+        bank.on_read(desc_base + DMA_DESC_ADDRESS_LO, vec![rx_buf_phys as u32]);
+        bank.on_read(
+            desc_base + DMA_DESC_ADDRESS_HI,
+            vec![(rx_buf_phys >> 32) as u32],
+        );
+        driver.poll_rx(&mut bank, &mut rx_pool);
 
         let stats = driver.stats();
         assert_eq!(stats.tx_packets, 1);
@@ -1140,41 +1334,46 @@ mod tests {
     fn send_rejects_undersized_frame() {
         let mut bank = init_bank();
         let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut tx_pool = make_test_pool::<256>();
 
         let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![0]);
 
         // Empty frame
-        assert_eq!(driver.send(&mut bank, &[]), Err(GenetError::FrameTooSmall));
+        assert_eq!(
+            driver.send(&mut bank, &[], &mut tx_pool),
+            Err(GenetError::FrameTooSmall)
+        );
         // 13 bytes — one short of minimum Ethernet header
         assert_eq!(
-            driver.send(&mut bank, &[0u8; 13]),
+            driver.send(&mut bank, &[0u8; 13], &mut tx_pool),
             Err(GenetError::FrameTooSmall)
         );
         // Exactly 14 bytes — minimum valid
-        assert!(driver.send(&mut bank, &[0u8; 14]).is_ok());
+        assert!(driver.send(&mut bank, &[0u8; 14], &mut tx_pool).is_ok());
     }
 
     #[test]
     fn send_errors_increment_tx_errors() {
         let mut bank = init_bank();
         let mut driver: GenetDriver<4, 4> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut tx_pool = make_test_pool::<4>();
 
         let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
         bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![0]);
 
         // FrameTooSmall
-        let _ = driver.send(&mut bank, &[]);
+        let _ = driver.send(&mut bank, &[], &mut tx_pool);
         assert_eq!(driver.stats().tx_errors, 1);
 
         // FrameTooLarge
-        let _ = driver.send(&mut bank, &[0u8; 2048]);
+        let _ = driver.send(&mut bank, &[0u8; 2048], &mut tx_pool);
         assert_eq!(driver.stats().tx_errors, 2);
 
         // TxRingFull — fill the ring first
         driver.tx_prod_index = 4;
         bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![0]);
-        let _ = driver.send(&mut bank, &[0u8; 64]);
+        let _ = driver.send(&mut bank, &[0u8; 64], &mut tx_pool);
         assert_eq!(driver.stats().tx_errors, 3);
     }
 
@@ -1215,5 +1414,111 @@ mod tests {
         // 256 >> 4 = 16, no guard needed: (16 << 16) | 5 = 0x0010_0005
         let expected = ((256u32 >> 4) << DMA_XOFF_THRESHOLD_SHIFT) | DMA_FC_THRESH_LO;
         assert_eq!(xon_xoff_writes, vec![expected]);
+    }
+
+    // ── DMA buffer tests ──────────────────────────────────────────
+
+    #[test]
+    fn send_writes_descriptor_addresses() {
+        let mut bank = init_bank();
+        let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut tx_pool = make_test_pool::<256>();
+
+        let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
+        bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![0]);
+
+        let frame = [0xAA; 64];
+        driver.send(&mut bank, &frame, &mut tx_pool).unwrap();
+
+        // Find ADDRESS_LO/HI writes for descriptor 0
+        let desc_base = TDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
+        let addr_lo_writes: Vec<u32> = bank
+            .writes
+            .iter()
+            .filter(|(off, _)| *off == desc_base + DMA_DESC_ADDRESS_LO)
+            .map(|(_, v)| *v)
+            .collect();
+        assert!(!addr_lo_writes.is_empty(), "ADDRESS_LO should be written");
+
+        // LENGTH_STATUS should be written AFTER addresses
+        // Verify ordering: ADDRESS_LO/HI written before LENGTH_STATUS.
+        // Filter to only descriptor-field writes at desc_base.
+        let desc_writes: Vec<usize> = bank
+            .writes
+            .iter()
+            .filter(|(off, _)| *off >= desc_base && *off < desc_base + DMA_DESC_SIZE)
+            .map(|(off, _)| *off)
+            .collect();
+        let addr_lo_pos = desc_writes
+            .iter()
+            .position(|&off| off == desc_base + DMA_DESC_ADDRESS_LO)
+            .unwrap();
+        let ls_pos = desc_writes
+            .iter()
+            .position(|&off| off == desc_base + DMA_DESC_LENGTH_STATUS)
+            .unwrap();
+        assert!(
+            addr_lo_pos < ls_pos,
+            "ADDRESS_LO must be written before LENGTH_STATUS"
+        );
+    }
+
+    #[test]
+    fn send_no_buffers_returns_error() {
+        let mut bank = init_bank();
+        let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut tx_pool = make_test_pool::<1>();
+
+        let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
+        bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![0, 0]);
+
+        // First send succeeds
+        driver.send(&mut bank, &[0xBB; 64], &mut tx_pool).unwrap();
+        // Second fails — pool exhausted
+        assert_eq!(
+            driver.send(&mut bank, &[0xCC; 64], &mut tx_pool),
+            Err(GenetError::NoBuffers)
+        );
+    }
+
+    #[test]
+    fn arm_rx_descriptors_fills_ring() {
+        let mut bank = init_bank();
+        let mut driver: GenetDriver<4, 4> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut rx_pool = make_test_pool::<4>();
+
+        driver.arm_rx_descriptors(&mut bank, &mut rx_pool).unwrap();
+
+        // All 4 RX descriptors should have ADDRESS_LO written
+        let rx_desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
+        for i in 0..4 {
+            let desc_offset = rx_desc_base + i * DMA_DESC_SIZE;
+            let has_addr = bank
+                .writes
+                .iter()
+                .any(|(off, _)| *off == desc_offset + DMA_DESC_ADDRESS_LO);
+            assert!(has_addr, "RX descriptor {i} should have ADDRESS_LO written");
+        }
+    }
+
+    #[test]
+    fn reclaim_tx_frees_completed_buffers() {
+        let mut bank = init_bank();
+        let mut driver: GenetDriver<256, 256> = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let mut tx_pool = make_test_pool::<256>();
+
+        let tx_ring_base = TDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
+        bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![0, 0, 0]);
+
+        // Send 3 frames
+        for _ in 0..3 {
+            driver.send(&mut bank, &[0xDD; 64], &mut tx_pool).unwrap();
+        }
+
+        // Simulate hardware consuming 2 descriptors
+        bank.on_read(tx_ring_base + RING_CONS_INDEX, vec![2]);
+
+        let freed = driver.reclaim_tx(&bank, &mut tx_pool);
+        assert_eq!(freed, 2, "should free 2 completed TX buffers");
     }
 }

@@ -15,6 +15,7 @@ use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use harmony_unikernel::drivers::dma_pool::DmaPool;
 use harmony_unikernel::drivers::genet::{GenetDriver, GenetError};
 use harmony_unikernel::drivers::RegisterBank;
 
@@ -40,16 +41,25 @@ pub struct GenetServer<B: RegisterBank, const RX: usize, const TX: usize> {
     tracker: FidTracker<()>,
     /// MDIO poll count for link status reads.
     mdio_polls: u32,
+    tx_pool: DmaPool<TX>,
+    rx_pool: DmaPool<RX>,
 }
 
 impl<B: RegisterBank, const RX: usize, const TX: usize> GenetServer<B, RX, TX> {
     /// Create a new GenetServer with an already-initialized driver.
-    pub fn new(driver: GenetDriver<RX, TX>, bank: B) -> Self {
+    pub fn new(
+        driver: GenetDriver<RX, TX>,
+        bank: B,
+        tx_pool: DmaPool<TX>,
+        rx_pool: DmaPool<RX>,
+    ) -> Self {
         Self {
             driver,
             bank,
             tracker: FidTracker::new(QPATH_ROOT, ()),
             mdio_polls: 100,
+            tx_pool,
+            rx_pool,
         }
     }
 
@@ -154,7 +164,7 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
                 if max == 0 {
                     return Ok(Vec::new());
                 }
-                match self.driver.poll_rx(&mut self.bank) {
+                match self.driver.poll_rx(&mut self.bank, &mut self.rx_pool) {
                     Some(frame) => {
                         if frame.data.len() > max {
                             // Frame too large for caller's buffer.
@@ -222,10 +232,15 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
         let qpath = entry.qpath; // Copy before match to avoid borrow conflict
         match qpath {
             QPATH_DATA => {
+                // Reclaim completed TX buffers before sending — without this,
+                // the TX pool would exhaust after all buffers are in-flight.
+                self.driver.reclaim_tx(&self.bank, &mut self.tx_pool);
                 self.driver
-                    .send(&mut self.bank, data)
+                    .send(&mut self.bank, data, &mut self.tx_pool)
                     .map_err(|e| match e {
-                        GenetError::TxRingFull => IpcError::ResourceExhausted,
+                        GenetError::TxRingFull | GenetError::NoBuffers => {
+                            IpcError::ResourceExhausted
+                        }
                         _ => IpcError::InvalidArgument,
                     })?;
                 Ok(data.len() as u32)
@@ -266,6 +281,7 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harmony_unikernel::drivers::dma_pool::DmaBuffer;
     use harmony_unikernel::drivers::genet::GenetDriver;
     use harmony_unikernel::drivers::register_bank::mock::MockRegisterBank;
 
@@ -284,14 +300,41 @@ mod tests {
     const BMSR_LSTATUS: u32 = 0x0004;
 
     const TEST_MAC: [u8; 6] = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
+    const TEST_BUF_SIZE: usize = 2048;
+
+    /// Build a DmaPool<N> with heap-allocated buffers for tests.
+    /// Uses identity-mapped virtual→physical addresses (ptr as u64).
+    /// Returns the pool and the physical address of buffer[0].
+    fn make_pool<const N: usize>() -> (DmaPool<N>, u64) {
+        let mut buffers = [DmaBuffer {
+            virt: core::ptr::null_mut(),
+            phys: 0,
+        }; N];
+        for item in buffers.iter_mut() {
+            let buf = alloc::vec![0u8; TEST_BUF_SIZE].into_boxed_slice();
+            let ptr = Box::into_raw(buf) as *mut u8;
+            *item = DmaBuffer {
+                virt: ptr,
+                phys: ptr as u64,
+            };
+        }
+        let buf0_phys = buffers[0].phys;
+        (DmaPool::new(buffers, TEST_BUF_SIZE), buf0_phys)
+    }
 
     fn test_server() -> GenetServer<MockRegisterBank, 256, 256> {
         let mut bank = MockRegisterBank::new();
         bank.on_read(TDMA_OFF + DMA_STATUS, alloc::vec![DMA_STATUS_DISABLED]);
         bank.on_read(RDMA_OFF + DMA_STATUS, alloc::vec![DMA_STATUS_DISABLED]);
         let driver = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
-        GenetServer::new(driver, bank)
+        let (tx_pool, _) = make_pool::<256>();
+        let (rx_pool, _) = make_pool::<256>();
+        GenetServer::new(driver, bank, tx_pool, rx_pool)
     }
+
+    // Additional offset constants for DMA descriptor address fields
+    const DMA_DESC_ADDRESS_LO: usize = 0x04;
+    const DMA_DESC_ADDRESS_HI: usize = 0x08;
 
     // ── Walk tests ────────────────────────────────────────────────
 
@@ -584,19 +627,46 @@ mod tests {
         assert_eq!(n, 64);
     }
 
+    /// Build a GenetServer manually, registering the RX pool buffer[0] physical
+    /// address into the mock descriptor so poll_rx can find the frame data.
+    /// Returns the server and the physical address of RX buffer[0].
+    fn test_server_with_rx_frame(
+        frame_len: usize,
+    ) -> (GenetServer<MockRegisterBank, 256, 256>, u64) {
+        let mut bank = MockRegisterBank::new();
+        bank.on_read(TDMA_OFF + DMA_STATUS, alloc::vec![DMA_STATUS_DISABLED]);
+        bank.on_read(RDMA_OFF + DMA_STATUS, alloc::vec![DMA_STATUS_DISABLED]);
+        let driver = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let (tx_pool, _) = make_pool::<256>();
+        let (mut rx_pool, rx_buf0_phys) = make_pool::<256>();
+
+        // Mark buffer 0 as allocated (simulates arm_rx_descriptors having armed it).
+        let _ = rx_pool.alloc(); // index 0 → in-use
+
+        // Set up RX ring with one frame (prod index = 1, cons index = 0)
+        let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
+        bank.on_read(rx_ring_base + RING_PROD_INDEX, alloc::vec![1]);
+
+        // Set up descriptor 0 with length/status and DMA buffer address.
+        let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
+        let len_status = ((frame_len as u32) << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP;
+        bank.on_read(desc_base + DMA_DESC_LENGTH_STATUS, alloc::vec![len_status]);
+        bank.on_read(
+            desc_base + DMA_DESC_ADDRESS_LO,
+            alloc::vec![rx_buf0_phys as u32],
+        );
+        bank.on_read(
+            desc_base + DMA_DESC_ADDRESS_HI,
+            alloc::vec![(rx_buf0_phys >> 32) as u32],
+        );
+
+        let srv = GenetServer::new(driver, bank, tx_pool, rx_pool);
+        (srv, rx_buf0_phys)
+    }
+
     #[test]
     fn read_data_returns_rx_frame() {
-        let mut srv = test_server();
-
-        // Set up RX ring with one frame
-        let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
-        srv.bank
-            .on_read(rx_ring_base + RING_PROD_INDEX, alloc::vec![1]);
-
-        let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
-        let len_status = (64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP;
-        srv.bank
-            .on_read(desc_base + DMA_DESC_LENGTH_STATUS, alloc::vec![len_status]);
+        let (mut srv, _) = test_server_with_rx_frame(64);
 
         srv.walk(0, 1, "genet0").unwrap();
         srv.walk(1, 2, "data").unwrap();
@@ -607,17 +677,7 @@ mod tests {
 
     #[test]
     fn read_data_undersized_buffer_returns_error() {
-        let mut srv = test_server();
-
-        // Set up RX ring with one 64-byte frame
-        let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
-        srv.bank
-            .on_read(rx_ring_base + RING_PROD_INDEX, alloc::vec![1]);
-
-        let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
-        let len_status = (64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP;
-        srv.bank
-            .on_read(desc_base + DMA_DESC_LENGTH_STATUS, alloc::vec![len_status]);
+        let (mut srv, _) = test_server_with_rx_frame(64);
 
         srv.walk(0, 1, "genet0").unwrap();
         srv.walk(1, 2, "data").unwrap();
@@ -629,17 +689,33 @@ mod tests {
 
     #[test]
     fn read_data_zero_count_does_not_consume_frame() {
-        let mut srv = test_server();
+        let mut bank = MockRegisterBank::new();
+        bank.on_read(TDMA_OFF + DMA_STATUS, alloc::vec![DMA_STATUS_DISABLED]);
+        bank.on_read(RDMA_OFF + DMA_STATUS, alloc::vec![DMA_STATUS_DISABLED]);
+        let driver = GenetDriver::init(&mut bank, TEST_MAC, 10).unwrap();
+        let (tx_pool, _) = make_pool::<256>();
+        let (mut rx_pool, rx_buf0_phys) = make_pool::<256>();
 
-        // Set up RX ring with one frame
+        // Mark buffer 0 as allocated (simulates arm_rx_descriptors).
+        let _ = rx_pool.alloc();
+
+        // Prod index stays at 1 across both reads (frame not yet consumed by zero-read)
         let rx_ring_base = RDMA_OFF + DEFAULT_RING * DMA_RING_SIZE;
-        srv.bank
-            .on_read(rx_ring_base + RING_PROD_INDEX, alloc::vec![1, 1]);
+        bank.on_read(rx_ring_base + RING_PROD_INDEX, alloc::vec![1, 1]);
 
         let desc_base = RDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
         let len_status = (64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP;
-        srv.bank
-            .on_read(desc_base + DMA_DESC_LENGTH_STATUS, alloc::vec![len_status]);
+        bank.on_read(desc_base + DMA_DESC_LENGTH_STATUS, alloc::vec![len_status]);
+        bank.on_read(
+            desc_base + DMA_DESC_ADDRESS_LO,
+            alloc::vec![rx_buf0_phys as u32],
+        );
+        bank.on_read(
+            desc_base + DMA_DESC_ADDRESS_HI,
+            alloc::vec![(rx_buf0_phys >> 32) as u32],
+        );
+
+        let mut srv = GenetServer::new(driver, bank, tx_pool, rx_pool);
 
         srv.walk(0, 1, "genet0").unwrap();
         srv.walk(1, 2, "data").unwrap();
