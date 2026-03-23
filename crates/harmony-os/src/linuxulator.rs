@@ -2070,6 +2070,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
         // are dropped with the child, so counter recovery is not needed.
         // next_child_pid must be recovered to keep the global PID space.
         self.next_child_pid = self.next_child_pid.max(c.next_child_pid);
+        // Auto-deliver SIGCHLD to parent (Linux does this on child exit).
+        self.pending_signals |= 1u64 << (SIGCHLD_NUM - 1);
     }
 
     /// Return the deepest actively-running Linuxulator in the process tree.
@@ -2680,6 +2682,13 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Deliver one pending signal at syscall boundary.
     ///
+    /// Queue a signal on this process's pending bitmask.
+    fn queue_signal(&mut self, sig: u32) {
+        if (1..=64).contains(&sig) {
+            self.pending_signals |= 1u64 << (sig - 1);
+        }
+    }
+
     /// Called at the end of dispatch_syscall. Handles SIG_DFL and
     /// SIG_IGN internally. Custom handlers are reported via
     /// pending_handler_signal for the caller to invoke.
@@ -3762,12 +3771,40 @@ impl<B: SyscallBackend> Linuxulator<B> {
         child_pid as i64
     }
 
-    fn sys_kill(&mut self, _pid: i32, _sig: i32) -> i64 {
-        ENOSYS
+    /// Linux kill(2): send a signal to a process.
+    fn sys_kill(&mut self, pid: i32, sig: i32) -> i64 {
+        if !(0..=64).contains(&sig) {
+            return EINVAL;
+        }
+        if pid <= -1 {
+            return ENOSYS; // process group not supported
+        }
+        if pid != 0 && pid != self.pid {
+            return ESRCH;
+        }
+        if sig == 0 {
+            return 0; // null signal — process exists check
+        }
+        self.queue_signal(sig as u32);
+        0
     }
 
-    fn sys_tgkill(&mut self, _tgid: i32, _tid: i32, _sig: i32) -> i64 {
-        ENOSYS
+    /// Linux tgkill(2): send signal to a specific thread.
+    fn sys_tgkill(&mut self, tgid: i32, tid: i32, sig: i32) -> i64 {
+        if tid <= 0 {
+            return EINVAL;
+        }
+        if !(0..=64).contains(&sig) {
+            return EINVAL;
+        }
+        if tgid != self.pid || tid != self.pid {
+            return ESRCH;
+        }
+        if sig == 0 {
+            return 0;
+        }
+        self.queue_signal(sig as u32);
+        0
     }
 
     /// Linux fstat(2): get file status.
