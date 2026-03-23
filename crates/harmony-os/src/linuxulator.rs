@@ -3747,6 +3747,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
         // Read the signal mask from user memory.
         let mask_bytes = unsafe { core::slice::from_raw_parts(mask_ptr as usize as *const u8, 8) };
         let mask = u64::from_le_bytes(mask_bytes.try_into().unwrap());
+        // Linux strips SIGKILL (9) and SIGSTOP (19) from signalfd masks
+        // unconditionally — these signals must not be consumable via read().
+        let mask = mask & !((1u64 << (SIGKILL - 1)) | (1u64 << (SIGSTOP - 1)));
 
         if fd == -1 {
             // Create new signalfd.

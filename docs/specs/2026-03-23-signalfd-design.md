@@ -15,7 +15,7 @@ or SIGHUP.
 
 ### signalfd4 Syscall
 
-`signalfd4(fd, mask_ptr, flags)`:
+`signalfd4(fd, mask_ptr, sizemask, flags)`:
 
 - `fd == -1`: create a new signalfd monitoring `mask`. Return new fd.
 - `fd >= 0`: update existing signalfd's mask. Return `fd`.
