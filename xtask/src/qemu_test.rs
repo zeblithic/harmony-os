@@ -44,8 +44,8 @@ fn aarch64_milestones() -> Vec<Milestone> {
             description: "PQ identity generated",
         },
         Milestone {
-            pattern: "[Runtime] Entering idle loop",
-            description: "runtime idle loop",
+            pattern: "[Boot] Entering event loop",
+            description: "event loop started",
         },
     ]
 }

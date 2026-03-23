@@ -18,6 +18,7 @@ mod platform;
 mod syscall;
 mod vectors;
 mod cache;
+mod mmio;
 mod pe;
 
 #[cfg(not(test))]
@@ -320,9 +321,23 @@ fn main() -> Status {
         );
     }
 
+    // Register network interface and announcing destination.
+    runtime.register_interface("eth0");
+    let dest_hash = runtime.register_announcing_destination(
+        "harmony",
+        &["node"],
+        300_000, // 5-minute announce interval
+        timer::now_ms(),
+    );
     let _ = writeln!(
         serial,
-        "[Runtime] UnikernelRuntime created, entering idle loop"
+        "[Boot] Announcing destination: {:02x}{:02x}{:02x}{:02x}",
+        dest_hash[0], dest_hash[1], dest_hash[2], dest_hash[3],
+    );
+
+    let _ = writeln!(
+        serial,
+        "[Runtime] UnikernelRuntime created"
     );
 
     // ── Initialise Linuxulator ──
@@ -601,18 +616,98 @@ fn main() -> Status {
 
     let _ = writeln!(
         serial,
-        "[Runtime] Entering idle loop (test exit code: {})",
+        "[Boot] Entering event loop (test exit code: {})",
         test_exit_code,
     );
 
     loop {
         let now = timer::now_ms();
+
+        // ── Network RX ──
+        // TODO(harmony-os-7ng): Poll GENET RX here when RP1 PCIe is ready.
+        // Pattern:
+        //   while let Some(frame) = genet.poll_rx(&mut bank, &mut rx_pool) {
+        //       cache::invalidate_range(buf.virt, frame.data.len());
+        //       if ethertype(&frame.data) == 0x88B5 {
+        //           let payload = &frame.data[14..]; // strip Ethernet header
+        //           let rx_actions = runtime.handle_packet("eth0", payload.to_vec(), now);
+        //           for action in &rx_actions { dispatch_action(action, &mut serial); }
+        //       }
+        //   }
+
+        // ── Timer tick ──
         let actions = runtime.tick(now);
-        for action in actions {
-            let _ = writeln!(serial, "[Runtime] action: {:?}", action);
+        for action in &actions {
+            dispatch_action(action, &mut serial);
         }
-        // WFE = Wait For Event — ARM equivalent of HLT, saves power
+
+        // WFE = Wait For Event — ARM equivalent of HLT, saves power.
+        // Timer interrupt will wake us for the next tick.
         unsafe { core::arch::asm!("wfe") };
+    }
+}
+
+#[cfg(target_os = "uefi")]
+fn dispatch_action(action: &harmony_unikernel::RuntimeAction, serial: &mut impl core::fmt::Write) {
+    use harmony_unikernel::RuntimeAction;
+    match action {
+        RuntimeAction::SendOnInterface {
+            interface_name,
+            raw,
+        } => {
+            // TODO(harmony-os-7ng): Send via GENET when PCIe is ready.
+            // Pattern: cache::clean_range(buf.virt, raw.len()); genet.send(&mut bank, raw, &mut tx_pool);
+            let _ = writeln!(serial, "[TX] {} bytes on {}", raw.len(), interface_name);
+        }
+        RuntimeAction::PeerDiscovered { address_hash, hops } => {
+            let _ = writeln!(
+                serial,
+                "[Peer] Discovered {:02x}{:02x}{:02x}{:02x} ({} hops)",
+                address_hash[0],
+                address_hash[1],
+                address_hash[2],
+                address_hash[3],
+                hops,
+            );
+        }
+        RuntimeAction::PeerLost { address_hash } => {
+            let _ = writeln!(
+                serial,
+                "[Peer] Lost {:02x}{:02x}{:02x}{:02x}",
+                address_hash[0],
+                address_hash[1],
+                address_hash[2],
+                address_hash[3],
+            );
+        }
+        RuntimeAction::HeartbeatReceived {
+            address_hash,
+            uptime_ms,
+        } => {
+            let _ = writeln!(
+                serial,
+                "[Peer] Heartbeat {:02x}{:02x}{:02x}{:02x} uptime={}ms",
+                address_hash[0],
+                address_hash[1],
+                address_hash[2],
+                address_hash[3],
+                uptime_ms,
+            );
+        }
+        RuntimeAction::DeliverLocally {
+            destination_hash,
+            payload,
+        } => {
+            let _ = writeln!(
+                serial,
+                "[Local] {} bytes for {:02x}{:02x}{:02x}{:02x}",
+                payload.len(),
+                destination_hash[0],
+                destination_hash[1],
+                destination_hash[2],
+                destination_hash[3],
+            );
+        }
     }
 }
 
