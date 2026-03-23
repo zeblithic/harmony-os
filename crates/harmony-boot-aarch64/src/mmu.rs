@@ -129,9 +129,10 @@ pub unsafe fn init_and_enable(
     // after writing them. Until vm_mprotect is implemented (requires page table
     // access from SyscallBackend), outside-image pages must stay executable.
     // TODO(harmony-os-fg5-followup): implement real vm_mprotect, then change
-    // default_outside to RW.
-    let fallback_flags = PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::EXECUTABLE;
-    let default_outside = PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::EXECUTABLE;
+    // default_outside to RW and keep fallback_flags as a separate decision.
+    let rwx = PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::EXECUTABLE;
+    let fallback_flags = rwx;
+    let default_outside = rwx;
 
     if image_sections.is_none() {
         let _ = writeln!(serial, "[MMU] WARNING: W^X disabled — mapping all RAM as RWX");

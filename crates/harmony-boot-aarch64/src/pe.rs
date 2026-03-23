@@ -206,6 +206,11 @@ pub fn parse_sections_from_bytes(
 
         let flags = characteristics_to_flags(characteristics)?;
 
+        // Reject zero-size sections (would be invisible in flags_for_addr).
+        if virtual_size == 0 {
+            return Err(PeError::TruncatedHeader);
+        }
+
         // Reject non-page-aligned section starts (standard UEFI PE uses 0x1000 alignment).
         if virtual_addr % PAGE_SIZE != 0 {
             return Err(PeError::UnalignedSection);
@@ -411,7 +416,7 @@ mod tests {
         // 0x8000_0000 and 0x0010_0000 are both outside
         let result = parse_sections_from_bytes(&buf, base, 0x10_0000).unwrap();
 
-        // Heap address far outside image → None (MMU maps as RW)
+        // Heap address far outside image → None (MMU maps as RWX)
         assert!(result.flags_for_addr(0x8000_0000).is_none());
         // Stack address → None
         assert!(result.flags_for_addr(0x0010_0000).is_none());
