@@ -5632,7 +5632,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Stores the new mask and returns the old mask.
     fn sys_umask(&mut self, mask: u32) -> i64 {
         let old = self.umask_val;
-        self.umask_val = mask & 0o7777; // full 12 bits (incl setuid/setgid/sticky)
+        self.umask_val = mask & 0o777; // S_IRWXUGO: 9 permission bits only
         old as i64
     }
 
