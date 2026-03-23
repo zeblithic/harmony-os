@@ -442,6 +442,17 @@ pub enum LinuxSyscall {
         arg4: u64,
         arg5: u64,
     },
+    SignalFd {
+        fd: i32,
+        mask_ptr: u64,
+        sizemask: u64,
+    },
+    SignalFd4 {
+        fd: i32,
+        mask_ptr: u64,
+        sizemask: u64,
+        flags: i32,
+    },
     Unknown {
         nr: u64,
     },
@@ -758,6 +769,17 @@ impl LinuxSyscall {
             },
             291 => LinuxSyscall::EpollCreate1 {
                 flags: args[0] as i32,
+            },
+            282 => LinuxSyscall::SignalFd {
+                fd: args[0] as i32,
+                mask_ptr: args[1],
+                sizemask: args[2],
+            },
+            289 => LinuxSyscall::SignalFd4 {
+                fd: args[0] as i32,
+                mask_ptr: args[1],
+                sizemask: args[2],
+                flags: args[3] as i32,
             },
             302 => LinuxSyscall::Prlimit64 {
                 pid: args[0] as i32,
@@ -1104,6 +1126,12 @@ impl LinuxSyscall {
                 buf: args[0],
                 buflen: args[1],
                 flags: args[2] as u32,
+            },
+            74 => LinuxSyscall::SignalFd4 {
+                fd: args[0] as i32,
+                mask_ptr: args[1],
+                sizemask: args[2],
+                flags: args[3] as i32,
             },
             293 => LinuxSyscall::Rseq,
             220 => LinuxSyscall::Clone {
@@ -1745,6 +1773,8 @@ enum FdKind {
     Socket { socket_id: usize },
     /// Epoll instance (always-ready stub).
     Epoll { epoll_id: usize },
+    /// signalfd descriptor for reading pending signals.
+    SignalFd { signalfd_id: usize },
 }
 
 /// Shared state for an eventfd instance.
@@ -1771,6 +1801,13 @@ struct SocketState {
 struct EpollState {
     /// Registered fds: fd → (event mask, user data).
     interests: BTreeMap<i32, (u32, u64)>,
+}
+
+/// State for a signalfd instance.
+#[derive(Clone)]
+struct SignalFdState {
+    /// Which signals this fd monitors (bitmask).
+    mask: u64,
 }
 
 /// Per-signal handler disposition, stored in a 64-element array.
@@ -1905,6 +1942,10 @@ pub struct Linuxulator<B: SyscallBackend> {
     killed_by_signal: Option<u32>,
     /// Process name set by prctl(PR_SET_NAME). 16 bytes max (including null).
     process_name: [u8; 16],
+    /// signalfd state keyed by signalfd_id.
+    signalfds: BTreeMap<usize, SignalFdState>,
+    /// Next signalfd_id to allocate.
+    next_signalfd_id: usize,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -1950,6 +1991,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
             pending_handler_signal: None,
             killed_by_signal: None,
             process_name: [0u8; 16],
+            signalfds: BTreeMap::new(),
+            next_signalfd_id: 0,
         }
     }
 
@@ -2428,6 +2471,17 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 rem,
             } => self.sys_clock_nanosleep(clockid, flags, req, rem),
             LinuxSyscall::Prctl { option, arg2, .. } => self.sys_prctl(option, arg2),
+            LinuxSyscall::SignalFd {
+                fd,
+                mask_ptr,
+                sizemask,
+            } => self.sys_signalfd4(fd, mask_ptr, sizemask, 0),
+            LinuxSyscall::SignalFd4 {
+                fd,
+                mask_ptr,
+                sizemask,
+                flags,
+            } => self.sys_signalfd4(fd, mask_ptr, sizemask, flags),
             LinuxSyscall::Unknown { .. } => ENOSYS,
         };
         self.deliver_pending_signals();
@@ -2531,6 +2585,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 count.min(i64::MAX as usize) as i64
             }
             FdKind::Epoll { .. } => EINVAL,
+            FdKind::SignalFd { .. } => EINVAL,
         }
     }
 
@@ -2634,6 +2689,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 0
             }
             FdKind::Epoll { .. } => EINVAL,
+            FdKind::SignalFd { .. } => EAGAIN,
         }
     }
 
@@ -2687,6 +2743,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
                     .any(|e| matches!(&e.kind, FdKind::Epoll { epoll_id: id } if *id == epoll_id));
                 if !still_referenced {
                     self.epolls.remove(&epoll_id);
+                }
+            }
+            FdKind::SignalFd { signalfd_id } => {
+                let still_referenced = self.fd_table.values().any(
+                    |e| matches!(&e.kind, FdKind::SignalFd { signalfd_id: id } if *id == signalfd_id),
+                );
+                if !still_referenced {
+                    self.signalfds.remove(&signalfd_id);
                 }
             }
         }
@@ -3636,6 +3700,65 @@ impl<B: SyscallBackend> Linuxulator<B> {
         written
     }
 
+    // ── SignalFd ──────────────────────────────────────────────────
+
+    /// Linux signalfd4(2): create or update a signal fd.
+    fn sys_signalfd4(&mut self, fd: i32, mask_ptr: u64, sizemask: u64, flags: i32) -> i64 {
+        const SFD_CLOEXEC: i32 = 0x80000;
+        const SFD_NONBLOCK: i32 = 0x800;
+
+        if sizemask != 8 {
+            return EINVAL;
+        }
+        if flags & !(SFD_CLOEXEC | SFD_NONBLOCK) != 0 {
+            return EINVAL;
+        }
+        if mask_ptr == 0 {
+            return EFAULT;
+        }
+
+        // Read the signal mask from user memory.
+        let mask_bytes = unsafe { core::slice::from_raw_parts(mask_ptr as usize as *const u8, 8) };
+        let mask = u64::from_le_bytes(mask_bytes.try_into().unwrap());
+
+        if fd == -1 {
+            // Create new signalfd.
+            let signalfd_id = self.next_signalfd_id;
+            self.next_signalfd_id += 1;
+            self.signalfds.insert(signalfd_id, SignalFdState { mask });
+
+            let new_fd = self.alloc_fd();
+            let fd_flags = if flags & SFD_CLOEXEC != 0 {
+                FD_CLOEXEC
+            } else {
+                0
+            };
+            self.fd_table.insert(
+                new_fd,
+                FdEntry {
+                    kind: FdKind::SignalFd { signalfd_id },
+                    flags: fd_flags,
+                },
+            );
+            new_fd as i64
+        } else {
+            // Update existing signalfd.
+            match self.fd_table.get(&fd) {
+                Some(FdEntry {
+                    kind: FdKind::SignalFd { signalfd_id },
+                    ..
+                }) => {
+                    let signalfd_id = *signalfd_id;
+                    if let Some(state) = self.signalfds.get_mut(&signalfd_id) {
+                        state.mask = mask;
+                    }
+                    fd as i64
+                }
+                _ => EINVAL,
+            }
+        }
+    }
+
     // ── Process management ────────────────────────────────────────
 
     /// Create a child Linuxulator with cloned state for fork.
@@ -3677,6 +3800,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
             pending_handler_signal: None,
             killed_by_signal: None,
             process_name: self.process_name,
+            signalfds: self.signalfds.clone(),
+            next_signalfd_id: self.next_signalfd_id,
         };
         // Move shared pipe/eventfd state to child
         core::mem::swap(&mut self.pipes, &mut child.pipes);
@@ -4064,6 +4189,16 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 let stat = FileStat {
                     qpath: epoll_id as u64,
                     name: alloc::sync::Arc::from("epoll"),
+                    size: 0,
+                    file_type: FileType::Regular,
+                };
+                write_linux_stat(statbuf_ptr, &stat);
+                0
+            }
+            FdKind::SignalFd { signalfd_id } => {
+                let stat = FileStat {
+                    qpath: signalfd_id as u64,
+                    name: alloc::sync::Arc::from("signalfd"),
                     size: 0,
                     file_type: FileType::Regular,
                 };
