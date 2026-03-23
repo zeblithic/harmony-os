@@ -5835,10 +5835,6 @@ impl<B: SyscallBackend> Linuxulator<B> {
         0
     }
 
-    /// Linux futex(2): fast userspace mutex.
-    ///
-    /// FUTEX_WAKE (cmd 1) returns 0 (no waiters woken — single-threaded).
-    /// All other operations return ENOSYS.
     /// Linux futex(2): fast userspace locking.
     ///
     /// FUTEX_WAKE (cmd 1): returns 0 (no waiters — single-threaded).
