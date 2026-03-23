@@ -47,7 +47,12 @@ pub struct GenetServer<B: RegisterBank, const RX: usize, const TX: usize> {
 
 impl<B: RegisterBank, const RX: usize, const TX: usize> GenetServer<B, RX, TX> {
     /// Create a new GenetServer with an already-initialized driver.
-    pub fn new(driver: GenetDriver<RX, TX>, bank: B, tx_pool: DmaPool<TX>, rx_pool: DmaPool<RX>) -> Self {
+    pub fn new(
+        driver: GenetDriver<RX, TX>,
+        bank: B,
+        tx_pool: DmaPool<TX>,
+        rx_pool: DmaPool<RX>,
+    ) -> Self {
         Self {
             driver,
             bank,
@@ -230,7 +235,9 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
                 self.driver
                     .send(&mut self.bank, data, &mut self.tx_pool)
                     .map_err(|e| match e {
-                        GenetError::TxRingFull => IpcError::ResourceExhausted,
+                        GenetError::TxRingFull | GenetError::NoBuffers => {
+                            IpcError::ResourceExhausted
+                        }
                         _ => IpcError::InvalidArgument,
                     })?;
                 Ok(data.len() as u32)

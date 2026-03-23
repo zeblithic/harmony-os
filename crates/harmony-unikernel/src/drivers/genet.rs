@@ -623,11 +623,17 @@ mod tests {
     use alloc::vec;
 
     fn make_test_pool<const N: usize>() -> DmaPool<N> {
-        let mut buffers = [DmaBuffer { virt: core::ptr::null_mut(), phys: 0 }; N];
+        let mut buffers = [DmaBuffer {
+            virt: core::ptr::null_mut(),
+            phys: 0,
+        }; N];
         for i in 0..N {
             let buf = alloc::vec![0u8; 2048].into_boxed_slice();
             let ptr = Box::into_raw(buf) as *mut u8;
-            buffers[i] = DmaBuffer { virt: ptr, phys: ptr as u64 };
+            buffers[i] = DmaBuffer {
+                virt: ptr,
+                phys: ptr as u64,
+            };
         }
         DmaPool::new(buffers, 2048)
     }
@@ -865,7 +871,7 @@ mod tests {
         bank.writes.clear(); // clear init writes for easier assertion
         driver.send(&mut bank, &frame, &mut tx_pool).unwrap();
 
-        // First write after clear should be the descriptor length_status.
+        // Descriptor writes: ADDRESS_LO, ADDRESS_HI, then LENGTH_STATUS last (ownership transfer).
         // Descriptor base = TDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET + desc_idx * DMA_DESC_SIZE
         let desc_base = TDMA_OFF + DMA_RINGS_SIZE + DMA_DESC_BASE_OFFSET;
         let len_status_writes: Vec<(usize, u32)> = bank
@@ -1000,7 +1006,10 @@ mod tests {
         let len_status = (64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP;
         bank.on_read(desc_base + DMA_DESC_LENGTH_STATUS, vec![len_status]);
         bank.on_read(desc_base + DMA_DESC_ADDRESS_LO, vec![buf_phys as u32]);
-        bank.on_read(desc_base + DMA_DESC_ADDRESS_HI, vec![(buf_phys >> 32) as u32]);
+        bank.on_read(
+            desc_base + DMA_DESC_ADDRESS_HI,
+            vec![(buf_phys >> 32) as u32],
+        );
 
         // Mark the buffer as in-use (allocated) so poll_rx can find and free it.
         // (Already allocated above — pool tracks it as in-use.)
@@ -1055,7 +1064,10 @@ mod tests {
         let len_status = (64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP;
         bank.on_read(desc_base + DMA_DESC_LENGTH_STATUS, vec![len_status]);
         bank.on_read(desc_base + DMA_DESC_ADDRESS_LO, vec![buf0_phys as u32]);
-        bank.on_read(desc_base + DMA_DESC_ADDRESS_HI, vec![(buf0_phys >> 32) as u32]);
+        bank.on_read(
+            desc_base + DMA_DESC_ADDRESS_HI,
+            vec![(buf0_phys >> 32) as u32],
+        );
         bank.on_read(
             desc_base + DMA_DESC_SIZE + DMA_DESC_LENGTH_STATUS,
             vec![len_status],
@@ -1161,7 +1173,10 @@ mod tests {
         let len_status = (64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP;
         bank.on_read(desc_base + DMA_DESC_LENGTH_STATUS, vec![len_status]);
         bank.on_read(desc_base + DMA_DESC_ADDRESS_LO, vec![buf0_phys as u32]);
-        bank.on_read(desc_base + DMA_DESC_ADDRESS_HI, vec![(buf0_phys >> 32) as u32]);
+        bank.on_read(
+            desc_base + DMA_DESC_ADDRESS_HI,
+            vec![(buf0_phys >> 32) as u32],
+        );
         bank.on_read(
             desc_base + DMA_DESC_SIZE + DMA_DESC_LENGTH_STATUS,
             vec![len_status],
@@ -1285,7 +1300,10 @@ mod tests {
             vec![(64u32 << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP],
         );
         bank.on_read(desc_base + DMA_DESC_ADDRESS_LO, vec![rx_buf_phys as u32]);
-        bank.on_read(desc_base + DMA_DESC_ADDRESS_HI, vec![(rx_buf_phys >> 32) as u32]);
+        bank.on_read(
+            desc_base + DMA_DESC_ADDRESS_HI,
+            vec![(rx_buf_phys >> 32) as u32],
+        );
         driver.poll_rx(&mut bank, &mut rx_pool);
 
         let stats = driver.stats();
@@ -1422,7 +1440,10 @@ mod tests {
             .iter()
             .position(|&off| off == desc_base + DMA_DESC_LENGTH_STATUS)
             .unwrap();
-        assert!(addr_lo_pos < ls_pos, "ADDRESS_LO must be written before LENGTH_STATUS");
+        assert!(
+            addr_lo_pos < ls_pos,
+            "ADDRESS_LO must be written before LENGTH_STATUS"
+        );
     }
 
     #[test]

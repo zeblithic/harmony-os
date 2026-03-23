@@ -23,7 +23,7 @@ pub unsafe fn clean_range(start: *const u8, len: usize) {
     let mut addr = (start as usize) & !(CACHE_LINE_SIZE - 1);
     let end = (start as usize) + len;
     while addr < end {
-        core::arch::asm!("dc cvau, {}", in(reg) addr);
+        core::arch::asm!("dc cvac, {}", in(reg) addr);
         addr += CACHE_LINE_SIZE;
     }
     core::arch::asm!("dsb sy");

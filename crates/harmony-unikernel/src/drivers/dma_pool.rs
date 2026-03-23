@@ -56,6 +56,9 @@ impl<const N: usize> DmaPool<N> {
     }
 
     /// Free a buffer by index. Returns error on double-free.
+    ///
+    /// # Panics
+    /// Panics if `index >= N`.
     pub fn free(&mut self, index: usize) -> Result<(), DmaPoolError> {
         if self.free[index] {
             return Err(DmaPoolError::DoubleFree(index));
@@ -65,6 +68,9 @@ impl<const N: usize> DmaPool<N> {
     }
 
     /// Get buffer metadata by index.
+    ///
+    /// # Panics
+    /// Panics if `index >= N`.
     pub fn get(&self, index: usize) -> &DmaBuffer {
         &self.buffers[index]
     }
