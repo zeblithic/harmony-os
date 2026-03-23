@@ -17,6 +17,7 @@ mod platform;
 
 mod syscall;
 mod vectors;
+mod pe;
 
 #[cfg(not(test))]
 use linked_list_allocator::LockedHeap;
@@ -27,6 +28,8 @@ use core::fmt::Write;
 use uefi::mem::memory_map::MemoryMap as _;
 #[cfg(target_os = "uefi")]
 use uefi::prelude::*;
+#[cfg(target_os = "uefi")]
+use uefi::proto::loaded_image::LoadedImage;
 
 #[cfg(not(test))]
 #[global_allocator]
@@ -75,6 +78,50 @@ fn is_usable_memory(ty: uefi::mem::memory_map::MemoryType) -> bool {
 fn main() -> Status {
     uefi::helpers::init().unwrap();
     uefi::println!("[UEFI] Booting Harmony aarch64...");
+
+    // ── Parse PE/COFF sections for W^X enforcement ──
+    // Must be done BEFORE ExitBootServices while UEFI protocols are still available.
+    let image_sections: Option<pe::ImageSections> = {
+        let handle = uefi::boot::image_handle();
+        // Use GetProtocol (non-exclusive) instead of Exclusive — OEM firmware
+        // may already hold LoadedImage open, causing ACCESS_DENIED with exclusive.
+        match unsafe {
+            uefi::boot::open_protocol::<LoadedImage>(
+                uefi::boot::OpenProtocolParams {
+                    handle,
+                    agent: handle,
+                    controller: None,
+                },
+                uefi::boot::OpenProtocolAttributes::GetProtocol,
+            )
+        } {
+            Ok(loaded_image) => {
+                let (base_ptr, size) = loaded_image.info();
+                let base = base_ptr as u64;
+                uefi::println!("[BOOT] PE image: base={:#x} size={:#x}", base, size);
+                match unsafe { pe::parse_sections(base, size) } {
+                    Ok(sections) => {
+                        uefi::println!("[BOOT] PE sections parsed: W^X will be enforced");
+                        Some(sections)
+                    }
+                    Err(e) => {
+                        uefi::println!(
+                            "[BOOT] WARNING: PE section parse failed ({:?}), falling back to RWX",
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                uefi::println!(
+                    "[BOOT] WARNING: LoadedImage protocol unavailable ({:?}), falling back to RWX",
+                    e
+                );
+                None
+            }
+        }
+    };
 
     // ── Exit boot services ── UEFI console is no longer available after this.
     // Capture the memory map -- we need it to build the identity page table.
@@ -162,7 +209,14 @@ fn main() -> Status {
     let mut bump = bump_alloc::BumpAllocator::new(bump_base, BUMP_REGION_SIZE);
 
     // ── Build identity map and enable MMU ──
-    unsafe { mmu::init_and_enable(&regions[..region_count], &mut bump, &mut serial) };
+    unsafe {
+        mmu::init_and_enable(
+            &regions[..region_count],
+            &mut bump,
+            &mut serial,
+            image_sections.as_ref(),
+        )
+    };
 
     // ── Initialise ARM Generic Timer ──
     unsafe { timer::init() };

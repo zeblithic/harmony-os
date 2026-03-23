@@ -95,6 +95,9 @@ const SCTLR_I: u64 = 1 << 12;
 
 /// Build an identity page table over the given memory regions and enable the MMU.
 ///
+/// When `image_sections` is `Some`, code pages are mapped RX and data pages RW
+/// (W^X enforced). When `None`, all RAM is mapped RWX as a fallback.
+///
 /// # Safety
 ///
 /// - Must be called exactly once, after ExitBootServices.
@@ -106,6 +109,7 @@ pub unsafe fn init_and_enable(
     regions: &[MemoryRegion],
     alloc: &mut BumpAllocator,
     serial: &mut impl Write,
+    image_sections: Option<&crate::pe::ImageSections>,
 ) {
     // 1. Allocate and zero the root (L0) page table frame.
     let root_frame = alloc
@@ -118,12 +122,22 @@ pub unsafe fn init_and_enable(
 
     // 3. Map all usable RAM regions as Normal cacheable memory.
     //
-    // TODO: W^X hardening — currently all RAM is mapped RWX because we cannot
-    // distinguish code from data pages without linker-provided section boundaries
-    // (UEFI loads us as PE/COFF, not ELF). After enabling the MMU, instruction
-    // fetches fault on non-executable pages, so we must mark code pages RX.
-    // Future work: use linker symbols to split into RX (code) and RW (data/heap).
-    let ram_flags = PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::EXECUTABLE;
+    // W^X: when image_sections is Some, each page within the image is mapped
+    // with per-section flags (code=RX, data=RW, rodata=RO). Pages outside the
+    // image (heap, stack, ELF load targets) remain RWX because vm_mprotect is
+    // currently a no-op — the ELF loader relies on it to set RX on text segments
+    // after writing them. Until vm_mprotect is implemented (requires page table
+    // access from SyscallBackend), outside-image pages must stay executable.
+    // TODO(harmony-os-fg5-followup): implement real vm_mprotect, then change
+    // default_outside to RW and keep fallback_flags as a separate decision.
+    let rwx = PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::EXECUTABLE;
+    let fallback_flags = rwx;
+    let default_outside = rwx;
+
+    if image_sections.is_none() {
+        let _ = writeln!(serial, "[MMU] WARNING: W^X disabled — mapping all RAM as RWX");
+    }
+
     let mut mapped_pages: u64 = 0;
 
     for region in regions {
@@ -132,7 +146,11 @@ pub unsafe fn init_and_enable(
         }
         for page_idx in 0..region.pages {
             let addr = region.base + page_idx * PAGE_SIZE;
-            let result = pt.map(VirtAddr(addr), PhysAddr(addr), ram_flags, &mut || {
+            let flags = match image_sections {
+                Some(sections) => sections.flags_for_addr(addr).unwrap_or(default_outside),
+                None => fallback_flags,
+            };
+            let result = pt.map(VirtAddr(addr), PhysAddr(addr), flags, &mut || {
                 alloc_zeroed_frame(alloc)
             });
             match result {
@@ -172,6 +190,13 @@ pub unsafe fn init_and_enable(
     }
 
     let _ = writeln!(serial, "[MMU] Mapped {} pages", mapped_pages);
+
+    if image_sections.is_some() {
+        let _ = writeln!(
+            serial,
+            "[MMU] W^X partial: image code=RX, image data=RW, outside image=RWX (vm_mprotect TODO)"
+        );
+    }
 
     // 5. Configure system registers and enable the MMU.
     //
