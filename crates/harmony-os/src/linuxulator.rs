@@ -511,10 +511,6 @@ impl LinuxSyscall {
                 iovcnt: args[2] as i32,
             },
             22 => LinuxSyscall::Pipe { fds: args[0] },
-            35 => LinuxSyscall::Nanosleep {
-                req: args[0],
-                rem: args[1],
-            },
             28 => LinuxSyscall::Madvise {
                 addr: args[0],
                 len: args[1],
@@ -526,6 +522,10 @@ impl LinuxSyscall {
             33 => LinuxSyscall::Dup2 {
                 oldfd: args[0] as i32,
                 newfd: args[1] as i32,
+            },
+            35 => LinuxSyscall::Nanosleep {
+                req: args[0],
+                rem: args[1],
             },
             39 => LinuxSyscall::Getpid,
             41 => LinuxSyscall::Socket {
@@ -3674,7 +3674,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             pending_signals: 0,
             pending_handler_signal: None,
             killed_by_signal: None,
-            process_name: [0u8; 16],
+            process_name: self.process_name,
         };
         // Move shared pipe/eventfd state to child
         core::mem::swap(&mut self.pipes, &mut child.pipes);
@@ -3895,8 +3895,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
         // Read struct timespec { tv_sec: i64, tv_nsec: i64 } from user memory.
         let req_bytes = unsafe { core::slice::from_raw_parts(req_ptr as usize as *const u8, 16) };
-        let tv_sec = i64::from_ne_bytes(req_bytes[0..8].try_into().unwrap());
-        let tv_nsec = i64::from_ne_bytes(req_bytes[8..16].try_into().unwrap());
+        let tv_sec = i64::from_le_bytes(req_bytes[0..8].try_into().unwrap());
+        let tv_nsec = i64::from_le_bytes(req_bytes[8..16].try_into().unwrap());
 
         if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
             return EINVAL;
@@ -3911,18 +3911,37 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux clock_nanosleep(2): sleep on a specific clock.
     ///
-    /// Delegates to nanosleep logic. TIMER_ABSTIME (flags & 1) is
-    /// accepted but treated the same as relative (clock is synthetic).
-    fn sys_clock_nanosleep(
-        &mut self,
-        clockid: i32,
-        _flags: i32,
-        req_ptr: u64,
-        rem_ptr: u64,
-    ) -> i64 {
+    /// Supports both relative (flags=0) and absolute (TIMER_ABSTIME)
+    /// sleep. For absolute, computes delta from current clock value.
+    fn sys_clock_nanosleep(&mut self, clockid: i32, flags: i32, req_ptr: u64, rem_ptr: u64) -> i64 {
         if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
             return EINVAL;
         }
+
+        const TIMER_ABSTIME: i32 = 1;
+        if flags & TIMER_ABSTIME != 0 {
+            // Absolute time: compute delta from current clock value.
+            if req_ptr == 0 {
+                return EFAULT;
+            }
+            let req_bytes =
+                unsafe { core::slice::from_raw_parts(req_ptr as usize as *const u8, 16) };
+            let abs_sec = i64::from_le_bytes(req_bytes[0..8].try_into().unwrap());
+            let abs_nsec = i64::from_le_bytes(req_bytes[8..16].try_into().unwrap());
+            if abs_sec < 0 || !(0..1_000_000_000).contains(&abs_nsec) {
+                return EINVAL;
+            }
+            let abs_ns = (abs_sec as u64) * 1_000_000_000 + (abs_nsec as u64);
+            let now = match clockid {
+                CLOCK_REALTIME => self.realtime_ns,
+                _ => self.monotonic_ns,
+            };
+            // If target is already in the past, return immediately.
+            let delta_ns = abs_ns.saturating_sub(now);
+            self.monotonic_ns = self.monotonic_ns.wrapping_add(delta_ns);
+            return 0;
+        }
+
         self.sys_nanosleep(req_ptr, rem_ptr)
     }
 
@@ -3939,15 +3958,17 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 if arg2 == 0 {
                     return EFAULT;
                 }
-                // Read up to 16 bytes (including null) from user memory.
+                // Copy up to 15 chars + always null-terminate at [15].
+                // Matches Linux kernel's strlcpy(tsk->comm, name, sizeof(tsk->comm)).
                 let src = unsafe { core::slice::from_raw_parts(arg2 as usize as *const u8, 16) };
                 self.process_name = [0u8; 16];
-                for (i, &b) in src.iter().enumerate() {
+                for (i, &b) in src.iter().take(15).enumerate() {
                     if b == 0 {
                         break;
                     }
                     self.process_name[i] = b;
                 }
+                // process_name[15] is always 0 (from the zeroing above)
                 0
             }
             PR_GET_NAME => {
