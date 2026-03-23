@@ -3925,6 +3925,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
 
         const TIMER_ABSTIME: i32 = 1;
+        if flags & !TIMER_ABSTIME != 0 {
+            return EINVAL;
+        }
         if flags & TIMER_ABSTIME != 0 {
             // Absolute time: compute delta from current clock value.
             if req_ptr == 0 {
