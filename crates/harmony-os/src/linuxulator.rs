@@ -3936,9 +3936,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
         match elapsed.checked_div(state.interval_ns) {
             None => (0, 0), // interval_ns==0: one-shot expired
             Some(extra) => {
-                let next = state.expiration_ns.saturating_add(
-                    extra.saturating_add(1).saturating_mul(state.interval_ns),
-                );
+                let next = state
+                    .expiration_ns
+                    .saturating_add(extra.saturating_add(1).saturating_mul(state.interval_ns));
                 let to_next = next.saturating_sub(now);
                 (
                     (to_next / 1_000_000_000) as i64,
