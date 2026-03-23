@@ -3780,12 +3780,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if !(0..=64).contains(&sig) {
             return EINVAL;
         }
-        // pid <= 0 is process-group signaling (not supported).
-        // pid == 0 means own process group, pid < 0 means group -pid.
-        if pid <= 0 {
+        // pid < 0: process group signaling (not supported).
+        // pid == -1 means all processes, pid < -1 means group abs(pid).
+        if pid < 0 {
             return ENOSYS;
         }
-        if pid != self.pid {
+        // pid == 0: send to own process group — treat as self-signal
+        // (matches libc raise() which uses kill(0, sig)).
+        if pid != 0 && pid != self.pid {
             return ESRCH;
         }
         if sig == 0 {
@@ -3797,7 +3799,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux tgkill(2): send signal to a specific thread.
     fn sys_tgkill(&mut self, tgid: i32, tid: i32, sig: i32) -> i64 {
-        if tid <= 0 {
+        if tgid <= 0 || tid <= 0 {
             return EINVAL;
         }
         if !(0..=64).contains(&sig) {
