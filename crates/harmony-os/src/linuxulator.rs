@@ -3918,6 +3918,36 @@ impl<B: SyscallBackend> Linuxulator<B> {
     // ── TimerFd ───────────────────────────────────────────────────
 
     /// Linux timerfd_create(2): create a timer file descriptor.
+    /// Compute the remaining time until next timerfd expiration as (sec, nsec).
+    /// Shared by timerfd_gettime and timerfd_settime's old_value output.
+    fn timerfd_remaining(state: &TimerFdState, now: u64) -> (i64, i64) {
+        if state.expiration_ns == 0 {
+            return (0, 0);
+        }
+        if now < state.expiration_ns {
+            let remaining = state.expiration_ns - now;
+            return (
+                (remaining / 1_000_000_000) as i64,
+                (remaining % 1_000_000_000) as i64,
+            );
+        }
+        // Expired: one-shot (interval=0) or repeating.
+        let elapsed = now - state.expiration_ns;
+        match elapsed.checked_div(state.interval_ns) {
+            None => (0, 0), // interval_ns==0: one-shot expired
+            Some(extra) => {
+                let next = state.expiration_ns.saturating_add(
+                    extra.saturating_add(1).saturating_mul(state.interval_ns),
+                );
+                let to_next = next.saturating_sub(now);
+                (
+                    (to_next / 1_000_000_000) as i64,
+                    (to_next % 1_000_000_000) as i64,
+                )
+            }
+        }
+    }
+
     fn sys_timerfd_create(&mut self, clockid: i32, flags: i32) -> i64 {
         const TFD_CLOEXEC: i32 = 0x80000;
         const TFD_NONBLOCK: i32 = 0x800;
@@ -4020,31 +4050,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 CLOCK_REALTIME => self.realtime_ns,
                 _ => self.monotonic_ns,
             };
-            let (old_val_sec, old_val_nsec) = if state.expiration_ns == 0 {
-                (0i64, 0i64)
-            } else if now < state.expiration_ns {
-                let remaining = state.expiration_ns - now;
-                (
-                    (remaining / 1_000_000_000) as i64,
-                    (remaining % 1_000_000_000) as i64,
-                )
-            } else {
-                // Expired: one-shot (interval=0) or repeating.
-                let elapsed = now - state.expiration_ns;
-                match elapsed.checked_div(state.interval_ns) {
-                    None => (0i64, 0i64), // interval_ns==0: one-shot expired
-                    Some(extra) => {
-                        let next = state.expiration_ns.saturating_add(
-                            extra.saturating_add(1).saturating_mul(state.interval_ns),
-                        );
-                        let to_next = next.saturating_sub(now);
-                        (
-                            (to_next / 1_000_000_000) as i64,
-                            (to_next % 1_000_000_000) as i64,
-                        )
-                    }
-                }
-            };
+            let (old_val_sec, old_val_nsec) = Self::timerfd_remaining(state, now);
             let old_int_sec = (state.interval_ns / 1_000_000_000) as i64;
             let old_int_nsec = (state.interval_ns % 1_000_000_000) as i64;
             let buf =
@@ -4098,38 +4104,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
         };
 
         // Compute remaining time until next expiration.
-        let (value_sec, value_nsec) = if state.expiration_ns == 0 {
-            (0i64, 0i64)
-        } else {
-            let now = match state.clockid {
-                CLOCK_REALTIME => self.realtime_ns,
-                _ => self.monotonic_ns,
-            };
-            if now < state.expiration_ns {
-                // Not yet expired — return remaining time.
-                let remaining = state.expiration_ns - now;
-                (
-                    (remaining / 1_000_000_000) as i64,
-                    (remaining % 1_000_000_000) as i64,
-                )
-            } else {
-                // Expired: one-shot (interval=0) or repeating.
-                let elapsed = now - state.expiration_ns;
-                match elapsed.checked_div(state.interval_ns) {
-                    None => (0i64, 0i64), // interval_ns==0: one-shot expired
-                    Some(extra) => {
-                        let next_expiration = state.expiration_ns.saturating_add(
-                            extra.saturating_add(1).saturating_mul(state.interval_ns),
-                        );
-                        let to_next = next_expiration.saturating_sub(now);
-                        (
-                            (to_next / 1_000_000_000) as i64,
-                            (to_next % 1_000_000_000) as i64,
-                        )
-                    }
-                }
-            }
+        let now = match state.clockid {
+            CLOCK_REALTIME => self.realtime_ns,
+            _ => self.monotonic_ns,
         };
+        let (value_sec, value_nsec) = Self::timerfd_remaining(state, now);
 
         let interval_sec = (state.interval_ns / 1_000_000_000) as i64;
         let interval_nsec = (state.interval_ns % 1_000_000_000) as i64;
