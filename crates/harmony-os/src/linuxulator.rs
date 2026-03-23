@@ -54,6 +54,7 @@ const SIGSTOP: u32 = 19;
 const SIG_BLOCK: i32 = 0;
 const SIG_UNBLOCK: i32 = 1;
 const SIG_SETMASK: i32 = 2;
+const SIGCHLD_NUM: u32 = 17;
 
 fn ipc_err_to_errno(e: IpcError) -> i64 {
     match e {
@@ -415,6 +416,15 @@ pub enum LinuxSyscall {
         argv: u64,
         envp: u64,
     },
+    Kill {
+        pid: i32,
+        sig: i32,
+    },
+    Tgkill {
+        tgid: i32,
+        tid: i32,
+        sig: i32,
+    },
     Unknown {
         nr: u64,
     },
@@ -574,6 +584,10 @@ impl LinuxSyscall {
             60 => LinuxSyscall::Exit {
                 code: args[0] as i32,
             },
+            62 => LinuxSyscall::Kill {
+                pid: args[0] as i32,
+                sig: args[1] as i32,
+            },
             63 => LinuxSyscall::Uname { buf: args[0] },
             72 => LinuxSyscall::Fcntl {
                 fd: args[0] as i32,
@@ -694,6 +708,11 @@ impl LinuxSyscall {
                 op: args[1] as i32,
                 fd: args[2] as i32,
                 event: args[3],
+            },
+            234 => LinuxSyscall::Tgkill {
+                tgid: args[0] as i32,
+                tid: args[1] as i32,
+                sig: args[2] as i32,
             },
             281 => LinuxSyscall::EpollPwait {
                 epfd: args[0] as i32,
@@ -897,6 +916,15 @@ impl LinuxSyscall {
                 pid: args[0] as i32,
                 cpusetsize: args[1],
                 mask: args[2],
+            },
+            129 => LinuxSyscall::Kill {
+                pid: args[0] as i32,
+                sig: args[1] as i32,
+            },
+            131 => LinuxSyscall::Tgkill {
+                tgid: args[0] as i32,
+                tid: args[1] as i32,
+                sig: args[2] as i32,
             },
             134 => LinuxSyscall::RtSigaction {
                 signum: args[0] as i32,
@@ -1716,6 +1744,21 @@ impl Default for SignalAction {
     }
 }
 
+/// Default action for a signal when SIG_DFL is the handler.
+enum DefaultAction {
+    Terminate,
+    Ignore,
+}
+
+/// Return the default action for a signal number (1-64).
+fn default_signal_action(signum: u32) -> DefaultAction {
+    match signum {
+        17 | 18 | 23 | 28 => DefaultAction::Ignore, // SIGCHLD, SIGCONT, SIGURG, SIGWINCH
+        19..=22 => DefaultAction::Ignore, // SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU (stop not supported)
+        _ => DefaultAction::Terminate,
+    }
+}
+
 /// A child process created by fork/clone.
 struct ChildProcess<B: SyscallBackend> {
     pid: i32,
@@ -1793,8 +1836,8 @@ pub struct Linuxulator<B: SyscallBackend> {
     next_child_pid: i32,
     /// Active children (running, not yet exited).
     children: Vec<ChildProcess<B>>,
-    /// Exited children: (pid, exit_code) pairs consumed by waitpid/wait4.
-    exited_children: Vec<(i32, i32)>,
+    /// Exited children: (pid, exit_code, killed_by_signal) triples consumed by waitpid/wait4.
+    exited_children: Vec<(i32, i32, Option<u32>)>,
     /// Arena size used for this process (inherited by children on fork).
     arena_size: usize,
     /// Set by sys_execve on success — caller should reset RIP/RSP.
@@ -1803,6 +1846,12 @@ pub struct Linuxulator<B: SyscallBackend> {
     signal_handlers: [SignalAction; 64],
     /// Blocked signal mask (bit N = signal N+1 is blocked).
     signal_mask: u64,
+    /// Pending signal bitmask (bit N = signal N+1 is pending).
+    pending_signals: u64,
+    /// Signal with custom handler pending for caller invocation.
+    pending_handler_signal: Option<u32>,
+    /// If set, process was killed by this signal (for wstatus encoding).
+    killed_by_signal: Option<u32>,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -1844,6 +1893,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
             pending_execve: None,
             signal_handlers: [SignalAction::default(); 64],
             signal_mask: 0,
+            pending_signals: 0,
+            pending_handler_signal: None,
+            killed_by_signal: None,
         }
     }
 
@@ -1999,7 +2051,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
         // The exit code is stored in exited_children for future waitpid.
         let child = self.children.pop().unwrap();
         let exit_code = child.linuxulator.exit_code.unwrap_or(0);
-        self.exited_children.push((child.pid, exit_code));
+        let killed_by = child.linuxulator.killed_by_signal;
+        self.exited_children.push((child.pid, exit_code, killed_by));
 
         // Swap pipes/eventfds back from the (now dropped) child.
         // We need to move them out before the child is dropped, so
@@ -2016,6 +2069,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
         // are dropped with the child, so counter recovery is not needed.
         // next_child_pid must be recovered to keep the global PID space.
         self.next_child_pid = self.next_child_pid.max(c.next_child_pid);
+        // Auto-deliver SIGCHLD to parent (Linux does this on child exit).
+        self.pending_signals |= 1u64 << (SIGCHLD_NUM - 1);
     }
 
     /// Return the deepest actively-running Linuxulator in the process tree.
@@ -2058,6 +2113,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// reset RIP to entry_point and RSP to stack_pointer.
     pub fn pending_execve(&mut self) -> Option<ExecveResult> {
         self.pending_execve.take()
+    }
+
+    /// Consume the pending handler signal.
+    pub fn pending_handler_signal(&mut self) -> Option<u32> {
+        self.pending_handler_signal.take()
     }
 
     /// Access the backend (for test assertions).
@@ -2107,7 +2167,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// to process memory. In the MVP flat address space, this is a direct
     /// dereference.
     pub fn dispatch_syscall(&mut self, syscall: LinuxSyscall) -> i64 {
-        match syscall {
+        let result = match syscall {
             LinuxSyscall::Read { fd, buf, count } => {
                 self.sys_read(fd, buf as usize, count as usize)
             }
@@ -2304,8 +2364,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 rusage,
             } => self.sys_wait4(pid, wstatus, options, rusage),
             LinuxSyscall::Execve { path, argv, envp } => self.sys_execve(path, argv, envp),
+            LinuxSyscall::Kill { pid, sig } => self.sys_kill(pid, sig),
+            LinuxSyscall::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
             LinuxSyscall::Unknown { .. } => ENOSYS,
-        }
+        };
+        self.deliver_pending_signals();
+        result
     }
 
     /// Linux write(2): write to a file descriptor.
@@ -2609,6 +2673,70 @@ impl<B: SyscallBackend> Linuxulator<B> {
             action.flags = 0;
             action.mask = 0;
             action.restorer = 0;
+        }
+        // pending_signals preserved across exec (Linux semantics).
+        self.pending_handler_signal = None;
+        self.killed_by_signal = None;
+    }
+
+    /// Deliver one pending signal at syscall boundary.
+    ///
+    /// Queue a signal on this process's pending bitmask.
+    fn queue_signal(&mut self, sig: u32) {
+        if (1..=64).contains(&sig) {
+            self.pending_signals |= 1u64 << (sig - 1);
+        }
+    }
+
+    /// Called at the end of dispatch_syscall. Handles SIG_DFL and
+    /// SIG_IGN internally. Custom handlers are reported via
+    /// pending_handler_signal for the caller to invoke.
+    fn deliver_pending_signals(&mut self) {
+        // If the process has already exited (e.g. via exit_group), do not
+        // deliver further signals — they cannot affect wstatus anymore.
+        if self.exit_code.is_some() {
+            return;
+        }
+        if self.pending_signals == 0 {
+            return;
+        }
+
+        // SIGKILL (9) always delivered regardless of mask.
+        let sigkill_pending = self.pending_signals & (1u64 << (SIGKILL - 1)) != 0;
+        if sigkill_pending {
+            self.pending_signals &= !(1u64 << (SIGKILL - 1));
+            self.exit_code = Some(0);
+            self.killed_by_signal = Some(SIGKILL);
+            return;
+        }
+
+        // Find lowest deliverable signal (pending AND not blocked).
+        let deliverable = self.pending_signals & !self.signal_mask;
+        if deliverable == 0 {
+            return;
+        }
+
+        let bit = deliverable.trailing_zeros();
+        let signum = bit + 1;
+        self.pending_signals &= !(1u64 << bit);
+
+        let handler = self.signal_handlers[bit as usize].handler;
+        match handler {
+            SIG_IGN => {}
+            SIG_DFL => match default_signal_action(signum) {
+                DefaultAction::Terminate => {
+                    self.exit_code = Some(0);
+                    self.killed_by_signal = Some(signum);
+                }
+                DefaultAction::Ignore => {}
+            },
+            _ => {
+                debug_assert!(
+                    self.pending_handler_signal.is_none(),
+                    "pending_handler_signal overwritten: caller must consume after each dispatch_syscall"
+                );
+                self.pending_handler_signal = Some(signum);
+            }
         }
     }
 
@@ -3481,6 +3609,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
             pending_execve: None,
             signal_handlers: self.signal_handlers,
             signal_mask: self.signal_mask,
+            pending_signals: 0,
+            pending_handler_signal: None,
+            killed_by_signal: None,
         };
         // Move shared pipe/eventfd state to child
         core::mem::swap(&mut self.pipes, &mut child.pipes);
@@ -3531,7 +3662,6 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// and CLONE_CHILD_CLEARTID (musl's fork() wrapper). Threading
     /// flags (CLONE_VM, CLONE_THREAD, CLONE_FILES) return ENOSYS.
     fn sys_clone(&mut self, flags: u64) -> i64 {
-        const SIGCHLD: u64 = 17;
         const CLONE_VM: u64 = 0x00000100;
         const CLONE_FILES: u64 = 0x00000400;
         const CLONE_THREAD: u64 = 0x00010000;
@@ -3549,8 +3679,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
         // waitpid uses SIGCHLD-based waiting for child processes, not
         // futex-based TID polling (which is only used for threads).
         let sig = flags & 0xFF;
-        let known_flags = SIGCHLD | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
-        if sig != SIGCHLD || (flags & !known_flags) != 0 {
+        let known_flags = SIGCHLD_NUM as u64 | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
+        if sig != SIGCHLD_NUM as u64 || (flags & !known_flags) != 0 {
             return ENOSYS;
         }
 
@@ -3595,7 +3725,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             !self.children.is_empty() || !self.exited_children.is_empty()
         } else {
             self.children.iter().any(|c| c.pid == pid)
-                || self.exited_children.iter().any(|&(p, _)| p == pid)
+                || self.exited_children.iter().any(|&(p, _, _)| p == pid)
         };
 
         let idx = if pid == -1 {
@@ -3607,7 +3737,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             }
         } else {
             // Specific child
-            self.exited_children.iter().position(|&(p, _)| p == pid)
+            self.exited_children.iter().position(|&(p, _, _)| p == pid)
         };
 
         let idx = match idx {
@@ -3624,12 +3754,16 @@ impl<B: SyscallBackend> Linuxulator<B> {
             }
         };
 
-        let (child_pid, exit_code) = self.exited_children.remove(idx);
+        let (child_pid, exit_code, killed_by) = self.exited_children.remove(idx);
 
         // Write wstatus if pointer is non-null.
         // Linux wstatus format for normal exit: (code & 0xFF) << 8
+        // Linux wstatus format for signal death: (sig & 0x7F)
         if wstatus_ptr != 0 {
-            let wstatus = ((exit_code & 0xFF) as u32) << 8;
+            let wstatus = match killed_by {
+                Some(sig) => sig & 0x7F,
+                None => ((exit_code & 0xFF) as u32) << 8,
+            };
             let buf =
                 unsafe { core::slice::from_raw_parts_mut(wstatus_ptr as usize as *mut u8, 4) };
             buf.copy_from_slice(&wstatus.to_ne_bytes());
@@ -3643,6 +3777,49 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
 
         child_pid as i64
+    }
+
+    /// Linux kill(2): send a signal to a process.
+    fn sys_kill(&mut self, pid: i32, sig: i32) -> i64 {
+        if !(0..=64).contains(&sig) {
+            return EINVAL;
+        }
+        // pid < 0: process group signaling (not supported).
+        // pid == -1 means all processes, pid < -1 means group abs(pid).
+        if pid < 0 {
+            return ENOSYS;
+        }
+        // pid == 0: send to own process group — treat as self-signal
+        // (matches libc raise() which uses kill(0, sig)).
+        // Non-self PIDs return ESRCH (standard "no such process" —
+        // callers like systemd use kill(pid, 0) for alive-checks and
+        // expect ESRCH). Cross-process signaling is not yet implemented.
+        if pid != 0 && pid != self.pid {
+            return ESRCH;
+        }
+        if sig == 0 {
+            return 0; // null signal — process exists check
+        }
+        self.queue_signal(sig as u32);
+        0
+    }
+
+    /// Linux tgkill(2): send signal to a specific thread.
+    fn sys_tgkill(&mut self, tgid: i32, tid: i32, sig: i32) -> i64 {
+        if tgid <= 0 || tid <= 0 {
+            return EINVAL;
+        }
+        if !(0..=64).contains(&sig) {
+            return EINVAL;
+        }
+        if tgid != self.pid || tid != self.pid {
+            return ESRCH;
+        }
+        if sig == 0 {
+            return 0;
+        }
+        self.queue_signal(sig as u32);
+        0
     }
 
     /// Linux fstat(2): get file status.
@@ -11325,5 +11502,280 @@ mod integration_tests {
             current_mask, set,
             "signal mask must be preserved across execve"
         );
+    }
+
+    // ── Signal delivery tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_kill_self_terminate() {
+        // kill(1, 10) — SIGUSR1 with default action Terminate → process exits.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+        assert_eq!(r, 0);
+        assert!(
+            lx.exited(),
+            "SIGUSR1 with SIG_DFL should terminate the process"
+        );
+    }
+
+    #[test]
+    fn test_kill_sigchld_default_ignored() {
+        // kill(1, 17) — SIGCHLD with default action Ignore → process NOT exited.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 17 });
+        assert_eq!(r, 0);
+        assert!(
+            !lx.exited(),
+            "SIGCHLD with SIG_DFL should be ignored, not terminate"
+        );
+    }
+
+    #[test]
+    fn test_kill_sig_ign() {
+        // Install SIG_IGN for sig 10, then kill(1, 10) → NOT exited.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let act = make_sigaction(SIG_IGN, 0, 0);
+        lx.dispatch_syscall(LinuxSyscall::RtSigaction {
+            signum: 10,
+            act: act.as_ptr() as u64,
+            oldact: 0,
+            sigsetsize: 8,
+        });
+        let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+        assert_eq!(r, 0);
+        assert!(!lx.exited(), "SIG_IGN should prevent termination");
+    }
+
+    #[test]
+    fn test_kill_blocked_stays_pending() {
+        // Block sig 10, send it → not exited; unblock → exited.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Block SIGUSR1 (signal 10 → bit 9 in the 64-bit mask).
+        let mask: u64 = 1u64 << 9;
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_SETMASK,
+            set: &mask as *const u64 as u64,
+            oldset: 0,
+            sigsetsize: 8,
+        });
+
+        // Send signal while blocked.
+        let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+        assert_eq!(r, 0);
+        assert!(!lx.exited(), "blocked signal should not terminate yet");
+
+        // Unblock — pending signal should fire immediately (deliver_pending_signals
+        // runs at the end of dispatch_syscall).
+        let empty: u64 = 0;
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_SETMASK,
+            set: &empty as *const u64 as u64,
+            oldset: 0,
+            sigsetsize: 8,
+        });
+        assert!(
+            lx.exited(),
+            "unblocking should deliver pending SIGUSR1 and terminate"
+        );
+    }
+
+    #[test]
+    fn test_kill_invalid_sig() {
+        // kill(1, 65) — signal number out of range → EINVAL.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 65 });
+        assert_eq!(r, EINVAL);
+        assert!(!lx.exited());
+    }
+
+    #[test]
+    fn test_kill_null_signal() {
+        // kill(1, 0) — null signal, existence check only → 0, NOT exited.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 0 });
+        assert_eq!(r, 0);
+        assert!(!lx.exited(), "null signal must not terminate the process");
+    }
+
+    #[test]
+    fn test_kill_unknown_pid_returns_esrch() {
+        // kill(999, 10) — PID not in process table → ESRCH.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 999, sig: 10 });
+        assert_eq!(r, ESRCH);
+        assert!(!lx.exited());
+    }
+
+    #[test]
+    fn test_tgkill_self() {
+        // tgkill(1, 1, 10) — send SIGUSR1 to self → exited.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let r = lx.dispatch_syscall(LinuxSyscall::Tgkill {
+            tgid: 1,
+            tid: 1,
+            sig: 10,
+        });
+        assert_eq!(r, 0);
+        assert!(lx.exited(), "tgkill to self with SIGUSR1 should terminate");
+    }
+
+    #[test]
+    fn test_tgkill_invalid_tgid_einval() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // tgid <= 0 must return EINVAL per tgkill(2).
+        let r1 = lx.dispatch_syscall(LinuxSyscall::Tgkill {
+            tgid: -1,
+            tid: 1,
+            sig: 10,
+        });
+        assert_eq!(r1, EINVAL, "tgkill(-1, 1, sig) must return EINVAL");
+        let r2 = lx.dispatch_syscall(LinuxSyscall::Tgkill {
+            tgid: 0,
+            tid: 1,
+            sig: 10,
+        });
+        assert_eq!(r2, EINVAL, "tgkill(0, 1, sig) must return EINVAL");
+        assert!(!lx.exited());
+    }
+
+    #[test]
+    fn test_sigchld_on_child_exit() {
+        // Fork a child, child exits → parent receives SIGCHLD (default=Ignore)
+        // → parent NOT exited.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.dispatch_syscall(LinuxSyscall::Fork);
+        {
+            let child = lx.active_process();
+            child.dispatch_syscall(LinuxSyscall::ExitGroup { code: 0 });
+        }
+        // active_process() triggers recover_child_state which queues SIGCHLD.
+        let _ = lx.active_process();
+
+        // Dispatch a no-op syscall to trigger deliver_pending_signals,
+        // which must apply SIGCHLD's default Ignore disposition.
+        lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 0 });
+
+        assert!(
+            !lx.exited(),
+            "SIGCHLD default=Ignore must not terminate parent after delivery"
+        );
+    }
+
+    #[test]
+    fn test_kill_custom_handler_reported() {
+        // Install custom handler 0x400000 for sig 10, kill → pending_handler_signal == Some(10).
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let act = make_sigaction(0x400000, 0, 0);
+        lx.dispatch_syscall(LinuxSyscall::RtSigaction {
+            signum: 10,
+            act: act.as_ptr() as u64,
+            oldact: 0,
+            sigsetsize: 8,
+        });
+        let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+        assert_eq!(r, 0);
+        assert!(
+            !lx.exited(),
+            "custom handler should not terminate the process"
+        );
+        assert_eq!(
+            lx.pending_handler_signal(),
+            Some(10),
+            "custom handler signal must be reported via pending_handler_signal"
+        );
+    }
+
+    #[test]
+    fn test_sigkill_bypasses_mask() {
+        // Block all signals, then kill(1, 9) — SIGKILL always terminates.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Set mask to all-ones (block everything, though SIGKILL cannot be masked).
+        let mask: u64 = u64::MAX;
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_SETMASK,
+            set: &mask as *const u64 as u64,
+            oldset: 0,
+            sigsetsize: 8,
+        });
+
+        let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 9 });
+        assert_eq!(r, 0);
+        assert!(
+            lx.exited(),
+            "SIGKILL must terminate even when all signals are blocked"
+        );
+    }
+
+    #[test]
+    fn test_kill_process_group_enosys() {
+        // kill(-1, 10) and kill(-2, 10) — negative PID (process group) → ENOSYS.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let r1 = lx.dispatch_syscall(LinuxSyscall::Kill { pid: -1, sig: 10 });
+        assert_eq!(r1, ENOSYS, "kill(-1, sig) should return ENOSYS");
+        let r2 = lx.dispatch_syscall(LinuxSyscall::Kill { pid: -2, sig: 10 });
+        assert_eq!(r2, ENOSYS, "kill(-2, sig) should return ENOSYS");
+        assert!(!lx.exited());
+    }
+
+    #[test]
+    fn test_fork_clears_pending_signals() {
+        // Block sig 10, send kill to queue it pending, fork → child inherits
+        // mask (signal still blocked in child). Unblock in child → child exits.
+        // Parent remains not exited because signal was only queued to parent.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Block SIGUSR1 in parent so the kill queues rather than terminates.
+        let mask: u64 = 1u64 << 9;
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_SETMASK,
+            set: &mask as *const u64 as u64,
+            oldset: 0,
+            sigsetsize: 8,
+        });
+
+        // Queue SIGUSR1 to parent.
+        let r = lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+        assert_eq!(r, 0);
+        assert!(
+            !lx.exited(),
+            "signal blocked in parent, should not exit yet"
+        );
+
+        // Fork — child inherits mask (SIGUSR1 still blocked). Child should NOT
+        // have inherited the pending signal (pending signals are not inherited
+        // across fork per POSIX).
+        lx.dispatch_syscall(LinuxSyscall::Fork);
+        {
+            let child = lx.active_process();
+            // Unblock SIGUSR1 in child. Because pending signals are cleared on
+            // fork, unblocking should not deliver anything.
+            let empty: u64 = 0;
+            child.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+                how: SIG_SETMASK,
+                set: &empty as *const u64 as u64,
+                oldset: 0,
+                sigsetsize: 8,
+            });
+            assert!(
+                !child.exited(),
+                "child must not exit — pending signals cleared on fork"
+            );
+        }
     }
 }
