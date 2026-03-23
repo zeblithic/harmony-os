@@ -467,6 +467,18 @@ pub enum LinuxSyscall {
         fd: i32,
         curr_value: u64,
     },
+    Poll {
+        fds: u64,
+        nfds: u64,
+        timeout: i32,
+    },
+    Ppoll {
+        fds: u64,
+        nfds: u64,
+        tmo_ptr: u64,
+        sigmask: u64,
+        sigsetsize: u64,
+    },
     Unknown {
         nr: u64,
     },
@@ -490,6 +502,11 @@ impl LinuxSyscall {
             5 => LinuxSyscall::Fstat {
                 fd: args[0] as i32,
                 buf: args[1],
+            },
+            7 => LinuxSyscall::Poll {
+                fds: args[0],
+                nfds: args[1],
+                timeout: args[2] as i32,
             },
             8 => LinuxSyscall::Lseek {
                 fd: args[0] as i32,
@@ -741,6 +758,13 @@ impl LinuxSyscall {
                 dirfd: args[0] as i32,
                 pathname: args[1],
                 mode: args[2] as i32,
+            },
+            271 => LinuxSyscall::Ppoll {
+                fds: args[0],
+                nfds: args[1],
+                tmo_ptr: args[2],
+                sigmask: args[3],
+                sigsetsize: args[4],
             },
             273 => LinuxSyscall::SetRobustList,
             290 => LinuxSyscall::EventFd2 {
@@ -1154,6 +1178,13 @@ impl LinuxSyscall {
                 buf: args[0],
                 buflen: args[1],
                 flags: args[2] as u32,
+            },
+            73 => LinuxSyscall::Ppoll {
+                fds: args[0],
+                nfds: args[1],
+                tmo_ptr: args[2],
+                sigmask: args[3],
+                sigsetsize: args[4],
             },
             74 => LinuxSyscall::SignalFd4 {
                 fd: args[0] as i32,
@@ -2414,7 +2445,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             LinuxSyscall::Getgid => self.sys_getgid(),
             LinuxSyscall::Getegid => self.sys_getegid(),
             LinuxSyscall::Madvise { .. } => self.sys_madvise(),
-            LinuxSyscall::Futex { op, .. } => self.sys_futex(op),
+            LinuxSyscall::Futex { uaddr, op, val } => self.sys_futex(uaddr, op, val),
             LinuxSyscall::SchedGetaffinity {
                 cpusetsize, mask, ..
             } => self.sys_sched_getaffinity(cpusetsize, mask),
@@ -2554,6 +2585,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
             LinuxSyscall::TimerfdGettime { fd, curr_value } => {
                 self.sys_timerfd_gettime(fd, curr_value)
             }
+            LinuxSyscall::Poll { fds, nfds, .. } => self.sys_poll(fds, nfds),
+            LinuxSyscall::Ppoll { fds, nfds, .. } => self.sys_poll(fds, nfds),
             LinuxSyscall::Unknown { .. } => ENOSYS,
         };
         self.deliver_pending_signals();
@@ -5806,16 +5839,70 @@ impl<B: SyscallBackend> Linuxulator<B> {
     ///
     /// FUTEX_WAKE (cmd 1) returns 0 (no waiters woken — single-threaded).
     /// All other operations return ENOSYS.
-    fn sys_futex(&self, op: i32) -> i64 {
+    fn sys_futex(&self, uaddr: u64, op: i32, val: u32) -> i64 {
         // The op field's lower bits encode the command; upper bits are
         // flags (FUTEX_PRIVATE_FLAG, etc.).  Mask to the command bits.
         const FUTEX_CMD_MASK: i32 = 0x7f;
+        const FUTEX_WAIT: i32 = 0;
         const FUTEX_WAKE: i32 = 1;
-        if (op & FUTEX_CMD_MASK) == FUTEX_WAKE {
-            0
-        } else {
-            ENOSYS
+        match op & FUTEX_CMD_MASK {
+            FUTEX_WAKE => 0, // no waiters in single-threaded model
+            FUTEX_WAIT => {
+                // In single-threaded model, FUTEX_WAIT checks *uaddr == val.
+                // If equal, would block (but we can't block) → EAGAIN.
+                // If not equal, return EAGAIN (value changed).
+                // Either way, return EAGAIN — there's no other thread to
+                // wake us up, so blocking would deadlock.
+                if uaddr == 0 {
+                    return EFAULT;
+                }
+                let current = unsafe { *(uaddr as usize as *const u32) };
+                if current != val {
+                    return EAGAIN; // value changed
+                }
+                // Value matches — would block, but single-threaded → EAGAIN
+                EAGAIN
+            }
+            _ => ENOSYS,
         }
+    }
+
+    /// Linux poll(2) / ppoll(2): wait for events on file descriptors.
+    ///
+    /// Always-ready model (same as epoll): for each valid fd in the
+    /// pollfd array, set revents to the requested events. Invalid fds
+    /// get POLLNVAL. Returns the number of fds with non-zero revents.
+    fn sys_poll(&self, fds_ptr: u64, nfds: u64) -> i64 {
+        if fds_ptr == 0 && nfds > 0 {
+            return EFAULT;
+        }
+        const POLLNVAL: i16 = 0x20;
+        let mut ready_count = 0i64;
+        for i in 0..nfds {
+            // struct pollfd = { fd: i32, events: i16, revents: i16 } = 8 bytes
+            let base = fds_ptr as usize + (i as usize) * 8;
+            let fd_bytes = unsafe { core::slice::from_raw_parts(base as *const u8, 4) };
+            let fd = i32::from_ne_bytes(fd_bytes.try_into().unwrap());
+            let events_bytes =
+                unsafe { core::slice::from_raw_parts((base + 4) as *const u8, 2) };
+            let events = i16::from_ne_bytes(events_bytes.try_into().unwrap());
+
+            let revents = if fd < 0 {
+                0i16 // negative fd → ignored (revents=0)
+            } else if self.fd_table.contains_key(&fd) {
+                events // all requested events are "ready"
+            } else {
+                POLLNVAL // fd doesn't exist
+            };
+
+            if revents != 0 {
+                ready_count += 1;
+            }
+            let revents_out =
+                unsafe { core::slice::from_raw_parts_mut((base + 6) as *mut u8, 2) };
+            revents_out.copy_from_slice(&revents.to_ne_bytes());
+        }
+        ready_count
     }
 
     /// Linux sched_getaffinity(2): get CPU affinity mask.
@@ -8619,16 +8706,17 @@ mod integration_tests {
     }
 
     #[test]
-    fn sys_futex_wait_returns_enosys() {
+    fn sys_futex_wait_returns_eagain() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
-        // FUTEX_WAIT = 0
+        // FUTEX_WAIT = 0. Single-threaded: always returns EAGAIN.
+        let val: u32 = 42;
         let result = lx.dispatch_syscall(LinuxSyscall::Futex {
-            uaddr: 0x1000,
+            uaddr: &val as *const u32 as u64,
             op: 0,
-            val: 0,
+            val: 42,
         });
-        assert_eq!(result, ENOSYS);
+        assert_eq!(result, EAGAIN);
     }
 
     #[test]
@@ -13013,5 +13101,101 @@ mod integration_tests {
             arg: 0,
         });
         assert_eq!(flags, FD_CLOEXEC as i64);
+    }
+
+    // ── Poll tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_poll_returns_ready() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.init_stdio().unwrap();
+
+        // struct pollfd { fd: i32, events: i16, revents: i16 }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct PollFd {
+            fd: i32,
+            events: i16,
+            revents: i16,
+        }
+
+        let mut fds = [
+            PollFd {
+                fd: 0,
+                events: 1,
+                revents: 0,
+            }, // POLLIN on stdin
+            PollFd {
+                fd: 1,
+                events: 4,
+                revents: 0,
+            }, // POLLOUT on stdout
+        ];
+
+        let r = lx.dispatch_syscall(LinuxSyscall::Poll {
+            fds: fds.as_mut_ptr() as u64,
+            nfds: 2,
+            timeout: 0,
+        });
+        assert_eq!(r, 2); // both ready
+        assert_eq!(fds[0].revents, 1); // POLLIN
+        assert_eq!(fds[1].revents, 4); // POLLOUT
+    }
+
+    #[test]
+    fn test_poll_invalid_fd_pollnval() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct PollFd {
+            fd: i32,
+            events: i16,
+            revents: i16,
+        }
+
+        let mut fds = [PollFd {
+            fd: 999,
+            events: 1,
+            revents: 0,
+        }];
+
+        let r = lx.dispatch_syscall(LinuxSyscall::Poll {
+            fds: fds.as_mut_ptr() as u64,
+            nfds: 1,
+            timeout: 0,
+        });
+        assert_eq!(r, 1);
+        assert_eq!(fds[0].revents, 0x20); // POLLNVAL
+    }
+
+    #[test]
+    fn test_poll_negative_fd_ignored() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct PollFd {
+            fd: i32,
+            events: i16,
+            revents: i16,
+        }
+
+        let mut fds = [PollFd {
+            fd: -1,
+            events: 1,
+            revents: 0xFF,
+        }];
+
+        let r = lx.dispatch_syscall(LinuxSyscall::Poll {
+            fds: fds.as_mut_ptr() as u64,
+            nfds: 1,
+            timeout: 0,
+        });
+        assert_eq!(r, 0); // negative fd ignored, revents=0
+        assert_eq!(fds[0].revents, 0);
     }
 }
