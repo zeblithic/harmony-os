@@ -41,6 +41,12 @@ pub enum PeError {
     WriteExecuteSection,
     /// Image too small to contain the expected headers.
     TruncatedHeader,
+    /// A section's VirtualAddress is not page-aligned.
+    UnalignedSection,
+    /// A section extends beyond the image size.
+    SectionOutOfBounds,
+    /// A section has no permission bits, or execute without read.
+    InvalidPermissions,
 }
 
 /// Cached page-aligned section boundaries with permission flags.
@@ -86,9 +92,12 @@ fn page_align_down(addr: u64) -> u64 {
     addr & !(PAGE_SIZE - 1)
 }
 
-/// Align address up to next page boundary.
+/// Align address up to next page boundary (saturates on overflow).
 fn page_align_up(addr: u64) -> u64 {
-    (addr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+    match addr.checked_add(PAGE_SIZE - 1) {
+        Some(a) => a & !(PAGE_SIZE - 1),
+        None => u64::MAX & !(PAGE_SIZE - 1),
+    }
 }
 
 /// Read a little-endian u16 from a byte slice at the given offset.
@@ -118,6 +127,14 @@ fn characteristics_to_flags(chars: u32) -> Result<PageFlags, PeError> {
     // Reject W+X sections.
     if flags.contains(PageFlags::WRITABLE | PageFlags::EXECUTABLE) {
         return Err(PeError::WriteExecuteSection);
+    }
+    // Reject execute-without-read (AArch64 instruction fetch needs readable pages)
+    // and completely empty permissions.
+    if flags.contains(PageFlags::EXECUTABLE) && !flags.contains(PageFlags::READABLE) {
+        return Err(PeError::InvalidPermissions);
+    }
+    if flags.is_empty() {
+        return Err(PeError::InvalidPermissions);
     }
     Ok(flags)
 }
@@ -186,6 +203,15 @@ pub fn parse_sections_from_bytes(
             read_u32(data, sec_offset + 36).ok_or(PeError::TruncatedHeader)?;
 
         let flags = characteristics_to_flags(characteristics)?;
+
+        // Reject non-page-aligned section starts (standard UEFI PE uses 0x1000 alignment).
+        if virtual_addr % PAGE_SIZE != 0 {
+            return Err(PeError::UnalignedSection);
+        }
+        // Reject sections that extend beyond the image.
+        if virtual_addr + virtual_size > image_size {
+            return Err(PeError::SectionOutOfBounds);
+        }
 
         let start = page_align_down(image_base + virtual_addr);
         let end = page_align_up(image_base + virtual_addr + virtual_size);

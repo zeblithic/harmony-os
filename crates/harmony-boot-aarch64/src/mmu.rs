@@ -122,11 +122,16 @@ pub unsafe fn init_and_enable(
 
     // 3. Map all usable RAM regions as Normal cacheable memory.
     //
-    // W^X: when image_sections is Some, each page is mapped with per-section
-    // flags (code=RX, data=RW). Pages outside the image range (heap, stack)
-    // get default_rw. Falls back to RWX if section info is unavailable.
+    // W^X: when image_sections is Some, each page within the image is mapped
+    // with per-section flags (code=RX, data=RW, rodata=RO). Pages outside the
+    // image (heap, stack, ELF load targets) remain RWX because vm_mprotect is
+    // currently a no-op — the ELF loader relies on it to set RX on text segments
+    // after writing them. Until vm_mprotect is implemented (requires page table
+    // access from SyscallBackend), outside-image pages must stay executable.
+    // TODO(harmony-os-fg5-followup): implement real vm_mprotect, then change
+    // default_outside to RW.
     let fallback_flags = PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::EXECUTABLE;
-    let default_rw = PageFlags::READABLE | PageFlags::WRITABLE;
+    let default_outside = PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::EXECUTABLE;
 
     if image_sections.is_none() {
         let _ = writeln!(serial, "[MMU] WARNING: W^X disabled — mapping all RAM as RWX");
@@ -141,7 +146,7 @@ pub unsafe fn init_and_enable(
         for page_idx in 0..region.pages {
             let addr = region.base + page_idx * PAGE_SIZE;
             let flags = match image_sections {
-                Some(sections) => sections.flags_for_addr(addr).unwrap_or(default_rw),
+                Some(sections) => sections.flags_for_addr(addr).unwrap_or(default_outside),
                 None => fallback_flags,
             };
             let result = pt.map(VirtAddr(addr), PhysAddr(addr), flags, &mut || {
