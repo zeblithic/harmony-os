@@ -3913,7 +3913,13 @@ impl<B: SyscallBackend> Linuxulator<B> {
     ///
     /// Supports both relative (flags=0) and absolute (TIMER_ABSTIME)
     /// sleep. For absolute, computes delta from current clock value.
-    fn sys_clock_nanosleep(&mut self, clockid: i32, flags: i32, req_ptr: u64, _rem_ptr: u64) -> i64 {
+    fn sys_clock_nanosleep(
+        &mut self,
+        clockid: i32,
+        flags: i32,
+        req_ptr: u64,
+        _rem_ptr: u64,
+    ) -> i64 {
         if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
             return EINVAL;
         }
@@ -3954,8 +3960,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if req_ptr == 0 {
             return EFAULT;
         }
-        let req_bytes =
-            unsafe { core::slice::from_raw_parts(req_ptr as usize as *const u8, 16) };
+        let req_bytes = unsafe { core::slice::from_raw_parts(req_ptr as usize as *const u8, 16) };
         let tv_sec = i64::from_le_bytes(req_bytes[0..8].try_into().unwrap());
         let tv_nsec = i64::from_le_bytes(req_bytes[8..16].try_into().unwrap());
         if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
