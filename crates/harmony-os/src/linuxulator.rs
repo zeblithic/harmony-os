@@ -11629,6 +11629,26 @@ mod integration_tests {
     }
 
     #[test]
+    fn test_tgkill_invalid_tgid_einval() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // tgid <= 0 must return EINVAL per tgkill(2).
+        let r1 = lx.dispatch_syscall(LinuxSyscall::Tgkill {
+            tgid: -1,
+            tid: 1,
+            sig: 10,
+        });
+        assert_eq!(r1, EINVAL, "tgkill(-1, 1, sig) must return EINVAL");
+        let r2 = lx.dispatch_syscall(LinuxSyscall::Tgkill {
+            tgid: 0,
+            tid: 1,
+            sig: 10,
+        });
+        assert_eq!(r2, EINVAL, "tgkill(0, 1, sig) must return EINVAL");
+        assert!(!lx.exited());
+    }
+
+    #[test]
     fn test_sigchld_on_child_exit() {
         // Fork a child, child exits → parent receives SIGCHLD (default=Ignore)
         // → parent NOT exited.
