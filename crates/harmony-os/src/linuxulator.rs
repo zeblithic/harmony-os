@@ -2739,6 +2739,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
         // pending_signals preserved across exec (Linux semantics).
         self.pending_handler_signal = None;
         self.killed_by_signal = None;
+        // Reset process name — Linux sets comm to the new binary's basename.
+        self.process_name = [0u8; 16];
     }
 
     /// Deliver one pending signal at syscall boundary.
@@ -3925,7 +3927,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             if abs_sec < 0 || !(0..1_000_000_000).contains(&abs_nsec) {
                 return EINVAL;
             }
-            let abs_ns = (abs_sec as u64) * 1_000_000_000 + (abs_nsec as u64);
+            let abs_ns = (abs_sec as u64).saturating_mul(1_000_000_000).saturating_add(abs_nsec as u64);
             let now = match clockid {
                 CLOCK_REALTIME => self.realtime_ns,
                 _ => self.monotonic_ns,
@@ -3954,7 +3956,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
             return EINVAL;
         }
-        let duration_ns = (tv_sec as u64) * 1_000_000_000 + (tv_nsec as u64);
+        let duration_ns = (tv_sec as u64).saturating_mul(1_000_000_000).saturating_add(tv_nsec as u64);
         match clockid {
             CLOCK_REALTIME => {
                 self.realtime_ns = self.realtime_ns.wrapping_add(duration_ns);
