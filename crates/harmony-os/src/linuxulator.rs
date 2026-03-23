@@ -2824,7 +2824,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
                         // Repeating: count how many intervals passed.
                         let count_val = 1 + extra;
                         // Advance expiration past current time.
-                        state.expiration_ns += (extra + 1) * state.interval_ns;
+                        state.expiration_ns = state.expiration_ns.saturating_add(
+                            extra.saturating_add(1).saturating_mul(state.interval_ns),
+                        );
                         count_val
                     }
                 };
@@ -4026,18 +4028,22 @@ impl<B: SyscallBackend> Linuxulator<B> {
                     (remaining / 1_000_000_000) as i64,
                     (remaining % 1_000_000_000) as i64,
                 )
-            } else if state.interval_ns == 0 {
-                (0i64, 0i64) // one-shot already expired
             } else {
-                // Repeating expired: compute time to next tick.
+                // Expired: one-shot (interval=0) or repeating.
                 let elapsed = now - state.expiration_ns;
-                let extra = elapsed / state.interval_ns;
-                let next = state.expiration_ns + (extra + 1) * state.interval_ns;
-                let to_next = next - now;
-                (
-                    (to_next / 1_000_000_000) as i64,
-                    (to_next % 1_000_000_000) as i64,
-                )
+                match elapsed.checked_div(state.interval_ns) {
+                    None => (0i64, 0i64), // interval_ns==0: one-shot expired
+                    Some(extra) => {
+                        let next = state.expiration_ns.saturating_add(
+                            extra.saturating_add(1).saturating_mul(state.interval_ns),
+                        );
+                        let to_next = next.saturating_sub(now);
+                        (
+                            (to_next / 1_000_000_000) as i64,
+                            (to_next % 1_000_000_000) as i64,
+                        )
+                    }
+                }
             };
             let old_int_sec = (state.interval_ns / 1_000_000_000) as i64;
             let old_int_nsec = (state.interval_ns % 1_000_000_000) as i64;
@@ -4106,19 +4112,22 @@ impl<B: SyscallBackend> Linuxulator<B> {
                     (remaining / 1_000_000_000) as i64,
                     (remaining % 1_000_000_000) as i64,
                 )
-            } else if state.interval_ns == 0 {
-                // One-shot that has already expired — report as disarmed.
-                (0i64, 0i64)
             } else {
-                // Repeating: compute time to next tick (without mutating state).
+                // Expired: one-shot (interval=0) or repeating.
                 let elapsed = now - state.expiration_ns;
-                let extra = elapsed / state.interval_ns;
-                let next_expiration = state.expiration_ns + (extra + 1) * state.interval_ns;
-                let to_next = next_expiration - now;
-                (
-                    (to_next / 1_000_000_000) as i64,
-                    (to_next % 1_000_000_000) as i64,
-                )
+                match elapsed.checked_div(state.interval_ns) {
+                    None => (0i64, 0i64), // interval_ns==0: one-shot expired
+                    Some(extra) => {
+                        let next_expiration = state.expiration_ns.saturating_add(
+                            extra.saturating_add(1).saturating_mul(state.interval_ns),
+                        );
+                        let to_next = next_expiration.saturating_sub(now);
+                        (
+                            (to_next / 1_000_000_000) as i64,
+                            (to_next % 1_000_000_000) as i64,
+                        )
+                    }
+                }
             }
         };
 
