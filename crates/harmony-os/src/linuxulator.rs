@@ -2691,6 +2691,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
             FdKind::Epoll { .. } => EINVAL,
             FdKind::SignalFd { signalfd_id } => {
                 // signalfd: consume one pending signal matching the fd's mask.
+                // Note: Linux supports returning multiple signalfd_siginfo structs
+                // per read (up to count/128). This implementation returns exactly
+                // one per call; callers must loop. Sufficient for systemd's
+                // one-signal-per-iteration event loop.
                 if count < 128 {
                     return EINVAL; // sizeof(signalfd_siginfo) = 128
                 }
@@ -3784,7 +3788,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
                     }
                     fd as i64
                 }
-                _ => EINVAL,
+                None => EBADF,
+                Some(_) => EINVAL,
             }
         }
     }
