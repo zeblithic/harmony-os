@@ -425,6 +425,23 @@ pub enum LinuxSyscall {
         tid: i32,
         sig: i32,
     },
+    Nanosleep {
+        req: u64,
+        rem: u64,
+    },
+    ClockNanosleep {
+        clockid: i32,
+        flags: i32,
+        req: u64,
+        rem: u64,
+    },
+    Prctl {
+        option: i32,
+        arg2: u64,
+        arg3: u64,
+        arg4: u64,
+        arg5: u64,
+    },
     Unknown {
         nr: u64,
     },
@@ -505,6 +522,10 @@ impl LinuxSyscall {
             33 => LinuxSyscall::Dup2 {
                 oldfd: args[0] as i32,
                 newfd: args[1] as i32,
+            },
+            35 => LinuxSyscall::Nanosleep {
+                req: args[0],
+                rem: args[1],
             },
             39 => LinuxSyscall::Getpid,
             41 => LinuxSyscall::Socket {
@@ -610,6 +631,13 @@ impl LinuxSyscall {
             107 => LinuxSyscall::Geteuid,
             108 => LinuxSyscall::Getegid,
             110 => LinuxSyscall::Getppid,
+            157 => LinuxSyscall::Prctl {
+                option: args[0] as i32,
+                arg2: args[1],
+                arg3: args[2],
+                arg4: args[3],
+                arg5: args[4],
+            },
             158 => LinuxSyscall::ArchPrctl {
                 code: args[0] as i32,
                 addr: args[1],
@@ -638,6 +666,12 @@ impl LinuxSyscall {
             229 => LinuxSyscall::ClockGetres {
                 clockid: args[0] as i32,
                 tp: args[1],
+            },
+            230 => LinuxSyscall::ClockNanosleep {
+                clockid: args[0] as i32,
+                flags: args[1] as i32,
+                req: args[2],
+                rem: args[3],
             },
             231 => LinuxSyscall::ExitGroup {
                 code: args[0] as i32,
@@ -904,6 +938,10 @@ impl LinuxSyscall {
                 val: args[2] as u32,
             },
             99 => LinuxSyscall::SetRobustList,
+            101 => LinuxSyscall::Nanosleep {
+                req: args[0],
+                rem: args[1],
+            },
             113 => LinuxSyscall::ClockGettime {
                 clockid: args[0] as i32,
                 tp: args[1],
@@ -911,6 +949,12 @@ impl LinuxSyscall {
             114 => LinuxSyscall::ClockGetres {
                 clockid: args[0] as i32,
                 tp: args[1],
+            },
+            115 => LinuxSyscall::ClockNanosleep {
+                clockid: args[0] as i32,
+                flags: args[1] as i32,
+                req: args[2],
+                rem: args[3],
             },
             123 => LinuxSyscall::SchedGetaffinity {
                 pid: args[0] as i32,
@@ -939,6 +983,13 @@ impl LinuxSyscall {
                 sigsetsize: args[3],
             },
             160 => LinuxSyscall::Uname { buf: args[0] },
+            167 => LinuxSyscall::Prctl {
+                option: args[0] as i32,
+                arg2: args[1],
+                arg3: args[2],
+                arg4: args[3],
+                arg5: args[4],
+            },
             172 => LinuxSyscall::Getpid,
             173 => LinuxSyscall::Getppid,
             174 => LinuxSyscall::Getuid,
@@ -1852,6 +1903,8 @@ pub struct Linuxulator<B: SyscallBackend> {
     pending_handler_signal: Option<u32>,
     /// If set, process was killed by this signal (for wstatus encoding).
     killed_by_signal: Option<u32>,
+    /// Process name set by prctl(PR_SET_NAME). 16 bytes max (including null).
+    process_name: [u8; 16],
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -1896,6 +1949,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             pending_signals: 0,
             pending_handler_signal: None,
             killed_by_signal: None,
+            process_name: [0u8; 16],
         }
     }
 
@@ -2366,6 +2420,14 @@ impl<B: SyscallBackend> Linuxulator<B> {
             LinuxSyscall::Execve { path, argv, envp } => self.sys_execve(path, argv, envp),
             LinuxSyscall::Kill { pid, sig } => self.sys_kill(pid, sig),
             LinuxSyscall::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
+            LinuxSyscall::Nanosleep { req, rem } => self.sys_nanosleep(req, rem),
+            LinuxSyscall::ClockNanosleep {
+                clockid,
+                flags,
+                req,
+                rem,
+            } => self.sys_clock_nanosleep(clockid, flags, req, rem),
+            LinuxSyscall::Prctl { option, arg2, .. } => self.sys_prctl(option, arg2),
             LinuxSyscall::Unknown { .. } => ENOSYS,
         };
         self.deliver_pending_signals();
@@ -2677,6 +2739,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
         // pending_signals preserved across exec (Linux semantics).
         self.pending_handler_signal = None;
         self.killed_by_signal = None;
+        // Reset process name — Linux sets comm to the new binary's basename.
+        self.process_name = [0u8; 16];
     }
 
     /// Deliver one pending signal at syscall boundary.
@@ -3612,6 +3676,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             pending_signals: 0,
             pending_handler_signal: None,
             killed_by_signal: None,
+            process_name: self.process_name,
         };
         // Move shared pipe/eventfd state to child
         core::mem::swap(&mut self.pipes, &mut child.pipes);
@@ -3820,6 +3885,130 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
         self.queue_signal(sig as u32);
         0
+    }
+
+    /// Linux nanosleep(2): sleep for the specified duration.
+    ///
+    /// In the sans-I/O model, sleep advances the monotonic clock by the
+    /// requested duration and returns immediately (no real blocking).
+    fn sys_nanosleep(&mut self, req_ptr: u64, rem_ptr: u64) -> i64 {
+        // nanosleep always sleeps on CLOCK_MONOTONIC with relative time.
+        self.sys_clock_nanosleep(CLOCK_MONOTONIC, 0, req_ptr, rem_ptr)
+    }
+
+    /// Linux clock_nanosleep(2): sleep on a specific clock.
+    ///
+    /// Supports both relative (flags=0) and absolute (TIMER_ABSTIME)
+    /// sleep. For absolute, computes delta from current clock value.
+    fn sys_clock_nanosleep(
+        &mut self,
+        clockid: i32,
+        flags: i32,
+        req_ptr: u64,
+        _rem_ptr: u64,
+    ) -> i64 {
+        if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
+            return EINVAL;
+        }
+
+        const TIMER_ABSTIME: i32 = 1;
+        if flags & !TIMER_ABSTIME != 0 {
+            return EINVAL;
+        }
+        if flags & TIMER_ABSTIME != 0 {
+            // Absolute time: compute delta from current clock value.
+            if req_ptr == 0 {
+                return EFAULT;
+            }
+            let req_bytes =
+                unsafe { core::slice::from_raw_parts(req_ptr as usize as *const u8, 16) };
+            let abs_sec = i64::from_le_bytes(req_bytes[0..8].try_into().unwrap());
+            let abs_nsec = i64::from_le_bytes(req_bytes[8..16].try_into().unwrap());
+            if abs_sec < 0 || !(0..1_000_000_000).contains(&abs_nsec) {
+                return EINVAL;
+            }
+            let abs_ns = (abs_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(abs_nsec as u64);
+            let now = match clockid {
+                CLOCK_REALTIME => self.realtime_ns,
+                _ => self.monotonic_ns,
+            };
+            // If target is already in the past, return immediately.
+            let delta_ns = abs_ns.saturating_sub(now);
+            // Advance the clock we're sleeping on (not always monotonic).
+            match clockid {
+                CLOCK_REALTIME => {
+                    self.realtime_ns = self.realtime_ns.wrapping_add(delta_ns);
+                }
+                _ => {
+                    self.monotonic_ns = self.monotonic_ns.wrapping_add(delta_ns);
+                }
+            }
+            return 0;
+        }
+
+        // Relative sleep: advance the requested clock by the duration.
+        if req_ptr == 0 {
+            return EFAULT;
+        }
+        let req_bytes = unsafe { core::slice::from_raw_parts(req_ptr as usize as *const u8, 16) };
+        let tv_sec = i64::from_le_bytes(req_bytes[0..8].try_into().unwrap());
+        let tv_nsec = i64::from_le_bytes(req_bytes[8..16].try_into().unwrap());
+        if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
+            return EINVAL;
+        }
+        let duration_ns = (tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(tv_nsec as u64);
+        match clockid {
+            CLOCK_REALTIME => {
+                self.realtime_ns = self.realtime_ns.wrapping_add(duration_ns);
+            }
+            _ => {
+                self.monotonic_ns = self.monotonic_ns.wrapping_add(duration_ns);
+            }
+        }
+        0
+    }
+
+    /// Linux prctl(2): process control operations.
+    ///
+    /// Supports PR_SET_NAME and PR_GET_NAME. Other options return 0
+    /// (no-op stub) to avoid breaking programs that probe capabilities.
+    fn sys_prctl(&mut self, option: i32, arg2: u64) -> i64 {
+        const PR_SET_NAME: i32 = 15;
+        const PR_GET_NAME: i32 = 16;
+
+        match option {
+            PR_SET_NAME => {
+                if arg2 == 0 {
+                    return EFAULT;
+                }
+                // Read byte-by-byte up to 15 chars (avoids reading past
+                // short buffers near page boundaries). Always null-terminates
+                // at [15]. Matches Linux kernel's strncpy_from_user semantics.
+                self.process_name = [0u8; 16];
+                let base = arg2 as usize;
+                for i in 0..15 {
+                    let b = unsafe { *((base + i) as *const u8) };
+                    if b == 0 {
+                        break;
+                    }
+                    self.process_name[i] = b;
+                }
+                0
+            }
+            PR_GET_NAME => {
+                if arg2 == 0 {
+                    return EFAULT;
+                }
+                let dst = unsafe { core::slice::from_raw_parts_mut(arg2 as usize as *mut u8, 16) };
+                dst.copy_from_slice(&self.process_name);
+                0
+            }
+            _ => 0, // stub: accept unknown options silently
+        }
     }
 
     /// Linux fstat(2): get file status.
@@ -11777,5 +11966,135 @@ mod integration_tests {
                 "child must not exit — pending signals cleared on fork"
             );
         }
+    }
+
+    // ── Nanosleep tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_nanosleep_advances_clock() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Get initial monotonic time
+        let mut ts1 = [0u8; 16];
+        lx.dispatch_syscall(LinuxSyscall::ClockGettime {
+            clockid: 1, // CLOCK_MONOTONIC
+            tp: ts1.as_mut_ptr() as u64,
+        });
+        let ns1 = u64::from_le_bytes(ts1[0..8].try_into().unwrap()) * 1_000_000_000
+            + u64::from_le_bytes(ts1[8..16].try_into().unwrap());
+
+        // Sleep for 1 second
+        let req = [0u8; 16];
+        let mut req_buf = req;
+        req_buf[0..8].copy_from_slice(&1i64.to_le_bytes()); // tv_sec = 1
+        let r = lx.dispatch_syscall(LinuxSyscall::Nanosleep {
+            req: req_buf.as_ptr() as u64,
+            rem: 0,
+        });
+        assert_eq!(r, 0);
+
+        // Get time again — should have advanced by ~1s
+        let mut ts2 = [0u8; 16];
+        lx.dispatch_syscall(LinuxSyscall::ClockGettime {
+            clockid: 1,
+            tp: ts2.as_mut_ptr() as u64,
+        });
+        let ns2 = u64::from_le_bytes(ts2[0..8].try_into().unwrap()) * 1_000_000_000
+            + u64::from_le_bytes(ts2[8..16].try_into().unwrap());
+
+        // Clock should have advanced by at least 1s (1_000_000_000 ns)
+        // Plus 2ms from the two clock_gettime calls
+        assert!(ns2 - ns1 >= 1_000_000_000);
+    }
+
+    #[test]
+    fn test_nanosleep_invalid_args() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Negative tv_sec
+        let mut req = [0u8; 16];
+        req[0..8].copy_from_slice(&(-1i64).to_le_bytes());
+        let r = lx.dispatch_syscall(LinuxSyscall::Nanosleep {
+            req: req.as_ptr() as u64,
+            rem: 0,
+        });
+        assert_eq!(r, EINVAL);
+
+        // tv_nsec >= 1_000_000_000
+        let mut req2 = [0u8; 16];
+        req2[8..16].copy_from_slice(&1_000_000_000i64.to_le_bytes());
+        let r = lx.dispatch_syscall(LinuxSyscall::Nanosleep {
+            req: req2.as_ptr() as u64,
+            rem: 0,
+        });
+        assert_eq!(r, EINVAL);
+
+        // Null pointer
+        let r = lx.dispatch_syscall(LinuxSyscall::Nanosleep { req: 0, rem: 0 });
+        assert_eq!(r, EFAULT);
+    }
+
+    #[test]
+    fn test_clock_nanosleep_invalid_clock() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let mut req = [0u8; 16];
+        req[0..8].copy_from_slice(&0i64.to_le_bytes());
+        let r = lx.dispatch_syscall(LinuxSyscall::ClockNanosleep {
+            clockid: 99, // invalid
+            flags: 0,
+            req: req.as_ptr() as u64,
+            rem: 0,
+        });
+        assert_eq!(r, EINVAL);
+    }
+
+    // ── Prctl tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_prctl_set_and_get_name() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let name = b"myprocess\0\0\0\0\0\0\0";
+        let r = lx.dispatch_syscall(LinuxSyscall::Prctl {
+            option: 15, // PR_SET_NAME
+            arg2: name.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        });
+        assert_eq!(r, 0);
+
+        let mut buf = [0u8; 16];
+        let r = lx.dispatch_syscall(LinuxSyscall::Prctl {
+            option: 16, // PR_GET_NAME
+            arg2: buf.as_mut_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        });
+        assert_eq!(r, 0);
+        assert_eq!(&buf[..9], b"myprocess");
+        assert_eq!(buf[9], 0); // null terminated
+    }
+
+    #[test]
+    fn test_prctl_unknown_option_succeeds() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Unknown option → 0 (stub, don't break programs)
+        let r = lx.dispatch_syscall(LinuxSyscall::Prctl {
+            option: 9999,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        });
+        assert_eq!(r, 0);
     }
 }
