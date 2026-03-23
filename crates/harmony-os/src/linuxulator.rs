@@ -2689,7 +2689,34 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 0
             }
             FdKind::Epoll { .. } => EINVAL,
-            FdKind::SignalFd { .. } => EAGAIN,
+            FdKind::SignalFd { signalfd_id } => {
+                // signalfd: consume one pending signal matching the fd's mask.
+                if count < 128 {
+                    return EINVAL; // sizeof(signalfd_siginfo) = 128
+                }
+                let mask = match self.signalfds.get(&signalfd_id) {
+                    Some(state) => state.mask,
+                    None => return EINVAL,
+                };
+
+                // Find a pending signal that matches the signalfd's mask.
+                let deliverable = self.pending_signals & mask;
+                if deliverable == 0 {
+                    return EAGAIN; // no matching signals pending
+                }
+
+                let bit = deliverable.trailing_zeros();
+                let signum = bit + 1;
+                self.pending_signals &= !(1u64 << bit);
+
+                // Write struct signalfd_siginfo (128 bytes) to user buffer.
+                // Only ssi_signo (u32 at offset 0) is set; rest zeroed.
+                let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, 128) };
+                buf.fill(0);
+                buf[0..4].copy_from_slice(&signum.to_le_bytes());
+
+                128 // bytes read
+            }
         }
     }
 
@@ -12231,5 +12258,199 @@ mod integration_tests {
             arg5: 0,
         });
         assert_eq!(r, 0);
+    }
+
+    // ── SignalFd tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_signalfd_create() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let mask: u64 = 1 << 9; // signal 10 (SIGUSR1)
+        let fd = lx.dispatch_syscall(LinuxSyscall::SignalFd4 {
+            fd: -1,
+            mask_ptr: &mask as *const u64 as u64,
+            sizemask: 8,
+            flags: 0,
+        });
+        assert!(fd >= 0, "signalfd4 should return a valid fd, got {fd}");
+        assert!(lx.has_fd(fd as i32));
+    }
+
+    #[test]
+    fn test_signalfd_read_pending() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Block SIGUSR1 so it stays pending (not delivered by deliver_pending_signals)
+        let mask: u64 = 1 << 9;
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_SETMASK,
+            set: &mask as *const u64 as u64,
+            oldset: 0,
+            sigsetsize: 8,
+        });
+
+        // Create signalfd monitoring SIGUSR1
+        let sfd = lx.dispatch_syscall(LinuxSyscall::SignalFd4 {
+            fd: -1,
+            mask_ptr: &mask as *const u64 as u64,
+            sizemask: 8,
+            flags: 0,
+        }) as i32;
+
+        // Queue SIGUSR1
+        lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+
+        // Read from signalfd — should get siginfo with ssi_signo=10
+        let mut siginfo = [0u8; 128];
+        let r = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: sfd,
+            buf: siginfo.as_mut_ptr() as u64,
+            count: 128,
+        });
+        assert_eq!(r, 128);
+        let ssi_signo = u32::from_le_bytes(siginfo[0..4].try_into().unwrap());
+        assert_eq!(ssi_signo, 10);
+    }
+
+    #[test]
+    fn test_signalfd_no_pending_eagain() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let mask: u64 = 1 << 9;
+        let sfd = lx.dispatch_syscall(LinuxSyscall::SignalFd4 {
+            fd: -1,
+            mask_ptr: &mask as *const u64 as u64,
+            sizemask: 8,
+            flags: 0,
+        }) as i32;
+
+        // No pending signals — read should return EAGAIN
+        let mut siginfo = [0u8; 128];
+        let r = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: sfd,
+            buf: siginfo.as_mut_ptr() as u64,
+            count: 128,
+        });
+        assert_eq!(r, EAGAIN);
+    }
+
+    #[test]
+    fn test_signalfd_consumes_signal() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Block and queue SIGUSR1
+        let mask: u64 = 1 << 9;
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_SETMASK,
+            set: &mask as *const u64 as u64,
+            oldset: 0,
+            sigsetsize: 8,
+        });
+
+        let sfd = lx.dispatch_syscall(LinuxSyscall::SignalFd4 {
+            fd: -1,
+            mask_ptr: &mask as *const u64 as u64,
+            sizemask: 8,
+            flags: 0,
+        }) as i32;
+
+        lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+
+        // First read consumes the signal
+        let mut siginfo = [0u8; 128];
+        let r = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: sfd,
+            buf: siginfo.as_mut_ptr() as u64,
+            count: 128,
+        });
+        assert_eq!(r, 128);
+
+        // Second read — signal consumed, should EAGAIN
+        let r = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: sfd,
+            buf: siginfo.as_mut_ptr() as u64,
+            count: 128,
+        });
+        assert_eq!(r, EAGAIN);
+    }
+
+    #[test]
+    fn test_signalfd_update_mask() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Create signalfd for SIGUSR1
+        let mask1: u64 = 1 << 9;
+        let sfd = lx.dispatch_syscall(LinuxSyscall::SignalFd4 {
+            fd: -1,
+            mask_ptr: &mask1 as *const u64 as u64,
+            sizemask: 8,
+            flags: 0,
+        }) as i32;
+
+        // Block both signals and queue SIGUSR2 (signal 12)
+        let block_mask: u64 = (1 << 9) | (1 << 11);
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_SETMASK,
+            set: &block_mask as *const u64 as u64,
+            oldset: 0,
+            sigsetsize: 8,
+        });
+        lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 12 });
+
+        // Read — should EAGAIN (mask only watches SIGUSR1, not SIGUSR2)
+        let mut siginfo = [0u8; 128];
+        let r = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: sfd,
+            buf: siginfo.as_mut_ptr() as u64,
+            count: 128,
+        });
+        assert_eq!(r, EAGAIN);
+
+        // Update mask to include SIGUSR2
+        let mask2: u64 = (1 << 9) | (1 << 11);
+        let r = lx.dispatch_syscall(LinuxSyscall::SignalFd4 {
+            fd: sfd,
+            mask_ptr: &mask2 as *const u64 as u64,
+            sizemask: 8,
+            flags: 0,
+        });
+        assert_eq!(r, sfd as i64);
+
+        // Now read should succeed
+        let r = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: sfd,
+            buf: siginfo.as_mut_ptr() as u64,
+            count: 128,
+        });
+        assert_eq!(r, 128);
+        let ssi_signo = u32::from_le_bytes(siginfo[0..4].try_into().unwrap());
+        assert_eq!(ssi_signo, 12);
+    }
+
+    #[test]
+    fn test_signalfd_cloexec() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let mask: u64 = 1 << 9;
+        let sfd = lx.dispatch_syscall(LinuxSyscall::SignalFd4 {
+            fd: -1,
+            mask_ptr: &mask as *const u64 as u64,
+            sizemask: 8,
+            flags: 0x80000, // SFD_CLOEXEC
+        }) as i32;
+
+        let flags = lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: sfd,
+            cmd: 1, // F_GETFD
+            arg: 0,
+        });
+        assert_eq!(flags, FD_CLOEXEC as i64);
     }
 }
