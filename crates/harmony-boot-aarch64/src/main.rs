@@ -17,6 +17,7 @@ mod platform;
 
 mod syscall;
 mod vectors;
+mod pe;
 
 #[cfg(not(test))]
 use linked_list_allocator::LockedHeap;
