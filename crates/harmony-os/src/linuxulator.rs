@@ -1847,7 +1847,6 @@ pub struct Linuxulator<B: SyscallBackend> {
     /// Blocked signal mask (bit N = signal N+1 is blocked).
     signal_mask: u64,
     /// Pending signal bitmask (bit N = signal N+1 is pending).
-    #[allow(dead_code)]
     pending_signals: u64,
     /// Signal with custom handler pending for caller invocation.
     pending_handler_signal: Option<u32>,
@@ -2693,6 +2692,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// SIG_IGN internally. Custom handlers are reported via
     /// pending_handler_signal for the caller to invoke.
     fn deliver_pending_signals(&mut self) {
+        // If the process has already exited (e.g. via exit_group), do not
+        // deliver further signals — they cannot affect wstatus anymore.
+        if self.exit_code.is_some() {
+            return;
+        }
         if self.pending_signals == 0 {
             return;
         }
@@ -3776,10 +3780,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
         if !(0..=64).contains(&sig) {
             return EINVAL;
         }
-        if pid <= -1 {
-            return ENOSYS; // process group not supported
+        // pid <= 0 is process-group signaling (not supported).
+        // pid == 0 means own process group, pid < 0 means group -pid.
+        if pid <= 0 {
+            return ENOSYS;
         }
-        if pid != 0 && pid != self.pid {
+        if pid != self.pid {
             return ESRCH;
         }
         if sig == 0 {
