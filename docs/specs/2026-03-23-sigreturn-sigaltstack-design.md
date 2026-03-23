@@ -55,6 +55,8 @@ Two new public methods:
 ```rust
 /// Build signal frame on user stack. Called by caller after
 /// pending_handler_signal() returns Some(signum).
+/// Panics (debug_assert) if the handler lacks SA_RESTORER — modern
+/// Linux requires it on x86_64, and both musl and glibc always set it.
 pub fn setup_signal_frame(
     &mut self, signum: u32, regs: &SavedRegisters,
 ) -> SignalHandlerSetup
@@ -112,8 +114,8 @@ High addresses (original RSP or alt stack top)
 - **sa_restorer**: placed as return address at frame top. When handler
   does `ret`, jumps to sa_restorer (musl/glibc `__restore_rt`:
   `mov $15,%rax; syscall`). If SA_RESTORER not set in flags, the
-  Linuxulator should return EINVAL — modern Linux requires SA_RESTORER
-  on x86_64, and both musl and glibc always set it.
+  Linuxulator panics via debug_assert — modern Linux requires
+  SA_RESTORER on x86_64, and both musl and glibc always set it.
 - **siginfo_t**: 128 bytes, only `si_signo` (u32 at offset 0) filled.
 - **sigcontext GPR order**: matches Linux exactly for SA_SIGINFO
   handler compatibility.
