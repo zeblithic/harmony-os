@@ -192,7 +192,10 @@ pub unsafe fn init_and_enable(
     let _ = writeln!(serial, "[MMU] Mapped {} pages", mapped_pages);
 
     if image_sections.is_some() {
-        let _ = writeln!(serial, "[MMU] W^X enforced: code=RX, data=RW");
+        let _ = writeln!(
+            serial,
+            "[MMU] W^X partial: image code=RX, image data=RW, outside image=RWX (vm_mprotect TODO)"
+        );
     }
 
     // 5. Configure system registers and enable the MMU.

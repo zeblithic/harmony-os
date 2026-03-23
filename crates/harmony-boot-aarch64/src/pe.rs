@@ -68,7 +68,8 @@ impl ImageSections {
     /// Return the PageFlags for a physical address within the image.
     ///
     /// Returns `None` if the address is outside the image range.
-    /// If the address falls between sections (padding), returns RW.
+    /// Pages in the PE header area (before the first section) return RO.
+    /// Pages in inter-section gaps return RW.
     pub fn flags_for_addr(&self, addr: u64) -> Option<PageFlags> {
         let image_end = page_align_up(self.image_base.saturating_add(self.image_size));
         if addr < self.image_base || addr >= image_end {
@@ -224,7 +225,9 @@ pub fn parse_sections_from_bytes(
         }
 
         // Reject non-page-aligned section starts (standard UEFI PE uses 0x1000 alignment).
-        if virtual_addr % PAGE_SIZE != 0 {
+        // Also reject VirtualAddress == 0 — a section at offset 0 would overlap the
+        // PE header area and bypass its RO protection.
+        if virtual_addr == 0 || virtual_addr % PAGE_SIZE != 0 {
             return Err(PeError::UnalignedSection);
         }
         // Reject sections that extend beyond the image (overflow-safe).
@@ -550,5 +553,32 @@ mod tests {
         assert!(flags.contains(PageFlags::READABLE));
         assert!(!flags.contains(PageFlags::WRITABLE));
         assert!(!flags.contains(PageFlags::EXECUTABLE));
+    }
+
+    #[test]
+    fn pe_parse_too_many_sections_rejected() {
+        let sections: Vec<(&str, u32, u32, u32)> = (0..=MAX_SECTIONS)
+            .map(|i| {
+                (
+                    ".s",
+                    (i as u32 + 1) * 0x1000,
+                    0x1000,
+                    IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE,
+                )
+            })
+            .collect();
+        let buf = build_pe_header(&sections);
+        let result = parse_sections_from_bytes(&buf, 0, 0x100_0000);
+        assert_eq!(result.unwrap_err(), PeError::TooManySections);
+    }
+
+    #[test]
+    fn pe_parse_virtual_addr_zero_rejected() {
+        // VirtualAddress == 0 would overlap the PE header area.
+        let sections =
+            &[(".text", 0x0000, 0x1000, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE)];
+        let buf = build_pe_header(sections);
+        let result = parse_sections_from_bytes(&buf, 0x4000_0000, 0x10_0000);
+        assert_eq!(result.unwrap_err(), PeError::UnalignedSection);
     }
 }
