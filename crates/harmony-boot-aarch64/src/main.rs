@@ -337,7 +337,7 @@ fn main() -> Status {
 
     let _ = writeln!(
         serial,
-        "[Runtime] UnikernelRuntime created, entering idle loop"
+        "[Runtime] UnikernelRuntime created"
     );
 
     // ── Initialise Linuxulator ──

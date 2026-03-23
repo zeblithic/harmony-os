@@ -33,12 +33,22 @@ impl MmioRegisterBank {
 }
 
 impl RegisterBank for MmioRegisterBank {
+    /// Read a 32-bit register at `offset` bytes from base.
+    ///
+    /// # Panics
+    /// Debug-asserts that `offset` is 4-byte aligned (required for u32 MMIO on aarch64).
     fn read(&self, offset: usize) -> u32 {
+        debug_assert!(offset % 4 == 0, "MMIO offset {offset:#x} is not 4-byte aligned");
         let addr = (self.base + offset) as *const u32;
         unsafe { core::ptr::read_volatile(addr) }
     }
 
+    /// Write a 32-bit register at `offset` bytes from base.
+    ///
+    /// # Panics
+    /// Debug-asserts that `offset` is 4-byte aligned (required for u32 MMIO on aarch64).
     fn write(&mut self, offset: usize, value: u32) {
+        debug_assert!(offset % 4 == 0, "MMIO offset {offset:#x} is not 4-byte aligned");
         let addr = (self.base + offset) as *mut u32;
         unsafe { core::ptr::write_volatile(addr, value) }
     }
