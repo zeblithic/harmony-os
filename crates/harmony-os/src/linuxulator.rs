@@ -2597,13 +2597,18 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.vm_brk_current = 0;
         self.getrandom_counter = 0;
         self.exit_code = None;
-        // Reset signal handlers: SIG_IGN is preserved across exec (nohup
-        // relies on this), all other handlers reset to SIG_DFL. This
-        // matches Linux kernel's flush_signal_handlers(t, 0).
+        // Reset signal handlers per Linux flush_signal_handlers(t, 0):
+        // - SIG_IGN handler is preserved (nohup relies on this)
+        // - All other handlers reset to SIG_DFL
+        // - flags, mask, and restorer are unconditionally cleared for ALL
+        //   signals (including SIG_IGN ones)
         for action in &mut self.signal_handlers {
             if action.handler != SIG_IGN {
-                *action = SignalAction::default();
+                action.handler = SIG_DFL;
             }
+            action.flags = 0;
+            action.mask = 0;
+            action.restorer = 0;
         }
     }
 
