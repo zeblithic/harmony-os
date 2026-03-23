@@ -3913,7 +3913,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
     ///
     /// Supports both relative (flags=0) and absolute (TIMER_ABSTIME)
     /// sleep. For absolute, computes delta from current clock value.
-    fn sys_clock_nanosleep(&mut self, clockid: i32, flags: i32, req_ptr: u64, rem_ptr: u64) -> i64 {
+    fn sys_clock_nanosleep(&mut self, clockid: i32, flags: i32, req_ptr: u64, _rem_ptr: u64) -> i64 {
         if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
             return EINVAL;
         }
@@ -3938,11 +3938,39 @@ impl<B: SyscallBackend> Linuxulator<B> {
             };
             // If target is already in the past, return immediately.
             let delta_ns = abs_ns.saturating_sub(now);
-            self.monotonic_ns = self.monotonic_ns.wrapping_add(delta_ns);
+            // Advance the clock we're sleeping on (not always monotonic).
+            match clockid {
+                CLOCK_REALTIME => {
+                    self.realtime_ns = self.realtime_ns.wrapping_add(delta_ns);
+                }
+                _ => {
+                    self.monotonic_ns = self.monotonic_ns.wrapping_add(delta_ns);
+                }
+            }
             return 0;
         }
 
-        self.sys_nanosleep(req_ptr, rem_ptr)
+        // Relative sleep: advance the requested clock by the duration.
+        if req_ptr == 0 {
+            return EFAULT;
+        }
+        let req_bytes =
+            unsafe { core::slice::from_raw_parts(req_ptr as usize as *const u8, 16) };
+        let tv_sec = i64::from_le_bytes(req_bytes[0..8].try_into().unwrap());
+        let tv_nsec = i64::from_le_bytes(req_bytes[8..16].try_into().unwrap());
+        if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
+            return EINVAL;
+        }
+        let duration_ns = (tv_sec as u64) * 1_000_000_000 + (tv_nsec as u64);
+        match clockid {
+            CLOCK_REALTIME => {
+                self.realtime_ns = self.realtime_ns.wrapping_add(duration_ns);
+            }
+            _ => {
+                self.monotonic_ns = self.monotonic_ns.wrapping_add(duration_ns);
+            }
+        }
+        0
     }
 
     /// Linux prctl(2): process control operations.
@@ -3958,17 +3986,18 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 if arg2 == 0 {
                     return EFAULT;
                 }
-                // Copy up to 15 chars + always null-terminate at [15].
-                // Matches Linux kernel's strlcpy(tsk->comm, name, sizeof(tsk->comm)).
-                let src = unsafe { core::slice::from_raw_parts(arg2 as usize as *const u8, 16) };
+                // Read byte-by-byte up to 15 chars (avoids reading past
+                // short buffers near page boundaries). Always null-terminates
+                // at [15]. Matches Linux kernel's strncpy_from_user semantics.
                 self.process_name = [0u8; 16];
-                for (i, &b) in src.iter().take(15).enumerate() {
+                let base = arg2 as usize;
+                for i in 0..15 {
+                    let b = unsafe { *((base + i) as *const u8) };
                     if b == 0 {
                         break;
                     }
                     self.process_name[i] = b;
                 }
-                // process_name[15] is always 0 (from the zeroing above)
                 0
             }
             PR_GET_NAME => {
