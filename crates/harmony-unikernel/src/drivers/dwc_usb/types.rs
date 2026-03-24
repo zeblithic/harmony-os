@@ -88,6 +88,12 @@ pub enum XhciAction {
     /// Ring a doorbell register (pre-computed offset and value).
     RingDoorbell { offset: usize, value: u32 },
     /// Update Event Ring Dequeue Pointer in interrupter register.
+    ///
+    /// **Phase 2b note:** When interrupt-driven operation is enabled,
+    /// the caller must OR bit 3 (EHB = Event Handler Busy) into the
+    /// ERDP write value to acknowledge the interrupt and allow the
+    /// next one to fire. In polling-only mode (Phase 2a), EHB is
+    /// not relevant since interrupts are not enabled.
     UpdateDequeuePointer { phys: u64 },
     /// Write a 32-bit value to a register (offset from MMIO base).
     WriteRegister { offset: usize, value: u32 },
