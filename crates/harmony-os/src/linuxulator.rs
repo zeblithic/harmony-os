@@ -2498,6 +2498,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Consume the pending signal return (set by rt_sigreturn).
     /// If Some, the caller should restore registers from the returned state.
+    ///
+    /// **Important:** After an `RtSigreturn` dispatch, the caller must
+    /// drain both `pending_signal_return()` and `pending_handler_signal()`.
+    /// `rt_sigreturn` restores the signal mask, and `deliver_pending_signals`
+    /// (which runs at the end of every `dispatch_syscall`) may immediately
+    /// deliver a previously-blocked signal, setting `pending_handler_signal`.
     pub fn pending_signal_return(&mut self) -> Option<SignalReturn> {
         self.pending_signal_return.take()
     }
@@ -5672,17 +5678,16 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Linux rt_sigreturn(2): restore register state and signal mask
     /// from the signal frame on the user stack.
     ///
-    /// When the signal handler returns via `ret`, it pops sa_restorer.
-    /// sa_restorer calls rt_sigreturn via `mov $15,%rax; syscall`.
-    /// At that point RSP = handler_rsp + 8 (the retaddr was popped by ret).
-    ///
     /// Frame layout from handler_rsp:
     ///   +0:   retaddr (consumed by ret)
-    ///   +8:   siginfo_t (128 bytes)
-    ///   +136: ucontext_t (240 bytes)
+    ///   +8:   ucontext_t (304 bytes)
+    ///         ├─ uc_flags/uc_link/uc_stack  (40 bytes)
+    ///         ├─ sigcontext (32 u64 × 8)   (256 bytes)
+    ///         └─ uc_sigmask                  (8 bytes)
+    ///   +312: siginfo_t (128 bytes)
     ///
     /// RSP passed to us = handler_rsp + 8 (retaddr already popped).
-    /// siginfo at rsp, ucontext at rsp + 128.
+    /// ucontext at rsp, siginfo at rsp + 304.
     fn sys_rt_sigreturn(&mut self, rsp: u64) -> i64 {
         let ucontext_ptr = rsp as usize; // ucontext is right after retaddr (which was popped)
         let sc = ucontext_ptr + 40; // sigcontext within ucontext
