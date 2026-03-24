@@ -236,10 +236,13 @@ impl NixStoreFetcher {
             let nar_bytes = nar_bytes.unwrap();
 
             if from_mesh {
-                // Mesh-sourced: no clone needed — we never return these
-                // for re-publishing (they're already on the mesh).
-                match import_fn(&name_str, nar_bytes) {
-                    Ok(_) => {}
+                // Mesh-sourced NARs are already on the mesh so callers don't
+                // need to re-publish, but we still return them so references
+                // can be persisted via .meta sidecars.
+                match import_fn(&name_str, nar_bytes.clone()) {
+                    Ok(_) => {
+                        imported.push((name_str, nar_bytes, nar_refs));
+                    }
                     Err(e) => {
                         // Mesh data failed import — try HTTP before blacklisting.
                         eprintln!(
@@ -727,14 +730,12 @@ mod tests {
         let _ = server.walk(0, 1, store_path_name);
 
         // Process — mesh provides NAR, HTTP is never consulted.
-        // Mesh-sourced NARs are NOT returned for re-publishing (already on mesh).
+        // Mesh-sourced NARs ARE returned so callers can persist references.
         let imported = fetcher.process_misses(&mut server);
-        assert!(
-            imported.is_empty(),
-            "mesh-sourced NARs should not be returned for re-publishing"
-        );
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].0, store_path_name);
 
-        // Verify import succeeded — store path is available despite empty return.
+        // Verify import succeeded.
         let qp = server.walk(0, 2, store_path_name).unwrap();
         assert_ne!(qp, 0);
 

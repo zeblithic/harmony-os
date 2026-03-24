@@ -132,20 +132,26 @@ impl PersistentNarStore {
             std::fs::write(&path, &nar_bytes)?;
             // Write .meta sidecar after .nar — crash between them leaves NAR
             // loadable but without references (safe degradation).
+            let meta_path = self.dir.join(format!("{name}.meta"));
             if let Some(ref refs) = references {
                 for r in refs {
-                    assert!(
-                        !r.contains('\n') && !r.contains('\r') && !r.contains('\0'),
-                        "reference must not contain control characters: {r:?}"
-                    );
+                    if r.contains('\n') || r.contains('\r') || r.contains('\0') {
+                        let _ = std::fs::remove_file(&path);
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("reference contains control characters: {r:?}"),
+                        ));
+                    }
                 }
-                let meta_path = self.dir.join(format!("{name}.meta"));
                 let meta_content = format!("References: {}\n", refs.join(" "));
                 if let Err(e) = std::fs::write(&meta_path, meta_content.as_bytes()) {
-                    // .meta write failed — clean up the .nar to avoid half-committed state.
                     let _ = std::fs::remove_file(&path);
                     return Err(e);
                 }
+            } else {
+                // Remove any stale .meta from a prior import to avoid
+                // returning references that no longer apply on reload.
+                let _ = std::fs::remove_file(&meta_path);
             }
         }
 
@@ -179,6 +185,12 @@ impl PersistentNarStore {
     ///
     /// Missing `.meta` files → the entry is absent from the map (caller
     /// treats as `None`). Corrupted `.meta` files are logged and skipped.
+    ///
+    /// Note: `ref_map` may contain entries for store paths not present in
+    /// `server` if orphaned `.meta` files exist (e.g. from a prior crash).
+    /// [`BinaryCacheServer::new_with_refs`](crate::nix_binary_cache::BinaryCacheServer::new_with_refs)
+    /// handles this correctly by only consulting `ref_map` for paths that
+    /// exist in the provided server.
     pub fn open_with_refs(
         dir: &Path,
     ) -> io::Result<(Self, NixStoreServer, HashMap<String, Vec<String>>)> {
