@@ -133,9 +133,19 @@ impl PersistentNarStore {
             // Write .meta sidecar after .nar — crash between them leaves NAR
             // loadable but without references (safe degradation).
             if let Some(ref refs) = references {
+                for r in refs {
+                    assert!(
+                        !r.contains('\n') && !r.contains('\r') && !r.contains('\0'),
+                        "reference must not contain control characters: {r:?}"
+                    );
+                }
                 let meta_path = self.dir.join(format!("{name}.meta"));
                 let meta_content = format!("References: {}\n", refs.join(" "));
-                std::fs::write(&meta_path, meta_content.as_bytes())?;
+                if let Err(e) = std::fs::write(&meta_path, meta_content.as_bytes()) {
+                    // .meta write failed — clean up the .nar to avoid half-committed state.
+                    let _ = std::fs::remove_file(&path);
+                    return Err(e);
+                }
             }
         }
 
