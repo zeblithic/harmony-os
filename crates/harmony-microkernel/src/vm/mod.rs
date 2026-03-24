@@ -201,6 +201,8 @@ pub enum VmError {
     PageTableError,
     /// An address or size is not properly aligned.
     Unaligned(u64),
+    /// An address + length calculation overflowed.
+    Overflow(u64),
     /// The requested buddy order is out of range.
     InvalidOrder(usize),
     /// A process space with this PID already exists.
