@@ -143,7 +143,7 @@ When a CID is written to `/env/config/stage`, the ConfigServer:
 
 1. Fetches the `SignedConfig` book from `ContentServer` by CID
 2. Deserializes the outer `SignedConfig` from CBOR
-3. Verifies the ML-DSA-65 signature over `config_bytes` using the signer's PQ public key (looked up from key hierarchy)
+3. Verifies the ML-DSA-65 signature over `config_bytes` using the signer's PQ public key (from the `SignedConfig` envelope — see Signer Public Key Resolution below)
 4. Deserializes the inner `config_bytes` as `NodeConfig`
 5. Validates schema version is supported
 6. Checks all referenced CIDs exist in the CAS (kernel, identity, each service binary and config)
