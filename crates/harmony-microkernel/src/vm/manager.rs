@@ -37,7 +37,7 @@ pub(crate) fn region_overlap(
     vaddr: VirtAddr,
     range_end: u64,
 ) -> (usize, usize) {
-    let region_end = base.as_u64() + region_len as u64;
+    let region_end = base.as_u64().saturating_add(region_len as u64);
     let overlap_start = vaddr.as_u64().max(base.as_u64());
     let overlap_end = range_end.min(region_end);
     debug_assert!(
@@ -335,7 +335,7 @@ impl<P: PageTable> AddressSpaceManager<P> {
             .map(|(&k, _)| k)
             .unwrap_or(vaddr);
         for (&base, region) in space.regions.range(start_key..) {
-            let region_end = base.as_u64() + region.len as u64;
+            let region_end = base.as_u64().saturating_add(region.len as u64);
             if region_end <= vaddr.as_u64() {
                 continue; // behind-region that doesn't reach vaddr (only when next_back found one)
             }
@@ -496,8 +496,10 @@ impl<P: PageTable> AddressSpaceManager<P> {
             len > 0 && len as u64 % PAGE_SIZE == 0 && vaddr.as_u64() % PAGE_SIZE == 0,
             "protect_partial_with_bases: unaligned or zero len"
         );
+        // mprotect requires all pages in the range to be mapped (ENOMEM).
+        // This differs from munmap which silently skips unmapped gaps.
         if bases.is_empty() {
-            return Ok(());
+            return Err(VmError::NotMapped(vaddr));
         }
 
         let range_end = vaddr
