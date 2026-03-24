@@ -42,6 +42,15 @@ pub const UART_CLOCK_HZ: u32 = 48_000_000;
 #[cfg(feature = "rpi5")]
 pub const GENET_BASE: usize = 0x1F_0058_0000;
 
+/// BCM2712 DesignWare xHCI USB controller base address (RPi5).
+///
+/// Accessed through RP1 PCIe BAR at offset 0xD0000. UEFI performs PCIe
+/// initialization; the BAR assignment is preserved by `pciex4_reset=0`.
+/// Maps 16 pages (~64KB) covering capability, operational, port,
+/// runtime, and doorbell register regions.
+#[cfg(feature = "rpi5")]
+pub const XHCI_BASE: usize = 0x1F_000D_0000;
+
 /// MMIO regions to map as Device memory (NO_CACHE) during MMU init.
 /// Each entry: (base_address, page_count).
 #[cfg(feature = "qemu-virt")]
@@ -59,7 +68,8 @@ pub const NODE_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 #[cfg(feature = "rpi5")]
 pub const MMIO_REGIONS: &[(usize, usize)] = &[
     (PL011_BASE, 1),
-    (GENET_BASE, 16), // SYS through TDMA + descriptor RAM (~64KB)
+    (GENET_BASE, 16),  // SYS through TDMA + descriptor RAM (~64KB)
+    (XHCI_BASE, 16),   // xHCI capability + operational + port registers (~64KB)
 ];
 
 #[cfg(test)]
