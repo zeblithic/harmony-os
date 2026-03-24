@@ -49,7 +49,7 @@ pub const GENET_BASE: usize = 0x1F_0058_0000;
 /// Maps 16 pages (~64KB) covering capability, operational, port,
 /// runtime, and doorbell register regions.
 #[cfg(feature = "rpi5")]
-pub const XHCI_BASE: usize = 0x1F00D_0000;
+pub const XHCI_BASE: usize = 0x1F_000D_0000;
 
 /// MMIO regions to map as Device memory (NO_CACHE) during MMU init.
 /// Each entry: (base_address, page_count).

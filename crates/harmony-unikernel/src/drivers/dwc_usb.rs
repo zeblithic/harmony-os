@@ -442,18 +442,16 @@ mod tests {
     }
 
     #[test]
-    fn detect_ports_before_init_fails() {
-        // Cannot call detect_ports without a driver instance (init creates it),
-        // but we can test the error state by simulating an error.
+    fn init_not_ready_timeout() {
         let mut bank = MockRegisterBank::new();
         bank.on_read(CAPLENGTH_HCIVERSION, vec![0x20]);
         bank.on_read(HCSPARAMS1, vec![0x0100_0001]);
         bank.on_read(DBOFF, vec![0]);
         bank.on_read(RTSOFF, vec![0]);
-        bank.on_read(0x20 + USBCMD, vec![USBCMD_RUN]);
-        bank.on_read(0x20 + USBSTS, vec![0]); // never halts
-                                              // init fails with HaltTimeout — no driver is returned
-        assert!(XhciDriver::init(&mut bank).is_err());
+        // Halt succeeds, reset completes, but CNR never clears.
+        bank.on_read(0x20 + USBCMD, vec![USBCMD_RUN, 0]); // halt ok, HCRST self-clears
+        bank.on_read(0x20 + USBSTS, vec![0, USBSTS_HCH, USBSTS_CNR]); // halt ok, then CNR sticky
+        assert_eq!(XhciDriver::init(&mut bank), Err(XhciError::NotReady));
     }
 
     #[test]
