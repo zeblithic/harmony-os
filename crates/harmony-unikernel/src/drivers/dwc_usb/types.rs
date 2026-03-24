@@ -28,8 +28,6 @@ pub enum XhciError {
     InvalidState,
     /// Command ring is full; cannot enqueue new TRB.
     CommandRingFull,
-    /// Event TRB has an unrecognized or unsupported type.
-    InvalidEvent,
 }
 
 // ── USB speed ────────────────────────────────────────────────────

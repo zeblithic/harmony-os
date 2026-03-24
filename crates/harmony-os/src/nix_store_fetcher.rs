@@ -11,6 +11,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use harmony_microkernel::nix_store_server::NixStoreServer;
+
+/// A NAR that was successfully fetched and imported into the store.
+#[derive(Debug, Clone)]
+pub struct ImportedNar {
+    /// The Nix store path name (e.g., "xxxxxxxx-package-1.0").
+    pub store_path: String,
+    /// The raw NAR bytes.
+    pub nar_bytes: Vec<u8>,
+    /// Optional references parsed from narinfo or mesh payload.
+    pub references: Option<Vec<String>>,
+    /// Whether this NAR was sourced from the mesh (already published).
+    /// Callers should skip re-publishing mesh-sourced NARs.
+    pub from_mesh: bool,
+}
 use sha2::{Digest, Sha256};
 use xz2::read::XzDecoder;
 
@@ -134,12 +148,9 @@ impl NixStoreFetcher {
 
     /// Process all pending misses: drain, deduplicate, fetch, import.
     ///
-    /// Returns a list of `(store_path_name, nar_bytes, references)` for each
-    /// successfully imported path, so callers can publish to the mesh.
-    pub fn process_misses(
-        &mut self,
-        server: &mut NixStoreServer,
-    ) -> Vec<(String, Vec<u8>, Option<Vec<String>>)> {
+    /// Returns a list of `(store_path_name, nar_bytes, references, from_mesh)` for each
+    /// successfully imported path. Skip re-publishing entries where `from_mesh` is `true`.
+    pub fn process_misses(&mut self, server: &mut NixStoreServer) -> Vec<ImportedNar> {
         let misses = server.drain_misses();
         self.process_miss_list(misses, |name, nar| {
             // Skip if already imported (race: kernel re-recorded a miss
@@ -157,12 +168,12 @@ impl NixStoreFetcher {
     /// Process misses from a shared (Arc<Mutex>) server, releasing the lock
     /// during HTTP I/O so the kernel thread isn't blocked.
     ///
-    /// Returns a list of `(store_path_name, nar_bytes, references)` for each
-    /// successfully imported path, so callers can publish to the mesh.
+    /// Returns a list of `(store_path_name, nar_bytes, references, from_mesh)` for each
+    /// successfully imported path. Skip re-publishing entries where `from_mesh` is `true`.
     pub fn process_misses_shared(
         &mut self,
         server: &Arc<Mutex<NixStoreServer>>,
-    ) -> Vec<(String, Vec<u8>, Option<Vec<String>>)> {
+    ) -> Vec<ImportedNar> {
         let misses = server
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -188,12 +199,10 @@ impl NixStoreFetcher {
     /// on mesh miss (or mesh import failure) the fetcher falls back to
     /// the upstream HTTP cache.
     ///
-    /// Returns `(store_path_name, nar_bytes, references)` for every *newly* imported path.
-    fn process_miss_list<F>(
-        &mut self,
-        misses: Vec<Arc<str>>,
-        mut import_fn: F,
-    ) -> Vec<(String, Vec<u8>, Option<Vec<String>>)>
+    /// Returns `(store_path_name, nar_bytes, references, from_mesh)` for every
+    /// *newly* imported path. Callers should skip re-publishing entries where
+    /// `from_mesh` is `true` — those NARs are already on the mesh.
+    fn process_miss_list<F>(&mut self, misses: Vec<Arc<str>>, mut import_fn: F) -> Vec<ImportedNar>
     where
         F: FnMut(&str, Vec<u8>) -> Result<bool, String>,
     {
@@ -237,11 +246,16 @@ impl NixStoreFetcher {
 
             if from_mesh {
                 // Mesh-sourced NARs are already on the mesh so callers don't
-                // need to re-publish, but we still return them so references
-                // can be persisted via .meta sidecars.
+                // need to re-publish (from_mesh=true), but we still return
+                // them so references can be persisted via .meta sidecars.
                 match import_fn(&name_str, nar_bytes.clone()) {
                     Ok(true) => {
-                        imported.push((name_str, nar_bytes, nar_refs));
+                        imported.push(ImportedNar {
+                            store_path: name_str,
+                            nar_bytes,
+                            references: nar_refs,
+                            from_mesh: true,
+                        });
                     }
                     Ok(false) => {
                         // Already present (race) — no .meta write needed.
@@ -256,7 +270,12 @@ impl NixStoreFetcher {
                             Ok((http_nar, http_refs)) => {
                                 match import_fn(&name_str, http_nar.clone()) {
                                     Ok(true) => {
-                                        imported.push((name_str, http_nar, http_refs));
+                                        imported.push(ImportedNar {
+                                            store_path: name_str,
+                                            nar_bytes: http_nar,
+                                            references: http_refs,
+                                            from_mesh: false,
+                                        });
                                         continue;
                                     }
                                     Ok(false) => continue,
@@ -283,11 +302,16 @@ impl NixStoreFetcher {
                     }
                 }
             } else {
-                // HTTP-sourced: clone needed — import_fn consumes the Vec,
-                // but we need the original for the return value.
+                // HTTP-sourced (from_mesh=false): clone needed — import_fn
+                // consumes the Vec, but we need the original for the return value.
                 match import_fn(&name_str, nar_bytes.clone()) {
                     Ok(true) => {
-                        imported.push((name_str, nar_bytes, nar_refs));
+                        imported.push(ImportedNar {
+                            store_path: name_str,
+                            nar_bytes,
+                            references: nar_refs,
+                            from_mesh: false,
+                        });
                     }
                     Ok(false) => {
                         // Already present — skip re-publishing.
@@ -522,8 +546,8 @@ mod tests {
         // Process misses — should fetch and import.
         let imported = fetcher.process_misses(&mut server);
         assert_eq!(imported.len(), 1);
-        assert_eq!(imported[0].0, store_path_name);
-        assert!(imported[0].2.is_none());
+        assert_eq!(imported[0].store_path, store_path_name);
+        assert!(imported[0].references.is_none());
 
         // Verify the store path is now available.
         let qp = server.walk(0, 2, &store_path_name).unwrap();
@@ -736,7 +760,7 @@ mod tests {
         // Mesh-sourced NARs ARE returned so callers can persist references.
         let imported = fetcher.process_misses(&mut server);
         assert_eq!(imported.len(), 1);
-        assert_eq!(imported[0].0, store_path_name);
+        assert_eq!(imported[0].store_path, store_path_name);
 
         // Verify import succeeded.
         let qp = server.walk(0, 2, store_path_name).unwrap();
@@ -786,8 +810,8 @@ mod tests {
         // Process — mesh misses, HTTP succeeds.
         let imported = fetcher.process_misses(&mut server);
         assert_eq!(imported.len(), 1);
-        assert_eq!(imported[0].0, store_path_name);
-        assert!(imported[0].2.is_none());
+        assert_eq!(imported[0].store_path, store_path_name);
+        assert!(imported[0].references.is_none());
 
         // Verify the store path is now available.
         let qp = server.walk(0, 2, &store_path_name).unwrap();
@@ -833,9 +857,9 @@ mod tests {
 
         let imported = fetcher.process_misses(&mut server);
         assert_eq!(imported.len(), 1);
-        assert_eq!(imported[0].0, store_path_name);
-        assert_eq!(imported[0].1, nar_bytes);
-        assert!(imported[0].2.is_none());
+        assert_eq!(imported[0].store_path, store_path_name);
+        assert_eq!(imported[0].nar_bytes, nar_bytes);
+        assert!(imported[0].references.is_none());
     }
 
     // ── Test: fetch propagates references ────────────────────────────
@@ -873,9 +897,9 @@ mod tests {
 
         let imported = fetcher.process_misses(&mut server);
         assert_eq!(imported.len(), 1);
-        assert_eq!(imported[0].0, store_path_name);
+        assert_eq!(imported[0].store_path, store_path_name);
         assert_eq!(
-            imported[0].2,
+            imported[0].references,
             Some(vec!["dep123-glibc".to_string(), "dep456-gcc".to_string()])
         );
     }

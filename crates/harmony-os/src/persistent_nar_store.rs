@@ -135,11 +135,16 @@ impl PersistentNarStore {
             let meta_path = self.dir.join(format!("{name}.meta"));
             if let Some(ref refs) = references {
                 for r in refs {
-                    if r.contains('\n') || r.contains('\r') || r.contains('\0') {
+                    if r.contains('\n')
+                        || r.contains('\r')
+                        || r.contains('\0')
+                        || r.contains(' ')
+                        || r.contains('\t')
+                    {
                         let _ = std::fs::remove_file(&path);
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
-                            format!("reference contains control characters: {r:?}"),
+                            format!("reference contains whitespace or control characters: {r:?}"),
                         ));
                     }
                 }

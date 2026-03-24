@@ -111,9 +111,14 @@ impl<A: ContentAnnouncer, S: BookStore> NarPublisher<A, S> {
             // - Some(refs) → "cid_hex\nref1\nref2"
             payload.push('\n');
             for (i, r) in refs.iter().enumerate() {
-                if r.contains('\n') || r.contains('\r') || r.contains('\0') {
+                if r.contains('\n')
+                    || r.contains('\r')
+                    || r.contains('\0')
+                    || r.contains(' ')
+                    || r.contains('\t')
+                {
                     return Err(format!(
-                        "reference must not contain control characters: {r:?}"
+                        "reference must not contain whitespace or control characters: {r:?}"
                     ));
                 }
                 if i > 0 {
