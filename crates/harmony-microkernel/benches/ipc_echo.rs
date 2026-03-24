@@ -6,7 +6,7 @@ use harmony_microkernel::{FileServer, OpenMode};
 fn bench_walk_open_read_clunk(c: &mut Criterion) {
     c.bench_function("ipc_echo/walk_open_read_clunk", |b| {
         b.iter_batched(
-            || EchoServer::new(),
+            EchoServer::new,
             |mut srv| {
                 srv.walk(0, 1, "hello").unwrap();
                 srv.open(1, OpenMode::Read).unwrap();
