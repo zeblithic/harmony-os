@@ -885,15 +885,21 @@ mod tests {
                 0,          // CMD16 response
             ],
         );
-        bank.on_read(SDHCI_RESPONSE_1, vec![
-            0,          // CMD2 R2 response
-            1000 << 8,  // CMD9 CSD: C_SIZE = 1000 in bits [29:8]
-        ]);
+        bank.on_read(
+            SDHCI_RESPONSE_1,
+            vec![
+                0,         // CMD2 R2 response
+                1000 << 8, // CMD9 CSD: C_SIZE = 1000 in bits [29:8]
+            ],
+        );
         bank.on_read(SDHCI_RESPONSE_2, vec![0]); // CMD2 and CMD9
-        bank.on_read(SDHCI_RESPONSE_3, vec![
-            0,          // CMD2 R2 response
-            1 << 22,    // CMD9 CSD: version 2.0 in bits [23:22]
-        ]);
+        bank.on_read(
+            SDHCI_RESPONSE_3,
+            vec![
+                0,       // CMD2 R2 response
+                1 << 22, // CMD9 CSD: version 2.0 in bits [23:22]
+            ],
+        );
 
         let info = driver.init_card(&mut bank).unwrap();
         assert_eq!(info.rca, 0x1234);
@@ -1233,12 +1239,7 @@ mod tests {
     #[test]
     fn parse_csd_v2_small_card() {
         // 4GB SDHC: C_SIZE = 8191 → (8191+1)*1024 = 8_388_608 blocks = 4 GB
-        let resp = [
-            0,
-            8191 << 8,
-            0,
-            1 << 22,
-        ];
+        let resp = [0, 8191 << 8, 0, 1 << 22];
         let blocks = parse_csd_capacity(resp, true);
         assert_eq!(blocks, 8_388_608);
     }
@@ -1258,8 +1259,8 @@ mod tests {
         let resp = [
             0,
             (0x3FF << 22) | (7 << 7), // RESPONSE_1: C_SIZE lower 10 bits [31:22] + C_SIZE_MULT [9:7]
-            (10 << 8) | 0x3,           // RESPONSE_2: READ_BL_LEN [11:8] + C_SIZE upper 2 bits [1:0]
-            0,                          // RESPONSE_3: CSD version 0 (v1.0)
+            (10 << 8) | 0x3,          // RESPONSE_2: READ_BL_LEN [11:8] + C_SIZE upper 2 bits [1:0]
+            0,                        // RESPONSE_3: CSD version 0 (v1.0)
         ];
         let blocks = parse_csd_capacity(resp, false);
         assert_eq!(blocks, 4_194_304, "2GB SDSC card should have 4M blocks");
