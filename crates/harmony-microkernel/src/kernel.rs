@@ -744,7 +744,10 @@ impl<P: PageTable> Kernel<P> {
     ) -> Result<(), VmError> {
         // Collect frames to unregister from guardians BEFORE unmap modifies state.
         let bases = self.vm.find_overlapping_regions(pid, vaddr, len)?;
-        let range_end = vaddr.as_u64() + len as u64;
+        let range_end = vaddr
+            .as_u64()
+            .checked_add(len as u64)
+            .ok_or(VmError::Overflow(vaddr.as_u64()))?;
 
         let mut frames_to_unregister: Vec<(PhysAddr, FrameClassification)> = Vec::new();
         for &base in &bases {
@@ -804,7 +807,10 @@ impl<P: PageTable> Kernel<P> {
     ) -> Result<(), VmError> {
         // Check per-region writability BEFORE mutating.
         let bases = self.vm.find_overlapping_regions(pid, vaddr, len)?;
-        let range_end = vaddr.as_u64() + len as u64;
+        let range_end = vaddr
+            .as_u64()
+            .checked_add(len as u64)
+            .ok_or(VmError::Overflow(vaddr.as_u64()))?;
 
         // Collect frames needing Snapshot promotion (from non-writable regions
         // being made writable). Invariant: a CidBacked frame that is currently

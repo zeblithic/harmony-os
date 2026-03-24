@@ -365,18 +365,29 @@ impl<P: PageTable> AddressSpaceManager<P> {
             let overlap_page_offset = ((overlap_start - base.as_u64()) / PAGE_SIZE) as usize;
             let overlap_page_count = ((overlap_end - overlap_start) / PAGE_SIZE) as usize;
 
-            // Unmap target pages from page table.
+            // Unmap target pages from page table, freeing intermediate PT
+            // structure frames to the correct buddy based on classification.
             {
+                let use_kernel = region
+                    .classification
+                    .contains(FrameClassification::ENCRYPTED)
+                    && self.buddy_kernel.total_frame_count() > 0;
                 let Self {
                     spaces,
                     buddy_public,
+                    buddy_kernel,
                     ..
                 } = self;
                 let space = spaces.get_mut(&pid).unwrap();
+                let buddy = if use_kernel {
+                    buddy_kernel
+                } else {
+                    buddy_public
+                };
                 for i in 0..overlap_page_count {
                     let page_vaddr = VirtAddr(overlap_start + (i as u64) * PAGE_SIZE);
                     let _ = space.page_table.unmap(page_vaddr, &mut |frame| {
-                        let _ = buddy_public.free_frame(frame);
+                        let _ = buddy.free_frame(frame);
                     });
                 }
             }
