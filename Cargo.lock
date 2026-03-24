@@ -756,6 +756,7 @@ name = "harmony-microkernel"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.11.0",
+ "ciborium",
  "criterion",
  "harmony-athenaeum",
  "harmony-crypto",
@@ -763,6 +764,7 @@ dependencies = [
  "harmony-platform",
  "harmony-unikernel",
  "rand_core 0.6.4",
+ "serde",
 ]
 
 [[package]]

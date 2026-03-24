@@ -79,7 +79,8 @@ impl NodeConfig {
     /// struct fields in the same order always produce the same bytes.
     pub fn to_cbor(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        ciborium::into_writer(self, &mut buf).expect("CBOR serialization of NodeConfig is infallible");
+        ciborium::into_writer(self, &mut buf)
+            .expect("CBOR serialization of NodeConfig is infallible");
         buf
     }
 
@@ -88,9 +89,8 @@ impl NodeConfig {
     /// Returns [`ConfigError::DeserializeFailed`] if the bytes are not
     /// valid CBOR or do not match the `NodeConfig` schema.
     pub fn from_cbor(bytes: &[u8]) -> Result<Self, ConfigError> {
-        ciborium::from_reader(bytes).map_err(|e| {
-            ConfigError::DeserializeFailed(alloc::format!("{e}"))
-        })
+        ciborium::from_reader(bytes)
+            .map_err(|e| ConfigError::DeserializeFailed(alloc::format!("{e}")))
     }
 
     /// Compute the content identifier (CID) for this config.
@@ -147,7 +147,11 @@ mod tests {
         let cid1 = config.cid();
         let cid2 = config.cid();
         assert_eq!(cid1, cid2, "CID must be stable across calls");
-        assert_eq!(cid1, sha256_hash(&config.to_cbor()), "CID must equal sha256_hash(to_cbor())");
+        assert_eq!(
+            cid1,
+            sha256_hash(&config.to_cbor()),
+            "CID must equal sha256_hash(to_cbor())"
+        );
     }
 
     #[test]
@@ -155,7 +159,11 @@ mod tests {
         let config_a = sample_config();
         let mut config_b = sample_config();
         config_b.network.port = 8888;
-        assert_ne!(config_a.cid(), config_b.cid(), "different content must produce different CID");
+        assert_ne!(
+            config_a.cid(),
+            config_b.cid(),
+            "different content must produce different CID"
+        );
     }
 
     #[test]
