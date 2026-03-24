@@ -173,7 +173,13 @@ pub unsafe fn init_and_enable(
             );
             match mmio_result {
                 Ok(()) => mapped_pages += 1,
-                Err(VmError::RegionConflict(_)) => {}
+                Err(VmError::RegionConflict(_)) => {
+                    let _ = writeln!(
+                        serial,
+                        "[MMU] WARNING: MMIO {:#x} conflicts — mapped as Normal memory, MMIO unreliable",
+                        addr,
+                    );
+                }
                 Err(e) => {
                     let _ = writeln!(serial, "[MMU] MMIO map error at {:#x}: {:?}", addr, e);
                 }

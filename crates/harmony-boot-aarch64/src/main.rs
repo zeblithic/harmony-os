@@ -52,10 +52,14 @@ use harmony_unikernel::{KernelEntropy, MemoryState, UnikernelRuntime};
 #[cfg(target_os = "uefi")]
 const BUMP_MIN_ADDR: u64 = 0x10_0000; // 1 MiB
 
-/// Size of the bump allocator region in bytes (2 MiB).
-/// This provides ~512 frames for page table construction.
-#[cfg(target_os = "uefi")]
+/// Size of the bump allocator region in bytes.
+/// QEMU: 2 MiB (~512 frames for page tables + stack).
+/// RPi5: 4 MiB (~1024 frames for page tables + stack + 512 DMA buffers).
+#[cfg(all(target_os = "uefi", feature = "qemu-virt"))]
 const BUMP_REGION_SIZE: u64 = 2 * 1024 * 1024;
+
+#[cfg(all(target_os = "uefi", feature = "rpi5"))]
+const BUMP_REGION_SIZE: u64 = 4 * 1024 * 1024;
 
 /// Returns `true` if a UEFI memory type represents usable RAM after
 /// ExitBootServices.
@@ -621,7 +625,7 @@ fn main() -> Status {
         use harmony_unikernel::drivers::genet::GenetDriver;
 
         let mut bank = unsafe { mmio::MmioRegisterBank::new(platform::GENET_BASE) };
-        let mac: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let mac = platform::NODE_MAC;
         let _ = writeln!(
             serial,
             "[GENET] Initializing at {:#x}, MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -680,14 +684,14 @@ fn main() -> Status {
         // ── Network RX (RPi5 GENET) ──
         #[cfg(feature = "rpi5")]
         {
-            while let Some(frame) = genet_driver.poll_rx(&mut genet_bank, &mut rx_pool) {
-                // Cache invalidate: ensure CPU sees DMA-written data.
-                // In identity map, buf.virt == phys; we need the virt addr of the
-                // buffer that was just consumed. Since poll_rx already copied the data
-                // into frame.data (a Vec), the DMA buffer is freed. Cache invalidation
-                // should happen inside the MMIO integration layer before the copy.
-                // For now, frame.data is already a CPU-side copy.
+            // Invalidate all RX DMA buffers before polling — ensures CPU sees
+            // data written by GENET's non-coherent PCIe DMA, not stale cache lines.
+            for i in 0..256usize {
+                let buf = rx_pool.get(i);
+                unsafe { cache::invalidate_range(buf.virt, 2048) };
+            }
 
+            while let Some(frame) = genet_driver.poll_rx(&mut genet_bank, &mut rx_pool) {
                 if frame.data.len() >= 14 {
                     let ethertype =
                         u16::from_be_bytes([frame.data[12], frame.data[13]]);
@@ -731,7 +735,17 @@ fn main() -> Status {
 
                 genet_driver.reclaim_tx(&genet_bank, &mut tx_pool);
                 match genet_driver.send(&mut genet_bank, &frame, &mut tx_pool) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        // Cache clean all TX pool buffers — flush data to physical
+                        // memory for GENET's non-coherent PCIe DMA. send() copies
+                        // data internally; we clean all buffers since we don't know
+                        // which index was used. DMA latency after PROD_INDEX write
+                        // gives us time to complete the flush.
+                        for i in 0..256usize {
+                            let buf = tx_pool.get(i);
+                            unsafe { cache::clean_range(buf.virt, 2048) };
+                        }
+                    }
                     Err(e) => {
                         let _ = writeln!(serial, "[TX] send error: {:?}", e);
                     }

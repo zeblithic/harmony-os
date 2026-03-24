@@ -49,6 +49,13 @@ pub const MMIO_REGIONS: &[(usize, usize)] = &[
     (PL011_BASE, 1),
 ];
 
+/// Locally-administered test MAC address for GENET (RPi5).
+///
+/// 0x02 prefix = locally administered unicast. Future work: read real
+/// MAC from OTP/firmware.
+#[cfg(feature = "rpi5")]
+pub const NODE_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+
 #[cfg(feature = "rpi5")]
 pub const MMIO_REGIONS: &[(usize, usize)] = &[
     (PL011_BASE, 1),
