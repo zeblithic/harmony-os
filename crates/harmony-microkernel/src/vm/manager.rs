@@ -507,6 +507,24 @@ impl<P: PageTable> AddressSpaceManager<P> {
             .checked_add(len as u64)
             .ok_or(VmError::Overflow(vaddr.as_u64()))?;
 
+        // Verify full coverage: the mapped regions must cover [vaddr, range_end)
+        // with no gaps. Regions are sorted by base (BTreeMap order).
+        {
+            let space = self.spaces.get(&pid).unwrap();
+            let mut covered = vaddr.as_u64();
+            for &base in &bases {
+                let region = space.regions.get(&base).unwrap();
+                let region_start = base.as_u64();
+                if region_start > covered {
+                    return Err(VmError::NotMapped(VirtAddr(covered)));
+                }
+                covered = covered.max(region_start.saturating_add(region.len as u64));
+            }
+            if covered < range_end {
+                return Err(VmError::NotMapped(VirtAddr(covered)));
+            }
+        }
+
         // Pass 1: update all HW page table entries. On failure, roll back
         // any pages already updated so HW state stays consistent with the
         // SW region map (which is not touched until Pass 2).
@@ -1897,17 +1915,24 @@ mod tests {
             FrameClassification::empty(),
         )
         .unwrap();
-        mgr.protect_partial(1, VirtAddr(0x1000), PAGE_SIZE as usize * 4, rx_user_flags())
-            .unwrap();
+        // Linux mprotect returns ENOMEM when the range has unmapped gaps.
+        let result =
+            mgr.protect_partial(1, VirtAddr(0x1000), PAGE_SIZE as usize * 4, rx_user_flags());
+        assert!(
+            matches!(result, Err(VmError::NotMapped(_))),
+            "expected NotMapped for range with unmapped gap, got {:?}",
+            result
+        );
+        // Regions should be unchanged — protect was rejected.
         let regions = &mgr.space(1).unwrap().regions;
         assert_eq!(regions.len(), 2);
         assert_eq!(
             regions.get(&VirtAddr(0x1000)).unwrap().flags,
-            rx_user_flags()
+            rw_user_flags()
         );
         assert_eq!(
             regions.get(&VirtAddr(0x4000)).unwrap().flags,
-            rx_user_flags()
+            rw_user_flags()
         );
     }
 
