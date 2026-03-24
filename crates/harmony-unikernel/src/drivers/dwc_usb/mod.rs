@@ -42,26 +42,36 @@ const USBSTS: usize = 0x04;
 const PAGESIZE: usize = 0x08;
 #[allow(dead_code)]
 const DNCTRL: usize = 0x14;
-#[allow(dead_code)]
 const CRCR_LO: usize = 0x18;
 #[allow(dead_code)]
 const CRCR_HI: usize = 0x1C;
-#[allow(dead_code)]
 const DCBAAP_LO: usize = 0x30;
 #[allow(dead_code)]
 const DCBAAP_HI: usize = 0x34;
-#[allow(dead_code)]
 const CONFIG: usize = 0x38;
 
 // ── USBCMD bits ──────────────────────────────────────────────────
 const USBCMD_RUN: u32 = 1 << 0;
 const USBCMD_HCRST: u32 = 1 << 1;
-#[allow(dead_code)]
 const USBCMD_INTE: u32 = 1 << 2;
 
 // ── USBSTS bits ──────────────────────────────────────────────────
 const USBSTS_HCH: u32 = 1 << 0; // HC Halted
 const USBSTS_CNR: u32 = 1 << 11; // Controller Not Ready
+
+// ── Interrupter 0 registers (offset from rts_offset + 0x20) ─────
+const INTERRUPTER_0_BASE: usize = 0x20;
+#[allow(dead_code)]
+const IMAN: usize = 0x00;
+#[allow(dead_code)]
+const IMOD: usize = 0x04;
+const ERSTSZ: usize = 0x08;
+const ERSTBA_LO: usize = 0x10;
+#[allow(dead_code)]
+const ERSTBA_HI: usize = 0x14;
+const ERDP_LO: usize = 0x18;
+#[allow(dead_code)]
+const ERDP_HI: usize = 0x1C;
 
 // ── PORTSC registers (offset from operational base) ──────────────
 /// First PORTSC relative to operational base.
@@ -85,6 +95,8 @@ const MAX_POLL_ITERATIONS: u32 = 1000;
 enum XhciState {
     /// Controller halted and reset, ready for port detection.
     Ready,
+    /// Rings configured and controller running.
+    Running,
     /// Unrecoverable error.
     #[allow(dead_code)] // Phase 2+ transitions; Phase 1 tests construct directly
     Error(XhciError),
@@ -115,6 +127,10 @@ pub struct XhciDriver {
     db_offset: u32,
     /// Current driver state.
     state: XhciState,
+    /// Command ring state (set after setup_rings).
+    command_ring: Option<ring::CommandRing>,
+    /// Event ring state (set after setup_rings).
+    event_ring: Option<ring::EventRing>,
 }
 
 impl XhciDriver {
@@ -185,6 +201,8 @@ impl XhciDriver {
             rts_offset,
             db_offset,
             state: XhciState::Ready,
+            command_ring: None,
+            event_ring: None,
         })
     }
 
@@ -225,6 +243,91 @@ impl XhciDriver {
         }
 
         Ok(ports)
+    }
+
+    /// Configure command ring, event ring, and start the controller.
+    ///
+    /// The caller must allocate DMA memory for:
+    /// - Command ring: 64 * 16 = 1024 bytes at `cmd_ring_phys`
+    /// - Event ring: 256 * 16 = 4096 bytes at `event_ring_phys`
+    /// - Event Ring Segment Table: 16 bytes at `erst_phys`
+    ///
+    /// Returns actions to write register values and the ERST entry.
+    /// Execute all actions in order, then the controller is running.
+    pub fn setup_rings(
+        &mut self,
+        cmd_ring_phys: u64,
+        event_ring_phys: u64,
+        erst_phys: u64,
+    ) -> Result<Vec<XhciAction>, XhciError> {
+        if self.state != XhciState::Ready {
+            return Err(XhciError::InvalidState);
+        }
+
+        let cmd_ring = ring::CommandRing::new(cmd_ring_phys);
+        let evt_ring = ring::EventRing::new(event_ring_phys);
+
+        let mut actions = Vec::new();
+        let op = self.cap_length;
+        let intr = self.rts_offset as usize + INTERRUPTER_0_BASE;
+
+        // 1. CONFIG: MaxSlotsEn = 0 (Phase 2a doesn't need slots)
+        actions.push(XhciAction::WriteRegister {
+            offset: op + CONFIG,
+            value: 0,
+        });
+
+        // 2. DCBAAP = 0 (valid because MaxSlotsEn = 0)
+        actions.push(XhciAction::WriteRegister64 {
+            offset_lo: op + DCBAAP_LO,
+            value: 0,
+        });
+
+        // 3. CRCR: command ring base + cycle bit
+        actions.push(XhciAction::WriteRegister64 {
+            offset_lo: op + CRCR_LO,
+            value: cmd_ring.crcr_value(),
+        });
+
+        // 4. Write ERST entry (16 bytes): {event_ring_phys, EVENT_RING_SIZE, 0}
+        actions.push(XhciAction::WriteTrb {
+            phys: erst_phys,
+            trb: trb::Trb {
+                parameter: event_ring_phys,
+                status: ring::EVENT_RING_SIZE as u32,
+                control: 0,
+            },
+        });
+
+        // 5. ERSTSZ = 1 (one segment)
+        actions.push(XhciAction::WriteRegister {
+            offset: intr + ERSTSZ,
+            value: 1,
+        });
+
+        // 6. ERSTBA = erst_phys
+        actions.push(XhciAction::WriteRegister64 {
+            offset_lo: intr + ERSTBA_LO,
+            value: erst_phys,
+        });
+
+        // 7. ERDP = event ring dequeue pointer
+        actions.push(XhciAction::WriteRegister64 {
+            offset_lo: intr + ERDP_LO,
+            value: evt_ring.dequeue_pointer(),
+        });
+
+        // 8. USBCMD: RUN + INTE
+        actions.push(XhciAction::WriteRegister {
+            offset: op + USBCMD,
+            value: USBCMD_RUN | USBCMD_INTE,
+        });
+
+        self.command_ring = Some(cmd_ring);
+        self.event_ring = Some(evt_ring);
+        self.state = XhciState::Running;
+
+        Ok(actions)
     }
 }
 
@@ -398,8 +501,57 @@ mod tests {
             rts_offset: 0,
             db_offset: 0,
             state: XhciState::Error(XhciError::HaltTimeout),
+            command_ring: None,
+            event_ring: None,
         };
         let bank = MockRegisterBank::new();
         assert_eq!(driver.detect_ports(&bank), Err(XhciError::InvalidState));
+    }
+
+    #[test]
+    fn setup_rings_returns_register_actions() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        let actions = driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000)
+            .unwrap();
+
+        // Should contain: CONFIG, DCBAAP(64), CRCR(64), ERST entry(WriteTrb),
+        // ERSTSZ, ERSTBA(64), ERDP(64), USBCMD(RUN|INTE)
+        // That's at least 8 actions
+        assert!(
+            actions.len() >= 8,
+            "expected at least 8 setup actions, got {}",
+            actions.len()
+        );
+
+        // Verify USBCMD.RUN is the last action (controller starts)
+        let last = actions.last().unwrap();
+        match last {
+            XhciAction::WriteRegister { offset, value } => {
+                assert_eq!(*offset, 0x20 + USBCMD); // cap_length + USBCMD
+                assert_ne!(*value & USBCMD_RUN, 0, "should set RUN");
+                assert_ne!(*value & USBCMD_INTE, 0, "should set INTE");
+            }
+            _ => panic!("last action should be WriteRegister for USBCMD"),
+        }
+    }
+
+    #[test]
+    fn setup_rings_before_ready_fails() {
+        let mut driver = XhciDriver {
+            max_ports: 1,
+            max_slots: 1,
+            cap_length: 0x20,
+            rts_offset: 0x2000,
+            db_offset: 0x1000,
+            state: XhciState::Error(XhciError::HaltTimeout),
+            command_ring: None,
+            event_ring: None,
+        };
+        assert_eq!(
+            driver.setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000),
+            Err(XhciError::InvalidState)
+        );
     }
 }

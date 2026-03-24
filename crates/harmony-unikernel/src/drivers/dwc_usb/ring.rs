@@ -22,6 +22,7 @@ pub const EVENT_RING_SIZE: usize = 256;
 const TRB_SIZE: u64 = 16;
 
 /// Command ring state — host enqueues commands, controller dequeues.
+#[derive(Debug, PartialEq, Eq)]
 pub struct CommandRing {
     base_phys: u64,
     enqueue_index: u16,
@@ -93,6 +94,7 @@ impl CommandRing {
 }
 
 /// Event ring state — controller enqueues events, host dequeues.
+#[derive(Debug, PartialEq, Eq)]
 pub struct EventRing {
     base_phys: u64,
     dequeue_index: u16,
