@@ -2517,11 +2517,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// 2. Apply action's sa_mask
     /// 3. Unless SA_NODEFER, block the signal being handled
     /// 4. SIGKILL/SIGSTOP always remain unblockable
-    pub fn setup_signal_frame(
-        &mut self,
-        signum: u32,
-        regs: &SavedRegisters,
-    ) -> SignalHandlerSetup {
+    pub fn setup_signal_frame(&mut self, signum: u32, regs: &SavedRegisters) -> SignalHandlerSetup {
         let idx = (signum - 1) as usize;
         let action = self.signal_handlers[idx];
 
@@ -2573,7 +2569,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         // ── Write ucontext_t (240 bytes) ────────────────────────────
         let ucontext_ptr = handler_rsp + 8 + 128; // = handler_rsp + 136
-        // Zero the entire ucontext_t region.
+                                                  // Zero the entire ucontext_t region.
         unsafe {
             core::ptr::write_bytes(ucontext_ptr as *mut u8, 0, 240);
         }
@@ -2584,14 +2580,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
         let uc_stack_ptr = ucontext_ptr + 16; // after uc_flags + uc_link
         unsafe {
             core::ptr::write_unaligned(uc_stack_ptr as *mut u64, self.alt_stack_sp);
-            core::ptr::write_unaligned(
-                (uc_stack_ptr + 8) as *mut i32,
-                self.alt_stack_flags,
-            );
-            core::ptr::write_unaligned(
-                (uc_stack_ptr + 16) as *mut u64,
-                self.alt_stack_size,
-            );
+            core::ptr::write_unaligned((uc_stack_ptr + 8) as *mut i32, self.alt_stack_flags);
+            core::ptr::write_unaligned((uc_stack_ptr + 16) as *mut u64, self.alt_stack_size);
         }
 
         // sigcontext starts at ucontext + 40 (after header).
@@ -2602,7 +2592,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         let sc_ptr = ucontext_ptr + 40;
         unsafe {
             // GPR fields at offsets 0..
-            core::ptr::write_unaligned((sc_ptr + 0) as *mut u64, regs.r8);
+            core::ptr::write_unaligned(sc_ptr as *mut u64, regs.r8);
             core::ptr::write_unaligned((sc_ptr + 8) as *mut u64, regs.r9);
             core::ptr::write_unaligned((sc_ptr + 16) as *mut u64, regs.r10);
             core::ptr::write_unaligned((sc_ptr + 24) as *mut u64, regs.r11);
@@ -2629,10 +2619,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
         // uc_sigmask at ucontext offset 232 (= ucontext_ptr + 232)
         unsafe {
-            core::ptr::write_unaligned(
-                (ucontext_ptr + 232) as *mut u64,
-                saved_mask,
-            );
+            core::ptr::write_unaligned((ucontext_ptr + 232) as *mut u64, saved_mask);
         }
 
         // ── Update signal mask for handler execution ────────────────
@@ -5709,9 +5696,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         };
 
         // Restore signal mask from uc_sigmask (at ucontext + 232).
-        let uc_sigmask = unsafe {
-            core::ptr::read_unaligned((ucontext_ptr + 232) as *const u64)
-        };
+        let uc_sigmask = unsafe { core::ptr::read_unaligned((ucontext_ptr + 232) as *const u64) };
         self.signal_mask = uc_sigmask;
         self.signal_mask &= !(1u64 << (SIGKILL - 1) | 1u64 << (SIGSTOP - 1));
 
@@ -5728,8 +5713,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
     fn sys_sigaltstack(&mut self, ss_ptr: u64, old_ss_ptr: u64) -> i64 {
         // Write current config to old_ss if requested.
         if old_ss_ptr != 0 {
-            let flags = self.alt_stack_flags
-                | if self.on_alt_stack { SS_ONSTACK } else { 0 };
+            let flags = self.alt_stack_flags | if self.on_alt_stack { SS_ONSTACK } else { 0 };
             unsafe {
                 let p = old_ss_ptr as usize;
                 core::ptr::write_unaligned(p as *mut u64, self.alt_stack_sp);
@@ -14096,8 +14080,14 @@ mod integration_tests {
         assert_eq!(setup.rdi, 10);
 
         // SA_SIGINFO was set, so rsi (siginfo ptr) and rdx (ucontext ptr) must be non-zero.
-        assert_ne!(setup.rsi, 0, "rsi (siginfo_t pointer) must be non-zero for SA_SIGINFO");
-        assert_ne!(setup.rdx, 0, "rdx (ucontext_t pointer) must be non-zero for SA_SIGINFO");
+        assert_ne!(
+            setup.rsi, 0,
+            "rsi (siginfo_t pointer) must be non-zero for SA_SIGINFO"
+        );
+        assert_ne!(
+            setup.rdx, 0,
+            "rdx (ucontext_t pointer) must be non-zero for SA_SIGINFO"
+        );
 
         // handler_rsp must be ≡ 8 (mod 16) for x86_64 ABI.
         assert_eq!(
@@ -14127,8 +14117,21 @@ mod integration_tests {
 
         let rsp = (lx.arena_base() + 0x50000) as u64;
         let regs = SavedRegisters {
-            r8: 0, r9: 0, r10: 0, r11: 0, r12: 0, r13: 0, r14: 0, r15: 0,
-            rdi: 0, rsi: 0, rbp: 0, rbx: 0, rdx: 0, rax: 0, rcx: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rdi: 0,
+            rsi: 0,
+            rbp: 0,
+            rbx: 0,
+            rdx: 0,
+            rax: 0,
+            rcx: 0,
             rsp,
             rip: 0x1000,
             eflags: 0x202,
@@ -14171,8 +14174,21 @@ mod integration_tests {
 
         let rsp = (lx.arena_base() + 0x50000) as u64;
         let regs = SavedRegisters {
-            r8: 0, r9: 0, r10: 0, r11: 0, r12: 0, r13: 0, r14: 0, r15: 0,
-            rdi: 0, rsi: 0, rbp: 0, rbx: 0, rdx: 0, rax: 0, rcx: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rdi: 0,
+            rsi: 0,
+            rbp: 0,
+            rbx: 0,
+            rdx: 0,
+            rax: 0,
+            rcx: 0,
             rsp,
             rip: 0x1000,
             eflags: 0x202,
@@ -14208,8 +14224,21 @@ mod integration_tests {
 
         let rsp = (lx.arena_base() + 0x50000) as u64;
         let regs = SavedRegisters {
-            r8: 0, r9: 0, r10: 0, r11: 0, r12: 0, r13: 0, r14: 0, r15: 0,
-            rdi: 0, rsi: 0, rbp: 0, rbx: 0, rdx: 0, rax: 0, rcx: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rdi: 0,
+            rsi: 0,
+            rbp: 0,
+            rbx: 0,
+            rdx: 0,
+            rax: 0,
+            rcx: 0,
             rsp,
             rip: 0x1000,
             eflags: 0x202,
@@ -14282,7 +14311,10 @@ mod integration_tests {
         let _result = lx.dispatch_syscall(LinuxSyscall::RtSigreturn { rsp: sigreturn_rsp });
 
         let sr = lx.pending_signal_return();
-        assert!(sr.is_some(), "pending_signal_return must be Some after sigreturn");
+        assert!(
+            sr.is_some(),
+            "pending_signal_return must be Some after sigreturn"
+        );
         let restored = sr.unwrap().regs;
 
         assert_eq!(restored.r8, 0x0808_0808);
@@ -14330,8 +14362,16 @@ mod integration_tests {
 
         // Verify pre-block mask.
         let mask_before_kill = read_signal_mask(&mut lx);
-        assert_ne!(mask_before_kill & (1u64 << 11), 0, "signal 12 should be blocked");
-        assert_ne!(mask_before_kill & (1u64 << 12), 0, "signal 13 should be blocked");
+        assert_ne!(
+            mask_before_kill & (1u64 << 11),
+            0,
+            "signal 12 should be blocked"
+        );
+        assert_ne!(
+            mask_before_kill & (1u64 << 12),
+            0,
+            "signal 13 should be blocked"
+        );
 
         // Send SIGUSR1 (10).
         lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
@@ -14348,10 +14388,18 @@ mod integration_tests {
 
         // After setup_signal_frame, mask should have 10+12+13+14 blocked.
         let mask_during = read_signal_mask(&mut lx);
-        assert_ne!(mask_during & (1u64 << 9), 0, "signal 10 blocked during handler");
+        assert_ne!(
+            mask_during & (1u64 << 9),
+            0,
+            "signal 10 blocked during handler"
+        );
         assert_ne!(mask_during & (1u64 << 11), 0, "signal 12 still blocked");
         assert_ne!(mask_during & (1u64 << 12), 0, "signal 13 still blocked");
-        assert_ne!(mask_during & (1u64 << 13), 0, "signal 14 blocked via sa_mask");
+        assert_ne!(
+            mask_during & (1u64 << 13),
+            0,
+            "signal 14 blocked via sa_mask"
+        );
 
         // sigreturn restores the mask.
         let sigreturn_rsp = setup.handler_rsp + 8;
@@ -14361,19 +14409,23 @@ mod integration_tests {
         // After sigreturn, mask should be restored to just 12+13.
         let mask_after = read_signal_mask(&mut lx);
         assert_eq!(
-            mask_after & (1u64 << 9), 0,
+            mask_after & (1u64 << 9),
+            0,
             "signal 10 must be unblocked after sigreturn"
         );
         assert_ne!(
-            mask_after & (1u64 << 11), 0,
+            mask_after & (1u64 << 11),
+            0,
             "signal 12 must remain blocked (was pre-blocked)"
         );
         assert_ne!(
-            mask_after & (1u64 << 12), 0,
+            mask_after & (1u64 << 12),
+            0,
             "signal 13 must remain blocked (was pre-blocked)"
         );
         assert_eq!(
-            mask_after & (1u64 << 13), 0,
+            mask_after & (1u64 << 13),
+            0,
             "signal 14 must be unblocked (was only in sa_mask)"
         );
     }
@@ -14404,7 +14456,11 @@ mod integration_tests {
 
         // Signal 10 is now blocked during the handler (no SA_NODEFER).
         let mask_during = read_signal_mask(&mut lx);
-        assert_ne!(mask_during & (1u64 << 9), 0, "signal 10 blocked during handler");
+        assert_ne!(
+            mask_during & (1u64 << 9),
+            0,
+            "signal 10 blocked during handler"
+        );
 
         // Second kill: signal 10 queued but blocked.
         lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
@@ -14569,7 +14625,10 @@ mod integration_tests {
             ss: ss2.as_ptr() as u64,
             old_ss: 0,
         });
-        assert_eq!(r, EPERM, "sigaltstack should return EPERM while on alt stack");
+        assert_eq!(
+            r, EPERM,
+            "sigaltstack should return EPERM while on alt stack"
+        );
     }
 
     #[test]
@@ -14817,6 +14876,9 @@ mod integration_tests {
         let size_out = u64::from_ne_bytes(old[16..24].try_into().unwrap());
 
         assert_eq!(sp_out, alt_sp, "child must inherit parent alt stack sp");
-        assert_eq!(size_out, alt_size, "child must inherit parent alt stack size");
+        assert_eq!(
+            size_out, alt_size,
+            "child must inherit parent alt stack size"
+        );
     }
 }
