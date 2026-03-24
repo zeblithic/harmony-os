@@ -159,6 +159,10 @@ impl PersistentNarStore {
             } else {
                 // Remove any stale .meta from a prior import to avoid
                 // returning references that no longer apply on reload.
+                // Note: if import_nar below fails, this deletion is not
+                // rolled back. This is intentional — the stale .meta
+                // belonged to a path not in the in-memory server, so
+                // its data was already unreachable.
                 let _ = std::fs::remove_file(&meta_path);
             }
         }

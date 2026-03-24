@@ -52,6 +52,7 @@ const CONFIG: usize = 0x38;
 // ── USBCMD bits ──────────────────────────────────────────────────
 const USBCMD_RUN: u32 = 1 << 0;
 const USBCMD_HCRST: u32 = 1 << 1;
+#[allow(dead_code)] // Phase 2a is polling-only; enable when interrupt path is wired
 const USBCMD_INTE: u32 = 1 << 2;
 
 // ── USBSTS bits ──────────────────────────────────────────────────
@@ -118,11 +119,9 @@ pub struct XhciDriver {
     max_slots: u8,
     /// Capability register length — offset to operational registers.
     cap_length: usize,
-    /// Runtime register offset (RTSOFF, stored for Phase 2+).
-    #[allow(dead_code)]
+    /// Runtime register offset (RTSOFF) — used for interrupter register base.
     rts_offset: u32,
-    /// Doorbell register offset (DBOFF, stored for Phase 2+).
-    #[allow(dead_code)]
+    /// Doorbell register offset (DBOFF) — used for doorbell writes.
     db_offset: u32,
     /// Current driver state.
     state: XhciState,
@@ -406,7 +405,9 @@ impl XhciDriver {
         // 8. USBCMD: RUN + INTE
         actions.push(XhciAction::WriteRegister {
             offset: op + USBCMD,
-            value: USBCMD_RUN | USBCMD_INTE,
+            // Polling-only: omit INTE until interrupt path is wired.
+            // INTE without IMAN.IE would set IMAN.IP but never fire.
+            value: USBCMD_RUN,
         });
 
         self.command_ring = Some(cmd_ring);
@@ -617,7 +618,7 @@ mod tests {
             XhciAction::WriteRegister { offset, value } => {
                 assert_eq!(*offset, 0x20 + USBCMD); // cap_length + USBCMD
                 assert_ne!(*value & USBCMD_RUN, 0, "should set RUN");
-                assert_ne!(*value & USBCMD_INTE, 0, "should set INTE");
+                // INTE omitted — Phase 2a is polling-only.
             }
             _ => panic!("last action should be WriteRegister for USBCMD"),
         }
