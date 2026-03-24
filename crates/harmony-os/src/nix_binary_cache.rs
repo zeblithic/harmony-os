@@ -39,6 +39,7 @@ struct IndexEntry {
     name: Arc<str>,
     nar_sha256: [u8; 32],
     nar_size: u64,
+    references: Option<Vec<String>>,
 }
 
 /// Sans-I/O Nix binary cache protocol handler.
@@ -77,6 +78,43 @@ impl BinaryCacheServer {
                         name: Arc::clone(name),
                         nar_sha256: sha256,
                         nar_size,
+                        references: None,
+                    },
+                );
+            }
+        }
+        Self {
+            server,
+            hash_index,
+            misses: BTreeSet::new(),
+        }
+    }
+
+    /// Create a new binary cache server from an existing NixStoreServer with
+    /// pre-populated reference metadata.
+    ///
+    /// `ref_map` maps full store path names (e.g. `<hash>-<name>`) to their
+    /// list of runtime references. Any name not present in the map will have
+    /// `None` references in the index.
+    pub fn new_with_refs(
+        server: NixStoreServer,
+        ref_map: std::collections::HashMap<String, Vec<String>>,
+    ) -> Self {
+        let mut hash_index = HashMap::new();
+        for name in server.store_path_names() {
+            if name.len() >= 33 && name.as_bytes()[32] == b'-' {
+                let hash = name[..32].to_string();
+                let nar_blob = server.get_nar_blob(name).unwrap();
+                let sha256: [u8; 32] = Sha256::digest(nar_blob).into();
+                let nar_size = nar_blob.len() as u64;
+                let references = ref_map.get(name.as_ref()).cloned();
+                hash_index.insert(
+                    hash,
+                    IndexEntry {
+                        name: Arc::clone(name),
+                        nar_sha256: sha256,
+                        nar_size,
+                        references,
                     },
                 );
             }
@@ -105,8 +143,12 @@ impl BinaryCacheServer {
             }
             return match self.hash_index.get(hash) {
                 Some(entry) => {
-                    let text =
-                        serialize_narinfo(&entry.name, &entry.nar_sha256, entry.nar_size, None);
+                    let text = serialize_narinfo(
+                        &entry.name,
+                        &entry.nar_sha256,
+                        entry.nar_size,
+                        entry.references.as_deref(),
+                    );
                     CacheResponse::Narinfo(text)
                 }
                 None => {
@@ -144,7 +186,12 @@ impl BinaryCacheServer {
     }
 
     /// Import a NAR into the underlying server and update the hash index.
-    pub fn import_nar(&mut self, name: &str, nar_bytes: Vec<u8>) -> Result<(), NarError> {
+    pub fn import_nar(
+        &mut self,
+        name: &str,
+        nar_bytes: Vec<u8>,
+        references: Option<Vec<String>>,
+    ) -> Result<(), NarError> {
         let sha256: [u8; 32] = Sha256::digest(&nar_bytes).into();
         let nar_size = nar_bytes.len() as u64;
         self.server.import_nar(name, nar_bytes)?;
@@ -157,6 +204,7 @@ impl BinaryCacheServer {
                     name: Arc::from(name),
                     nar_sha256: sha256,
                     nar_size,
+                    references,
                 },
             );
         }
@@ -313,7 +361,7 @@ mod tests {
     fn hash_index_populated_on_import() {
         let mut srv = build_server();
         let name = "imp12345678901234567890123456789-imported";
-        srv.import_nar(name, build_test_nar(b"imported data"))
+        srv.import_nar(name, build_test_nar(b"imported data"), None)
             .unwrap();
         let resp = srv.handle_request("/imp12345678901234567890123456789.narinfo");
         match resp {
@@ -333,7 +381,8 @@ mod tests {
         );
         let misses = srv.drain_misses();
         assert_eq!(misses, vec![hash]);
-        srv.import_nar(&name, build_test_nar(b"recovered")).unwrap();
+        srv.import_nar(&name, build_test_nar(b"recovered"), None)
+            .unwrap();
         match srv.handle_request(&format!("/{hash}.narinfo")) {
             CacheResponse::Narinfo(text) => assert!(text.contains(&name)),
             other => panic!("expected Narinfo after import, got {other:?}"),
@@ -351,7 +400,7 @@ mod tests {
         srv.handle_request(&format!("/{hash}.narinfo"));
 
         // Import WITHOUT draining first — the miss should be cleared by import.
-        srv.import_nar(&name, build_test_nar(b"no longer missing"))
+        srv.import_nar(&name, build_test_nar(b"no longer missing"), None)
             .unwrap();
 
         // drain_misses must NOT return the now-imported hash.
@@ -366,7 +415,8 @@ mod tests {
         let name = "has12345678901234567890123456789-check";
         let mut srv = build_server();
         assert!(!srv.has_store_path(name));
-        srv.import_nar(name, build_test_nar(b"check")).unwrap();
+        srv.import_nar(name, build_test_nar(b"check"), None)
+            .unwrap();
         assert!(srv.has_store_path(name));
     }
 
@@ -378,5 +428,53 @@ mod tests {
         srv.handle_request(&format!("/{hash}.narinfo"));
         let misses = srv.drain_misses();
         assert_eq!(misses.len(), 1);
+    }
+
+    #[test]
+    fn narinfo_includes_references() {
+        let name = "abc12345678901234567890123456789-hello";
+        let refs = Some(vec!["dep12345678901234567890123456789-glibc".to_string()]);
+        let mut srv = build_server();
+        srv.import_nar(name, build_test_nar(b"data"), refs).unwrap();
+        let resp = srv.handle_request("/abc12345678901234567890123456789.narinfo");
+        match resp {
+            CacheResponse::Narinfo(text) => {
+                assert!(text.contains("References: dep12345678901234567890123456789-glibc\n"));
+            }
+            other => panic!("expected Narinfo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn narinfo_omits_references_when_none() {
+        let name = "abc12345678901234567890123456789-hello";
+        let mut srv = build_server();
+        srv.import_nar(name, build_test_nar(b"data"), None).unwrap();
+        let resp = srv.handle_request("/abc12345678901234567890123456789.narinfo");
+        match resp {
+            CacheResponse::Narinfo(text) => {
+                assert!(!text.contains("References"));
+            }
+            other => panic!("expected Narinfo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_with_refs_populates_references() {
+        let mut nix = NixStoreServer::new();
+        let name = "abc12345678901234567890123456789-hello";
+        nix.import_nar(name, build_test_nar(b"data")).unwrap();
+
+        let mut ref_map = std::collections::HashMap::new();
+        ref_map.insert(name.to_string(), vec!["dep123-glibc".to_string()]);
+
+        let mut srv = BinaryCacheServer::new_with_refs(nix, ref_map);
+        let resp = srv.handle_request("/abc12345678901234567890123456789.narinfo");
+        match resp {
+            CacheResponse::Narinfo(text) => {
+                assert!(text.contains("References: dep123-glibc\n"));
+            }
+            other => panic!("expected Narinfo, got {other:?}"),
+        }
     }
 }
