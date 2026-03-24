@@ -59,6 +59,17 @@ fn is_valid_store_hash(hash: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
+/// Sanitize a reference list: drop entries that are empty, contain NUL,
+/// or contain any whitespace. These would corrupt space-separated or
+/// newline-separated serialization formats.
+fn sanitize_refs(refs: Option<Vec<String>>) -> Option<Vec<String>> {
+    refs.map(|r| {
+        r.into_iter()
+            .filter(|s| !s.is_empty() && !s.contains('\0') && !s.chars().any(|c| c.is_whitespace()))
+            .collect()
+    })
+}
+
 impl BinaryCacheServer {
     /// Create a new binary cache server from an existing NixStoreServer.
     ///
@@ -85,7 +96,7 @@ impl BinaryCacheServer {
                 let nar_blob = server.get_nar_blob(name).unwrap();
                 let sha256: [u8; 32] = Sha256::digest(nar_blob).into();
                 let nar_size = nar_blob.len() as u64;
-                let references = ref_map.get(name.as_ref()).cloned();
+                let references = sanitize_refs(ref_map.get(name.as_ref()).cloned());
                 hash_index.insert(
                     hash,
                     IndexEntry {
@@ -176,13 +187,7 @@ impl BinaryCacheServer {
         references: Option<Vec<String>>,
     ) -> Result<(), NarError> {
         // Sanitize references at the boundary — drop invalid entries.
-        let references = references.map(|refs| {
-            refs.into_iter()
-                .filter(|r| {
-                    !r.is_empty() && !r.contains('\0') && !r.chars().any(|c| c.is_whitespace())
-                })
-                .collect()
-        });
+        let references = sanitize_refs(references);
 
         let sha256: [u8; 32] = Sha256::digest(&nar_bytes).into();
         let nar_size = nar_bytes.len() as u64;
