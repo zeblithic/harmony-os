@@ -614,6 +614,60 @@ fn main() -> Status {
         }
     }
 
+    // ── GENET Ethernet initialization (RPi5 only) ──
+    #[cfg(feature = "rpi5")]
+    let (mut genet_driver, mut genet_bank, mut tx_pool, mut rx_pool) = {
+        use harmony_unikernel::drivers::dma_pool::{DmaBuffer, DmaPool};
+        use harmony_unikernel::drivers::genet::GenetDriver;
+
+        let mut bank = unsafe { mmio::MmioRegisterBank::new(platform::GENET_BASE) };
+        let mac: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let _ = writeln!(
+            serial,
+            "[GENET] Initializing at {:#x}, MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            platform::GENET_BASE, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+        );
+
+        let driver = match GenetDriver::<256, 256>::init(&mut bank, mac, 1000) {
+            Ok(d) => {
+                let _ = writeln!(serial, "[GENET] Driver initialized");
+                d
+            }
+            Err(e) => {
+                let _ = writeln!(serial, "[GENET] FATAL: init failed: {:?}", e);
+                panic!("GENET init failed");
+            }
+        };
+
+        // Allocate DMA buffer pools from bump allocator.
+        // Each page = 4 KiB, one 2048-byte DMA buffer per page.
+        let mut tx_bufs = [DmaBuffer { virt: core::ptr::null_mut(), phys: 0 }; 256];
+        for buf in tx_bufs.iter_mut() {
+            let frame = bump.alloc_frame().expect("TX DMA buffer alloc failed");
+            *buf = DmaBuffer { virt: frame.as_u64() as *mut u8, phys: frame.as_u64() };
+        }
+        let tx_pool = DmaPool::new(tx_bufs, 2048);
+
+        let mut rx_bufs = [DmaBuffer { virt: core::ptr::null_mut(), phys: 0 }; 256];
+        for buf in rx_bufs.iter_mut() {
+            let frame = bump.alloc_frame().expect("RX DMA buffer alloc failed");
+            *buf = DmaBuffer { virt: frame.as_u64() as *mut u8, phys: frame.as_u64() };
+        }
+        let mut rx_pool = DmaPool::new(rx_bufs, 2048);
+
+        (driver, bank, tx_pool, rx_pool)
+    };
+
+    // Arm RX descriptors with DMA buffer addresses.
+    #[cfg(feature = "rpi5")]
+    {
+        if let Err(e) = genet_driver.arm_rx_descriptors(&mut genet_bank, &mut rx_pool) {
+            let _ = writeln!(serial, "[GENET] FATAL: arm RX failed: {:?}", e);
+            panic!("GENET arm_rx_descriptors failed");
+        }
+        let _ = writeln!(serial, "[GENET] RX armed: 256 descriptors");
+    }
+
     let _ = writeln!(
         serial,
         "[Boot] Entering event loop (test exit code: {})",
