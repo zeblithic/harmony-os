@@ -10,6 +10,8 @@
 extern crate alloc;
 
 #[cfg(feature = "std")]
+pub mod config_applicator;
+#[cfg(feature = "std")]
 pub mod disk_book_store;
 pub mod elf;
 pub mod elf_loader;
