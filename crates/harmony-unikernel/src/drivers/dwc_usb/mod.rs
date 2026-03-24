@@ -15,7 +15,6 @@ pub mod types;
 pub use types::*;
 
 pub mod trb;
-pub use trb::*;
 
 mod ring;
 
@@ -374,7 +373,9 @@ impl XhciDriver {
             value: cmd_ring.crcr_value(),
         });
 
-        // 4. Write ERST entry (16 bytes): {event_ring_phys, EVENT_RING_SIZE, 0}
+        // 4. Write ERST entry (16 bytes): {base_phys, size, reserved}.
+        // Reuse WriteTrb as a 16-byte DMA write — ERST entry layout
+        // coincides with Trb (u64 + u32 + u32). Not a real TRB.
         actions.push(XhciAction::WriteTrb {
             phys: erst_phys,
             trb: trb::Trb {
@@ -695,7 +696,7 @@ mod tests {
         let slot_id: u8 = 3;
         let evt_trb = trb::Trb {
             parameter: 0x2000_0000, // command TRB pointer
-            status: (COMPLETION_SUCCESS as u32) << 24,
+            status: (trb::COMPLETION_SUCCESS as u32) << 24,
             control: (slot_id as u32) << 24 | (trb::TRB_COMMAND_COMPLETION as u32) << 10 | 1, // cycle bit
         };
 
@@ -704,7 +705,7 @@ mod tests {
             event,
             XhciEvent::CommandCompletion {
                 slot_id: 3,
-                completion_code: COMPLETION_SUCCESS,
+                completion_code: trb::COMPLETION_SUCCESS,
             }
         );
 

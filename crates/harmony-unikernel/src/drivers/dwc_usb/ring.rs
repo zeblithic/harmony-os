@@ -46,7 +46,7 @@ impl CommandRing {
     /// Normally returns 1 pair. When the enqueue fills the last usable
     /// slot, returns 2 pairs: the command TRB + the Link TRB at slot 63.
     pub fn enqueue(&mut self, trb_type: u8, parameter: u64) -> Result<Vec<(u64, Trb)>, XhciError> {
-        if self.pending_count >= COMMAND_RING_SIZE as u16 {
+        if self.pending_count >= COMMAND_RING_USABLE as u16 {
             return Err(XhciError::CommandRingFull);
         }
 
@@ -186,9 +186,11 @@ mod tests {
     #[test]
     fn command_ring_cycle_toggles_on_wrap() {
         let mut ring = CommandRing::new(BASE);
-        for _ in 0..63 {
+        for _ in 0..COMMAND_RING_USABLE {
             ring.enqueue(23, 0).unwrap();
         }
+        // Free a slot so we can enqueue on the second lap
+        ring.complete_one();
         // After wrap, cycle bit should have toggled
         let entries = ring.enqueue(23, 0).unwrap();
         assert!(!entries[0].1.cycle_bit(), "cycle should toggle after wrap");
@@ -211,10 +213,10 @@ mod tests {
     #[test]
     fn command_ring_full_returns_error() {
         let mut ring = CommandRing::new(BASE);
-        for _ in 0..64 {
+        for _ in 0..COMMAND_RING_USABLE {
             ring.enqueue(23, 0).unwrap();
         }
-        // Ring is full (64 pending across two laps, no completions)
+        // Ring is full (63 pending = all usable slots, no completions)
         assert_eq!(ring.enqueue(23, 0), Err(XhciError::CommandRingFull));
     }
 
