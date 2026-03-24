@@ -56,6 +56,22 @@ const SIG_UNBLOCK: i32 = 1;
 const SIG_SETMASK: i32 = 2;
 const SIGCHLD_NUM: u32 = 17;
 
+// Signal action flags
+const SA_NOCLDSTOP: u64 = 1;
+const SA_NOCLDWAIT: u64 = 2;
+const SA_SIGINFO: u64 = 4;
+const SA_RESTORER: u64 = 0x04000000;
+const SA_ONSTACK: u64 = 0x08000000;
+const SA_RESTART: u64 = 0x10000000;
+const SA_NODEFER: u64 = 0x40000000;
+const SA_RESETHAND: u64 = 0x80000000;
+
+// Alternate signal stack constants
+const SS_ONSTACK: i32 = 1;
+const SS_DISABLE: i32 = 2;
+const SS_AUTODISARM: i32 = 1 << 31;
+const MINSIGSTKSZ: u64 = 2048;
+
 fn ipc_err_to_errno(e: IpcError) -> i64 {
     match e {
         IpcError::NotFound => ENOENT,
@@ -1983,6 +1999,53 @@ struct TimerFdState {
     interval_ns: u64,
 }
 
+/// Register state the caller provides for signal frame construction.
+/// Matches the x86_64 GPR set needed for Linux sigcontext.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SavedRegisters {
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rbp: u64,
+    pub rbx: u64,
+    pub rdx: u64,
+    pub rax: u64,
+    pub rcx: u64,
+    pub rsp: u64,
+    pub rip: u64,
+    pub eflags: u64,
+}
+
+/// Returned by `setup_signal_frame` — tells the caller where to jump
+/// and what register values to set for signal handler invocation.
+#[derive(Debug, Clone, Copy)]
+pub struct SignalHandlerSetup {
+    /// Handler function address (set RIP to this).
+    pub handler_rip: u64,
+    /// Top of signal frame on user stack (set RSP to this).
+    pub handler_rsp: u64,
+    /// First argument: signal number.
+    pub rdi: u64,
+    /// Second argument: pointer to siginfo_t on stack (SA_SIGINFO) or 0.
+    pub rsi: u64,
+    /// Third argument: pointer to ucontext_t on stack (SA_SIGINFO) or 0.
+    pub rdx: u64,
+}
+
+/// Returned by `pending_signal_return` — restored register state
+/// after rt_sigreturn reads the signal frame from the user stack.
+#[derive(Debug, Clone, Copy)]
+pub struct SignalReturn {
+    pub regs: SavedRegisters,
+}
+
 /// Per-signal handler disposition, stored in a 64-element array.
 #[derive(Clone, Copy)]
 struct SignalAction {
@@ -2125,6 +2188,16 @@ pub struct Linuxulator<B: SyscallBackend> {
     next_timerfd_id: usize,
     /// File creation mask (umask). Default 0o022.
     umask_val: u32,
+    /// Alternate signal stack: base address (ss_sp).
+    alt_stack_sp: u64,
+    /// Alternate signal stack: size (ss_size).
+    alt_stack_size: u64,
+    /// Alternate signal stack: flags (0 or SS_DISABLE).
+    alt_stack_flags: i32,
+    /// Whether currently executing on the alternate signal stack.
+    on_alt_stack: bool,
+    /// Restored register state from rt_sigreturn, consumed by caller.
+    pending_signal_return: Option<SignalReturn>,
 }
 
 impl<B: SyscallBackend> Linuxulator<B> {
@@ -2175,6 +2248,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
             timerfds: BTreeMap::new(),
             next_timerfd_id: 0,
             umask_val: 0o022,
+            alt_stack_sp: 0,
+            alt_stack_size: 0,
+            alt_stack_flags: SS_DISABLE,
+            on_alt_stack: false,
+            pending_signal_return: None,
         }
     }
 
@@ -2397,6 +2475,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// Consume the pending handler signal.
     pub fn pending_handler_signal(&mut self) -> Option<u32> {
         self.pending_handler_signal.take()
+    }
+
+    /// Consume the pending signal return (set by rt_sigreturn).
+    /// If Some, the caller should restore registers from the returned state.
+    pub fn pending_signal_return(&mut self) -> Option<SignalReturn> {
+        self.pending_signal_return.take()
     }
 
     /// Access the backend (for test assertions).
@@ -3101,6 +3185,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.killed_by_signal = None;
         // Reset process name — Linux sets comm to the new binary's basename.
         self.process_name = [0u8; 16];
+        // Reset alt stack on exec (Linux clears on exec).
+        self.alt_stack_sp = 0;
+        self.alt_stack_size = 0;
+        self.alt_stack_flags = SS_DISABLE;
+        self.on_alt_stack = false;
+        self.pending_signal_return = None;
     }
 
     /// Deliver one pending signal at syscall boundary.
@@ -4314,6 +4404,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
             timerfds: self.timerfds.clone(),
             next_timerfd_id: self.next_timerfd_id,
             umask_val: self.umask_val,
+            alt_stack_sp: self.alt_stack_sp,
+            alt_stack_size: self.alt_stack_size,
+            alt_stack_flags: self.alt_stack_flags,
+            on_alt_stack: false,
+            pending_signal_return: None,
         };
         // Move shared pipe/eventfd state to child
         core::mem::swap(&mut self.pipes, &mut child.pipes);
