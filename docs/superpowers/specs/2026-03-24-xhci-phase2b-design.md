@@ -144,7 +144,9 @@ Packs a 96-byte Input Context:
 pub fn max_packet_size_for_speed(speed: UsbSpeed) -> u16
 ```
 
-Returns the default max packet size for EP0 based on link speed.
+Returns the default max packet size for EP0 based on link speed. Returns 8 for `Unknown` (safe minimum — USB spec allows 8-byte packets on any speed).
+
+Note: the 96-byte Input Context assumes 32-byte contexts (CSZ=0 in HCCPARAMS1). RPi5's BCM2712 xHCI uses 32-byte contexts. If CSZ=1 (64-byte contexts), sizes would double to 192 bytes — revisit for future hardware ports.
 
 ### get_descriptor_setup_packet
 
@@ -221,10 +223,10 @@ pub fn enqueue_control_in(
 Returns 3 TRBs (possibly + Link TRBs if wrapping occurs mid-sequence):
 
 1. **Setup TRB**: parameter = setup_packet as u64 LE, status = 8, control = `TRB_SETUP_STAGE << 10 | TRT_IN | IDT | cycle`
-2. **Data TRB**: parameter = data_buf_phys, status = data_len as u32, control = `TRB_DATA_STAGE << 10 | DIR_IN | IOC | cycle`
+2. **Data TRB**: parameter = data_buf_phys, status = data_len as u32, control = `TRB_DATA_STAGE << 10 | DIR_IN | cycle`
 3. **Status TRB**: parameter = 0, status = 0, control = `TRB_STATUS_STAGE << 10 | IOC | cycle` (direction OUT — opposite of data phase, no DIR_IN flag)
 
-Note: IOC on Status TRB ensures the controller posts a Transfer Event when the full control transfer completes.
+IOC is set only on the Status TRB — one Transfer Event per control transfer. The controller still writes data to `data_buf_phys` during the Data stage; IOC only controls when the event is posted.
 
 ## XhciDriver Method Extensions
 
