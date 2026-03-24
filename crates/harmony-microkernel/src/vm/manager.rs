@@ -40,6 +40,11 @@ pub(crate) fn region_overlap(
     let region_end = base.as_u64() + region_len as u64;
     let overlap_start = vaddr.as_u64().max(base.as_u64());
     let overlap_end = range_end.min(region_end);
+    debug_assert!(
+        overlap_end >= overlap_start,
+        "region_overlap called with non-overlapping region: base={:?} region_len={} vaddr={:?} range_end={}",
+        base, region_len, vaddr, range_end
+    );
     let page_offset = ((overlap_start - base.as_u64()) / PAGE_SIZE) as usize;
     let page_count = ((overlap_end - overlap_start) / PAGE_SIZE) as usize;
     (page_offset, page_count)
@@ -361,6 +366,10 @@ impl<P: PageTable> AddressSpaceManager<P> {
         len: usize,
         bases: Vec<VirtAddr>,
     ) -> Result<(), VmError> {
+        debug_assert!(
+            len > 0 && len as u64 % PAGE_SIZE == 0 && vaddr.as_u64() % PAGE_SIZE == 0,
+            "unmap_partial_with_bases: unaligned or zero len"
+        );
         if bases.is_empty() {
             return Ok(());
         }
@@ -439,6 +448,11 @@ impl<P: PageTable> AddressSpaceManager<P> {
                 );
             }
             if !after_frames.is_empty() {
+                debug_assert!(
+                    !space.regions.contains_key(&VirtAddr(overlap_end)),
+                    "after-fragment key {:?} already occupied",
+                    VirtAddr(overlap_end)
+                );
                 space.regions.insert(
                     VirtAddr(overlap_end),
                     Region {
@@ -478,6 +492,10 @@ impl<P: PageTable> AddressSpaceManager<P> {
         new_flags: PageFlags,
         bases: Vec<VirtAddr>,
     ) -> Result<(), VmError> {
+        debug_assert!(
+            len > 0 && len as u64 % PAGE_SIZE == 0 && vaddr.as_u64() % PAGE_SIZE == 0,
+            "protect_partial_with_bases: unaligned or zero len"
+        );
         if bases.is_empty() {
             return Ok(());
         }
@@ -541,6 +559,11 @@ impl<P: PageTable> AddressSpaceManager<P> {
             // Skip splitting when flags already match — avoids fragmenting
             // the address space on redundant mprotect calls.
             if new_flags == region.flags {
+                debug_assert!(
+                    !space.regions.contains_key(&base),
+                    "key {:?} already occupied before no-change reinsert",
+                    base
+                );
                 space.regions.insert(base, region);
                 continue;
             }
@@ -580,6 +603,11 @@ impl<P: PageTable> AddressSpaceManager<P> {
                 },
             );
             if !after_frames.is_empty() {
+                debug_assert!(
+                    !space.regions.contains_key(&VirtAddr(overlap_end)),
+                    "after-fragment key {:?} already occupied",
+                    VirtAddr(overlap_end)
+                );
                 space.regions.insert(
                     VirtAddr(overlap_end),
                     Region {
