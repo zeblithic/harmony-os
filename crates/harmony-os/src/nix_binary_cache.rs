@@ -164,12 +164,26 @@ impl BinaryCacheServer {
     }
 
     /// Import a NAR into the underlying server and update the hash index.
+    ///
+    /// References are validated: any entry that is empty, contains NUL, or
+    /// contains whitespace is silently dropped. This guards against
+    /// untrusted sources (e.g. mesh peers) injecting invalid references
+    /// that would panic `serialize_narinfo`.
     pub fn import_nar(
         &mut self,
         name: &str,
         nar_bytes: Vec<u8>,
         references: Option<Vec<String>>,
     ) -> Result<(), NarError> {
+        // Sanitize references at the boundary — drop invalid entries.
+        let references = references.map(|refs| {
+            refs.into_iter()
+                .filter(|r| {
+                    !r.is_empty() && !r.contains('\0') && !r.chars().any(|c| c.is_whitespace())
+                })
+                .collect()
+        });
+
         let sha256: [u8; 32] = Sha256::digest(&nar_bytes).into();
         let nar_size = nar_bytes.len() as u64;
         self.server.import_nar(name, nar_bytes)?;
