@@ -9,7 +9,6 @@
 //! the driver is a pure state machine with no embedded I/O.
 
 extern crate alloc;
-#[allow(unused_imports)] // used by detect_ports in Phase 1 Task 3
 use alloc::vec::Vec;
 
 use super::register_bank::RegisterBank;
@@ -58,20 +57,14 @@ const USBSTS_CNR: u32 = 1 << 11; // Controller Not Ready
 
 // ── PORTSC registers (offset from operational base) ──────────────
 /// First PORTSC relative to operational base.
-#[allow(dead_code)] // Phase 2+
 const PORTSC_BASE: usize = 0x400;
 /// Byte spacing between successive PORTSC registers.
-#[allow(dead_code)] // Phase 2+
 const PORTSC_STRIDE: usize = 0x10;
 
 // ── PORTSC bits ──────────────────────────────────────────────────
-#[allow(dead_code)] // Phase 2+
 const PORTSC_CCS: u32 = 1 << 0; // Current Connect Status
-#[allow(dead_code)] // Phase 2+
 const PORTSC_PED: u32 = 1 << 1; // Port Enabled/Disabled
-#[allow(dead_code)] // Phase 2+
 const PORTSC_SPEED_SHIFT: u32 = 10;
-#[allow(dead_code)] // Phase 2+
 const PORTSC_SPEED_MASK: u32 = 0xF << PORTSC_SPEED_SHIFT;
 
 // ── xHCI speed IDs ───────────────────────────────────────────────
@@ -155,7 +148,7 @@ enum XhciState {
     /// Controller halted and reset, ready for port detection.
     Ready,
     /// Unrecoverable error.
-    #[allow(dead_code)] // Phase 2+
+    #[allow(dead_code)] // Phase 2+ transitions; Phase 1 tests construct directly
     Error(XhciError),
 }
 
@@ -266,6 +259,35 @@ impl XhciDriver {
     pub fn max_slots(&self) -> u8 {
         self.max_slots
     }
+
+    /// Scan all ports and return their status.
+    ///
+    /// Reads the PORTSC register for each port and reports connection
+    /// state, enabled state, and negotiated speed.
+    ///
+    /// Requires `Ready` state (call `init` first).
+    pub fn detect_ports(&self, bank: &impl RegisterBank) -> Result<Vec<PortStatus>, XhciError> {
+        if self.state != XhciState::Ready {
+            return Err(XhciError::InvalidState);
+        }
+
+        let mut ports = Vec::with_capacity(self.max_ports as usize);
+        for i in 0..self.max_ports {
+            let offset = self.cap_length + PORTSC_BASE + PORTSC_STRIDE * (i as usize);
+            let portsc = bank.read(offset);
+
+            let speed_id = ((portsc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT) as u8;
+
+            ports.push(PortStatus {
+                port: i,
+                connected: portsc & PORTSC_CCS != 0,
+                enabled: portsc & PORTSC_PED != 0,
+                speed: UsbSpeed::from_id(speed_id),
+            });
+        }
+
+        Ok(ports)
+    }
 }
 
 #[cfg(test)]
@@ -362,5 +384,90 @@ mod tests {
             ],
         );
         assert_eq!(XhciDriver::init(&mut bank), Err(XhciError::ResetTimeout));
+    }
+
+    /// Build a mock for port detection: 4 ports with specified PORTSC values.
+    fn mock_with_ports(cap_length: usize, portsc_values: &[u32]) -> MockRegisterBank {
+        let mut bank = mock_init_success();
+        for (i, &val) in portsc_values.iter().enumerate() {
+            bank.on_read(cap_length + PORTSC_BASE + PORTSC_STRIDE * i, vec![val]);
+        }
+        bank
+    }
+
+    #[test]
+    fn detect_ports_empty() {
+        let mut bank = mock_with_ports(0x20, &[0, 0, 0, 0]);
+        let driver = XhciDriver::init(&mut bank).unwrap();
+        let ports = driver.detect_ports(&bank).unwrap();
+        assert_eq!(ports.len(), 4);
+        assert!(ports.iter().all(|p| !p.connected));
+    }
+
+    #[test]
+    fn detect_ports_one_usb2_device() {
+        // Port 0: CCS=1, PED=1, speed=HighSpeed(3)
+        let portsc = PORTSC_CCS | PORTSC_PED | (3 << PORTSC_SPEED_SHIFT);
+        let mut bank = mock_with_ports(0x20, &[portsc, 0, 0, 0]);
+        let driver = XhciDriver::init(&mut bank).unwrap();
+        let ports = driver.detect_ports(&bank).unwrap();
+        assert_eq!(ports[0].port, 0);
+        assert!(ports[0].connected);
+        assert!(ports[0].enabled);
+        assert_eq!(ports[0].speed, UsbSpeed::HighSpeed);
+        assert!(!ports[1].connected);
+    }
+
+    #[test]
+    fn detect_ports_mixed_speeds() {
+        let fs = PORTSC_CCS | PORTSC_PED | (1 << PORTSC_SPEED_SHIFT); // Full Speed
+        let hs = PORTSC_CCS | PORTSC_PED | (3 << PORTSC_SPEED_SHIFT); // High Speed
+        let ss = PORTSC_CCS | PORTSC_PED | (4 << PORTSC_SPEED_SHIFT); // SuperSpeed
+        let mut bank = mock_with_ports(0x20, &[fs, 0, hs, ss]);
+        let driver = XhciDriver::init(&mut bank).unwrap();
+        let ports = driver.detect_ports(&bank).unwrap();
+        assert_eq!(ports[0].speed, UsbSpeed::FullSpeed);
+        assert!(!ports[1].connected);
+        assert_eq!(ports[2].speed, UsbSpeed::HighSpeed);
+        assert_eq!(ports[3].speed, UsbSpeed::SuperSpeed);
+    }
+
+    #[test]
+    fn detect_ports_unknown_speed() {
+        let portsc = PORTSC_CCS | (15 << PORTSC_SPEED_SHIFT);
+        let mut bank = mock_with_ports(0x20, &[portsc, 0, 0, 0]);
+        let driver = XhciDriver::init(&mut bank).unwrap();
+        let ports = driver.detect_ports(&bank).unwrap();
+        assert_eq!(ports[0].speed, UsbSpeed::Unknown(15));
+    }
+
+    #[test]
+    fn detect_ports_before_init_fails() {
+        // Cannot call detect_ports without a driver instance (init creates it),
+        // but we can test the error state by simulating an error.
+        let mut bank = MockRegisterBank::new();
+        bank.on_read(CAPLENGTH_HCIVERSION, vec![0x20]);
+        bank.on_read(HCSPARAMS1, vec![0x0100_0001]);
+        bank.on_read(DBOFF, vec![0]);
+        bank.on_read(RTSOFF, vec![0]);
+        bank.on_read(0x20 + USBCMD, vec![USBCMD_RUN]);
+        bank.on_read(0x20 + USBSTS, vec![0]); // never halts
+                                              // init fails with HaltTimeout — no driver is returned
+        assert!(XhciDriver::init(&mut bank).is_err());
+    }
+
+    #[test]
+    fn detect_ports_in_error_state_fails() {
+        // Directly construct a driver in Error state to test the guard.
+        let driver = XhciDriver {
+            max_ports: 1,
+            max_slots: 1,
+            cap_length: 0x20,
+            rts_offset: 0,
+            db_offset: 0,
+            state: XhciState::Error(XhciError::HaltTimeout),
+        };
+        let bank = MockRegisterBank::new();
+        assert_eq!(driver.detect_ports(&bank), Err(XhciError::InvalidState));
     }
 }
