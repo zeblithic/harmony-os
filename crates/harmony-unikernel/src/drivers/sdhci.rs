@@ -87,6 +87,7 @@ const CMD8_SEND_IF_COND: u8 = 8;
 const CMD16_SET_BLOCKLEN: u8 = 16;
 const CMD17_READ_SINGLE: u8 = 17;
 const CMD24_WRITE_SINGLE: u8 = 24;
+const CMD9_SEND_CSD: u8 = 9;
 const CMD55_APP_CMD: u8 = 55;
 const ACMD41_SD_SEND_OP_COND: u8 = 41;
 
@@ -527,6 +528,23 @@ impl SdhciDriver {
             0,
         )?;
 
+        // Determine card type and capacity from OCR
+        // CCS bit (30) distinguishes SDHC/SDXC (block-addressed) from SDSC (byte-addressed)
+        let is_sdhc = ocr & (1 << 30) != 0;
+
+        // CMD9: SEND_CSD — read Card-Specific Data register for capacity.
+        // Must be sent with RCA in [31:16], returns R2 (136-bit) response.
+        let capacity_blocks = match self.send_command(
+            bank,
+            CMD9_SEND_CSD,
+            (rca as u32) << 16,
+            CMD_RESP_136 | CMD_CRC_CHECK,
+            0,
+        )? {
+            Response::Long(words) => parse_csd_capacity(words, is_sdhc),
+            _ => 0,
+        };
+
         // CMD16: SET_BLOCKLEN (512 bytes)
         self.send_command(
             bank,
@@ -535,13 +553,6 @@ impl SdhciDriver {
             CMD_RESP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK,
             0,
         )?;
-
-        // Determine card type and capacity from OCR
-        // CCS bit (30) distinguishes SDHC/SDXC (block-addressed) from SDSC (byte-addressed)
-        let is_sdhc = ocr & (1 << 30) != 0;
-        // TODO(cmd9): Parse CSD register via CMD9 to obtain real card capacity.
-        // Until then, stat() will report size=0 and callers cannot bounds-check LBAs.
-        let capacity_blocks = 0;
 
         let info = CardInfo {
             rca,
@@ -556,6 +567,42 @@ impl SdhciDriver {
 impl Default for SdhciDriver {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Parse card capacity from CSD register response.
+///
+/// The SDHCI controller shifts R2 (128-bit) responses right by 8 bits when
+/// storing them in RESPONSE_0-3. All bit positions are adjusted accordingly.
+///
+/// Returns capacity in 512-byte blocks.
+fn parse_csd_capacity(resp: [u32; 4], is_sdhc: bool) -> u32 {
+    // CSD version: CSD bits [127:126] → after 8-bit shift: RESPONSE_3 bits [23:22]
+    let csd_version = (resp[3] >> 22) & 0x3;
+
+    if is_sdhc && csd_version == 1 {
+        // CSD v2.0 (SDHC/SDXC):
+        // C_SIZE in CSD bits [69:48] → after 8-bit shift: bits [61:40]
+        // Spans RESPONSE_1 bits [29:8] (22 bits).
+        let c_size = (resp[1] >> 8) & 0x3F_FFFF;
+        // Capacity = (C_SIZE + 1) * 512KB = (C_SIZE + 1) * 1024 blocks
+        (c_size + 1) * 1024
+    } else if csd_version == 0 {
+        // CSD v1.0 (SDSC):
+        // READ_BL_LEN: CSD bits [83:80] → after shift: RESPONSE_2 bits [11:8]
+        let read_bl_len = ((resp[2] >> 8) & 0xF) as u32;
+        // C_SIZE: CSD bits [73:62] → after shift: bits [65:54]
+        //   RESPONSE_2 bits [1:0] (upper 2 bits) + RESPONSE_1 bits [31:22] (lower 10 bits)
+        let c_size = (((resp[2] & 0x3) << 10) | ((resp[1] >> 22) & 0x3FF)) as u32;
+        // C_SIZE_MULT: CSD bits [49:47] → after shift: RESPONSE_1 bits [9:7]
+        let c_size_mult = ((resp[1] >> 7) & 0x7) as u32;
+
+        let block_len = 1u32 << read_bl_len;
+        let mult = 1u32 << (c_size_mult + 2);
+        let total_bytes = (c_size + 1) as u64 * mult as u64 * block_len as u64;
+        (total_bytes / 512) as u32
+    } else {
+        0 // Unknown CSD version
     }
 }
 
@@ -814,7 +861,7 @@ mod tests {
         // Set up mock for the full init sequence:
         // Each send_command reads: PRESENT_STATE (not inhibited), INT_STATUS (cmd complete),
         // RESPONSE_0. We need enough responses for: CMD0, CMD8, CMD55, ACMD41, CMD2, CMD3,
-        // CMD7, CMD16. That's 8 commands.
+        // CMD7, CMD9, CMD16. That's 9 commands.
 
         // Present state: never inhibited
         bank.on_read(SDHCI_PRESENT_STATE, vec![0]);
@@ -834,17 +881,26 @@ mod tests {
                 0,          // CMD2 uses RESP_136, reads all 4 response regs
                 0x12340000, // CMD3 response (RCA = 0x1234 in upper 16 bits)
                 0,          // CMD7 response
+                0,          // CMD9 uses RESP_136, reads all 4 response regs
                 0,          // CMD16 response
             ],
         );
-        bank.on_read(SDHCI_RESPONSE_1, vec![0]); // for CMD2 R2 response
-        bank.on_read(SDHCI_RESPONSE_2, vec![0]);
-        bank.on_read(SDHCI_RESPONSE_3, vec![0]);
+        bank.on_read(SDHCI_RESPONSE_1, vec![
+            0,          // CMD2 R2 response
+            1000 << 8,  // CMD9 CSD: C_SIZE = 1000 in bits [29:8]
+        ]);
+        bank.on_read(SDHCI_RESPONSE_2, vec![0]); // CMD2 and CMD9
+        bank.on_read(SDHCI_RESPONSE_3, vec![
+            0,          // CMD2 R2 response
+            1 << 22,    // CMD9 CSD: version 2.0 in bits [23:22]
+        ]);
 
         let info = driver.init_card(&mut bank).unwrap();
         assert_eq!(info.rca, 0x1234);
         // ACMD41 response has CCS bit (30) set → SDHC
         assert!(info.is_sdhc);
+        // CSD v2.0 with C_SIZE=1000 → (1000+1)*1024 = 1_025_024 blocks
+        assert!(info.capacity_blocks > 0);
 
         // Verify the command sequence from the combined writes at SDHCI_TRANSFER_MODE.
         // Upper 16 bits = command register, lower 16 bits = transfer mode (0 for all init cmds).
@@ -855,7 +911,7 @@ mod tests {
             .map(|(_, v)| v >> 16) // extract command portion
             .collect();
 
-        assert_eq!(cmd_writes.len(), 8);
+        assert_eq!(cmd_writes.len(), 9);
         // Verify command indices (bits 13:8 of the command register)
         assert_eq!(cmd_writes[0] >> 8, 0); // CMD0
         assert_eq!(cmd_writes[1] >> 8, 8); // CMD8
@@ -864,7 +920,8 @@ mod tests {
         assert_eq!(cmd_writes[4] >> 8, 2); // CMD2
         assert_eq!(cmd_writes[5] >> 8, 3); // CMD3
         assert_eq!(cmd_writes[6] >> 8, 7); // CMD7
-        assert_eq!(cmd_writes[7] >> 8, 16); // CMD16
+        assert_eq!(cmd_writes[7] >> 8, 9); // CMD9
+        assert_eq!(cmd_writes[8] >> 8, 16); // CMD16
     }
 
     /// Helper: set up mock for a successful read_single_block.
@@ -1154,5 +1211,63 @@ mod tests {
             driver.write_single_block(&mut bank, 0, &buf),
             Err(SdError::NoCard)
         );
+    }
+
+    #[test]
+    fn parse_csd_v2_capacity() {
+        // Simulate a 32GB SDHC card:
+        // CSD v2.0: csd_version = 1, C_SIZE = 65535 → (65535+1)*1024 = 67_108_864 blocks = 32 GB
+        //
+        // CSD bits [127:126] = 0b01 (v2.0) → after shift: RESPONSE_3 bits [23:22] = 0b01
+        // CSD bits [69:48] = C_SIZE = 65535 → after shift: RESPONSE_1 bits [29:8] = 65535
+        let resp = [
+            0u32,       // RESPONSE_0: unused for v2.0 capacity
+            65535 << 8, // RESPONSE_1: C_SIZE in bits [29:8]
+            0,          // RESPONSE_2
+            1 << 22,    // RESPONSE_3: CSD version 1 (v2.0) in bits [23:22]
+        ];
+        let blocks = parse_csd_capacity(resp, true);
+        assert_eq!(blocks, 67_108_864, "32GB SDHC card should have 67M blocks");
+    }
+
+    #[test]
+    fn parse_csd_v2_small_card() {
+        // 4GB SDHC: C_SIZE = 8191 → (8191+1)*1024 = 8_388_608 blocks = 4 GB
+        let resp = [
+            0,
+            8191 << 8,
+            0,
+            1 << 22,
+        ];
+        let blocks = parse_csd_capacity(resp, true);
+        assert_eq!(blocks, 8_388_608);
+    }
+
+    #[test]
+    fn parse_csd_v1_capacity() {
+        // Simulate a 2GB SDSC card:
+        // READ_BL_LEN = 10 (1024 bytes), C_SIZE = 4095, C_SIZE_MULT = 7
+        // Capacity = (4095+1) * (1<<9) * 1024 = 4096 * 512 * 1024 = 2,147,483,648 bytes = 2GB
+        // In 512-byte blocks: 2,147,483,648 / 512 = 4,194,304
+        //
+        // CSD bits [127:126] = 0b00 (v1.0) → RESPONSE_3 bits [23:22] = 0
+        // READ_BL_LEN in CSD bits [83:80] → after shift: RESPONSE_2 bits [11:8] = 10
+        // C_SIZE in CSD bits [73:62] → after shift: RESPONSE_2 bits [1:0] (upper 2) + RESPONSE_1 bits [31:22] (lower 10)
+        //   C_SIZE = 4095 = 0xFFF → upper 2 bits = 0b11, lower 10 bits = 0x3FF
+        // C_SIZE_MULT in CSD bits [49:47] → after shift: RESPONSE_1 bits [9:7] = 7
+        let resp = [
+            0,
+            (0x3FF << 22) | (7 << 7), // RESPONSE_1: C_SIZE lower 10 bits [31:22] + C_SIZE_MULT [9:7]
+            (10 << 8) | 0x3,           // RESPONSE_2: READ_BL_LEN [11:8] + C_SIZE upper 2 bits [1:0]
+            0,                          // RESPONSE_3: CSD version 0 (v1.0)
+        ];
+        let blocks = parse_csd_capacity(resp, false);
+        assert_eq!(blocks, 4_194_304, "2GB SDSC card should have 4M blocks");
+    }
+
+    #[test]
+    fn parse_csd_unknown_version_returns_zero() {
+        let resp = [0, 0, 0, 0b11 << 22]; // CSD version 3 (invalid)
+        assert_eq!(parse_csd_capacity(resp, true), 0);
     }
 }
