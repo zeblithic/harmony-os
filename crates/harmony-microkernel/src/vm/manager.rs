@@ -326,86 +326,76 @@ impl<P: PageTable> AddressSpaceManager<P> {
         Ok(result)
     }
 
-    /// Unmap a sub-range `[vaddr, vaddr+len)` within an existing region.
+    /// Unmap a range `[vaddr, vaddr+len)` that may span multiple regions.
     ///
-    /// The containing region is split into up to two surviving regions
-    /// (before and after the unmapped range). Physical frames in the target
-    /// range are freed and removed from the capability tracker.
+    /// Each overlapping region is processed independently: the overlap is
+    /// removed and surviving portions (before/after) are re-inserted.
+    /// Gaps (unmapped pages) in the target range are silently skipped,
+    /// matching Linux munmap semantics.
     pub fn unmap_partial(&mut self, pid: u32, vaddr: VirtAddr, len: usize) -> Result<(), VmError> {
-        let region_base = self.find_containing_region(pid, vaddr, len)?;
-        let region = {
-            let space = self.spaces.get_mut(&pid).unwrap();
-            space.regions.remove(&region_base).unwrap()
-        };
-        let page_offset = ((vaddr.as_u64() - region_base.as_u64()) / PAGE_SIZE) as usize;
-        let page_count = len / PAGE_SIZE as usize;
+        let bases = self.find_overlapping_regions(pid, vaddr, len)?;
+        if bases.is_empty() {
+            return Ok(());
+        }
 
-        // Unmap target pages from page table, freeing any intermediate
-        // page table frames (PDP/PD/PT levels) back to the public buddy.
-        // Split borrow: spaces and buddy_public are disjoint fields.
-        {
-            let Self {
-                spaces,
-                buddy_public,
-                ..
-            } = self;
-            let space = spaces.get_mut(&pid).unwrap();
-            for i in 0..page_count {
-                let page_vaddr = VirtAddr(vaddr.as_u64() + (i as u64) * PAGE_SIZE);
-                let _ = space.page_table.unmap(page_vaddr, &mut |frame| {
-                    let _ = buddy_public.free_frame(frame);
-                });
+        let range_end = vaddr.as_u64() + len as u64;
+
+        for base in bases {
+            let region = {
+                let space = self.spaces.get_mut(&pid).unwrap();
+                space.regions.remove(&base).unwrap()
+            };
+            let region_end = base.as_u64() + region.len as u64;
+            let overlap_start = vaddr.as_u64().max(base.as_u64());
+            let overlap_end = range_end.min(region_end);
+            let overlap_page_offset = ((overlap_start - base.as_u64()) / PAGE_SIZE) as usize;
+            let overlap_page_count = ((overlap_end - overlap_start) / PAGE_SIZE) as usize;
+
+            // Unmap target pages from page table.
+            {
+                let Self { spaces, buddy_public, .. } = self;
+                let space = spaces.get_mut(&pid).unwrap();
+                for i in 0..overlap_page_count {
+                    let page_vaddr = VirtAddr(overlap_start + (i as u64) * PAGE_SIZE);
+                    let _ = space.page_table.unmap(page_vaddr, &mut |frame| {
+                        let _ = buddy_public.free_frame(frame);
+                    });
+                }
             }
-        }
 
-        // Partition frames: before | target | after
-        let mut all_frames = region.frames;
-        let after_frames = all_frames.split_off(page_offset + page_count);
-        let target_frames = all_frames.split_off(page_offset);
-        let before_frames = all_frames;
+            // Partition frames: before | overlap | after
+            let mut all_frames = region.frames;
+            let after_frames = all_frames.split_off(overlap_page_offset + overlap_page_count);
+            let target_frames = all_frames.split_off(overlap_page_offset);
+            let before_frames = all_frames;
 
-        // Free target frames.
-        let use_kernel = region
-            .classification
-            .contains(FrameClassification::ENCRYPTED)
-            && self.buddy_kernel.total_frame_count() > 0;
-        let buddy = if use_kernel {
-            &mut self.buddy_kernel
-        } else {
-            &mut self.buddy_public
-        };
-        for &paddr in &target_frames {
-            let _ = self.cap_tracker.remove_mapping(paddr, pid);
-            // NOTE: If classification contains ENCRYPTED, the frame contents
-            // should be zeroized before freeing. Hardware page table impls
-            // will handle this; the mock does not model frame contents.
-            let _ = buddy.free_frame(paddr);
-        }
+            // Free target frames.
+            let use_kernel = region.classification.contains(FrameClassification::ENCRYPTED)
+                && self.buddy_kernel.total_frame_count() > 0;
+            let buddy = if use_kernel { &mut self.buddy_kernel } else { &mut self.buddy_public };
+            for &paddr in &target_frames {
+                let _ = self.cap_tracker.remove_mapping(paddr, pid);
+                let _ = buddy.free_frame(paddr);
+            }
 
-        // Re-insert surviving region(s).
-        let space = self.spaces.get_mut(&pid).unwrap();
-        if !before_frames.is_empty() {
-            space.regions.insert(
-                region_base,
-                Region {
+            // Re-insert surviving regions.
+            let space = self.spaces.get_mut(&pid).unwrap();
+            if !before_frames.is_empty() {
+                space.regions.insert(base, Region {
                     len: before_frames.len() * PAGE_SIZE as usize,
                     flags: region.flags,
                     classification: region.classification,
                     frames: before_frames,
-                },
-            );
-        }
-        if !after_frames.is_empty() {
-            let after_base = VirtAddr(vaddr.as_u64() + len as u64);
-            space.regions.insert(
-                after_base,
-                Region {
+                });
+            }
+            if !after_frames.is_empty() {
+                space.regions.insert(VirtAddr(overlap_end), Region {
                     len: after_frames.len() * PAGE_SIZE as usize,
                     flags: region.flags,
                     classification: region.classification,
                     frames: after_frames,
-                },
-            );
+                });
+            }
         }
         Ok(())
     }
@@ -1241,9 +1231,11 @@ mod tests {
         assert!(matches!(err, VmError::Unaligned(_)));
     }
 
-    /// `unmap_partial` on a range that spans beyond the region returns NotMapped.
+    /// `unmap_partial` on a range that spans beyond a single region succeeds,
+    /// unmapping only the mapped pages and silently skipping the gap
+    /// (Linux munmap semantics).
     #[test]
-    fn unmap_partial_out_of_bounds_returns_not_mapped() {
+    fn unmap_partial_beyond_region_skips_gap() {
         let mut mgr = make_manager(16);
         mgr.create_space(1, default_budget(), mock_pt()).unwrap();
         let base = VirtAddr(0x1000);
@@ -1256,12 +1248,12 @@ mod tests {
             FrameClassification::empty(),
         )
         .unwrap();
+        let initial_free = mgr.buddy_public().free_frame_count();
 
-        // Try to unmap 3 pages starting at 0x1000 — exceeds the region.
-        let err = mgr
-            .unmap_partial(1, base, PAGE_SIZE as usize * 3)
-            .unwrap_err();
-        assert!(matches!(err, VmError::NotMapped(_)));
+        // Unmap 3 pages starting at 0x1000 — only 2 are mapped; gap is skipped.
+        mgr.unmap_partial(1, base, PAGE_SIZE as usize * 3).unwrap();
+        assert_eq!(mgr.buddy_public().free_frame_count(), initial_free + 2);
+        assert_eq!(mgr.space(1).unwrap().regions.len(), 0);
     }
 
     /// `protect_partial` on the first page changes only that page's flags.
@@ -1452,6 +1444,70 @@ mod tests {
                 region.classification
             );
         }
+    }
+
+    #[test]
+    fn unmap_spanning_two_regions() {
+        let mut mgr = make_manager(32);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        mgr.map_region(1, VirtAddr(0x1000), PAGE_SIZE as usize * 2, rw_user_flags(), FrameClassification::empty()).unwrap();
+        mgr.map_region(1, VirtAddr(0x3000), PAGE_SIZE as usize * 2, rw_user_flags(), FrameClassification::empty()).unwrap();
+        let initial_free = mgr.buddy_public().free_frame_count();
+        mgr.unmap_partial(1, VirtAddr(0x2000), PAGE_SIZE as usize * 2).unwrap();
+        assert_eq!(mgr.buddy_public().free_frame_count(), initial_free + 2);
+        let regions = &mgr.space(1).unwrap().regions;
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions.get(&VirtAddr(0x1000)).unwrap().len, PAGE_SIZE as usize);
+        assert_eq!(regions.get(&VirtAddr(0x4000)).unwrap().len, PAGE_SIZE as usize);
+    }
+
+    #[test]
+    fn unmap_covering_middle_region() {
+        let mut mgr = make_manager(32);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        mgr.map_region(1, VirtAddr(0x1000), PAGE_SIZE as usize * 2, rw_user_flags(), FrameClassification::empty()).unwrap();
+        mgr.map_region(1, VirtAddr(0x3000), PAGE_SIZE as usize * 2, rw_user_flags(), FrameClassification::empty()).unwrap();
+        mgr.map_region(1, VirtAddr(0x5000), PAGE_SIZE as usize * 2, rw_user_flags(), FrameClassification::empty()).unwrap();
+        let initial_free = mgr.buddy_public().free_frame_count();
+        mgr.unmap_partial(1, VirtAddr(0x2000), PAGE_SIZE as usize * 4).unwrap();
+        assert_eq!(mgr.buddy_public().free_frame_count(), initial_free + 4);
+        let regions = &mgr.space(1).unwrap().regions;
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions.get(&VirtAddr(0x1000)).unwrap().len, PAGE_SIZE as usize);
+        assert_eq!(regions.get(&VirtAddr(0x6000)).unwrap().len, PAGE_SIZE as usize);
+    }
+
+    #[test]
+    fn unmap_with_gap() {
+        let mut mgr = make_manager(32);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        mgr.map_region(1, VirtAddr(0x1000), PAGE_SIZE as usize, rw_user_flags(), FrameClassification::empty()).unwrap();
+        mgr.map_region(1, VirtAddr(0x4000), PAGE_SIZE as usize, rw_user_flags(), FrameClassification::empty()).unwrap();
+        let initial_free = mgr.buddy_public().free_frame_count();
+        mgr.unmap_partial(1, VirtAddr(0x1000), PAGE_SIZE as usize * 4).unwrap();
+        assert_eq!(mgr.buddy_public().free_frame_count(), initial_free + 2);
+        assert_eq!(mgr.space(1).unwrap().regions.len(), 0);
+    }
+
+    #[test]
+    fn unmap_entire_two_regions() {
+        let mut mgr = make_manager(32);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        mgr.map_region(1, VirtAddr(0x1000), PAGE_SIZE as usize * 2, rw_user_flags(), FrameClassification::empty()).unwrap();
+        mgr.map_region(1, VirtAddr(0x3000), PAGE_SIZE as usize * 2, rw_user_flags(), FrameClassification::empty()).unwrap();
+        let initial_free = mgr.buddy_public().free_frame_count();
+        mgr.unmap_partial(1, VirtAddr(0x1000), PAGE_SIZE as usize * 4).unwrap();
+        assert_eq!(mgr.buddy_public().free_frame_count(), initial_free + 4);
+        assert_eq!(mgr.space(1).unwrap().regions.len(), 0);
+    }
+
+    #[test]
+    fn unmap_no_overlap() {
+        let mut mgr = make_manager(32);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        mgr.map_region(1, VirtAddr(0x1000), PAGE_SIZE as usize, rw_user_flags(), FrameClassification::empty()).unwrap();
+        let result = mgr.unmap_partial(1, VirtAddr(0x5000), PAGE_SIZE as usize);
+        assert!(result.is_ok());
     }
 
     #[test]
