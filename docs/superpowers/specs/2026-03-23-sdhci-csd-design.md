@@ -60,14 +60,14 @@ const CMD9_SEND_CSD: u8 = 9;
 
 ### CMD9 in init_card()
 
-After CMD7 (select card) and before CMD16 (set block length):
+Before CMD7 (Stand-by state), after CMD3:
 
 ```rust
 // CMD9: SEND_CSD — read Card-Specific Data register.
 // Argument: RCA in [31:16], R2 (Long) response.
 let csd_resp = self.send_command(
     bank, CMD9_SEND_CSD, (rca as u32) << 16,
-    CMD_RSP_136 | CMD_CRC_CHK, 0,
+    CMD_RESP_136 | CMD_CRC_CHECK, 0,
 )?;
 let capacity_blocks = match csd_resp {
     Response::Long(words) => parse_csd_capacity(words, is_sdhc),
@@ -79,30 +79,24 @@ let capacity_blocks = match csd_resp {
 
 ```rust
 fn parse_csd_capacity(resp: [u32; 4], is_sdhc: bool) -> u32 {
-    // SDHCI shifts R2 response right by 8 bits.
-    // CSD version in bits [127:126] → after shift: RESPONSE_3 bits [23:22].
     let csd_version = (resp[3] >> 22) & 0x3;
 
     if is_sdhc && csd_version == 1 {
-        // CSD v2.0: C_SIZE in CSD bits [69:48] → after shift: bits [61:40].
-        // Spans RESPONSE_1 [29:8] and top bits of RESPONSE_0.
-        let c_size = ((resp[1] & 0x3F_FF_FF00) >> 8) as u32;
-        // Actually: need to extract 22 bits carefully.
-        // RESPONSE_1 bits [29:8] = CSD bits [69:48] after shift.
-        let c_size_hi = (resp[1] >> 8) & 0x3F_FFFF; // 22 bits
-        (c_size_hi + 1) * 1024
-    } else if csd_version == 0 {
-        // CSD v1.0: C_SIZE [73:62], C_SIZE_MULT [49:47], READ_BL_LEN [83:80]
-        // After 8-bit shift: C_SIZE [65:54], C_SIZE_MULT [41:39], READ_BL_LEN [75:72]
-        let read_bl_len = ((resp[2] >> 8) & 0xF) as u32;
-        let c_size = (((resp[2] & 0x3) << 10) | ((resp[1] >> 22) & 0x3FF)) as u32;
-        let c_size_mult = ((resp[1] >> 7) & 0x7) as u32;
-        let block_len = 1u32 << read_bl_len;
-        let mult = 1u32 << (c_size_mult + 2);
-        let total_bytes = (c_size + 1) as u64 * mult as u64 * block_len as u64;
+        // CSD v2.0: C_SIZE in CSD bits [69:48] → after shift: RESPONSE_1 bits [29:8].
+        let c_size = ((resp[1] >> 8) & 0x3F_FFFF) as u64;
+        let blocks = (c_size + 1) * 1024;
+        if blocks > u32::MAX as u64 { u32::MAX } else { blocks as u32 }
+    } else if !is_sdhc && csd_version == 0 {
+        // CSD v1.0: READ_BL_LEN, C_SIZE, C_SIZE_MULT
+        let read_bl_len = (resp[2] >> 8) & 0xF;
+        let c_size = ((resp[2] & 0x3) << 10) | ((resp[1] >> 22) & 0x3FF);
+        let c_size_mult = (resp[1] >> 7) & 0x7;
+        let block_len = 1u64 << read_bl_len;
+        let mult = 1u64 << (c_size_mult + 2);
+        let total_bytes = (c_size + 1) as u64 * mult * block_len;
         (total_bytes / 512) as u32
     } else {
-        0 // Unknown CSD version
+        0 // Unknown CSD version or SDHC with wrong CSD version
     }
 }
 ```

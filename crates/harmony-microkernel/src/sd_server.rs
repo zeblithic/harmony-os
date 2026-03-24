@@ -202,8 +202,8 @@ mod tests {
         bank.on_read(SDHCI_INT_STATUS, vec![INT_CMD_COMPLETE]);
 
         // SDHCI_RESPONSE_0: one value per command that reads a response
-        // CMD8(R48), CMD55(R48), ACMD41(R48), CMD2(R136), CMD3(R48), CMD7(R48b),
-        // CMD9(R136), CMD16(R48) = 8 reads
+        // CMD8(R48), CMD55(R48), ACMD41(R48), CMD2(R136), CMD3(R48), CMD9(R136),
+        // CMD7(R48b), CMD16(R48) = 8 reads
         bank.on_read(
             SDHCI_RESPONSE_0,
             vec![
@@ -212,8 +212,8 @@ mod tests {
                 0xC0100000, // ACMD41: ready bit 31 + CCS bit 30 = SDHC
                 0,          // CMD2: R2 word 0
                 0xAAAA0000, // CMD3: RCA in bits [31:16]
-                0,          // CMD7: R1b status
                 0,          // CMD9: R2 word 0
+                0,          // CMD7: R1b status
                 0,          // CMD16: R1 status
             ],
         );
