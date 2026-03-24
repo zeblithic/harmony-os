@@ -99,16 +99,20 @@ pub struct SignedConfig {
     pub config_bytes: Vec<u8>,
     /// ML-DSA-65 signature over config_bytes by the operator identity.
     pub signature: Vec<u8>,
-    /// Operator's PQ address hash (verifier looks up public key).
+    /// Operator's PQ address hash (derived from signer_pubkey).
     pub signer: [u8; 16],
+    /// Operator's ML-DSA-65 public key (2592 bytes for ML-DSA-65).
+    pub signer_pubkey: Vec<u8>,
 }
 ```
 
-The `SignedConfig` is what gets stored as a book in the CAS. Its CID is the SHA-256 of the entire CBOR-serialized `SignedConfig`. The inner `config_bytes` contains the deterministic CBOR encoding of `NodeConfig`, whose own hash serves as a stable content identifier for the logical config (independent of who signed it).
+The `SignedConfig` is what gets stored as a book in the CAS. Its CID is the SHA-256 of the entire CBOR-serialized `SignedConfig`. The inner `config_bytes` contains the deterministic CBOR encoding of `NodeConfig`, whose own hash serves as a stable content identifier for the logical config (independent of who signed it). The public key is included so verification is self-contained — the `signer` address is verified to match `signer_pubkey` before trusting it.
 
 ## Serialization
 
-**Format:** CBOR (RFC 8949) via the `ciborium` crate.
+**Format:** CBOR (RFC 8949) via the `ciborium` crate with `serde` derives.
+
+**Dependencies:** Both `serde` (with `derive` feature) and `ciborium` are added as workspace dependencies in the root `Cargo.toml`, then referenced from `harmony-microkernel/Cargo.toml`. Both crates support `no_std` + `alloc` — `ciborium` needs `default-features = false` to disable its `std` feature.
 
 **Determinism:** Structs have fixed field order, so CBOR encoding is deterministic without explicit map key sorting. Same `NodeConfig` always produces the same bytes, which always produces the same CID.
 
@@ -156,10 +160,32 @@ When a CID is written to `/env/config/stage`, the ConfigServer:
 - Requires: `previous` is set
 - Action: swap `active` ↔ `previous`
 - Returns: success or `IpcError::InvalidArgument` if no previous config
+- Note: a second rollback undoes the first (toggles between two configs). This is intentional — generation-based rollback-to-N is deferred.
 
 ### Interaction with ContentServer
 
-ConfigServer holds a reference (shared `Arc` or direct 9P client) to the ContentServer for CID lookups. It does not duplicate book storage — it only caches the three CID pointers (active/pending/previous) and the deserialized active `NodeConfig`.
+ConfigServer accesses the CAS via a direct Rust API — `ContentServer` gains a new `pub fn get_book_bytes(&self, cid: &[u8; 32]) -> Option<Vec<u8>>` method that returns raw book bytes by CID, and a `pub fn has_book(&self, cid: &[u8; 32]) -> bool` for existence checks during CID reference validation. Both servers live in the same Ring 2 process, so a direct `Arc<ContentServer>` reference avoids the overhead of 9P walk/open/read for internal kernel use.
+
+ConfigServer does not duplicate book storage — it only caches the three CID pointers (active/pending/previous) and the deserialized active `NodeConfig`.
+
+### Signer Public Key Resolution
+
+`SignedConfig` includes the signer's 16-byte PQ address hash. To verify the signature, ConfigServer needs the full `PqPublicIdentity`. For this deliverable, the signer's public key is included directly in the `SignedConfig` envelope:
+
+```rust
+pub struct SignedConfig {
+    /// CBOR-encoded NodeConfig bytes (deterministic).
+    pub config_bytes: Vec<u8>,
+    /// ML-DSA-65 signature over config_bytes by the operator identity.
+    pub signature: Vec<u8>,
+    /// Operator's PQ address hash (derived from public key, used for display/logging).
+    pub signer: [u8; 16],
+    /// Operator's ML-DSA-65 public key (2592 bytes for ML-DSA-65).
+    pub signer_pubkey: Vec<u8>,
+}
+```
+
+ConfigServer verifies: (1) `signer` matches the address derived from `signer_pubkey`, (2) the signature over `config_bytes` verifies against `signer_pubkey`, (3) `signer` is in the node's trusted operator set. The trusted operator set is initially a hardcoded list of address hashes (the owner's address from the key hierarchy). A UCAN delegation-based trust model is deferred to future work.
 
 ## ConfigApplicator (Ring 3)
 
@@ -218,11 +244,13 @@ Config books are fetched through the existing content layer — same as NARs or 
 
 | File | Ring | Purpose |
 |------|------|---------|
+| `Cargo.toml` (root) | — | Add `serde` and `ciborium` to workspace dependencies |
+| `harmony-microkernel/Cargo.toml` | 2 | Reference `serde` and `ciborium` workspace deps |
 | `harmony-microkernel/src/node_config.rs` | 2 | `NodeConfig`, `NetworkConfig`, `ServiceEntry` types + CBOR serialization + CID computation |
-| `harmony-microkernel/src/signed_config.rs` | 2 | `SignedConfig` type + ML-DSA-65 signature verification |
+| `harmony-microkernel/src/signed_config.rs` | 2 | `SignedConfig` type + ML-DSA-65 signature verification + signer trust check |
 | `harmony-microkernel/src/config_server.rs` | 2 | `ConfigServer` 9P file server at `/env/config` |
+| `harmony-microkernel/src/content_server.rs` | 2 | Add `get_book_bytes()` and `has_book()` public methods |
 | `harmony-os/src/config_applicator.rs` | 3 | Config watcher, Zenoh subscription, diff + apply logic |
-| `harmony-microkernel/Cargo.toml` | 2 | Add `ciborium` dependency |
 
 ## Testing Strategy
 
