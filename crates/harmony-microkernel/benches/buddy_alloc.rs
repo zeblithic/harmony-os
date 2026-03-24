@@ -25,11 +25,11 @@ fn bench_alloc_free_cycle(c: &mut Criterion) {
     group.bench_function("100_frames", |b| {
         let mut alloc = make_allocator(1024);
         b.iter(|| {
-            let mut addrs = Vec::with_capacity(100);
-            for _ in 0..100 {
-                addrs.push(alloc.alloc_frame().unwrap());
+            let mut addrs = [PhysAddr(0); 100];
+            for slot in addrs.iter_mut() {
+                *slot = alloc.alloc_frame().unwrap();
             }
-            for addr in addrs {
+            for &addr in addrs.iter() {
                 alloc.free_frame(addr).unwrap();
             }
         });

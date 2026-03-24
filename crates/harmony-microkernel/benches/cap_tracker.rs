@@ -7,6 +7,11 @@ fn bench_check_budget(c: &mut Criterion) {
     let mut tracker = CapTracker::new();
     tracker.set_budget(1, MemoryBudget::new(1024, FrameClassification::all()));
 
+    // Sanity check: verify setup is correct before benchmarking.
+    tracker
+        .check_budget(1, 1, FrameClassification::empty())
+        .expect("setup: check_budget should succeed with empty classification");
+
     c.bench_function("cap_tracker/check_budget", |b| {
         b.iter(|| {
             let result = tracker

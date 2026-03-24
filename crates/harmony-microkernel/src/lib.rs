@@ -14,6 +14,7 @@ extern crate alloc;
 #[cfg(feature = "kernel")]
 pub mod content_server;
 pub mod echo;
+#[doc(hidden)] // pub for bench access only — not a stable API
 pub mod fid_tracker;
 pub mod genet_server;
 pub mod gpio_server;

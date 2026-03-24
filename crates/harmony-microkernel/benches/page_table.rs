@@ -1,25 +1,25 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use harmony_microkernel::vm::mock::MockPageTable;
 use harmony_microkernel::vm::page_table::PageTable;
 use harmony_microkernel::vm::{PageFlags, PhysAddr, VirtAddr};
 
 fn bench_map_single(c: &mut Criterion) {
     c.bench_function("page_table/map_single", |b| {
-        let mut pt = MockPageTable::new(PhysAddr(0x10_0000));
-        let mut next_vaddr = 0x1000u64;
-        b.iter(|| {
-            let vaddr = VirtAddr(next_vaddr);
-            pt.map(
-                vaddr,
-                PhysAddr(0xDEAD_0000),
-                PageFlags::READABLE | PageFlags::WRITABLE,
-                &mut || None,
-            )
-            .unwrap();
-            next_vaddr += 4096;
-            black_box(vaddr);
-        });
+        b.iter_batched(
+            || MockPageTable::new(PhysAddr(0x10_0000)),
+            |mut pt| {
+                pt.map(
+                    VirtAddr(0x1000),
+                    PhysAddr(0xDEAD_0000),
+                    PageFlags::READABLE | PageFlags::WRITABLE,
+                    &mut || None,
+                )
+                .unwrap();
+                black_box(pt)
+            },
+            BatchSize::SmallInput,
+        );
     });
 }
 
