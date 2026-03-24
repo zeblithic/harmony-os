@@ -2,7 +2,9 @@
 
 //! Types for the DWC xHCI USB host controller driver.
 //!
-//! `XhciError`, `UsbSpeed`, `PortStatus`, `XhciAction`, and `XhciEvent` — shared across the module.
+//! `XhciError`, `UsbSpeed`, `PortStatus`, `XhciAction`, `XhciEvent`, and `DeviceDescriptor` — shared across the module.
+
+extern crate alloc;
 
 use super::trb::Trb;
 
@@ -28,6 +30,10 @@ pub enum XhciError {
     InvalidState,
     /// Command ring is full; cannot enqueue new TRB.
     CommandRingFull,
+    /// No transfer ring allocated for the requested endpoint.
+    NoTransferRing,
+    /// Received descriptor data is malformed or too short to parse.
+    InvalidDescriptor,
 }
 
 // ── USB speed ────────────────────────────────────────────────────
@@ -99,6 +105,11 @@ pub enum XhciAction {
     WriteRegister { offset: usize, value: u32 },
     /// Write a 64-bit value as LO/HI pair (offset_lo, offset_lo + 4).
     WriteRegister64 { offset_lo: usize, value: u64 },
+    /// Write a DMA buffer to physical memory (e.g. Input Context or transfer data).
+    WriteDma {
+        phys: u64,
+        data: alloc::vec::Vec<u8>,
+    },
 }
 
 // ── Driver events ────────────────────────────────────────────────
@@ -110,8 +121,47 @@ pub enum XhciEvent {
     CommandCompletion { slot_id: u8, completion_code: u8 },
     /// A port status changed (connect/disconnect).
     PortStatusChange { port_id: u8 },
+    /// A transfer TRB completed (or errored).
+    TransferEvent {
+        /// Slot ID of the device that generated the event.
+        slot_id: u8,
+        /// Endpoint ID (DCI: 1 = EP0 OUT, 2 = EP0 IN, …).
+        endpoint_id: u8,
+        /// xHCI completion code (1 = Success, 13 = Short Packet, etc.).
+        completion_code: u8,
+        /// Number of bytes NOT transferred (residual length from TRB status).
+        transfer_length: u32,
+    },
     /// Unrecognized event TRB type.
     Unknown { trb_type: u8 },
+}
+
+// ── Device Descriptor ─────────────────────────────────────────────
+
+/// Parsed USB Device Descriptor (subset of bLength=18 standard fields).
+///
+/// All multi-byte fields are stored in host byte order after parsing
+/// from the little-endian wire format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceDescriptor {
+    /// USB specification version (BCD, e.g. 0x0200 = USB 2.0).
+    pub usb_version: u16,
+    /// Class code assigned by USB-IF (0 = class info in Interface Descriptors).
+    pub device_class: u8,
+    /// Subclass code (qualified by `device_class`).
+    pub device_subclass: u8,
+    /// Protocol code (qualified by `device_class` and `device_subclass`).
+    pub device_protocol: u8,
+    /// Maximum packet size for endpoint zero (8, 16, 32, or 64 bytes).
+    pub max_packet_size_ep0: u8,
+    /// Vendor ID assigned by USB-IF.
+    pub vendor_id: u16,
+    /// Product ID assigned by the manufacturer.
+    pub product_id: u16,
+    /// Device release number (BCD).
+    pub device_version: u16,
+    /// Number of possible configurations.
+    pub num_configurations: u8,
 }
 
 #[cfg(test)]
@@ -141,6 +191,10 @@ mod tests {
             offset_lo: 0x30,
             value: 0xDEAD,
         };
+        let _dma = XhciAction::WriteDma {
+            phys: 0x4000,
+            data: alloc::vec![0u8; 64],
+        };
     }
 
     #[test]
@@ -150,6 +204,38 @@ mod tests {
             completion_code: 1,
         };
         let _psc = XhciEvent::PortStatusChange { port_id: 3 };
+        let _transfer = XhciEvent::TransferEvent {
+            slot_id: 2,
+            endpoint_id: 2,
+            completion_code: 1,
+            transfer_length: 0,
+        };
         let _unk = XhciEvent::Unknown { trb_type: 99 };
+    }
+
+    #[test]
+    fn xhci_error_variants_constructible() {
+        let _no_ring = XhciError::NoTransferRing;
+        let _bad_desc = XhciError::InvalidDescriptor;
+    }
+
+    #[test]
+    fn device_descriptor_constructible() {
+        let desc = DeviceDescriptor {
+            usb_version: 0x0200,
+            device_class: 0,
+            device_subclass: 0,
+            device_protocol: 0,
+            max_packet_size_ep0: 64,
+            vendor_id: 0x045E,
+            product_id: 0x028E,
+            device_version: 0x0100,
+            num_configurations: 1,
+        };
+        assert_eq!(desc.usb_version, 0x0200);
+        assert_eq!(desc.max_packet_size_ep0, 64);
+        assert_eq!(desc.vendor_id, 0x045E);
+        assert_eq!(desc.product_id, 0x028E);
+        assert_eq!(desc.num_configurations, 1);
     }
 }
