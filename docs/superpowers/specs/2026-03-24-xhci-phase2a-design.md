@@ -34,6 +34,8 @@ Implement the TRB ring machinery that underpins all xHCI communication: a comman
 
 Same as Phase 1: the driver is a pure state machine. All DMA memory is owned by the caller. The driver computes what to write and where, returning `XhciAction` variants. The caller executes them (MMIO writes, DMA buffer writes, doorbell rings).
 
+**Paradigm shift from Phase 1:** Phase 1 methods (`init`, `detect_ports`) take `&mut impl RegisterBank` directly — they're one-shot operations during boot before the rings exist. Phase 2a methods (`setup_rings`, `enqueue_noop`, `process_event`) return `Vec<XhciAction>` instead — the caller executes actions against both registers and DMA memory. Both patterns coexist in the same driver.
+
 ### Ring Protocol
 
 xHCI uses circular TRB rings for all communication:
@@ -116,8 +118,9 @@ pub const COMPLETION_NO_SLOTS: u8 = 9;
 pub enum XhciAction {
     /// Write a TRB to DMA memory at the given physical address.
     WriteTrb { phys: u64, trb: Trb },
-    /// Ring a doorbell register. slot=0 means command ring.
-    RingDoorbell { slot: u8 },
+    /// Ring a doorbell register. Pre-computed offset = db_offset + 4 * slot.
+    /// slot=0 means command ring.
+    RingDoorbell { offset: usize, value: u32 },
     /// Update Event Ring Dequeue Pointer in interrupter register.
     UpdateDequeuePointer { phys: u64 },
     /// Write a 32-bit value to a register (offset from MMIO base).
@@ -230,8 +233,8 @@ pub struct XhciDriver {
 `setup_rings(&mut self, cmd_ring_phys: u64, event_ring_phys: u64, erst_phys: u64) -> Result<Vec<XhciAction>, XhciError>`
 
 Requires `Ready` state. Returns actions to:
-1. Write CONFIG register with max_slots
-2. Write DCBAAP (zeroed — no device contexts yet, Phase 2b allocates them)
+1. Write CONFIG register with MaxSlotsEn=0 (no slots needed in Phase 2a; Phase 2b bumps this when allocating the DCBAA)
+2. Write DCBAAP to 0 (valid because MaxSlotsEn=0 — the controller won't dereference slot contexts)
 3. Write CRCR with command ring base + cycle bit
 4. Write interrupter 0 registers: ERSTSZ (segment table size = 1), ERSTBA (segment table base), ERDP (initial dequeue pointer)
 5. Write USBCMD (RUN + INTE)
