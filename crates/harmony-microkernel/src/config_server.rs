@@ -98,8 +98,10 @@ impl ConfigServer {
     /// 3. Deserialize `SignedConfig`.
     /// 4. Verify signature against trusted operators.
     /// 5. Deserialize the embedded `NodeConfig`.
-    /// 6. Verify all referenced CIDs exist in CAS.
-    /// 7. Store as pending.
+    /// 6. Validate service entries (count, name length, uniqueness).
+    /// 7. Verify all referenced CIDs exist in CAS.
+    /// 8. Store as pending (unconditionally overwrites any existing
+    ///    pending config — single-actor design, no concurrent staging).
     fn do_stage(&mut self, cid_hex: &str) -> Result<(), IpcError> {
         // 1. Parse hex CID.
         let cid = parse_hex_cid(cid_hex.trim()).ok_or(IpcError::InvalidArgument)?;
@@ -139,13 +141,15 @@ impl ConfigServer {
             return Err(IpcError::InvalidArgument);
         }
 
-        // 6b. Reject empty or duplicate service names — empty names are
-        //     never useful, duplicates cause HashMap-based diffing in
-        //     ConfigApplicator to silently collapse entries.
+        // 6b. Reject invalid service names: empty, too long, or duplicate.
+        const MAX_SERVICE_NAME_LEN: usize = 64;
         {
             let mut seen = alloc::collections::BTreeSet::new();
             for svc in &config.services {
-                if svc.name.is_empty() || !seen.insert(svc.name.as_str()) {
+                if svc.name.is_empty()
+                    || svc.name.len() > MAX_SERVICE_NAME_LEN
+                    || !seen.insert(svc.name.as_str())
+                {
                     return Err(IpcError::InvalidArgument);
                 }
             }
@@ -896,6 +900,41 @@ mod tests {
                 port: 4242,
             },
             services,
+        };
+
+        let signer = PqPrivateIdentity::generate(&mut OsRng);
+        let signed_cid = sign_and_ingest(&mut cas, &config, &signer);
+        let trusted = alloc::vec![signer.public_identity().address_hash];
+        let cas = Arc::new(cas);
+        let mut server = ConfigServer::new(cas, trusted);
+
+        assert_eq!(
+            stage_config(&mut server, &signed_cid),
+            Err(IpcError::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn stage_overlong_service_name_rejected() {
+        let mut cas = ContentServer::new();
+        let kernel_cid = ingest_book(&mut cas, b"kernel-bin");
+        let identity_cid = ingest_book(&mut cas, b"identity-bin");
+        let bin = ingest_book(&mut cas, b"binary-one");
+
+        let long_name: alloc::string::String = core::iter::repeat('x').take(65).collect();
+        let config = NodeConfig {
+            version: SCHEMA_VERSION,
+            kernel: kernel_cid,
+            identity: identity_cid,
+            network: NetworkConfig {
+                mesh_seeds: alloc::vec![],
+                port: 4242,
+            },
+            services: alloc::vec![ServiceEntry {
+                name: long_name,
+                binary: bin,
+                config: None,
+            }],
         };
 
         let signer = PqPrivateIdentity::generate(&mut OsRng);
