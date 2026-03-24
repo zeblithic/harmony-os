@@ -21,6 +21,8 @@ kernel = [
     "dep:harmony-platform", "harmony-platform/std",
     "dep:harmony-athenaeum", "harmony-athenaeum/std",
     "dep:rand_core",
+    "dep:serde",
+    "dep:ciborium",
 ]
 
 [dependencies]
@@ -34,6 +36,8 @@ harmony-identity = { workspace = true, optional = true }
 harmony-platform = { workspace = true, optional = true }
 harmony-athenaeum = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+ciborium = { workspace = true, optional = true }
 
 [dev-dependencies]
 harmony-unikernel = { workspace = true, features = ["test-utils"] }
