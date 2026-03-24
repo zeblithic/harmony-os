@@ -39,6 +39,8 @@ pub mod integrity;
 pub mod key_hierarchy;
 #[cfg(feature = "kernel")]
 pub mod pq_capability;
+#[cfg(feature = "kernel")]
+pub mod signed_config;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
