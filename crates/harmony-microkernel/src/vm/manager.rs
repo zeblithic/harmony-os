@@ -296,6 +296,36 @@ impl<P: PageTable> AddressSpaceManager<P> {
         Err(VmError::NotMapped(vaddr))
     }
 
+    /// Find all regions that overlap `[vaddr, vaddr+len)`.
+    ///
+    /// Returns a Vec of base addresses (sorted ascending) for every region
+    /// whose range intersects the target. Returns an empty Vec if no regions
+    /// overlap. Returns `Err` for invalid arguments or missing process.
+    pub(crate) fn find_overlapping_regions(
+        &self,
+        pid: u32,
+        vaddr: VirtAddr,
+        len: usize,
+    ) -> Result<Vec<VirtAddr>, VmError> {
+        if len == 0 || vaddr.as_u64() % PAGE_SIZE != 0 || (len as u64) % PAGE_SIZE != 0 {
+            return Err(VmError::Unaligned(vaddr.as_u64()));
+        }
+        let space = self.spaces.get(&pid).ok_or(VmError::NoSuchProcess(pid))?;
+        let range_end = vaddr.as_u64() + len as u64;
+        let mut result = Vec::new();
+        for (&base, region) in space.regions.iter() {
+            let region_end = base.as_u64() + region.len as u64;
+            if region_end <= vaddr.as_u64() {
+                continue;
+            }
+            if base.as_u64() >= range_end {
+                break;
+            }
+            result.push(base);
+        }
+        Ok(result)
+    }
+
     /// Unmap a sub-range `[vaddr, vaddr+len)` within an existing region.
     ///
     /// The containing region is split into up to two surviving regions
@@ -1422,5 +1452,27 @@ mod tests {
                 region.classification
             );
         }
+    }
+
+    #[test]
+    fn find_overlapping_regions_basic() {
+        let mut mgr = make_manager(32);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        mgr.map_region(1, VirtAddr(0x1000), PAGE_SIZE as usize * 2, rw_user_flags(), FrameClassification::empty()).unwrap();
+        mgr.map_region(1, VirtAddr(0x5000), PAGE_SIZE as usize * 2, rw_user_flags(), FrameClassification::empty()).unwrap();
+        mgr.map_region(1, VirtAddr(0x9000), PAGE_SIZE as usize * 2, rw_user_flags(), FrameClassification::empty()).unwrap();
+
+        let overlaps = mgr.find_overlapping_regions(1, VirtAddr(0x2000), 0x8000).unwrap();
+        assert_eq!(overlaps.len(), 3);
+        assert_eq!(overlaps[0], VirtAddr(0x1000));
+        assert_eq!(overlaps[1], VirtAddr(0x5000));
+        assert_eq!(overlaps[2], VirtAddr(0x9000));
+
+        let overlaps = mgr.find_overlapping_regions(1, VirtAddr(0x3000), 0x2000).unwrap();
+        assert_eq!(overlaps.len(), 0);
+
+        let overlaps = mgr.find_overlapping_regions(1, VirtAddr(0x6000), PAGE_SIZE as usize).unwrap();
+        assert_eq!(overlaps.len(), 1);
+        assert_eq!(overlaps[0], VirtAddr(0x5000));
     }
 }
