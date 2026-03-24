@@ -290,7 +290,10 @@ impl<P: PageTable> AddressSpaceManager<P> {
             return Err(VmError::Unaligned(vaddr.as_u64()));
         }
         let space = self.spaces.get(&pid).ok_or(VmError::NoSuchProcess(pid))?;
-        let range_end = vaddr.as_u64() + len as u64;
+        let range_end = vaddr
+            .as_u64()
+            .checked_add(len as u64)
+            .ok_or(VmError::Overflow(vaddr.as_u64()))?;
         let mut result = Vec::new();
         // Jump to the last region whose base ≤ vaddr (it could overlap from behind),
         // then scan forward. When `next_back()` returns Some, the first iteration
@@ -340,7 +343,10 @@ impl<P: PageTable> AddressSpaceManager<P> {
             return Ok(());
         }
 
-        let range_end = vaddr.as_u64() + len as u64;
+        let range_end = vaddr
+            .as_u64()
+            .checked_add(len as u64)
+            .ok_or(VmError::Overflow(vaddr.as_u64()))?;
 
         for base in bases {
             let region = {
@@ -453,7 +459,10 @@ impl<P: PageTable> AddressSpaceManager<P> {
             return Ok(());
         }
 
-        let range_end = vaddr.as_u64() + len as u64;
+        let range_end = vaddr
+            .as_u64()
+            .checked_add(len as u64)
+            .ok_or(VmError::Overflow(vaddr.as_u64()))?;
 
         // Pass 1: update all HW page table entries. On failure, roll back
         // any pages already updated so HW state stays consistent with the
@@ -472,6 +481,9 @@ impl<P: PageTable> AddressSpaceManager<P> {
                         }
                     };
                     let old_flags = region.flags;
+                    if new_flags == old_flags {
+                        continue; // flags already match — no HW work needed
+                    }
                     let region_end_local = base.as_u64() + region.len as u64;
                     let overlap_start = vaddr.as_u64().max(base.as_u64());
                     let overlap_end = range_end.min(region_end_local);
