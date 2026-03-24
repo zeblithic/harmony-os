@@ -65,29 +65,7 @@ impl BinaryCacheServer {
     /// Builds the hash index (including precomputed SHA-256 digests) by
     /// scanning existing store path names.
     pub fn new(server: NixStoreServer) -> Self {
-        let mut hash_index = HashMap::new();
-        for name in server.store_path_names() {
-            if name.len() >= 33 && name.as_bytes()[32] == b'-' {
-                let hash = name[..32].to_string();
-                let nar_blob = server.get_nar_blob(name).unwrap();
-                let sha256: [u8; 32] = Sha256::digest(nar_blob).into();
-                let nar_size = nar_blob.len() as u64;
-                hash_index.insert(
-                    hash,
-                    IndexEntry {
-                        name: Arc::clone(name),
-                        nar_sha256: sha256,
-                        nar_size,
-                        references: None,
-                    },
-                );
-            }
-        }
-        Self {
-            server,
-            hash_index,
-            misses: BTreeSet::new(),
-        }
+        Self::new_with_refs(server, std::collections::HashMap::new())
     }
 
     /// Create a new binary cache server from an existing NixStoreServer with

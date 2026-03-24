@@ -116,6 +116,12 @@ pub fn serialize_narinfo(
          NarSize: {nar_size}\n"
     );
     if let Some(refs) = references {
+        for r in refs {
+            assert!(
+                !r.contains('\n') && !r.contains('\r') && !r.contains('\0'),
+                "reference must not contain control characters: {r:?}"
+            );
+        }
         text.push_str("References: ");
         text.push_str(&refs.join(" "));
         text.push('\n');

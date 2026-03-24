@@ -105,8 +105,15 @@ impl<A: ContentAnnouncer, S: BookStore> NarPublisher<A, S> {
         let store_key = format!("harmony/nix/store/{store_hash}");
         let mut payload = root_cid_hex.clone();
         if let Some(refs) = &references {
-            for r in refs {
-                payload.push('\n');
+            // Trailing \n distinguishes Some(vec![]) from None:
+            // - None → "cid_hex" (no newline)
+            // - Some(vec![]) → "cid_hex\n" (newline, no refs)
+            // - Some(refs) → "cid_hex\nref1\nref2"
+            payload.push('\n');
+            for (i, r) in refs.iter().enumerate() {
+                if i > 0 {
+                    payload.push('\n');
+                }
                 payload.push_str(r);
             }
         }

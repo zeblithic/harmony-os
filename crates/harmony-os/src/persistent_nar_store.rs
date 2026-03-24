@@ -148,6 +148,11 @@ impl PersistentNarStore {
             // the parse-error skip path handles it.
             if !already_imported {
                 let _ = std::fs::remove_file(&path);
+                // Also clean up the .meta sidecar if it was written in this call.
+                if references.is_some() {
+                    let meta_path = self.dir.join(format!("{name}.meta"));
+                    let _ = std::fs::remove_file(&meta_path);
+                }
             }
             io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}"))
         })
