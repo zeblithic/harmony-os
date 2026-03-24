@@ -400,11 +400,11 @@ impl<P: PageTable> AddressSpaceManager<P> {
         Ok(())
     }
 
-    /// Change the permission flags on a sub-range `[vaddr, vaddr+len)`.
+    /// Change permission flags on `[vaddr, vaddr+len)`, spanning multiple regions.
     ///
-    /// The containing region is split into up to three regions: the
-    /// before-range (unchanged flags), the target range (new flags), and
-    /// the after-range (unchanged flags).
+    /// Each overlapping region is split into up to three parts: before
+    /// (unchanged), overlap (new flags), after (unchanged). Gaps in the
+    /// target range are silently skipped.
     pub fn protect_partial(
         &mut self,
         pid: u32,
@@ -412,64 +412,64 @@ impl<P: PageTable> AddressSpaceManager<P> {
         len: usize,
         new_flags: PageFlags,
     ) -> Result<(), VmError> {
-        let region_base = self.find_containing_region(pid, vaddr, len)?;
-
-        // Update page table entries BEFORE removing the region from the
-        // BTreeMap. If set_flags fails, the region remains intact.
-        {
-            let space = self.spaces.get_mut(&pid).unwrap();
-            let page_count = len / PAGE_SIZE as usize;
-            for i in 0..page_count {
-                let page_vaddr = VirtAddr(vaddr.as_u64() + (i as u64) * PAGE_SIZE);
-                space.page_table.set_flags(page_vaddr, new_flags)?;
-            }
+        let bases = self.find_overlapping_regions(pid, vaddr, len)?;
+        if bases.is_empty() {
+            return Ok(());
         }
 
-        // Now remove and split the region (point of no return — set_flags
-        // already succeeded for all target pages).
-        let space = self.spaces.get_mut(&pid).unwrap();
-        let region = space.regions.remove(&region_base).unwrap();
-        let page_offset = ((vaddr.as_u64() - region_base.as_u64()) / PAGE_SIZE) as usize;
-        let page_count = len / PAGE_SIZE as usize;
+        let range_end = vaddr.as_u64() + len as u64;
 
-        // Partition frames.
-        let mut all_frames = region.frames;
-        let after_frames = all_frames.split_off(page_offset + page_count);
-        let target_frames = all_frames.split_off(page_offset);
-        let before_frames = all_frames;
+        for base in bases {
+            let region_len = {
+                let space = self.spaces.get(&pid).unwrap();
+                space.regions.get(&base).unwrap().len
+            };
+            let region_end = base.as_u64() + region_len as u64;
+            let overlap_start = vaddr.as_u64().max(base.as_u64());
+            let overlap_end = range_end.min(region_end);
+            let overlap_page_count = ((overlap_end - overlap_start) / PAGE_SIZE) as usize;
 
-        // Re-insert up to 3 regions.
-        if !before_frames.is_empty() {
-            space.regions.insert(
-                region_base,
-                Region {
+            // Update page table flags BEFORE modifying region map.
+            {
+                let space = self.spaces.get_mut(&pid).unwrap();
+                for i in 0..overlap_page_count {
+                    let page_vaddr = VirtAddr(overlap_start + (i as u64) * PAGE_SIZE);
+                    space.page_table.set_flags(page_vaddr, new_flags)?;
+                }
+            }
+
+            // Remove region, partition, re-insert.
+            let space = self.spaces.get_mut(&pid).unwrap();
+            let region = space.regions.remove(&base).unwrap();
+            let overlap_page_offset = ((overlap_start - base.as_u64()) / PAGE_SIZE) as usize;
+
+            let mut all_frames = region.frames;
+            let after_frames = all_frames.split_off(overlap_page_offset + overlap_page_count);
+            let target_frames = all_frames.split_off(overlap_page_offset);
+            let before_frames = all_frames;
+
+            if !before_frames.is_empty() {
+                space.regions.insert(base, Region {
                     len: before_frames.len() * PAGE_SIZE as usize,
                     flags: region.flags,
                     classification: region.classification,
                     frames: before_frames,
-                },
-            );
-        }
-        space.regions.insert(
-            vaddr,
-            Region {
+                });
+            }
+            space.regions.insert(VirtAddr(overlap_start), Region {
                 len: target_frames.len() * PAGE_SIZE as usize,
                 flags: new_flags,
                 classification: region.classification,
                 frames: target_frames,
-            },
-        );
-        if !after_frames.is_empty() {
-            let after_base = VirtAddr(vaddr.as_u64() + len as u64);
-            space.regions.insert(
-                after_base,
-                Region {
+            });
+            if !after_frames.is_empty() {
+                space.regions.insert(VirtAddr(overlap_end), Region {
                     len: after_frames.len() * PAGE_SIZE as usize,
                     flags: region.flags,
                     classification: region.classification,
                     frames: after_frames,
-                },
-            );
+                });
+            }
         }
         Ok(())
     }
@@ -1530,5 +1530,50 @@ mod tests {
         let overlaps = mgr.find_overlapping_regions(1, VirtAddr(0x6000), PAGE_SIZE as usize).unwrap();
         assert_eq!(overlaps.len(), 1);
         assert_eq!(overlaps[0], VirtAddr(0x5000));
+    }
+
+    #[test]
+    fn protect_spanning_two_regions() {
+        let mut mgr = make_manager(32);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        mgr.map_region(1, VirtAddr(0x1000), PAGE_SIZE as usize * 2, rw_user_flags(), FrameClassification::empty()).unwrap();
+        mgr.map_region(1, VirtAddr(0x3000), PAGE_SIZE as usize * 2, rw_user_flags(), FrameClassification::empty()).unwrap();
+        mgr.protect_partial(1, VirtAddr(0x2000), PAGE_SIZE as usize * 2, rx_user_flags()).unwrap();
+        let regions = &mgr.space(1).unwrap().regions;
+        assert_eq!(regions.len(), 4);
+        assert_eq!(regions.get(&VirtAddr(0x1000)).unwrap().flags, rw_user_flags());
+        assert_eq!(regions.get(&VirtAddr(0x2000)).unwrap().flags, rx_user_flags());
+        assert_eq!(regions.get(&VirtAddr(0x3000)).unwrap().flags, rx_user_flags());
+        assert_eq!(regions.get(&VirtAddr(0x4000)).unwrap().flags, rw_user_flags());
+    }
+
+    #[test]
+    fn protect_with_gap() {
+        let mut mgr = make_manager(32);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        mgr.map_region(1, VirtAddr(0x1000), PAGE_SIZE as usize, rw_user_flags(), FrameClassification::empty()).unwrap();
+        mgr.map_region(1, VirtAddr(0x4000), PAGE_SIZE as usize, rw_user_flags(), FrameClassification::empty()).unwrap();
+        mgr.protect_partial(1, VirtAddr(0x1000), PAGE_SIZE as usize * 4, rx_user_flags()).unwrap();
+        let regions = &mgr.space(1).unwrap().regions;
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions.get(&VirtAddr(0x1000)).unwrap().flags, rx_user_flags());
+        assert_eq!(regions.get(&VirtAddr(0x4000)).unwrap().flags, rx_user_flags());
+    }
+
+    #[test]
+    fn protect_spanning_three_regions() {
+        let mut mgr = make_manager(32);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        mgr.map_region(1, VirtAddr(0x1000), PAGE_SIZE as usize * 2, rw_user_flags(), FrameClassification::empty()).unwrap();
+        mgr.map_region(1, VirtAddr(0x3000), PAGE_SIZE as usize * 2, rw_user_flags(), FrameClassification::empty()).unwrap();
+        mgr.map_region(1, VirtAddr(0x5000), PAGE_SIZE as usize * 2, rw_user_flags(), FrameClassification::empty()).unwrap();
+        mgr.protect_partial(1, VirtAddr(0x2000), PAGE_SIZE as usize * 4, rx_user_flags()).unwrap();
+        let regions = &mgr.space(1).unwrap().regions;
+        assert_eq!(regions.len(), 5);
+        assert_eq!(regions.get(&VirtAddr(0x1000)).unwrap().flags, rw_user_flags());
+        assert_eq!(regions.get(&VirtAddr(0x2000)).unwrap().flags, rx_user_flags());
+        assert_eq!(regions.get(&VirtAddr(0x3000)).unwrap().flags, rx_user_flags());
+        assert_eq!(regions.get(&VirtAddr(0x5000)).unwrap().flags, rx_user_flags());
+        assert_eq!(regions.get(&VirtAddr(0x6000)).unwrap().flags, rw_user_flags());
     }
 }
