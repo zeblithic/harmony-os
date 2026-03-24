@@ -84,10 +84,10 @@ const CMD2_ALL_SEND_CID: u8 = 2;
 const CMD3_SEND_RCA: u8 = 3;
 const CMD7_SELECT_CARD: u8 = 7;
 const CMD8_SEND_IF_COND: u8 = 8;
+const CMD9_SEND_CSD: u8 = 9;
 const CMD16_SET_BLOCKLEN: u8 = 16;
 const CMD17_READ_SINGLE: u8 = 17;
 const CMD24_WRITE_SINGLE: u8 = 24;
-const CMD9_SEND_CSD: u8 = 9;
 const CMD55_APP_CMD: u8 = 55;
 const ACMD41_SD_SEND_OP_COND: u8 = 41;
 
@@ -519,21 +519,12 @@ impl SdhciDriver {
             _ => return Err(SdError::InitFailed),
         };
 
-        // CMD7: SELECT_CARD
-        self.send_command(
-            bank,
-            CMD7_SELECT_CARD,
-            (rca as u32) << 16,
-            CMD_RESP_48_BUSY | CMD_CRC_CHECK | CMD_INDEX_CHECK,
-            0,
-        )?;
-
-        // Determine card type and capacity from OCR
+        // Determine card type from OCR before CMD9.
         // CCS bit (30) distinguishes SDHC/SDXC (block-addressed) from SDSC (byte-addressed)
         let is_sdhc = ocr & (1 << 30) != 0;
 
-        // CMD9: SEND_CSD — read Card-Specific Data register for capacity.
-        // Must be sent with RCA in [31:16], returns R2 (136-bit) response.
+        // CMD9: SEND_CSD — must be sent while card is in Stand-by state
+        // (after CMD3, before CMD7). Returns R2 (136-bit) response.
         let capacity_blocks = match self.send_command(
             bank,
             CMD9_SEND_CSD,
@@ -544,6 +535,15 @@ impl SdhciDriver {
             Response::Long(words) => parse_csd_capacity(words, is_sdhc),
             _ => 0,
         };
+
+        // CMD7: SELECT_CARD — transitions card from Stand-by → Transfer state.
+        self.send_command(
+            bank,
+            CMD7_SELECT_CARD,
+            (rca as u32) << 16,
+            CMD_RESP_48_BUSY | CMD_CRC_CHECK | CMD_INDEX_CHECK,
+            0,
+        )?;
 
         // CMD16: SET_BLOCKLEN (512 bytes)
         self.send_command(
@@ -584,22 +584,23 @@ fn parse_csd_capacity(resp: [u32; 4], is_sdhc: bool) -> u32 {
         // CSD v2.0 (SDHC/SDXC):
         // C_SIZE in CSD bits [69:48] → after 8-bit shift: bits [61:40]
         // Spans RESPONSE_1 bits [29:8] (22 bits).
-        let c_size = (resp[1] >> 8) & 0x3F_FFFF;
+        // Use u64 to avoid overflow: max C_SIZE (0x3FFFFF) → (4194304 * 1024) = 2^32.
+        let c_size = ((resp[1] >> 8) & 0x3F_FFFF) as u64;
         // Capacity = (C_SIZE + 1) * 512KB = (C_SIZE + 1) * 1024 blocks
-        (c_size + 1) * 1024
+        ((c_size + 1) * 1024) as u32
     } else if csd_version == 0 {
         // CSD v1.0 (SDSC):
         // READ_BL_LEN: CSD bits [83:80] → after shift: RESPONSE_2 bits [11:8]
-        let read_bl_len = ((resp[2] >> 8) & 0xF) as u32;
+        let read_bl_len = (resp[2] >> 8) & 0xF;
         // C_SIZE: CSD bits [73:62] → after shift: bits [65:54]
         //   RESPONSE_2 bits [1:0] (upper 2 bits) + RESPONSE_1 bits [31:22] (lower 10 bits)
-        let c_size = (((resp[2] & 0x3) << 10) | ((resp[1] >> 22) & 0x3FF)) as u32;
+        let c_size = ((resp[2] & 0x3) << 10) | ((resp[1] >> 22) & 0x3FF);
         // C_SIZE_MULT: CSD bits [49:47] → after shift: RESPONSE_1 bits [9:7]
-        let c_size_mult = ((resp[1] >> 7) & 0x7) as u32;
+        let c_size_mult = (resp[1] >> 7) & 0x7;
 
-        let block_len = 1u32 << read_bl_len;
-        let mult = 1u32 << (c_size_mult + 2);
-        let total_bytes = (c_size + 1) as u64 * mult as u64 * block_len as u64;
+        let block_len = 1u64 << read_bl_len;
+        let mult = 1u64 << (c_size_mult + 2);
+        let total_bytes = (c_size + 1) as u64 * mult * block_len;
         (total_bytes / 512) as u32
     } else {
         0 // Unknown CSD version
@@ -861,7 +862,7 @@ mod tests {
         // Set up mock for the full init sequence:
         // Each send_command reads: PRESENT_STATE (not inhibited), INT_STATUS (cmd complete),
         // RESPONSE_0. We need enough responses for: CMD0, CMD8, CMD55, ACMD41, CMD2, CMD3,
-        // CMD7, CMD9, CMD16. That's 9 commands.
+        // CMD9, CMD7, CMD16. That's 9 commands. CMD9 is before CMD7 (Stand-by state).
 
         // Present state: never inhibited
         bank.on_read(SDHCI_PRESENT_STATE, vec![0]);
@@ -880,8 +881,8 @@ mod tests {
                 0xC0100000, // ACMD41 response (ready bit 31 + CCS bit 30 = SDHC)
                 0,          // CMD2 uses RESP_136, reads all 4 response regs
                 0x12340000, // CMD3 response (RCA = 0x1234 in upper 16 bits)
-                0,          // CMD7 response
                 0,          // CMD9 uses RESP_136, reads all 4 response regs
+                0,          // CMD7 response
                 0,          // CMD16 response
             ],
         );
@@ -925,8 +926,8 @@ mod tests {
         assert_eq!(cmd_writes[3] >> 8, 41); // ACMD41
         assert_eq!(cmd_writes[4] >> 8, 2); // CMD2
         assert_eq!(cmd_writes[5] >> 8, 3); // CMD3
-        assert_eq!(cmd_writes[6] >> 8, 7); // CMD7
-        assert_eq!(cmd_writes[7] >> 8, 9); // CMD9
+        assert_eq!(cmd_writes[6] >> 8, 9); // CMD9 (Stand-by state, before CMD7)
+        assert_eq!(cmd_writes[7] >> 8, 7); // CMD7
         assert_eq!(cmd_writes[8] >> 8, 16); // CMD16
     }
 
