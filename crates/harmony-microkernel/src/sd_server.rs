@@ -181,32 +181,53 @@ mod tests {
     }
 
     /// Set up the mock for a successful init_card call.
+    ///
+    /// The CMD9 (SEND_CSD) response uses CSD v2.0 with C_SIZE=1000,
+    /// giving capacity_blocks = (1000 + 1) * 1024 = 1_025_024 blocks.
     fn setup_init_card_mock(bank: &mut MockRegisterBank, _capacity: u32) {
-        // We need the full init sequence to pass. The capacity comes
-        // from OCR in the real driver (SDHC with CCS set = capacity 0
-        // since CSD is not parsed). For test purposes this is fine;
-        // we test stat with whatever the driver stores.
-        bank.on_read(SDHCI_PRESENT_STATE, vec![0]);
-        bank.on_read(SDHCI_INT_STATUS, vec![INT_CMD_COMPLETE]);
-        // CMD8 SEND_IF_COND response
+        // We need the full init sequence to pass (9 commands total):
+        // CMD0, CMD8, CMD55, ACMD41, CMD2, CMD3, CMD7, CMD9, CMD16
         const SDHCI_RESPONSE_1: usize = 0x14;
         const SDHCI_RESPONSE_2: usize = 0x18;
         const SDHCI_RESPONSE_3: usize = 0x1C;
+
+        // C_SIZE = 1000 for CMD9 CSD v2.0 response
+        const C_SIZE: u32 = 1000;
+
+        // SDHCI_PRESENT_STATE: one value (0 = not busy), sticky for all 9 commands
+        bank.on_read(SDHCI_PRESENT_STATE, vec![0]);
+
+        // SDHCI_INT_STATUS: INT_CMD_COMPLETE, sticky for all 8 commands with responses
+        // (CMD0 has no response, all others do)
+        bank.on_read(SDHCI_INT_STATUS, vec![INT_CMD_COMPLETE]);
+
+        // SDHCI_RESPONSE_0: one value per command that reads a response
+        // CMD8(R48), CMD55(R48), ACMD41(R48), CMD2(R136), CMD3(R48), CMD7(R48b),
+        // CMD9(R136), CMD16(R48) = 8 reads
         bank.on_read(
             SDHCI_RESPONSE_0,
             vec![
-                0x1AA,      // CMD8
-                0x0120,     // CMD55
-                0xC0100000, // ACMD41 (ready bit 31 + CCS bit 30 = SDHC)
-                0,          // CMD2 R2
-                0xAAAA0000, // CMD3 RCA
-                0,          // CMD7
-                0,          // CMD16
+                0x1AA,      // CMD8: voltage pattern echo
+                0x0120,     // CMD55: R1 status
+                0xC0100000, // ACMD41: ready bit 31 + CCS bit 30 = SDHC
+                0,          // CMD2: R2 word 0
+                0xAAAA0000, // CMD3: RCA in bits [31:16]
+                0,          // CMD7: R1b status
+                0,          // CMD9: R2 word 0
+                0,          // CMD16: R1 status
             ],
         );
-        bank.on_read(SDHCI_RESPONSE_1, vec![0]);
-        bank.on_read(SDHCI_RESPONSE_2, vec![0]);
-        bank.on_read(SDHCI_RESPONSE_3, vec![0]);
+
+        // SDHCI_RESPONSE_1: read by CMD2 (R136) then CMD9 (R136)
+        // CMD9: C_SIZE in bits [29:8] encodes 1000 → (1000+1)*1024 = 1_025_024 blocks
+        bank.on_read(SDHCI_RESPONSE_1, vec![0, C_SIZE << 8]);
+
+        // SDHCI_RESPONSE_2: read by CMD2 then CMD9 (both zero)
+        bank.on_read(SDHCI_RESPONSE_2, vec![0, 0]);
+
+        // SDHCI_RESPONSE_3: read by CMD2 then CMD9
+        // CMD9: CSD version = 1 (CSD v2.0) in bits [23:22] → value = 1 << 22
+        bank.on_read(SDHCI_RESPONSE_3, vec![0, 1 << 22]);
     }
 
     /// Program the server's bank for a successful read_single_block.
@@ -391,10 +412,10 @@ mod tests {
         let st = srv.stat(1).unwrap();
         assert_eq!(&*st.name, "sd0");
         assert_eq!(st.file_type, FileType::Regular);
-        // init_card with CCS bit set stores capacity_blocks = 0
-        // (real CSD parsing not implemented), so size = 0
-        // This is correct behavior — the driver placeholder returns 0.
-        assert_eq!(st.size, 0);
+        // CMD9 CSD v2.0 mock: C_SIZE=1000 → capacity = (1000+1)*1024 = 1_025_024 blocks
+        // size = capacity_blocks * 512 = 524_812_288 bytes
+        const C_SIZE: u64 = 1000;
+        assert_eq!(st.size, (C_SIZE + 1) * 1024 * 512);
     }
 
     #[test]
@@ -411,9 +432,10 @@ mod tests {
         srv.walk(0, 1, "sd0").unwrap();
 
         let st = srv.stat(1).unwrap();
-        // capacity_blocks is 0 from the mock init (CSD not parsed)
-        // but the code path capacity_blocks * 512 is exercised
-        assert_eq!(st.size, 0);
+        // CMD9 CSD v2.0 mock: C_SIZE=1000 → capacity = (1000+1)*1024 = 1_025_024 blocks
+        // size = capacity_blocks * 512 = 524_812_288 bytes
+        const C_SIZE: u64 = 1000;
+        assert_eq!(st.size, (C_SIZE + 1) * 1024 * 512);
     }
 
     // ── Mode enforcement tests ──────────────────────────────────────
