@@ -62,11 +62,22 @@ fn is_valid_store_hash(hash: &str) -> bool {
 /// Sanitize a reference list: drop entries that are empty, contain NUL,
 /// or contain any whitespace. These would corrupt space-separated or
 /// newline-separated serialization formats.
+///
+/// If all entries are invalid and dropped, returns `None` (unknown) rather
+/// than `Some(vec![])` (zero deps) to preserve three-state semantics.
 fn sanitize_refs(refs: Option<Vec<String>>) -> Option<Vec<String>> {
-    refs.map(|r| {
-        r.into_iter()
+    refs.and_then(|r| {
+        let orig_len = r.len();
+        let filtered: Vec<String> = r
+            .into_iter()
             .filter(|s| !s.is_empty() && !s.contains('\0') && !s.chars().any(|c| c.is_whitespace()))
-            .collect()
+            .collect();
+        if filtered.len() < orig_len && filtered.is_empty() {
+            // All entries were invalid — treat as unknown rather than zero-deps.
+            None
+        } else {
+            Some(filtered)
+        }
     })
 }
 
