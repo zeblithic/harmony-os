@@ -23,6 +23,28 @@ const USER_SPACE_START: u64 = 0x1000;
 /// End of the user-space virtual address range (guard before kernel half).
 const USER_SPACE_END: u64 = 0x0000_7FFF_FFFF_F000;
 
+// ── Helpers ──────────────────────────────────────────────────────────
+
+/// Compute the page-level overlap between a region starting at `base`
+/// with length `region_len` and a query range `[vaddr, range_end)`.
+/// Returns `(page_offset, page_count)` within the region's frame array.
+///
+/// Single source of truth for overlap arithmetic — used by both the
+/// manager internals and the kernel guardian wrappers.
+pub(crate) fn region_overlap(
+    base: VirtAddr,
+    region_len: usize,
+    vaddr: VirtAddr,
+    range_end: u64,
+) -> (usize, usize) {
+    let region_end = base.as_u64() + region_len as u64;
+    let overlap_start = vaddr.as_u64().max(base.as_u64());
+    let overlap_end = range_end.min(region_end);
+    let page_offset = ((overlap_start - base.as_u64()) / PAGE_SIZE) as usize;
+    let page_count = ((overlap_end - overlap_start) / PAGE_SIZE) as usize;
+    (page_offset, page_count)
+}
+
 // ── Data structures ──────────────────────────────────────────────────
 
 /// A contiguous virtual memory region within a process's address space.
@@ -359,35 +381,25 @@ impl<P: PageTable> AddressSpaceManager<P> {
                     }
                 }
             };
-            let region_end = base.as_u64() + region.len as u64;
+            let (overlap_page_offset, overlap_page_count) =
+                region_overlap(base, region.len, vaddr, range_end);
             let overlap_start = vaddr.as_u64().max(base.as_u64());
-            let overlap_end = range_end.min(region_end);
-            let overlap_page_offset = ((overlap_start - base.as_u64()) / PAGE_SIZE) as usize;
-            let overlap_page_count = ((overlap_end - overlap_start) / PAGE_SIZE) as usize;
+            let overlap_end = range_end.min(base.as_u64() + region.len as u64);
 
-            // Unmap target pages from page table, freeing intermediate PT
-            // structure frames to the correct buddy based on classification.
+            // Unmap target pages from page table. PT structure frames are
+            // always allocated from the public pool regardless of data
+            // classification, so the callback always frees to buddy_public.
             {
-                let use_kernel = region
-                    .classification
-                    .contains(FrameClassification::ENCRYPTED)
-                    && self.buddy_kernel.total_frame_count() > 0;
                 let Self {
                     spaces,
                     buddy_public,
-                    buddy_kernel,
                     ..
                 } = self;
                 let space = spaces.get_mut(&pid).unwrap();
-                let buddy = if use_kernel {
-                    buddy_kernel
-                } else {
-                    buddy_public
-                };
                 for i in 0..overlap_page_count {
                     let page_vaddr = VirtAddr(overlap_start + (i as u64) * PAGE_SIZE);
                     let _ = space.page_table.unmap(page_vaddr, &mut |frame| {
-                        let _ = buddy.free_frame(frame);
+                        let _ = buddy_public.free_frame(frame);
                     });
                 }
             }
@@ -495,10 +507,9 @@ impl<P: PageTable> AddressSpaceManager<P> {
                     if new_flags == old_flags {
                         continue; // flags already match — no HW work needed
                     }
-                    let region_end_local = base.as_u64() + region.len as u64;
+                    let (_, overlap_page_count) =
+                        region_overlap(base, region.len, vaddr, range_end);
                     let overlap_start = vaddr.as_u64().max(base.as_u64());
-                    let overlap_end = range_end.min(region_end_local);
-                    let overlap_page_count = ((overlap_end - overlap_start) / PAGE_SIZE) as usize;
                     for i in 0..overlap_page_count {
                         let page_vaddr = VirtAddr(overlap_start + (i as u64) * PAGE_SIZE);
                         space.page_table.set_flags(page_vaddr, new_flags)?;
@@ -534,11 +545,10 @@ impl<P: PageTable> AddressSpaceManager<P> {
                 continue;
             }
 
-            let region_end_local = base.as_u64() + region.len as u64;
+            let (overlap_page_offset, overlap_page_count) =
+                region_overlap(base, region.len, vaddr, range_end);
             let overlap_start = vaddr.as_u64().max(base.as_u64());
-            let overlap_end = range_end.min(region_end_local);
-            let overlap_page_offset = ((overlap_start - base.as_u64()) / PAGE_SIZE) as usize;
-            let overlap_page_count = ((overlap_end - overlap_start) / PAGE_SIZE) as usize;
+            let overlap_end = range_end.min(base.as_u64() + region.len as u64);
 
             let mut all_frames = region.frames;
             let after_frames = all_frames.split_off(overlap_page_offset + overlap_page_count);
@@ -556,6 +566,10 @@ impl<P: PageTable> AddressSpaceManager<P> {
                     },
                 );
             }
+            debug_assert!(
+                !target_frames.is_empty(),
+                "overlap produced zero pages for region returned by find_overlapping_regions"
+            );
             space.regions.insert(
                 VirtAddr(overlap_start),
                 Region {

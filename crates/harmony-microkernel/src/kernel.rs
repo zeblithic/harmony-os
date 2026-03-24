@@ -16,10 +16,10 @@ use crate::integrity::lyll::{HashEntry, Lyll, LyllConfig};
 use crate::integrity::nakaiah::{CapChain, Nakaiah};
 use crate::namespace::Namespace;
 use crate::vm::cap_tracker::MemoryBudget;
-use crate::vm::manager::AddressSpaceManager;
+use crate::vm::manager::{region_overlap, AddressSpaceManager};
 use crate::vm::page_table::PageTable;
 use crate::vm::{
-    ContentHash, FrameClassification, MemoryZone, PageFlags, PhysAddr, VirtAddr, VmError, PAGE_SIZE,
+    ContentHash, FrameClassification, MemoryZone, PageFlags, PhysAddr, VirtAddr, VmError,
 };
 use crate::{Fid, FileServer, IpcError, OpenMode, QPath};
 
@@ -753,11 +753,7 @@ impl<P: PageTable> Kernel<P> {
         for &base in &bases {
             let space = self.vm.space(pid).unwrap();
             let region = space.regions.get(&base).unwrap();
-            let region_end = base.as_u64() + region.len as u64;
-            let overlap_start = vaddr.as_u64().max(base.as_u64());
-            let overlap_end = range_end.min(region_end);
-            let page_offset = ((overlap_start - base.as_u64()) / PAGE_SIZE) as usize;
-            let page_count = ((overlap_end - overlap_start) / PAGE_SIZE) as usize;
+            let (page_offset, page_count) = region_overlap(base, region.len, vaddr, range_end);
             for &paddr in &region.frames[page_offset..page_offset + page_count] {
                 frames_to_unregister.push((paddr, region.classification));
             }
@@ -824,11 +820,8 @@ impl<P: PageTable> Kernel<P> {
                 let space = self.vm.space(pid).unwrap();
                 let region = space.regions.get(&base).unwrap();
                 if !region.flags.contains(PageFlags::WRITABLE) {
-                    let region_end = base.as_u64() + region.len as u64;
-                    let overlap_start = vaddr.as_u64().max(base.as_u64());
-                    let overlap_end = range_end.min(region_end);
-                    let page_offset = ((overlap_start - base.as_u64()) / PAGE_SIZE) as usize;
-                    let page_count = ((overlap_end - overlap_start) / PAGE_SIZE) as usize;
+                    let (page_offset, page_count) =
+                        region_overlap(base, region.len, vaddr, range_end);
                     for &paddr in &region.frames[page_offset..page_offset + page_count] {
                         frames_to_promote.push(paddr);
                     }
