@@ -79,13 +79,26 @@ without using this helper.
 
 ### Kernel Wrapper Changes
 
-`vm_unmap_partial` in `kernel.rs` currently uses `find_containing_region`
-to pre-check guardian classifications. For cross-region support, it needs
-to iterate over all overlapping regions and check each one's classification.
+**`vm_unmap_partial`** in `kernel.rs` currently uses
+`find_containing_region` to pre-check guardian classifications and
+collect target frames. For cross-region support, it must iterate over
+all overlapping regions, compute the per-region intersection
+(`overlap_start`/`overlap_end`), slice each region's `frames` vec
+for only the overlapping portion, and check each region's
+classification independently. If one region is ENCRYPTED and an
+adjacent region is not, only the encrypted region's frames are
+unregistered from the Nakaiah guardian.
 
-`vm_protect_partial` in `kernel.rs` currently uses `find_containing_region`
-to check writable transitions (Lyll/Nakaiah guardians). For cross-region
-support, it needs to check each overlapping region's flags.
+**`vm_protect_partial`** in `kernel.rs` currently checks a single
+`was_writable` boolean. For cross-region support, writability must
+be checked per-region: only frames from regions that were NOT
+previously writable need Snapshot promotion when the new flags
+include WRITABLE. Regions that were already writable need no
+promotion. The overlap calculation (per-region intersection) is
+the same as for unmap.
+
+Both wrappers should use the AddressSpaceManager's overlapping-region
+helper (`pub(crate)`) to avoid duplicating the scan logic.
 
 ### No Linuxulator Changes
 
