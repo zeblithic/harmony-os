@@ -760,7 +760,8 @@ impl<P: PageTable> Kernel<P> {
             }
         }
 
-        self.vm.unmap_partial(pid, vaddr, len)?;
+        let had_bases = !bases.is_empty();
+        self.vm.unmap_partial_with_bases(pid, vaddr, len, bases)?;
 
         // Unregister freed frames from guardians.
         for (paddr, classification) in frames_to_unregister {
@@ -770,7 +771,7 @@ impl<P: PageTable> Kernel<P> {
             }
         }
 
-        if !bases.is_empty() {
+        if had_bases {
             self.sync_guardian_state_hashes();
         }
         Ok(())
@@ -825,7 +826,8 @@ impl<P: PageTable> Kernel<P> {
             }
         }
 
-        self.vm.protect_partial(pid, vaddr, len, new_flags)?;
+        self.vm
+            .protect_partial_with_bases(pid, vaddr, len, new_flags, bases)?;
 
         // Promote CidBacked → Snapshot for frames that just became writable.
         for paddr in &frames_to_promote {

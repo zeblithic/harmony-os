@@ -292,10 +292,18 @@ impl<P: PageTable> AddressSpaceManager<P> {
         let space = self.spaces.get(&pid).ok_or(VmError::NoSuchProcess(pid))?;
         let range_end = vaddr.as_u64() + len as u64;
         let mut result = Vec::new();
-        for (&base, region) in space.regions.iter() {
+        // Jump to the last region whose base ≤ vaddr (it could overlap from behind),
+        // then scan forward.
+        let start_key = space
+            .regions
+            .range(..=vaddr)
+            .next_back()
+            .map(|(&k, _)| k)
+            .unwrap_or(vaddr);
+        for (&base, region) in space.regions.range(start_key..) {
             let region_end = base.as_u64() + region.len as u64;
             if region_end <= vaddr.as_u64() {
-                continue;
+                continue; // the one "behind" entry that doesn't reach vaddr
             }
             if base.as_u64() >= range_end {
                 break;
@@ -313,6 +321,17 @@ impl<P: PageTable> AddressSpaceManager<P> {
     /// matching Linux munmap semantics.
     pub fn unmap_partial(&mut self, pid: u32, vaddr: VirtAddr, len: usize) -> Result<(), VmError> {
         let bases = self.find_overlapping_regions(pid, vaddr, len)?;
+        self.unmap_partial_with_bases(pid, vaddr, len, bases)
+    }
+
+    /// Internal: unmap with pre-computed overlapping region bases.
+    pub(crate) fn unmap_partial_with_bases(
+        &mut self,
+        pid: u32,
+        vaddr: VirtAddr,
+        len: usize,
+        bases: Vec<VirtAddr>,
+    ) -> Result<(), VmError> {
         if bases.is_empty() {
             return Ok(());
         }
@@ -408,35 +427,50 @@ impl<P: PageTable> AddressSpaceManager<P> {
         new_flags: PageFlags,
     ) -> Result<(), VmError> {
         let bases = self.find_overlapping_regions(pid, vaddr, len)?;
+        self.protect_partial_with_bases(pid, vaddr, len, new_flags, bases)
+    }
+
+    /// Internal: protect with pre-computed overlapping region bases.
+    pub(crate) fn protect_partial_with_bases(
+        &mut self,
+        pid: u32,
+        vaddr: VirtAddr,
+        len: usize,
+        new_flags: PageFlags,
+        bases: Vec<VirtAddr>,
+    ) -> Result<(), VmError> {
         if bases.is_empty() {
             return Ok(());
         }
 
         let range_end = vaddr.as_u64() + len as u64;
 
-        for base in bases {
-            let region_len = {
-                let space = self.spaces.get(&pid).unwrap();
-                space.regions.get(&base).unwrap().len
-            };
-            let region_end = base.as_u64() + region_len as u64;
-            let overlap_start = vaddr.as_u64().max(base.as_u64());
-            let overlap_end = range_end.min(region_end);
-            let overlap_page_count = ((overlap_end - overlap_start) / PAGE_SIZE) as usize;
-
-            // Update page table flags BEFORE modifying region map.
-            {
-                let space = self.spaces.get_mut(&pid).unwrap();
+        // Pass 1: update all page table entries. If any fails, the region
+        // map remains completely untouched.
+        {
+            let space = self.spaces.get_mut(&pid).unwrap();
+            for &base in &bases {
+                let region = space.regions.get(&base).unwrap();
+                let region_end_local = base.as_u64() + region.len as u64;
+                let overlap_start = vaddr.as_u64().max(base.as_u64());
+                let overlap_end = range_end.min(region_end_local);
+                let overlap_page_count = ((overlap_end - overlap_start) / PAGE_SIZE) as usize;
                 for i in 0..overlap_page_count {
                     let page_vaddr = VirtAddr(overlap_start + (i as u64) * PAGE_SIZE);
                     space.page_table.set_flags(page_vaddr, new_flags)?;
                 }
             }
+        }
 
-            // Remove region, partition, re-insert.
+        // Pass 2: all set_flags succeeded — now split and re-insert regions.
+        for base in bases {
             let space = self.spaces.get_mut(&pid).unwrap();
             let region = space.regions.remove(&base).unwrap();
+            let region_end_local = base.as_u64() + region.len as u64;
+            let overlap_start = vaddr.as_u64().max(base.as_u64());
+            let overlap_end = range_end.min(region_end_local);
             let overlap_page_offset = ((overlap_start - base.as_u64()) / PAGE_SIZE) as usize;
+            let overlap_page_count = ((overlap_end - overlap_start) / PAGE_SIZE) as usize;
 
             let mut all_frames = region.frames;
             let after_frames = all_frames.split_off(overlap_page_offset + overlap_page_count);
