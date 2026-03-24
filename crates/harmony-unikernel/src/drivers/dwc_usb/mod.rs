@@ -14,6 +14,9 @@ use alloc::vec::Vec;
 pub mod types;
 pub use types::*;
 
+pub mod trb;
+pub use trb::*;
+
 use super::register_bank::RegisterBank;
 
 // ── Capability registers (offset from MMIO base) ─────────────────
