@@ -2645,10 +2645,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.signal_mask &= !(1u64 << (SIGKILL - 1));
         self.signal_mask &= !(1u64 << (SIGSTOP - 1));
 
-        // ── SA_RESETHAND: reset handler to SIG_DFL ──────────────────
+        // ── SA_RESETHAND: full reset to default disposition ─────────
         if action.flags & SA_RESETHAND != 0 {
             self.signal_handlers[idx].handler = SIG_DFL;
-            self.signal_handlers[idx].flags &= !SA_RESETHAND;
+            self.signal_handlers[idx].flags = 0;
+            self.signal_handlers[idx].mask = 0;
         }
 
         // ── Build return value ──────────────────────────────────────
@@ -5730,18 +5731,13 @@ impl<B: SyscallBackend> Linuxulator<B> {
 
     /// Linux sigaltstack(2): get/set alternate signal stack configuration.
     fn sys_sigaltstack(&mut self, ss_ptr: u64, old_ss_ptr: u64) -> i64 {
-        // Write current config to old_ss if requested.
-        if old_ss_ptr != 0 {
-            let flags = self.alt_stack_flags | if self.on_alt_stack { SS_ONSTACK } else { 0 };
-            unsafe {
-                let p = old_ss_ptr as usize;
-                core::ptr::write_unaligned(p as *mut u64, self.alt_stack_sp);
-                core::ptr::write_unaligned((p + 8) as *mut i32, flags);
-                core::ptr::write_unaligned((p + 16) as *mut u64, self.alt_stack_size);
-            }
-        }
+        // Snapshot current config before any mutation (Linux writes old_ss
+        // only on success — never dirty the caller's buffer on error).
+        let old_sp = self.alt_stack_sp;
+        let old_flags = self.alt_stack_flags | if self.on_alt_stack { SS_ONSTACK } else { 0 };
+        let old_size = self.alt_stack_size;
 
-        // Set new config if requested.
+        // Validate and apply new config first.
         if ss_ptr != 0 {
             if self.on_alt_stack {
                 return EPERM;
@@ -5769,6 +5765,16 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 self.alt_stack_sp = sp;
                 self.alt_stack_size = size;
                 self.alt_stack_flags = flags;
+            }
+        }
+
+        // Write old state only after successful validation.
+        if old_ss_ptr != 0 {
+            unsafe {
+                let p = old_ss_ptr as usize;
+                core::ptr::write_unaligned(p as *mut u64, old_sp);
+                core::ptr::write_unaligned((p + 8) as *mut i32, old_flags);
+                core::ptr::write_unaligned((p + 16) as *mut u64, old_size);
             }
         }
 
