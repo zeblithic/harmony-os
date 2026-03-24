@@ -455,26 +455,41 @@ impl<P: PageTable> AddressSpaceManager<P> {
 
         let range_end = vaddr.as_u64() + len as u64;
 
-        // Pass 1: update all page table entries. If any fails, the region
-        // map remains completely untouched.
+        // Pass 1: update all HW page table entries. On failure, roll back
+        // any pages already updated so HW state stays consistent with the
+        // SW region map (which is not touched until Pass 2).
         {
             let space = self.spaces.get_mut(&pid).unwrap();
-            for &base in &bases {
-                let region = match space.regions.get(&base) {
-                    Some(r) => r,
-                    None => {
-                        debug_assert!(false, "base {:?} not in regions map", base);
-                        continue;
+            // Track (page_vaddr, old_flags) for rollback on failure.
+            let mut applied: Vec<(VirtAddr, PageFlags)> = Vec::new();
+            let result: Result<(), VmError> = (|| {
+                for &base in &bases {
+                    let region = match space.regions.get(&base) {
+                        Some(r) => r,
+                        None => {
+                            debug_assert!(false, "base {:?} not in regions map", base);
+                            continue;
+                        }
+                    };
+                    let old_flags = region.flags;
+                    let region_end_local = base.as_u64() + region.len as u64;
+                    let overlap_start = vaddr.as_u64().max(base.as_u64());
+                    let overlap_end = range_end.min(region_end_local);
+                    let overlap_page_count = ((overlap_end - overlap_start) / PAGE_SIZE) as usize;
+                    for i in 0..overlap_page_count {
+                        let page_vaddr = VirtAddr(overlap_start + (i as u64) * PAGE_SIZE);
+                        space.page_table.set_flags(page_vaddr, new_flags)?;
+                        applied.push((page_vaddr, old_flags));
                     }
-                };
-                let region_end_local = base.as_u64() + region.len as u64;
-                let overlap_start = vaddr.as_u64().max(base.as_u64());
-                let overlap_end = range_end.min(region_end_local);
-                let overlap_page_count = ((overlap_end - overlap_start) / PAGE_SIZE) as usize;
-                for i in 0..overlap_page_count {
-                    let page_vaddr = VirtAddr(overlap_start + (i as u64) * PAGE_SIZE);
-                    space.page_table.set_flags(page_vaddr, new_flags)?;
                 }
+                Ok(())
+            })();
+            if let Err(e) = result {
+                // Roll back: restore old HW flags for every page we already touched.
+                for &(page_vaddr, old_flags) in &applied {
+                    let _ = space.page_table.set_flags(page_vaddr, old_flags);
+                }
+                return Err(e);
             }
         }
 
