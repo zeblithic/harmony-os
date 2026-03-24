@@ -735,36 +735,44 @@ impl<P: PageTable> Kernel<P> {
         self.vm_unmap_partial(pid, vaddr, len)
     }
 
-    /// Unmap a sub-range within a single region, with guardian integration.
+    /// Unmap a sub-range that may span multiple regions, with guardian integration.
     pub fn vm_unmap_partial(
         &mut self,
         pid: u32,
         vaddr: VirtAddr,
         len: usize,
     ) -> Result<(), VmError> {
-        // Identify which frames will be freed (before the unmap modifies state).
-        let (target_frames, classification) = {
-            let base = self.vm.find_containing_region(pid, vaddr, len)?;
+        // Collect frames to unregister from guardians BEFORE unmap modifies state.
+        let bases = self.vm.find_overlapping_regions(pid, vaddr, len)?;
+        let range_end = vaddr.as_u64() + len as u64;
+
+        let mut frames_to_unregister: Vec<(PhysAddr, FrameClassification)> = Vec::new();
+        for &base in &bases {
             let space = self.vm.space(pid).unwrap();
             let region = space.regions.get(&base).unwrap();
-            let page_offset = ((vaddr.as_u64() - base.as_u64()) / PAGE_SIZE) as usize;
-            let page_count = len / PAGE_SIZE as usize;
-            let frames: Vec<PhysAddr> =
-                region.frames[page_offset..page_offset + page_count].to_vec();
-            (frames, region.classification)
-        };
+            let region_end = base.as_u64() + region.len as u64;
+            let overlap_start = vaddr.as_u64().max(base.as_u64());
+            let overlap_end = range_end.min(region_end);
+            let page_offset = ((overlap_start - base.as_u64()) / PAGE_SIZE) as usize;
+            let page_count = ((overlap_end - overlap_start) / PAGE_SIZE) as usize;
+            for &paddr in &region.frames[page_offset..page_offset + page_count] {
+                frames_to_unregister.push((paddr, region.classification));
+            }
+        }
 
         self.vm.unmap_partial(pid, vaddr, len)?;
 
         // Unregister freed frames from guardians.
-        for &paddr in &target_frames {
+        for (paddr, classification) in frames_to_unregister {
             self.lyll.unregister_frame(paddr);
             if classification.contains(FrameClassification::ENCRYPTED) {
                 self.nakaiah.unregister_frame(paddr);
             }
         }
 
-        self.sync_guardian_state_hashes();
+        if !bases.is_empty() {
+            self.sync_guardian_state_hashes();
+        }
         Ok(())
     }
 
@@ -784,7 +792,8 @@ impl<P: PageTable> Kernel<P> {
         self.vm_protect_partial(pid, vaddr, len, new_flags)
     }
 
-    /// Change permissions on a sub-range, with CidBacked→Snapshot promotion.
+    /// Change permissions on a sub-range that may span multiple regions,
+    /// with CidBacked→Snapshot promotion.
     pub fn vm_protect_partial(
         &mut self,
         pid: u32,
@@ -792,27 +801,37 @@ impl<P: PageTable> Kernel<P> {
         len: usize,
         new_flags: PageFlags,
     ) -> Result<(), VmError> {
-        // Check writable transition before mutating.
-        let was_writable = {
-            let base = self.vm.find_containing_region(pid, vaddr, len)?;
-            let space = self.vm.space(pid).unwrap();
-            let region = space.regions.get(&base).unwrap();
-            region.flags.contains(PageFlags::WRITABLE)
-        };
+        // Check per-region writability BEFORE mutating.
+        let bases = self.vm.find_overlapping_regions(pid, vaddr, len)?;
+        let range_end = vaddr.as_u64() + len as u64;
+
+        // Collect frames needing Snapshot promotion (from non-writable regions
+        // being made writable).
+        let mut frames_to_promote: Vec<PhysAddr> = Vec::new();
+        if new_flags.contains(PageFlags::WRITABLE) {
+            for &base in &bases {
+                let space = self.vm.space(pid).unwrap();
+                let region = space.regions.get(&base).unwrap();
+                if !region.flags.contains(PageFlags::WRITABLE) {
+                    let region_end = base.as_u64() + region.len as u64;
+                    let overlap_start = vaddr.as_u64().max(base.as_u64());
+                    let overlap_end = range_end.min(region_end);
+                    let page_offset = ((overlap_start - base.as_u64()) / PAGE_SIZE) as usize;
+                    let page_count = ((overlap_end - overlap_start) / PAGE_SIZE) as usize;
+                    for &paddr in &region.frames[page_offset..page_offset + page_count] {
+                        frames_to_promote.push(paddr);
+                    }
+                }
+            }
+        }
 
         self.vm.protect_partial(pid, vaddr, len, new_flags)?;
 
         // Promote CidBacked → Snapshot for frames that just became writable.
-        if !was_writable && new_flags.contains(PageFlags::WRITABLE) {
-            let region = self
-                .vm
-                .space(pid)
-                .and_then(|s| s.regions.get(&vaddr))
-                .expect("target region must exist after successful protect_partial");
-            let frames: Vec<PhysAddr> = region.frames.clone();
-            for paddr in frames {
-                self.lyll.promote_to_snapshot(paddr);
-            }
+        for paddr in &frames_to_promote {
+            self.lyll.promote_to_snapshot(*paddr);
+        }
+        if !frames_to_promote.is_empty() {
             self.sync_guardian_state_hashes();
         }
 
