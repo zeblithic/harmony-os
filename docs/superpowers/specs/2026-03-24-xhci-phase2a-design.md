@@ -254,7 +254,7 @@ Requires `Running` state. Enqueues a No-Op command TRB on the command ring and r
 `process_event(&mut self, trb: Trb) -> Result<(XhciEvent, Vec<XhciAction>), XhciError>`
 
 Requires `Running` state. Parses the event TRB type:
-- `TRB_COMMAND_COMPLETION` → extract slot_id (bits 31:24 of parameter high dword), completion_code (bits 31:24 of status). Call `command_ring.complete_one()`.
+- `TRB_COMMAND_COMPLETION` → extract slot_id (bits 31:24 of control, per xHCI Table 6-38), completion_code (bits 31:24 of status). Call `command_ring.complete_one()`.
 - `TRB_PORT_STATUS_CHANGE` → extract port_id (bits 31:24 of parameter high dword).
 - Other → `XhciEvent::Unknown`.
 
