@@ -701,10 +701,29 @@ fn main() -> Status {
                         let rx_actions =
                             runtime.handle_packet("eth0", payload, now);
                         for action in &rx_actions {
+                            // Dispatch TX actions from RX path (e.g., announce responses).
+                            if let harmony_unikernel::RuntimeAction::SendOnInterface {
+                                interface_name: _,
+                                raw,
+                            } = action
+                            {
+                                let mac = platform::NODE_MAC;
+                                let mut tx_frame = alloc::vec::Vec::with_capacity(14 + raw.len());
+                                tx_frame.extend_from_slice(&[0xFF; 6]);
+                                tx_frame.extend_from_slice(&mac);
+                                tx_frame.extend_from_slice(&0x88B5u16.to_be_bytes());
+                                tx_frame.extend_from_slice(raw);
+                                // Clean TX buffers before send — flush to physical memory.
+                                for j in 0..256usize {
+                                    let buf = tx_pool.get(j);
+                                    unsafe { cache::clean_range(buf.virt, 2048) };
+                                }
+                                genet_driver.reclaim_tx(&genet_bank, &mut tx_pool);
+                                let _ = genet_driver.send(&mut genet_bank, &tx_frame, &mut tx_pool);
+                            }
                             dispatch_action(action, &mut serial);
                         }
                     }
-                    // Other EtherTypes (IP, ARP) dropped for now — no netstack.
                 }
             }
         }
@@ -720,38 +739,42 @@ fn main() -> Status {
             // sending via GENET before falling through to dispatch_action for
             // the serial log.
             #[cfg(feature = "rpi5")]
-            if let harmony_unikernel::RuntimeAction::SendOnInterface {
-                interface_name: _,
-                raw,
-            } = action
             {
-                // Wrap payload in Ethernet frame: broadcast dst + src MAC + EtherType 0x88B5
-                let mac = [0x02u8, 0x00, 0x00, 0x00, 0x00, 0x01];
-                let mut frame = alloc::vec::Vec::with_capacity(14 + raw.len());
-                frame.extend_from_slice(&[0xFF; 6]); // broadcast destination
-                frame.extend_from_slice(&mac);
-                frame.extend_from_slice(&0x88B5u16.to_be_bytes());
-                frame.extend_from_slice(raw);
+                let mut sent = false;
+                if let harmony_unikernel::RuntimeAction::SendOnInterface {
+                    interface_name: _,
+                    raw,
+                } = action
+                {
+                    let mac = platform::NODE_MAC;
+                    let mut frame = alloc::vec::Vec::with_capacity(14 + raw.len());
+                    frame.extend_from_slice(&[0xFF; 6]);
+                    frame.extend_from_slice(&mac);
+                    frame.extend_from_slice(&0x88B5u16.to_be_bytes());
+                    frame.extend_from_slice(raw);
 
-                genet_driver.reclaim_tx(&genet_bank, &mut tx_pool);
-                match genet_driver.send(&mut genet_bank, &frame, &mut tx_pool) {
-                    Ok(()) => {
-                        // Cache clean all TX pool buffers — flush data to physical
-                        // memory for GENET's non-coherent PCIe DMA. send() copies
-                        // data internally; we clean all buffers since we don't know
-                        // which index was used. DMA latency after PROD_INDEX write
-                        // gives us time to complete the flush.
-                        for i in 0..256usize {
-                            let buf = tx_pool.get(i);
-                            unsafe { cache::clean_range(buf.virt, 2048) };
+                    // Clean TX buffers BEFORE send — flush any previously written
+                    // data to physical memory for GENET's non-coherent PCIe DMA.
+                    for i in 0..256usize {
+                        let buf = tx_pool.get(i);
+                        unsafe { cache::clean_range(buf.virt, 2048) };
+                    }
+                    genet_driver.reclaim_tx(&genet_bank, &mut tx_pool);
+                    match genet_driver.send(&mut genet_bank, &frame, &mut tx_pool) {
+                        Ok(()) => {
+                            sent = true;
+                            let _ = writeln!(serial, "[TX] {} bytes on eth0", raw.len());
+                        }
+                        Err(e) => {
+                            let _ = writeln!(serial, "[TX] send error: {:?}", e);
                         }
                     }
-                    Err(e) => {
-                        let _ = writeln!(serial, "[TX] send error: {:?}", e);
-                    }
+                }
+                if !sent {
+                    dispatch_action(action, &mut serial);
                 }
             }
-
+            #[cfg(not(feature = "rpi5"))]
             dispatch_action(action, &mut serial);
         }
 
