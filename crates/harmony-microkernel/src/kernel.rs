@@ -807,7 +807,11 @@ impl<P: PageTable> Kernel<P> {
         let range_end = vaddr.as_u64() + len as u64;
 
         // Collect frames needing Snapshot promotion (from non-writable regions
-        // being made writable).
+        // being made writable). Invariant: a CidBacked frame that is currently
+        // mapped writable must already have been promoted to Snapshot at map time.
+        // Therefore we only need to promote frames in regions that are transitioning
+        // from non-writable to writable — already-writable regions are skipped
+        // because their frames were promoted when the writable mapping was created.
         let mut frames_to_promote: Vec<PhysAddr> = Vec::new();
         if new_flags.contains(PageFlags::WRITABLE) {
             for &base in &bases {

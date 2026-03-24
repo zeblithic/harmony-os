@@ -293,7 +293,11 @@ impl<P: PageTable> AddressSpaceManager<P> {
         let range_end = vaddr.as_u64() + len as u64;
         let mut result = Vec::new();
         // Jump to the last region whose base ≤ vaddr (it could overlap from behind),
-        // then scan forward.
+        // then scan forward. When `next_back()` returns Some, the first iteration
+        // may be a region that ends before vaddr — the `continue` below skips it.
+        // When `next_back()` returns None, every region base is > vaddr, so we
+        // start the forward scan at vaddr itself; the `continue` is dead code in
+        // that case since `range(vaddr..)` only yields keys ≥ vaddr.
         let start_key = space
             .regions
             .range(..=vaddr)
@@ -303,7 +307,7 @@ impl<P: PageTable> AddressSpaceManager<P> {
         for (&base, region) in space.regions.range(start_key..) {
             let region_end = base.as_u64() + region.len as u64;
             if region_end <= vaddr.as_u64() {
-                continue; // the one "behind" entry that doesn't reach vaddr
+                continue; // behind-region that doesn't reach vaddr (only when next_back found one)
             }
             if base.as_u64() >= range_end {
                 break;
@@ -341,7 +345,13 @@ impl<P: PageTable> AddressSpaceManager<P> {
         for base in bases {
             let region = {
                 let space = self.spaces.get_mut(&pid).unwrap();
-                space.regions.remove(&base).unwrap()
+                match space.regions.remove(&base) {
+                    Some(r) => r,
+                    None => {
+                        debug_assert!(false, "base {:?} not in regions map", base);
+                        continue;
+                    }
+                }
             };
             let region_end = base.as_u64() + region.len as u64;
             let overlap_start = vaddr.as_u64().max(base.as_u64());
@@ -450,7 +460,13 @@ impl<P: PageTable> AddressSpaceManager<P> {
         {
             let space = self.spaces.get_mut(&pid).unwrap();
             for &base in &bases {
-                let region = space.regions.get(&base).unwrap();
+                let region = match space.regions.get(&base) {
+                    Some(r) => r,
+                    None => {
+                        debug_assert!(false, "base {:?} not in regions map", base);
+                        continue;
+                    }
+                };
                 let region_end_local = base.as_u64() + region.len as u64;
                 let overlap_start = vaddr.as_u64().max(base.as_u64());
                 let overlap_end = range_end.min(region_end_local);
@@ -465,7 +481,13 @@ impl<P: PageTable> AddressSpaceManager<P> {
         // Pass 2: all set_flags succeeded — now split and re-insert regions.
         for base in bases {
             let space = self.spaces.get_mut(&pid).unwrap();
-            let region = space.regions.remove(&base).unwrap();
+            let region = match space.regions.remove(&base) {
+                Some(r) => r,
+                None => {
+                    debug_assert!(false, "base {:?} not in regions map", base);
+                    continue;
+                }
+            };
             let region_end_local = base.as_u64() + region.len as u64;
             let overlap_start = vaddr.as_u64().max(base.as_u64());
             let overlap_end = range_end.min(region_end_local);
@@ -1681,6 +1703,46 @@ mod tests {
             .unwrap();
         assert_eq!(overlaps.len(), 1);
         assert_eq!(overlaps[0], VirtAddr(0x5000));
+    }
+
+    #[test]
+    fn find_overlapping_regions_all_after_vaddr() {
+        // Test the None path in find_overlapping_regions: every mapped region
+        // starts strictly after vaddr, so range(..=vaddr).next_back() returns
+        // None and the forward scan begins at vaddr.
+        let mut mgr = make_manager(32);
+        mgr.create_space(1, default_budget(), mock_pt()).unwrap();
+        mgr.map_region(
+            1,
+            VirtAddr(0x5000),
+            PAGE_SIZE as usize,
+            rw_user_flags(),
+            FrameClassification::empty(),
+        )
+        .unwrap();
+        mgr.map_region(
+            1,
+            VirtAddr(0x8000),
+            PAGE_SIZE as usize,
+            rw_user_flags(),
+            FrameClassification::empty(),
+        )
+        .unwrap();
+
+        // Query range [0x1000, 0x9000) — both regions are inside but none has
+        // base ≤ 0x1000, so the next_back() fallback fires.
+        let overlaps = mgr
+            .find_overlapping_regions(1, VirtAddr(0x1000), 0x8000)
+            .unwrap();
+        assert_eq!(overlaps.len(), 2);
+        assert_eq!(overlaps[0], VirtAddr(0x5000));
+        assert_eq!(overlaps[1], VirtAddr(0x8000));
+
+        // Query range [0x1000, 0x4000) — no region overlaps at all.
+        let overlaps = mgr
+            .find_overlapping_regions(1, VirtAddr(0x1000), 0x3000)
+            .unwrap();
+        assert_eq!(overlaps.len(), 0);
     }
 
     #[test]
