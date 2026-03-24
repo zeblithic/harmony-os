@@ -503,6 +503,14 @@ impl<P: PageTable> AddressSpaceManager<P> {
                     continue;
                 }
             };
+
+            // Skip splitting when flags already match — avoids fragmenting
+            // the address space on redundant mprotect calls.
+            if new_flags == region.flags {
+                space.regions.insert(base, region);
+                continue;
+            }
+
             let region_end_local = base.as_u64() + region.len as u64;
             let overlap_start = vaddr.as_u64().max(base.as_u64());
             let overlap_end = range_end.min(region_end_local);

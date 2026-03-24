@@ -760,7 +760,7 @@ impl<P: PageTable> Kernel<P> {
             }
         }
 
-        let had_bases = !bases.is_empty();
+        let frames_changed = !frames_to_unregister.is_empty();
         self.vm.unmap_partial_with_bases(pid, vaddr, len, bases)?;
 
         // Unregister freed frames from guardians.
@@ -771,7 +771,7 @@ impl<P: PageTable> Kernel<P> {
             }
         }
 
-        if had_bases {
+        if frames_changed {
             self.sync_guardian_state_hashes();
         }
         Ok(())
