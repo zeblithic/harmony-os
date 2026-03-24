@@ -9,6 +9,7 @@
 //! the driver is a pure state machine with no embedded I/O.
 
 extern crate alloc;
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 pub mod types;
@@ -131,6 +132,10 @@ pub struct XhciDriver {
     command_ring: Option<ring::CommandRing>,
     /// Event ring state (set after setup_rings).
     event_ring: Option<ring::EventRing>,
+    /// Physical address of the DCBAA (set after setup_rings).
+    dcbaa_phys: Option<u64>,
+    /// Transfer rings keyed by slot ID (populated during device enumeration).
+    transfer_rings: BTreeMap<u8, ring::TransferRing>,
 }
 
 impl XhciDriver {
@@ -203,6 +208,8 @@ impl XhciDriver {
             state: XhciState::Ready,
             command_ring: None,
             event_ring: None,
+            dcbaa_phys: None,
+            transfer_rings: BTreeMap::new(),
         })
     }
 
@@ -344,6 +351,8 @@ impl XhciDriver {
         cmd_ring_phys: u64,
         event_ring_phys: u64,
         erst_phys: u64,
+        dcbaa_phys: u64,
+        max_slots_enabled: u8,
     ) -> Result<Vec<XhciAction>, XhciError> {
         if self.state != XhciState::Ready {
             return Err(XhciError::InvalidState);
@@ -356,16 +365,16 @@ impl XhciDriver {
         let op = self.cap_length;
         let intr = self.rts_offset as usize + INTERRUPTER_0_BASE;
 
-        // 1. CONFIG: MaxSlotsEn = 0 (Phase 2a doesn't need slots)
+        // 1. CONFIG: MaxSlotsEn
         actions.push(XhciAction::WriteRegister {
             offset: op + CONFIG,
-            value: 0,
+            value: max_slots_enabled as u32,
         });
 
-        // 2. DCBAAP = 0 (valid because MaxSlotsEn = 0)
+        // 2. DCBAAP
         actions.push(XhciAction::WriteRegister64 {
             offset_lo: op + DCBAAP_LO,
-            value: 0,
+            value: dcbaa_phys,
         });
 
         // 3. CRCR: command ring base + cycle bit
@@ -414,6 +423,11 @@ impl XhciDriver {
 
         self.command_ring = Some(cmd_ring);
         self.event_ring = Some(evt_ring);
+        self.dcbaa_phys = if dcbaa_phys != 0 {
+            Some(dcbaa_phys)
+        } else {
+            None
+        };
         self.state = XhciState::Running;
 
         Ok(actions)
@@ -592,6 +606,8 @@ mod tests {
             state: XhciState::Error(XhciError::HaltTimeout),
             command_ring: None,
             event_ring: None,
+            dcbaa_phys: None,
+            transfer_rings: BTreeMap::new(),
         };
         let bank = MockRegisterBank::new();
         assert_eq!(driver.detect_ports(&bank), Err(XhciError::InvalidState));
@@ -602,7 +618,7 @@ mod tests {
         let mut bank = mock_init_success();
         let mut driver = XhciDriver::init(&mut bank).unwrap();
         let actions = driver
-            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000)
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0, 0)
             .unwrap();
 
         // Should contain: CONFIG, DCBAAP(64), CRCR(64), ERST entry(WriteTrb),
@@ -637,9 +653,11 @@ mod tests {
             state: XhciState::Error(XhciError::HaltTimeout),
             command_ring: None,
             event_ring: None,
+            dcbaa_phys: None,
+            transfer_rings: BTreeMap::new(),
         };
         assert_eq!(
-            driver.setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000),
+            driver.setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0, 0),
             Err(XhciError::InvalidState)
         );
     }
@@ -649,7 +667,7 @@ mod tests {
         let mut bank = mock_init_success();
         let mut driver = XhciDriver::init(&mut bank).unwrap();
         driver
-            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000)
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0, 0)
             .unwrap();
 
         let actions = driver.enqueue_noop().unwrap();
@@ -690,7 +708,7 @@ mod tests {
         let mut bank = mock_init_success();
         let mut driver = XhciDriver::init(&mut bank).unwrap();
         driver
-            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000)
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0, 0)
             .unwrap();
         driver.enqueue_noop().unwrap();
 
@@ -723,7 +741,7 @@ mod tests {
         let mut bank = mock_init_success();
         let mut driver = XhciDriver::init(&mut bank).unwrap();
         driver
-            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000)
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0, 0)
             .unwrap();
 
         let evt_trb = trb::Trb {
@@ -741,7 +759,7 @@ mod tests {
         let mut bank = mock_init_success();
         let mut driver = XhciDriver::init(&mut bank).unwrap();
         driver
-            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000)
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0, 0)
             .unwrap();
 
         let evt_trb = trb::Trb {
@@ -759,7 +777,7 @@ mod tests {
         let mut bank = mock_init_success();
         let mut driver = XhciDriver::init(&mut bank).unwrap();
         driver
-            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000)
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0, 0)
             .unwrap();
 
         assert!(driver.should_process_event(true)); // initial CCS = true
@@ -771,7 +789,7 @@ mod tests {
         let mut bank = mock_init_success();
         let mut driver = XhciDriver::init(&mut bank).unwrap();
         driver
-            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000)
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0, 0)
             .unwrap();
         // Enqueue should succeed (Running state)
         assert!(driver.enqueue_noop().is_ok());
