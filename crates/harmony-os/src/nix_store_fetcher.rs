@@ -240,8 +240,11 @@ impl NixStoreFetcher {
                 // need to re-publish, but we still return them so references
                 // can be persisted via .meta sidecars.
                 match import_fn(&name_str, nar_bytes.clone()) {
-                    Ok(_) => {
+                    Ok(true) => {
                         imported.push((name_str, nar_bytes, nar_refs));
+                    }
+                    Ok(false) => {
+                        // Already present (race) — no .meta write needed.
                     }
                     Err(e) => {
                         // Mesh data failed import — try HTTP before blacklisting.
