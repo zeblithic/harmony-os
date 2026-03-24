@@ -317,12 +317,8 @@ mod tests {
         bank.on_read(DBOFF, vec![0x1000]);
         bank.on_read(RTSOFF, vec![0x2000]);
         // Operational registers (at cap_length=0x20)
-        bank.on_read(0x20 + USBCMD, vec![USBCMD_RUN, 0]); // first read has RUN set, second cleared
-        bank.on_read(0x20 + USBSTS, vec![0, USBSTS_HCH, USBSTS_HCH]); // not halted, then halted
-                                                                      // After reset: HCRST clears, CNR clears
-                                                                      // USBCMD reads after reset write: HCRST set (first poll), then cleared
-                                                                      // We need sequential reads that handle both the halt write-back and the reset sequence.
-                                                                      // Simplify: after halt, USBCMD reads return 0 (HCRST already cleared), CNR=0.
+        bank.on_read(0x20 + USBCMD, vec![USBCMD_RUN, 0]); // pre-halt: RUN set; pre-reset + poll: 0 (HCRST self-clears)
+        bank.on_read(0x20 + USBSTS, vec![0, USBSTS_HCH, 0]); // halt: 0 then HCH; CNR poll: 0 (ready)
         bank
     }
 
