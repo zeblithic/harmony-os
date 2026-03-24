@@ -37,3 +37,24 @@ rand_core = { workspace = true, optional = true }
 
 [dev-dependencies]
 harmony-unikernel = { workspace = true, features = ["test-utils"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "buddy_alloc"
+harness = false
+
+[[bench]]
+name = "page_table"
+harness = false
+
+[[bench]]
+name = "fid_tracker"
+harness = false
+
+[[bench]]
+name = "ipc_echo"
+harness = false
+
+[[bench]]
+name = "cap_tracker"
+harness = false
