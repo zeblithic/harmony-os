@@ -2578,16 +2578,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
 
         // sigcontext starts at ucontext + 40 (after header).
-        // 24 fields × 8 bytes = 192 bytes.
-        // Field order: r8,r9,r10,r11,r12,r13,r14,r15,
-        //              rdi,rsi,rbp,rbx, rdx,rax,rcx,rsp,
-        //              rip,eflags, cs,gs,fs,ss, err,trapno,
-        //              oldmask, cr2, fpstate(ptr)
-        // Wait — that's 25 fields if we count fpstate. Let me count:
-        // r8-r15 = 8, rdi-rbx = 4, rdx-rsp = 4, rip+eflags = 2,
-        // cs+gs+fs+ss = 4, err+trapno = 2, oldmask+cr2+fpstate = 3
-        // Total = 8+4+4+2+4+2+3 = 27... but the spec says 24 fields × 8 = 192.
-        // The spec says 192 bytes for sigcontext, we'll trust that layout.
+        // 24 u64 slots × 8 bytes = 192 bytes.
+        // Layout: r8-r15(8), rdi/rsi/rbp/rbx(4), rdx/rax/rcx/rsp(4),
+        //         rip/eflags(2), cs_gs_fs_pad(1 packed u64),
+        //         err(1), trapno(1), oldmask(1), cr2(1), fpstate(1)
         let sc_ptr = ucontext_ptr + 40;
         unsafe {
             // GPR fields at offsets 0..
@@ -2609,11 +2603,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
             core::ptr::write_unaligned((sc_ptr + 120) as *mut u64, regs.rsp);
             core::ptr::write_unaligned((sc_ptr + 128) as *mut u64, regs.rip);
             core::ptr::write_unaligned((sc_ptr + 136) as *mut u64, regs.eflags);
-            // cs, gs, fs, ss, err, trapno — zeroed (already zeroed by write_bytes)
-            // oldmask at offset 176 (22 × 8 from sc_ptr)
-            core::ptr::write_unaligned((sc_ptr + 176) as *mut u64, saved_mask);
-            // cr2 at offset 184 — zeroed
-            // fpstate at offset 192 — NULL/zeroed
+            // cs/gs/fs/pad packed u64 at sc+144 — zeroed
+            // err at sc+152, trapno at sc+160 — zeroed
+            // oldmask at sc+168 (21st field × 8)
+            core::ptr::write_unaligned((sc_ptr + 168) as *mut u64, saved_mask);
+            // cr2 at sc+176, fpstate at sc+184 — zeroed
         }
 
         // uc_sigmask at ucontext offset 232 (= ucontext_ptr + 232)
