@@ -13,17 +13,19 @@ is never read.
 
 ## Solution
 
-Add CMD9 (SEND_CSD) to the card init sequence after CMD7. Parse the 128-bit
-R2 response to extract card capacity. Support both CSD v2.0 (SDHC/SDXC) and
-CSD v1.0 (SDSC) formats.
+Add CMD9 (SEND_CSD) to the card init sequence **before CMD7**, while the
+card is still in Stand-by state. Parse the 128-bit R2 response to extract
+card capacity. Support both CSD v2.0 (SDHC/SDXC) and CSD v1.0 (SDSC)
+formats.
 
 ## Design Decisions
 
-### CMD9 after CMD7, before CMD16
+### CMD9 before CMD7, while in Stand-by state
 
-CMD9 requires the card to be in standby or transfer state. After CMD7 selects
-the card, it's in transfer state — CMD9 works here. The card must be
-addressed by its RCA (bits [31:16] of the argument).
+CMD9 (`SEND_CSD`) is only valid when the card is in **Stand-by** state (after
+CMD3 assigns the RCA, before CMD7 selects the card). Issuing CMD9 after CMD7
+would put the card in Transfer state, where it ignores the command. The card
+must be addressed by its RCA (bits [31:16] of the argument).
 
 ### SDHCI response register shift
 
