@@ -111,15 +111,8 @@ impl<A: ContentAnnouncer, S: BookStore> NarPublisher<A, S> {
             // - Some(refs) → "cid_hex\nref1\nref2"
             payload.push('\n');
             for (i, r) in refs.iter().enumerate() {
-                if r.contains('\n')
-                    || r.contains('\r')
-                    || r.contains('\0')
-                    || r.contains(' ')
-                    || r.contains('\t')
-                {
-                    return Err(format!(
-                        "reference must not contain whitespace or control characters: {r:?}"
-                    ));
+                if r.is_empty() || r.contains('\0') || r.chars().any(|c| c.is_whitespace()) {
+                    return Err(format!("invalid reference: {r:?}"));
                 }
                 if i > 0 {
                     payload.push('\n');
@@ -433,7 +426,11 @@ mod tests {
         let announcements = log.borrow();
         let payload = String::from_utf8(announcements[0].1.clone()).unwrap();
         let lines: Vec<&str> = payload.lines().collect();
-        assert!(lines.len() >= 3, "expected CID + 2 refs, got {lines:?}");
+        assert_eq!(
+            lines.len(),
+            3,
+            "expected exactly CID + 2 refs, got {lines:?}"
+        );
         assert_eq!(lines[0].len(), 64); // CID hex
         assert_eq!(lines[1], "dep123-glibc");
         assert_eq!(lines[2], "dep456-gcc");
