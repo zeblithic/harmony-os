@@ -52,10 +52,14 @@ use harmony_unikernel::{KernelEntropy, MemoryState, UnikernelRuntime};
 #[cfg(target_os = "uefi")]
 const BUMP_MIN_ADDR: u64 = 0x10_0000; // 1 MiB
 
-/// Size of the bump allocator region in bytes (2 MiB).
-/// This provides ~512 frames for page table construction.
-#[cfg(target_os = "uefi")]
+/// Size of the bump allocator region in bytes.
+/// QEMU: 2 MiB (~512 frames for page tables + stack).
+/// RPi5: 4 MiB (~1024 frames for page tables + stack + 512 DMA buffers).
+#[cfg(all(target_os = "uefi", feature = "qemu-virt"))]
 const BUMP_REGION_SIZE: u64 = 2 * 1024 * 1024;
+
+#[cfg(all(target_os = "uefi", feature = "rpi5"))]
+const BUMP_REGION_SIZE: u64 = 4 * 1024 * 1024;
 
 /// Returns `true` if a UEFI memory type represents usable RAM after
 /// ExitBootServices.
@@ -614,6 +618,60 @@ fn main() -> Status {
         }
     }
 
+    // ── GENET Ethernet initialization (RPi5 only) ──
+    #[cfg(feature = "rpi5")]
+    let (mut genet_driver, mut genet_bank, mut tx_pool, mut rx_pool) = {
+        use harmony_unikernel::drivers::dma_pool::{DmaBuffer, DmaPool};
+        use harmony_unikernel::drivers::genet::GenetDriver;
+
+        let mut bank = unsafe { mmio::MmioRegisterBank::new(platform::GENET_BASE) };
+        let mac = platform::NODE_MAC;
+        let _ = writeln!(
+            serial,
+            "[GENET] Initializing at {:#x}, MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            platform::GENET_BASE, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+        );
+
+        let driver = match GenetDriver::<256, 256>::init(&mut bank, mac, 1000) {
+            Ok(d) => {
+                let _ = writeln!(serial, "[GENET] Driver initialized");
+                d
+            }
+            Err(e) => {
+                let _ = writeln!(serial, "[GENET] FATAL: init failed: {:?}", e);
+                panic!("GENET init failed");
+            }
+        };
+
+        // Allocate DMA buffer pools from bump allocator.
+        // Each page = 4 KiB, one 2048-byte DMA buffer per page.
+        let mut tx_bufs = [DmaBuffer { virt: core::ptr::null_mut(), phys: 0 }; 256];
+        for buf in tx_bufs.iter_mut() {
+            let frame = bump.alloc_frame().expect("TX DMA buffer alloc failed");
+            *buf = DmaBuffer { virt: frame.as_u64() as *mut u8, phys: frame.as_u64() };
+        }
+        let tx_pool = DmaPool::new(tx_bufs, 2048);
+
+        let mut rx_bufs = [DmaBuffer { virt: core::ptr::null_mut(), phys: 0 }; 256];
+        for buf in rx_bufs.iter_mut() {
+            let frame = bump.alloc_frame().expect("RX DMA buffer alloc failed");
+            *buf = DmaBuffer { virt: frame.as_u64() as *mut u8, phys: frame.as_u64() };
+        }
+        let mut rx_pool = DmaPool::new(rx_bufs, 2048);
+
+        (driver, bank, tx_pool, rx_pool)
+    };
+
+    // Arm RX descriptors with DMA buffer addresses.
+    #[cfg(feature = "rpi5")]
+    {
+        if let Err(e) = genet_driver.arm_rx_descriptors(&mut genet_bank, &mut rx_pool) {
+            let _ = writeln!(serial, "[GENET] FATAL: arm RX failed: {:?}", e);
+            panic!("GENET arm_rx_descriptors failed");
+        }
+        let _ = writeln!(serial, "[GENET] RX armed: 256 descriptors");
+    }
+
     let _ = writeln!(
         serial,
         "[Boot] Entering event loop (test exit code: {})",
@@ -623,21 +681,118 @@ fn main() -> Status {
     loop {
         let now = timer::now_ms();
 
-        // ── Network RX ──
-        // TODO(harmony-os-7ng): Poll GENET RX here when RP1 PCIe is ready.
-        // Pattern:
-        //   while let Some(frame) = genet.poll_rx(&mut bank, &mut rx_pool) {
-        //       cache::invalidate_range(buf.virt, frame.data.len());
-        //       if ethertype(&frame.data) == 0x88B5 {
-        //           let payload = &frame.data[14..]; // strip Ethernet header
-        //           let rx_actions = runtime.handle_packet("eth0", payload.to_vec(), now);
-        //           for action in &rx_actions { dispatch_action(action, &mut serial); }
-        //       }
-        //   }
+        // ── Network RX (RPi5 GENET) ──
+        #[cfg(feature = "rpi5")]
+        {
+            // Invalidate all RX DMA buffers before polling — ensures CPU sees
+            // data written by GENET's non-coherent PCIe DMA, not stale cache lines.
+            for i in 0..256usize {
+                let buf = rx_pool.get(i);
+                unsafe { cache::invalidate_range(buf.virt, 2048) };
+            }
+
+            while let Some(frame) = genet_driver.poll_rx(&mut genet_bank, &mut rx_pool) {
+                if frame.data.len() >= 14 {
+                    let ethertype =
+                        u16::from_be_bytes([frame.data[12], frame.data[13]]);
+                    if ethertype == 0x88B5 {
+                        // Raw Harmony frame — strip Ethernet header
+                        let payload = frame.data[14..].to_vec();
+                        let rx_actions =
+                            runtime.handle_packet("eth0", payload, now);
+                        for action in &rx_actions {
+                            let mut handled = false;
+                            // Dispatch TX actions from RX path (e.g., announce responses).
+                            if let harmony_unikernel::RuntimeAction::SendOnInterface {
+                                interface_name,
+                                raw,
+                            } = action
+                            {
+                                if interface_name.as_ref() != "eth0" {
+                                    let _ = writeln!(serial, "[TX] WARN: unknown interface {:?}, skipping", interface_name);
+                                } else {
+                                    let mac = platform::NODE_MAC;
+                                    let mut tx_frame = alloc::vec::Vec::with_capacity(14 + raw.len());
+                                    tx_frame.extend_from_slice(&[0xFF; 6]);
+                                    tx_frame.extend_from_slice(&mac);
+                                    tx_frame.extend_from_slice(&0x88B5u16.to_be_bytes());
+                                    tx_frame.extend_from_slice(raw);
+                                    for j in 0..256usize {
+                                        let buf = tx_pool.get(j);
+                                        unsafe { cache::clean_range(buf.virt, 2048) };
+                                    }
+                                    genet_driver.reclaim_tx(&genet_bank, &mut tx_pool);
+                                    match genet_driver.send(&mut genet_bank, &tx_frame, &mut tx_pool) {
+                                        Ok(()) => {
+                                            let _ = writeln!(serial, "[TX] {} bytes on eth0 (rx-resp)", tx_frame.len());
+                                        }
+                                        Err(e) => {
+                                            let _ = writeln!(serial, "[TX] rx-resp send error: {:?}", e);
+                                        }
+                                    }
+                                }
+                                handled = true;
+                            }
+                            if !handled {
+                                dispatch_action(action, &mut serial);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Reclaim completed TX buffers.
+        #[cfg(feature = "rpi5")]
+        genet_driver.reclaim_tx(&genet_bank, &mut tx_pool);
 
         // ── Timer tick ──
         let actions = runtime.tick(now);
         for action in &actions {
+            // RPi5: handle SendOnInterface by building an Ethernet frame and
+            // sending via GENET before falling through to dispatch_action for
+            // the serial log.
+            #[cfg(feature = "rpi5")]
+            {
+                let mut sent = false;
+                if let harmony_unikernel::RuntimeAction::SendOnInterface {
+                    interface_name,
+                    raw,
+                } = action
+                {
+                    sent = true;
+                    if interface_name.as_ref() != "eth0" {
+                        let _ = writeln!(serial, "[TX] WARN: unknown interface {:?}, skipping", interface_name);
+                    } else {
+                        let mac = platform::NODE_MAC;
+                        let mut frame = alloc::vec::Vec::with_capacity(14 + raw.len());
+                        // TODO: broadcast dst is correct for Reticulum announces
+                        // but wrong for unicast responses. Needs neighbor table.
+                        frame.extend_from_slice(&[0xFF; 6]);
+                        frame.extend_from_slice(&mac);
+                        frame.extend_from_slice(&0x88B5u16.to_be_bytes());
+                        frame.extend_from_slice(raw);
+
+                        for i in 0..256usize {
+                            let buf = tx_pool.get(i);
+                            unsafe { cache::clean_range(buf.virt, 2048) };
+                        }
+                        genet_driver.reclaim_tx(&genet_bank, &mut tx_pool);
+                        match genet_driver.send(&mut genet_bank, &frame, &mut tx_pool) {
+                            Ok(()) => {
+                                let _ = writeln!(serial, "[TX] {} bytes on eth0", frame.len());
+                            }
+                            Err(e) => {
+                                let _ = writeln!(serial, "[TX] send error: {:?}", e);
+                            }
+                        }
+                    }
+                }
+                if !sent {
+                    dispatch_action(action, &mut serial);
+                }
+            }
+            #[cfg(not(feature = "rpi5"))]
             dispatch_action(action, &mut serial);
         }
 
@@ -655,8 +810,6 @@ fn dispatch_action(action: &harmony_unikernel::RuntimeAction, serial: &mut impl 
             interface_name,
             raw,
         } => {
-            // TODO(harmony-os-7ng): Send via GENET when PCIe is ready.
-            // Pattern: cache::clean_range(buf.virt, raw.len()); genet.send(&mut bank, raw, &mut tx_pool);
             let _ = writeln!(serial, "[TX] {} bytes on {}", raw.len(), interface_name);
         }
         RuntimeAction::PeerDiscovered { address_hash, hops } => {

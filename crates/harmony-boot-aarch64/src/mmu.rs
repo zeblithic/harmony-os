@@ -2,8 +2,8 @@
 //! MMU configuration -- identity map + system register setup for aarch64.
 //!
 //! After ExitBootServices, builds an identity map (virt == phys) for all usable
-//! RAM and the PL011 MMIO page, configures MAIR_EL1 / TCR_EL1, and enables the
-//! MMU via SCTLR_EL1.
+//! RAM and all platform MMIO regions, configures MAIR_EL1 / TCR_EL1, and enables
+//! the MMU via SCTLR_EL1.
 
 // Constants and functions used only by the aarch64-gated `init_and_enable`
 // appear unused on non-aarch64 host builds (x86_64 test runner).
@@ -20,6 +20,7 @@ use harmony_microkernel::vm::aarch64::Aarch64PageTable;
 use harmony_microkernel::vm::page_table::PageTable;
 
 use crate::bump_alloc::BumpAllocator;
+use crate::platform;
 
 // ── Memory region descriptor ────────────────────────────────────────
 
@@ -39,11 +40,6 @@ pub struct MemoryRegion {
     /// so those must not be used as heap.
     pub is_conventional: bool,
 }
-
-// ── PL011 MMIO address ──────────────────────────────────────────────
-
-/// PL011 UART base address on QEMU aarch64 `virt` platform.
-const PL011_MMIO_BASE: u64 = 0x0900_0000;
 
 // ── System register constants ───────────────────────────────────────
 
@@ -164,28 +160,30 @@ pub unsafe fn init_and_enable(
         }
     }
 
-    // 4. Map the PL011 MMIO page as Device memory (NO_CACHE).
+    // 4. Map platform MMIO regions as Device memory (NO_CACHE).
     let mmio_flags = PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::NO_CACHE;
-    let mmio_result = pt.map(
-        VirtAddr(PL011_MMIO_BASE),
-        PhysAddr(PL011_MMIO_BASE),
-        mmio_flags,
-        &mut || alloc_zeroed_frame(alloc),
-    );
-    match mmio_result {
-        Ok(()) => mapped_pages += 1,
-        Err(VmError::RegionConflict(_)) => {
-            // On QEMU virt, PL011 MMIO (0x0900_0000) is never inside a usable
-            // RAM region, so this branch should be unreachable. If it IS reached,
-            // the UART was mapped as Normal cacheable memory (AttrIndx=0) which
-            // causes undefined hardware behaviour for MMIO — warn loudly.
-            let _ = writeln!(
-                serial,
-                "[MMU] WARNING: PL011 MMIO conflict — UART mapped as Normal memory, may be unreliable"
+    for &(base, pages) in platform::MMIO_REGIONS {
+        for page_idx in 0..pages {
+            let addr = base as u64 + page_idx as u64 * PAGE_SIZE;
+            let mmio_result = pt.map(
+                VirtAddr(addr),
+                PhysAddr(addr),
+                mmio_flags,
+                &mut || alloc_zeroed_frame(alloc),
             );
-        }
-        Err(e) => {
-            let _ = writeln!(serial, "[MMU] PL011 MMIO map error: {:?}", e);
+            match mmio_result {
+                Ok(()) => mapped_pages += 1,
+                Err(VmError::RegionConflict(_)) => {
+                    let _ = writeln!(
+                        serial,
+                        "[MMU] WARNING: MMIO {:#x} conflicts — mapped as Normal memory, MMIO unreliable",
+                        addr,
+                    );
+                }
+                Err(e) => {
+                    let _ = writeln!(serial, "[MMU] MMIO map error at {:#x}: {:?}", addr, e);
+                }
+            }
         }
     }
 

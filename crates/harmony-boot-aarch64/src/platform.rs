@@ -34,12 +34,33 @@ pub const UART_CLOCK_HZ: u32 = 24_000_000;
 #[cfg(feature = "rpi5")]
 pub const UART_CLOCK_HZ: u32 = 48_000_000;
 
-// RPi5-only peripherals (reserved for future network driver).
-// The BCM2712 GENET is accessed through RP1 PCIe BAR at 0x1F_xxxx_xxxx.
-// Not usable without PCIe initialization.
+/// BCM2712 GENET Ethernet controller base address (RPi5).
+///
+/// Accessed through RP1 PCIe BAR at 0x1F_0058_0000. UEFI performs PCIe
+/// initialization before ExitBootServices; the BAR assignment is preserved
+/// by passing `pciex4_reset=0` in the kernel command line.
 #[cfg(feature = "rpi5")]
-#[allow(dead_code)]
 pub const GENET_BASE: usize = 0x1F_0058_0000;
+
+/// MMIO regions to map as Device memory (NO_CACHE) during MMU init.
+/// Each entry: (base_address, page_count).
+#[cfg(feature = "qemu-virt")]
+pub const MMIO_REGIONS: &[(usize, usize)] = &[
+    (PL011_BASE, 1),
+];
+
+/// Locally-administered test MAC address for GENET (RPi5).
+///
+/// 0x02 prefix = locally administered unicast. Future work: read real
+/// MAC from OTP/firmware.
+#[cfg(feature = "rpi5")]
+pub const NODE_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+
+#[cfg(feature = "rpi5")]
+pub const MMIO_REGIONS: &[(usize, usize)] = &[
+    (PL011_BASE, 1),
+    (GENET_BASE, 16), // SYS through TDMA + descriptor RAM (~64KB)
+];
 
 #[cfg(test)]
 mod tests {
