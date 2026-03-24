@@ -527,6 +527,13 @@ pub enum LinuxSyscall {
         newdirfd: i32,
         newpath: u64,
     },
+    RtSigreturn {
+        rsp: u64,
+    },
+    Sigaltstack {
+        ss: u64,
+        old_ss: u64,
+    },
     Unknown {
         nr: u64,
     },
@@ -591,6 +598,7 @@ impl LinuxSyscall {
                 oldset: args[2],
                 sigsetsize: args[3],
             },
+            15 => LinuxSyscall::RtSigreturn { rsp: args[0] },
             16 => LinuxSyscall::Ioctl {
                 fd: args[0] as i32,
                 request: args[1],
@@ -743,6 +751,10 @@ impl LinuxSyscall {
             107 => LinuxSyscall::Geteuid,
             108 => LinuxSyscall::Getegid,
             110 => LinuxSyscall::Getppid,
+            131 => LinuxSyscall::Sigaltstack {
+                ss: args[0],
+                old_ss: args[1],
+            },
             157 => LinuxSyscall::Prctl {
                 option: args[0] as i32,
                 arg2: args[1],
@@ -1139,6 +1151,10 @@ impl LinuxSyscall {
                 tid: args[1] as i32,
                 sig: args[2] as i32,
             },
+            132 => LinuxSyscall::Sigaltstack {
+                ss: args[0],
+                old_ss: args[1],
+            },
             134 => LinuxSyscall::RtSigaction {
                 signum: args[0] as i32,
                 act: args[1],
@@ -1151,6 +1167,7 @@ impl LinuxSyscall {
                 oldset: args[2],
                 sigsetsize: args[3],
             },
+            139 => LinuxSyscall::RtSigreturn { rsp: args[0] },
             160 => LinuxSyscall::Uname { buf: args[0] },
             166 => LinuxSyscall::Umask {
                 mask: args[0] as u32,
@@ -2948,6 +2965,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 }
             }
             LinuxSyscall::Renameat { .. } => self.sys_renameat(),
+            LinuxSyscall::RtSigreturn { rsp } => self.sys_rt_sigreturn(rsp),
+            LinuxSyscall::Sigaltstack { ss, old_ss } => self.sys_sigaltstack(ss, old_ss),
             LinuxSyscall::Unknown { .. } => ENOSYS,
         };
         self.deliver_pending_signals();
@@ -5646,6 +5665,68 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
 
         0
+    }
+
+    /// Linux rt_sigreturn(2): restore register state and signal mask
+    /// from the signal frame on the user stack.
+    ///
+    /// When the signal handler returns via `ret`, it pops sa_restorer.
+    /// sa_restorer calls rt_sigreturn via `mov $15,%rax; syscall`.
+    /// At that point RSP = handler_rsp + 8 (the retaddr was popped by ret).
+    ///
+    /// Frame layout from handler_rsp:
+    ///   +0:   retaddr (consumed by ret)
+    ///   +8:   siginfo_t (128 bytes)
+    ///   +136: ucontext_t (240 bytes)
+    ///
+    /// RSP passed to us = handler_rsp + 8 (retaddr already popped).
+    /// siginfo at rsp, ucontext at rsp + 128.
+    fn sys_rt_sigreturn(&mut self, rsp: u64) -> i64 {
+        let ucontext_ptr = (rsp + 128) as usize;
+        let sc = ucontext_ptr + 40; // sigcontext within ucontext
+
+        let regs = unsafe {
+            SavedRegisters {
+                r8: core::ptr::read_unaligned(sc as *const u64),
+                r9: core::ptr::read_unaligned((sc + 8) as *const u64),
+                r10: core::ptr::read_unaligned((sc + 16) as *const u64),
+                r11: core::ptr::read_unaligned((sc + 24) as *const u64),
+                r12: core::ptr::read_unaligned((sc + 32) as *const u64),
+                r13: core::ptr::read_unaligned((sc + 40) as *const u64),
+                r14: core::ptr::read_unaligned((sc + 48) as *const u64),
+                r15: core::ptr::read_unaligned((sc + 56) as *const u64),
+                rdi: core::ptr::read_unaligned((sc + 64) as *const u64),
+                rsi: core::ptr::read_unaligned((sc + 72) as *const u64),
+                rbp: core::ptr::read_unaligned((sc + 80) as *const u64),
+                rbx: core::ptr::read_unaligned((sc + 88) as *const u64),
+                rdx: core::ptr::read_unaligned((sc + 96) as *const u64),
+                rax: core::ptr::read_unaligned((sc + 104) as *const u64),
+                rcx: core::ptr::read_unaligned((sc + 112) as *const u64),
+                rsp: core::ptr::read_unaligned((sc + 120) as *const u64),
+                rip: core::ptr::read_unaligned((sc + 128) as *const u64),
+                eflags: core::ptr::read_unaligned((sc + 136) as *const u64),
+            }
+        };
+
+        // Restore signal mask from uc_sigmask (at ucontext + 232).
+        let uc_sigmask = unsafe {
+            core::ptr::read_unaligned((ucontext_ptr + 232) as *const u64)
+        };
+        self.signal_mask = uc_sigmask;
+        self.signal_mask &= !(1u64 << (SIGKILL - 1) | 1u64 << (SIGSTOP - 1));
+
+        // Clear on_alt_stack — returning to interrupted context.
+        self.on_alt_stack = false;
+
+        self.pending_signal_return = Some(SignalReturn { regs });
+
+        // Return value is meaningless — caller uses pending_signal_return().
+        regs.rax as i64
+    }
+
+    /// Linux sigaltstack(2): stub — real implementation is Task 4.
+    fn sys_sigaltstack(&mut self, _ss: u64, _old_ss: u64) -> i64 {
+        ENOSYS
     }
 
     /// Linux set_tid_address(2): return TID = 1 (single-threaded).
@@ -14104,6 +14185,207 @@ mod integration_tests {
             read_handler(&oldact),
             SIG_DFL,
             "handler must be reset to SIG_DFL after SA_RESETHAND"
+        );
+    }
+
+    #[test]
+    fn test_sigreturn_restores_registers() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let handler_addr: u64 = 0x400000;
+        let restorer_addr: u64 = 0x401000;
+        let flags = SA_RESTORER | SA_SIGINFO;
+
+        install_handler_with_restorer(&mut lx, 10, handler_addr, flags, 0, restorer_addr);
+
+        // Send SIGUSR1 (10).
+        lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+        let sig = lx.pending_handler_signal();
+        assert_eq!(sig, Some(10));
+
+        // Place the stack in real writable memory (the arena).
+        let rsp = (lx.arena_base() + 0x50000) as u64;
+
+        // Known register values to save and restore.
+        let regs = SavedRegisters {
+            r8: 0x0808_0808,
+            r9: 0x0909_0909,
+            r10: 0x1010_1010,
+            r11: 0x1111_1111,
+            r12: 0x1212_1212,
+            r13: 0x1313_1313,
+            r14: 0x1414_1414,
+            r15: 0x1515_1515,
+            rdi: 0xD1D1_D1D1,
+            rsi: 0x5151_5151,
+            rbp: 0xBBBB_BBBB,
+            rbx: 0xBBB0_BBB0,
+            rdx: 0xDDDD_DDDD,
+            rax: 0xAAAA_AAAA,
+            rcx: 0xCCCC_CCCC,
+            rsp,
+            rip: 0x1000,
+            eflags: 0x202,
+        };
+
+        let setup = lx.setup_signal_frame(10, &regs);
+
+        // Simulate handler executing `ret` which pops sa_restorer,
+        // then sa_restorer does syscall with RSP = handler_rsp + 8.
+        let sigreturn_rsp = setup.handler_rsp + 8;
+
+        let _result = lx.dispatch_syscall(LinuxSyscall::RtSigreturn { rsp: sigreturn_rsp });
+
+        let sr = lx.pending_signal_return();
+        assert!(sr.is_some(), "pending_signal_return must be Some after sigreturn");
+        let restored = sr.unwrap().regs;
+
+        assert_eq!(restored.r8, 0x0808_0808);
+        assert_eq!(restored.r9, 0x0909_0909);
+        assert_eq!(restored.r10, 0x1010_1010);
+        assert_eq!(restored.r11, 0x1111_1111);
+        assert_eq!(restored.r12, 0x1212_1212);
+        assert_eq!(restored.r13, 0x1313_1313);
+        assert_eq!(restored.r14, 0x1414_1414);
+        assert_eq!(restored.r15, 0x1515_1515);
+        assert_eq!(restored.rdi, 0xD1D1_D1D1);
+        assert_eq!(restored.rsi, 0x5151_5151);
+        assert_eq!(restored.rbp, 0xBBBB_BBBB);
+        assert_eq!(restored.rbx, 0xBBB0_BBB0);
+        assert_eq!(restored.rdx, 0xDDDD_DDDD);
+        assert_eq!(restored.rax, 0xAAAA_AAAA);
+        assert_eq!(restored.rcx, 0xCCCC_CCCC);
+        assert_eq!(restored.rsp, rsp);
+        assert_eq!(restored.rip, 0x1000);
+        assert_eq!(restored.eflags, 0x202);
+    }
+
+    #[test]
+    fn test_sigreturn_restores_signal_mask() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let handler_addr: u64 = 0x400000;
+        let restorer_addr: u64 = 0x401000;
+        let flags = SA_RESTORER | SA_SIGINFO;
+        // sa_mask blocks signal 14 (bit 13).
+        let sa_mask: u64 = 1u64 << 13;
+
+        install_handler_with_restorer(&mut lx, 10, handler_addr, flags, sa_mask, restorer_addr);
+
+        // Pre-block signals 12 and 13 (bits 11 and 12).
+        let pre_block: u64 = (1u64 << 11) | (1u64 << 12);
+        let pre_block_bytes = pre_block.to_ne_bytes();
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_SETMASK,
+            set: pre_block_bytes.as_ptr() as u64,
+            oldset: 0,
+            sigsetsize: 8,
+        });
+
+        // Verify pre-block mask.
+        let mask_before_kill = read_signal_mask(&mut lx);
+        assert_ne!(mask_before_kill & (1u64 << 11), 0, "signal 12 should be blocked");
+        assert_ne!(mask_before_kill & (1u64 << 12), 0, "signal 13 should be blocked");
+
+        // Send SIGUSR1 (10).
+        lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+        let sig = lx.pending_handler_signal();
+        assert_eq!(sig, Some(10));
+
+        let rsp = (lx.arena_base() + 0x50000) as u64;
+        let regs = SavedRegisters {
+            rsp,
+            ..SavedRegisters::default()
+        };
+
+        let setup = lx.setup_signal_frame(10, &regs);
+
+        // After setup_signal_frame, mask should have 10+12+13+14 blocked.
+        let mask_during = read_signal_mask(&mut lx);
+        assert_ne!(mask_during & (1u64 << 9), 0, "signal 10 blocked during handler");
+        assert_ne!(mask_during & (1u64 << 11), 0, "signal 12 still blocked");
+        assert_ne!(mask_during & (1u64 << 12), 0, "signal 13 still blocked");
+        assert_ne!(mask_during & (1u64 << 13), 0, "signal 14 blocked via sa_mask");
+
+        // sigreturn restores the mask.
+        let sigreturn_rsp = setup.handler_rsp + 8;
+        lx.dispatch_syscall(LinuxSyscall::RtSigreturn { rsp: sigreturn_rsp });
+        let _ = lx.pending_signal_return(); // consume
+
+        // After sigreturn, mask should be restored to just 12+13.
+        let mask_after = read_signal_mask(&mut lx);
+        assert_eq!(
+            mask_after & (1u64 << 9), 0,
+            "signal 10 must be unblocked after sigreturn"
+        );
+        assert_ne!(
+            mask_after & (1u64 << 11), 0,
+            "signal 12 must remain blocked (was pre-blocked)"
+        );
+        assert_ne!(
+            mask_after & (1u64 << 12), 0,
+            "signal 13 must remain blocked (was pre-blocked)"
+        );
+        assert_eq!(
+            mask_after & (1u64 << 13), 0,
+            "signal 14 must be unblocked (was only in sa_mask)"
+        );
+    }
+
+    #[test]
+    fn test_sigreturn_delivers_unblocked() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let handler_addr: u64 = 0x400000;
+        let restorer_addr: u64 = 0x401000;
+        let flags = SA_RESTORER | SA_SIGINFO;
+
+        install_handler_with_restorer(&mut lx, 10, handler_addr, flags, 0, restorer_addr);
+
+        // First kill: triggers signal 10, delivered to handler.
+        lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+        let sig = lx.pending_handler_signal();
+        assert_eq!(sig, Some(10));
+
+        let rsp = (lx.arena_base() + 0x50000) as u64;
+        let regs = SavedRegisters {
+            rsp,
+            ..SavedRegisters::default()
+        };
+
+        let setup = lx.setup_signal_frame(10, &regs);
+
+        // Signal 10 is now blocked during the handler (no SA_NODEFER).
+        let mask_during = read_signal_mask(&mut lx);
+        assert_ne!(mask_during & (1u64 << 9), 0, "signal 10 blocked during handler");
+
+        // Second kill: signal 10 queued but blocked.
+        lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+        // Should NOT fire handler because signal 10 is blocked.
+        assert!(
+            lx.pending_handler_signal().is_none(),
+            "signal 10 should be queued but not delivered while blocked"
+        );
+
+        // sigreturn restores mask (signal 10 unblocked).
+        // deliver_pending_signals runs at end of dispatch_syscall,
+        // so the queued signal 10 should fire.
+        let sigreturn_rsp = setup.handler_rsp + 8;
+        lx.dispatch_syscall(LinuxSyscall::RtSigreturn { rsp: sigreturn_rsp });
+
+        // Consume the signal return (restored regs).
+        let sr = lx.pending_signal_return();
+        assert!(sr.is_some(), "pending_signal_return must be set");
+
+        // The previously-blocked signal 10 should now be delivered.
+        let sig2 = lx.pending_handler_signal();
+        assert_eq!(
+            sig2,
+            Some(10),
+            "signal 10 must be delivered after sigreturn unblocks it"
         );
     }
 }
