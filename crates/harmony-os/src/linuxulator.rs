@@ -5724,9 +5724,53 @@ impl<B: SyscallBackend> Linuxulator<B> {
         regs.rax as i64
     }
 
-    /// Linux sigaltstack(2): stub — real implementation is Task 4.
-    fn sys_sigaltstack(&mut self, _ss: u64, _old_ss: u64) -> i64 {
-        ENOSYS
+    /// Linux sigaltstack(2): get/set alternate signal stack configuration.
+    fn sys_sigaltstack(&mut self, ss_ptr: u64, old_ss_ptr: u64) -> i64 {
+        // Write current config to old_ss if requested.
+        if old_ss_ptr != 0 {
+            let flags = self.alt_stack_flags
+                | if self.on_alt_stack { SS_ONSTACK } else { 0 };
+            unsafe {
+                let p = old_ss_ptr as usize;
+                core::ptr::write_unaligned(p as *mut u64, self.alt_stack_sp);
+                core::ptr::write_unaligned((p + 8) as *mut i32, flags);
+                core::ptr::write_unaligned((p + 16) as *mut u64, self.alt_stack_size);
+            }
+        }
+
+        // Set new config if requested.
+        if ss_ptr != 0 {
+            if self.on_alt_stack {
+                return EPERM;
+            }
+            let (sp, flags, size) = unsafe {
+                let p = ss_ptr as usize;
+                let sp = core::ptr::read_unaligned(p as *const u64);
+                let flags = core::ptr::read_unaligned((p + 8) as *const i32);
+                let size = core::ptr::read_unaligned((p + 16) as *const u64);
+                (sp, flags, size)
+            };
+
+            let valid_flags = SS_DISABLE | SS_AUTODISARM;
+            if flags & !valid_flags != 0 {
+                return EINVAL;
+            }
+
+            if flags & SS_DISABLE != 0 {
+                self.alt_stack_sp = 0;
+                self.alt_stack_size = 0;
+                self.alt_stack_flags = SS_DISABLE;
+            } else {
+                if size < MINSIGSTKSZ {
+                    return ENOMEM;
+                }
+                self.alt_stack_sp = sp;
+                self.alt_stack_size = size;
+                self.alt_stack_flags = flags;
+            }
+        }
+
+        0
     }
 
     /// Linux set_tid_address(2): return TID = 1 (single-threaded).
@@ -14387,5 +14431,144 @@ mod integration_tests {
             Some(10),
             "signal 10 must be delivered after sigreturn unblocks it"
         );
+    }
+
+    // ── sigaltstack tests ───────────────────────────────────────────
+
+    /// Helper: write a stack_t buffer (ss_sp u64, ss_flags i32, _pad i32, ss_size u64).
+    fn make_stack_t(sp: u64, flags: i32, size: u64) -> [u8; 24] {
+        let mut buf = [0u8; 24];
+        buf[0..8].copy_from_slice(&sp.to_ne_bytes());
+        buf[8..12].copy_from_slice(&flags.to_ne_bytes());
+        // bytes 12..16 are padding — leave as zero
+        buf[16..24].copy_from_slice(&size.to_ne_bytes());
+        buf
+    }
+
+    #[test]
+    fn test_sigaltstack_set_and_get() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Configure alt stack: sp=0x60000, size=8192, flags=0.
+        let ss = make_stack_t(0x60000, 0, 8192);
+        let r = lx.dispatch_syscall(LinuxSyscall::Sigaltstack {
+            ss: ss.as_ptr() as u64,
+            old_ss: 0,
+        });
+        assert_eq!(r, 0, "sigaltstack set should succeed");
+
+        // Read back via old_ss.
+        let mut old = [0u8; 24];
+        let r = lx.dispatch_syscall(LinuxSyscall::Sigaltstack {
+            ss: 0,
+            old_ss: old.as_mut_ptr() as u64,
+        });
+        assert_eq!(r, 0, "sigaltstack get should succeed");
+
+        let sp_out = u64::from_ne_bytes(old[0..8].try_into().unwrap());
+        let flags_out = i32::from_ne_bytes(old[8..12].try_into().unwrap());
+        let size_out = u64::from_ne_bytes(old[16..24].try_into().unwrap());
+
+        assert_eq!(sp_out, 0x60000, "sp should round-trip");
+        assert_eq!(flags_out, 0, "flags should round-trip");
+        assert_eq!(size_out, 8192, "size should round-trip");
+    }
+
+    #[test]
+    fn test_sigaltstack_disable() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // First configure a valid alt stack.
+        let ss = make_stack_t(0x70000, 0, 8192);
+        let r = lx.dispatch_syscall(LinuxSyscall::Sigaltstack {
+            ss: ss.as_ptr() as u64,
+            old_ss: 0,
+        });
+        assert_eq!(r, 0);
+
+        // Now disable it.
+        let ss_disable = make_stack_t(0, SS_DISABLE, 0);
+        let r = lx.dispatch_syscall(LinuxSyscall::Sigaltstack {
+            ss: ss_disable.as_ptr() as u64,
+            old_ss: 0,
+        });
+        assert_eq!(r, 0, "SS_DISABLE should succeed");
+
+        // Read back and verify flags has SS_DISABLE.
+        let mut old = [0u8; 24];
+        lx.dispatch_syscall(LinuxSyscall::Sigaltstack {
+            ss: 0,
+            old_ss: old.as_mut_ptr() as u64,
+        });
+        let flags_out = i32::from_ne_bytes(old[8..12].try_into().unwrap());
+        assert_ne!(
+            flags_out & SS_DISABLE,
+            0,
+            "flags should have SS_DISABLE set after disabling"
+        );
+    }
+
+    #[test]
+    fn test_sigaltstack_too_small() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // size < MINSIGSTKSZ (2048) → ENOMEM.
+        let ss = make_stack_t(0x80000, 0, MINSIGSTKSZ - 1);
+        let r = lx.dispatch_syscall(LinuxSyscall::Sigaltstack {
+            ss: ss.as_ptr() as u64,
+            old_ss: 0,
+        });
+        assert_eq!(r, ENOMEM, "undersized stack should return ENOMEM");
+    }
+
+    #[test]
+    fn test_sigaltstack_eperm_on_altstack() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Install a handler on SIGUSR1 (10) with SA_ONSTACK.
+        let handler_addr: u64 = 0x400000;
+        let restorer_addr: u64 = 0x401000;
+        let flags = SA_RESTORER | SA_SIGINFO | SA_ONSTACK;
+        install_handler_with_restorer(&mut lx, 10, handler_addr, flags, 0, restorer_addr);
+
+        // Configure a valid alt stack in the arena so setup_signal_frame can write to it.
+        let arena_base = lx.arena_base() as u64;
+        // Place the alt stack near the top of the arena (0x80000 offset, size 0x10000).
+        let alt_sp = arena_base + 0x80000;
+        let alt_size: u64 = 0x10000;
+        let ss = make_stack_t(alt_sp, 0, alt_size);
+        let r = lx.dispatch_syscall(LinuxSyscall::Sigaltstack {
+            ss: ss.as_ptr() as u64,
+            old_ss: 0,
+        });
+        assert_eq!(r, 0, "initial sigaltstack setup should succeed");
+
+        // Send SIGUSR1 to self so a pending signal is queued.
+        lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+        assert_eq!(
+            lx.pending_handler_signal(),
+            Some(10),
+            "signal 10 should be pending"
+        );
+
+        // Call setup_signal_frame — this sets on_alt_stack = true.
+        let rsp = alt_sp + alt_size - 0x100;
+        let regs = SavedRegisters {
+            rsp,
+            ..SavedRegisters::default()
+        };
+        let _setup = lx.setup_signal_frame(10, &regs);
+
+        // Now trying to reconfigure sigaltstack should return EPERM.
+        let ss2 = make_stack_t(alt_sp, 0, alt_size);
+        let r = lx.dispatch_syscall(LinuxSyscall::Sigaltstack {
+            ss: ss2.as_ptr() as u64,
+            old_ss: 0,
+        });
+        assert_eq!(r, EPERM, "sigaltstack should return EPERM while on alt stack");
     }
 }
