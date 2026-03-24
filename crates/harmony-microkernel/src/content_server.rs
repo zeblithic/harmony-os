@@ -340,7 +340,7 @@ impl Default for ContentServer {
 // ── Slice helper ────────────────────────────────────────────────
 
 /// Extract a sub-slice from `data` bounded by `offset` and `count`, clamped to data length.
-fn slice_data(data: &[u8], offset: u64, count: u32) -> Vec<u8> {
+pub(crate) fn slice_data(data: &[u8], offset: u64, count: u32) -> Vec<u8> {
     let off = usize::try_from(offset)
         .unwrap_or(usize::MAX)
         .min(data.len());

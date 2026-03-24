@@ -8,7 +8,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::content_server::{format_cid_hex, parse_hex_cid, ContentServer};
+use crate::content_server::{format_cid_hex, parse_hex_cid, slice_data, ContentServer};
 use crate::fid_tracker::FidTracker;
 use crate::node_config::NodeConfig;
 use crate::signed_config::{SignedConfig, SignedConfigError};
@@ -48,14 +48,20 @@ enum NodeKind {
 ///
 /// ```text
 /// /
-/// ├── active    — hex CID of the active config (read-only)
-/// ├── pending   — hex CID of the staged (not yet committed) config (read-only)
-/// ├── previous  — hex CID of the previous config before last commit (read-only)
+/// ├── active    — hex CID of the active SignedConfig envelope in the CAS (read-only)
+/// ├── pending   — hex CID of the staged SignedConfig envelope (read-only)
+/// ├── previous  — hex CID of the previous SignedConfig envelope (read-only)
 /// ├── stage     — ctl-file: write a hex CID to stage it (validates + verifies)
 /// ├── commit    — ctl-file: write any byte to atomically commit pending → active
 /// ├── rollback  — ctl-file: write any byte to swap active ↔ previous
-/// └── node.cbor — CBOR-encoded active NodeConfig (read-only)
+/// └── node.cbor — inner NodeConfig CBOR extracted from the active SignedConfig (read-only)
 /// ```
+///
+/// **CID semantics:** `active`/`pending`/`previous` return the CID of the
+/// outer `SignedConfig` envelope (what's stored in the CAS). `node.cbor`
+/// returns the inner `NodeConfig` CBOR bytes; its SHA-256 hash will differ
+/// from the `active` CID. To verify the inner config against the CAS, fetch
+/// the `SignedConfig` by the `active` CID and extract `config_bytes`.
 pub struct ConfigServer {
     cas: Arc<ContentServer>,
     tracker: FidTracker<NodeKind>,
@@ -108,8 +114,14 @@ impl ConfigServer {
         signed
             .verify(&self.trusted_operators)
             .map_err(|e| match e {
-                SignedConfigError::UntrustedSigner => IpcError::PermissionDenied,
-                _ => IpcError::InvalidArgument,
+                // All authentication failures → PermissionDenied to avoid
+                // leaking which step failed (oracle resistance).
+                SignedConfigError::UntrustedSigner
+                | SignedConfigError::AddressMismatch
+                | SignedConfigError::SignatureInvalid(_) => IpcError::PermissionDenied,
+                // Structural/parsing failures → InvalidArgument.
+                SignedConfigError::DeserializeFailed(_)
+                | SignedConfigError::InvalidPublicKey(_) => IpcError::InvalidArgument,
             })?;
 
         // 5. Deserialize the embedded NodeConfig.
@@ -181,8 +193,10 @@ impl ConfigServer {
     /// Rollback: swap active ↔ previous.
     ///
     /// Requires a previous config; returns `InvalidArgument` if none.
+    /// Any staged-but-uncommitted pending config is preserved — a caller
+    /// can rollback and then immediately commit the pending config.
     fn do_rollback(&mut self) -> Result<(), IpcError> {
-        if self.previous_cid.is_none() {
+        if self.previous_cid.is_none() || self.previous_config.is_none() {
             return Err(IpcError::InvalidArgument);
         }
 
@@ -396,17 +410,6 @@ impl FileServer for ConfigServer {
     fn clone_fid(&mut self, fid: Fid, new_fid: Fid) -> Result<QPath, IpcError> {
         self.tracker.clone_fid(fid, new_fid)
     }
-}
-
-// ── Slice helper ─────────────────────────────────────────────────────
-
-/// Extract a sub-slice from `data` bounded by `offset` and `count`, clamped to data length.
-fn slice_data(data: &[u8], offset: u64, count: u32) -> Vec<u8> {
-    let off = usize::try_from(offset)
-        .unwrap_or(usize::MAX)
-        .min(data.len());
-    let end = off.saturating_add(count as usize).min(data.len());
-    data[off..end].to_vec()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
