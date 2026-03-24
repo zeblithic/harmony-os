@@ -2507,12 +2507,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
     ///
     /// The frame layout (from handler_rsp upward) is:
     ///   +0:   return address (sa_restorer)           8 bytes
-    ///   +8:   siginfo_t (si_signo + padding)       128 bytes
-    ///   +136: ucontext_t                           240 bytes
+    ///   +8:   ucontext_t                           304 bytes
     ///         ├─ uc_flags/uc_link/uc_stack           40 bytes
-    ///         ├─ sigcontext (24 GPRs × 8)           192 bytes
+    ///         ├─ sigcontext (32 u64 × 8)            256 bytes
     ///         └─ uc_sigmask                            8 bytes
-    /// Total frame: 376 bytes.
+    ///   +312: siginfo_t (si_signo + padding)       128 bytes
+    /// Total frame: 440 bytes.
     ///
     /// Signal mask management:
     /// 1. Save current mask into sigcontext.oldmask and uc_sigmask
@@ -2531,6 +2531,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
         );
 
         // ── Choose stack base ────────────────────────────────────────
+        // Save on_alt_stack BEFORE modification — this is written into the
+        // frame's uc_stack so rt_sigreturn can restore the correct state
+        // for nested signal handlers.
+        let was_on_alt_stack = self.on_alt_stack;
         let stack_top = if action.flags & SA_ONSTACK != 0
             && self.alt_stack_flags != SS_DISABLE
             && !self.on_alt_stack
@@ -2584,7 +2588,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             core::ptr::write_unaligned(uc_stack_ptr as *mut u64, self.alt_stack_sp);
             core::ptr::write_unaligned(
                 (uc_stack_ptr + 8) as *mut i32,
-                self.alt_stack_flags | if self.on_alt_stack { SS_ONSTACK } else { 0 },
+                self.alt_stack_flags | if was_on_alt_stack { SS_ONSTACK } else { 0 },
             );
             core::ptr::write_unaligned((uc_stack_ptr + 16) as *mut u64, self.alt_stack_size);
         }
@@ -5706,8 +5710,13 @@ impl<B: SyscallBackend> Linuxulator<B> {
         self.signal_mask = uc_sigmask;
         self.signal_mask &= !(1u64 << (SIGKILL - 1) | 1u64 << (SIGSTOP - 1));
 
-        // Clear on_alt_stack — returning to interrupted context.
-        self.on_alt_stack = false;
+        // Restore on_alt_stack from the frame's saved uc_stack.ss_flags.
+        // This handles nested signals correctly: if the interrupted context
+        // was already on the alt stack (SS_ONSTACK set in saved flags),
+        // we stay on it; otherwise we clear it.
+        let saved_ss_flags =
+            unsafe { core::ptr::read_unaligned((ucontext_ptr + 24) as *const i32) };
+        self.on_alt_stack = saved_ss_flags & SS_ONSTACK != 0;
 
         self.pending_signal_return = Some(SignalReturn { regs });
 
