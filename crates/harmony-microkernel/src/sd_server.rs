@@ -186,7 +186,7 @@ mod tests {
     /// giving capacity_blocks = (1000 + 1) * 1024 = 1_025_024 blocks.
     fn setup_init_card_mock(bank: &mut MockRegisterBank, _capacity: u32) {
         // We need the full init sequence to pass (9 commands total):
-        // CMD0, CMD8, CMD55, ACMD41, CMD2, CMD3, CMD7, CMD9, CMD16
+        // CMD0, CMD8, CMD55, ACMD41, CMD2, CMD3, CMD9, CMD7, CMD16
         const SDHCI_RESPONSE_1: usize = 0x14;
         const SDHCI_RESPONSE_2: usize = 0x18;
         const SDHCI_RESPONSE_3: usize = 0x1C;
