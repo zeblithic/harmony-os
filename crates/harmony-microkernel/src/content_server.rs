@@ -124,6 +124,30 @@ impl ContentServer {
         self.pages.len()
     }
 
+    /// Retrieve full book content by CID, reassembled from stored pages.
+    ///
+    /// Returns `None` if the book is not stored. This is the direct API
+    /// equivalent of walking to `/books/{cid_hex}` and reading via 9P,
+    /// intended for internal Ring 2 consumers like `ConfigServer`.
+    pub fn get_book_bytes(&self, cid: &[u8; 32]) -> Option<Vec<u8>> {
+        let book = self.books.get(cid)?;
+        let pages = &self.pages;
+        book.reassemble(|idx| {
+            let addr = book
+                .pages
+                .get(idx as usize)
+                .and_then(|v| v.first())
+                .copied()?;
+            pages.get(&addr.hash_bits()).map(|(_, d)| d.clone())
+        })
+        .ok()
+    }
+
+    /// Check whether a book with the given CID is stored.
+    pub fn has_book(&self, cid: &[u8; 32]) -> bool {
+        self.books.contains_key(cid)
+    }
+
     /// Find a page by its `hash_bits` value.
     ///
     /// Returns the first page whose 28-bit `hash_bits` matches. Within a
@@ -327,7 +351,7 @@ fn slice_data(data: &[u8], offset: u64, count: u32) -> Vec<u8> {
 // ── Hex helpers ─────────────────────────────────────────────────────
 
 /// Parse a 64-character hex string into a 32-byte CID.
-fn parse_hex_cid(s: &str) -> Option<[u8; 32]> {
+pub(crate) fn parse_hex_cid(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 || !s.is_ascii() {
         return None;
     }
@@ -339,7 +363,7 @@ fn parse_hex_cid(s: &str) -> Option<[u8; 32]> {
 }
 
 /// Format a 32-byte CID as 64-character lowercase hex.
-pub(crate) fn format_cid_hex(cid: &[u8; 32]) -> alloc::string::String {
+pub fn format_cid_hex(cid: &[u8; 32]) -> alloc::string::String {
     use core::fmt::Write;
     let mut s = alloc::string::String::with_capacity(64);
     for byte in cid {
@@ -1140,5 +1164,44 @@ mod tests {
         assert_eq!(stat.file_type, FileType::Regular);
         assert_eq!(stat.size, expected_size);
         assert_eq!(&*stat.name, &*addr_hex);
+    }
+
+    #[test]
+    fn get_book_bytes_returns_full_content() {
+        let mut server = ContentServer::new();
+        let blob = alloc::vec![0x42u8; 8000];
+        server.walk(0, 1, "ingest").unwrap();
+        server.open(1, OpenMode::ReadWrite).unwrap();
+        server.write(1, 0, &blob).unwrap();
+        let resp = server.read(1, 0, 256).unwrap();
+        let cid: [u8; 32] = resp[..32].try_into().unwrap();
+        server.clunk(1).unwrap();
+        let retrieved = server.get_book_bytes(&cid).unwrap();
+        assert_eq!(retrieved, blob);
+    }
+
+    #[test]
+    fn get_book_bytes_missing_returns_none() {
+        let server = ContentServer::new();
+        assert!(server.get_book_bytes(&[0xAA; 32]).is_none());
+    }
+
+    #[test]
+    fn has_book_true_after_ingest() {
+        let mut server = ContentServer::new();
+        let blob = alloc::vec![0x55u8; PAGE_SIZE];
+        server.walk(0, 1, "ingest").unwrap();
+        server.open(1, OpenMode::ReadWrite).unwrap();
+        server.write(1, 0, &blob).unwrap();
+        let resp = server.read(1, 0, 256).unwrap();
+        let cid: [u8; 32] = resp[..32].try_into().unwrap();
+        server.clunk(1).unwrap();
+        assert!(server.has_book(&cid));
+    }
+
+    #[test]
+    fn has_book_false_for_missing() {
+        let server = ContentServer::new();
+        assert!(!server.has_book(&[0xBB; 32]));
     }
 }
