@@ -771,12 +771,16 @@ fn main() -> Status {
                         unsafe { cache::clean_range(buf.virt, 2048) };
                     }
                     genet_driver.reclaim_tx(&genet_bank, &mut tx_pool);
+                    // TODO: broadcast dst [0xFF;6] is correct for Reticulum announces
+                    // but wrong for unicast protocol responses. Needs neighbor table
+                    // for unicast MAC resolution.
                     match genet_driver.send(&mut genet_bank, &frame, &mut tx_pool) {
                         Ok(()) => {
                             sent = true;
                             let _ = writeln!(serial, "[TX] {} bytes on eth0", raw.len());
                         }
                         Err(e) => {
+                            sent = true;
                             let _ = writeln!(serial, "[TX] send error: {:?}", e);
                         }
                     }
