@@ -6,8 +6,9 @@
 //! We only need three fields for Layer 4 (lazy fetch).
 
 use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
-/// Parsed NARInfo — the three fields needed for lazy fetch.
+/// Parsed NARInfo — the fields needed for lazy fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NarInfo {
     /// Relative URL to the NAR file (e.g. `nar/1234abcd.nar.xz`).
@@ -18,6 +19,12 @@ pub struct NarInfo {
     pub nar_hash: String,
     /// Size of the decompressed NAR in bytes.
     pub nar_size: u64,
+    /// Runtime dependency store path names.
+    ///
+    /// `None` — field was absent from the narinfo.
+    /// `Some(vec![])` — field was present but empty (zero dependencies).
+    /// `Some(names)` — full list of runtime dependency store path names.
+    pub references: Option<Vec<String>>,
 }
 
 /// Errors from parsing NARInfo.
@@ -36,6 +43,7 @@ impl NarInfo {
         let mut compression = None;
         let mut nar_hash = None;
         let mut nar_size = None;
+        let mut references = None;
 
         for line in input.lines() {
             if let Some(val) = line.strip_prefix("URL: ") {
@@ -49,6 +57,13 @@ impl NarInfo {
                     val.parse::<u64>()
                         .map_err(|_| NarInfoError::InvalidNarSize)?,
                 );
+            } else if let Some(val) = line.strip_prefix("References: ") {
+                let refs: Vec<String> = val
+                    .split_whitespace()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
+                references = Some(refs);
             }
         }
 
@@ -57,23 +72,32 @@ impl NarInfo {
             compression: compression.unwrap_or_else(|| "bzip2".to_string()),
             nar_hash: nar_hash.ok_or(NarInfoError::MissingField("NarHash"))?,
             nar_size: nar_size.ok_or(NarInfoError::MissingField("NarSize"))?,
+            references,
         })
     }
 }
 
 /// Generate a minimal unsigned narinfo string.
 ///
-/// Produces 5 fields: StorePath, URL, Compression, NarHash, NarSize.
+/// Produces 5 fields: StorePath, URL, Compression, NarHash, NarSize,
+/// and optionally a References field.
 /// The NAR is served uncompressed (`Compression: none`).
 ///
 /// `nar_sha256` is the raw 32-byte SHA-256 digest of the NAR blob.
+/// `references` is `None` to omit the field, or `Some(slice)` to emit it
+/// (an empty slice produces `References: ` with no names).
 ///
 /// # Panics
 ///
 /// Panics if `store_path_name` contains `\n`, `\r`, or `\0` (would
 /// allow narinfo field injection).
 #[cfg(feature = "std")]
-pub fn serialize_narinfo(store_path_name: &str, nar_sha256: &[u8; 32], nar_size: u64) -> String {
+pub fn serialize_narinfo(
+    store_path_name: &str,
+    nar_sha256: &[u8; 32],
+    nar_size: u64,
+    references: Option<&[String]>,
+) -> String {
     use crate::nix_base32::encode_nix_base32;
 
     assert!(
@@ -84,13 +108,29 @@ pub fn serialize_narinfo(store_path_name: &str, nar_sha256: &[u8; 32], nar_size:
     );
 
     let hash_b32 = encode_nix_base32(nar_sha256);
-    format!(
+    let mut text = format!(
         "StorePath: /nix/store/{store_path_name}\n\
          URL: nar/{store_path_name}.nar\n\
          Compression: none\n\
          NarHash: sha256:{hash_b32}\n\
          NarSize: {nar_size}\n"
-    )
+    );
+    if let Some(refs) = references {
+        for r in refs {
+            assert!(
+                !r.contains('\n')
+                    && !r.contains('\r')
+                    && !r.contains('\0')
+                    && !r.contains(' ')
+                    && !r.contains('\t'),
+                "reference must not contain whitespace or control characters: {r:?}"
+            );
+        }
+        text.push_str("References: ");
+        text.push_str(&refs.join(" "));
+        text.push('\n');
+    }
+    text
 }
 
 #[cfg(test)]
@@ -171,6 +211,52 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
         assert_eq!(info.compression, "zstd");
     }
 
+    #[test]
+    fn parse_references_field() {
+        let input = "URL: nar/a.nar\nNarHash: sha256:abc\nNarSize: 10\nReferences: def456-glibc-2.38 ghi789-gcc-13.2\n";
+        let info = NarInfo::parse(input).unwrap();
+        assert_eq!(
+            info.references,
+            Some(vec![
+                "def456-glibc-2.38".to_string(),
+                "ghi789-gcc-13.2".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_missing_references_is_none() {
+        let input = "URL: nar/a.nar\nNarHash: sha256:abc\nNarSize: 10\n";
+        let info = NarInfo::parse(input).unwrap();
+        assert_eq!(info.references, None);
+    }
+
+    #[test]
+    fn parse_empty_references_is_some_empty() {
+        let input = "URL: nar/a.nar\nNarHash: sha256:abc\nNarSize: 10\nReferences: \n";
+        let info = NarInfo::parse(input).unwrap();
+        assert_eq!(info.references, Some(vec![]));
+    }
+
+    #[test]
+    fn parse_references_no_space_after_colon_is_none() {
+        let input = "URL: nar/a.nar\nNarHash: sha256:abc\nNarSize: 10\nReferences:packed\n";
+        let info = NarInfo::parse(input).unwrap();
+        assert_eq!(info.references, None);
+    }
+
+    #[test]
+    fn parse_references_from_sample_narinfo() {
+        let info = NarInfo::parse(SAMPLE_NARINFO).unwrap();
+        assert_eq!(
+            info.references,
+            Some(vec![
+                "def456-glibc-2.38".to_string(),
+                "ghi789-gcc-13.2".to_string()
+            ])
+        );
+    }
+
     #[cfg(feature = "std")]
     mod serialize_tests {
         use super::super::*;
@@ -179,7 +265,7 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
         #[test]
         fn serialize_minimal_narinfo() {
             let hash = sha2::Sha256::digest(b"test nar data");
-            let text = serialize_narinfo("abc123-hello", &hash.into(), 13);
+            let text = serialize_narinfo("abc123-hello", &hash.into(), 13, None);
 
             assert!(text.contains("StorePath: /nix/store/abc123-hello\n"));
             assert!(text.contains("URL: nar/abc123-hello.nar\n"));
@@ -192,7 +278,7 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
         fn serialize_round_trip() {
             let nar_data = b"some nar content for round trip";
             let hash = sha2::Sha256::digest(nar_data);
-            let text = serialize_narinfo("xyz789-world", &hash.into(), nar_data.len() as u64);
+            let text = serialize_narinfo("xyz789-world", &hash.into(), nar_data.len() as u64, None);
 
             // Parse it back with the existing parser.
             let parsed = NarInfo::parse(&text).unwrap();
@@ -205,7 +291,7 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
         #[test]
         fn serialize_store_path_format() {
             let hash = sha2::Sha256::digest(b"data");
-            let text = serialize_narinfo("test123-pkg", &hash.into(), 4);
+            let text = serialize_narinfo("test123-pkg", &hash.into(), 4, None);
             let store_line = text.lines().find(|l| l.starts_with("StorePath:")).unwrap();
             assert_eq!(store_line, "StorePath: /nix/store/test123-pkg");
         }
@@ -214,7 +300,36 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
         #[should_panic(expected = "control characters")]
         fn serialize_rejects_newline_injection() {
             let hash = sha2::Sha256::digest(b"data");
-            serialize_narinfo("abc123-pkg\nURL: nar/fake.nar\njunk", &hash.into(), 4);
+            serialize_narinfo("abc123-pkg\nURL: nar/fake.nar\njunk", &hash.into(), 4, None);
+        }
+
+        #[test]
+        fn serialize_with_references() {
+            let hash = sha2::Sha256::digest(b"ref test");
+            let refs = vec![
+                "def456-glibc-2.39".to_string(),
+                "ghi789-gcc-lib".to_string(),
+            ];
+            let text = serialize_narinfo("abc123-hello", &hash.into(), 8, Some(&refs));
+            assert!(text.contains("References: def456-glibc-2.39 ghi789-gcc-lib\n"));
+            let parsed = NarInfo::parse(&text).unwrap();
+            assert_eq!(parsed.references, Some(refs));
+        }
+
+        #[test]
+        fn serialize_without_references() {
+            let hash = sha2::Sha256::digest(b"no ref test");
+            let text = serialize_narinfo("abc123-hello", &hash.into(), 11, None);
+            assert!(!text.contains("References"));
+        }
+
+        #[test]
+        fn serialize_with_empty_references() {
+            let hash = sha2::Sha256::digest(b"empty ref");
+            let text = serialize_narinfo("abc123-hello", &hash.into(), 9, Some(&[]));
+            assert!(text.contains("References: \n"));
+            let parsed = NarInfo::parse(&text).unwrap();
+            assert_eq!(parsed.references, Some(vec![]));
         }
     }
 }

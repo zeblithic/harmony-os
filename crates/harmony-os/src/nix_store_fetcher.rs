@@ -11,6 +11,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use harmony_microkernel::nix_store_server::NixStoreServer;
+
+/// A NAR that was successfully fetched and imported into the store.
+#[derive(Debug, Clone)]
+pub struct ImportedNar {
+    /// The Nix store path name (e.g., "xxxxxxxx-package-1.0").
+    pub store_path: String,
+    /// The raw NAR bytes.
+    pub nar_bytes: Vec<u8>,
+    /// Optional references parsed from narinfo or mesh payload.
+    pub references: Option<Vec<String>>,
+    /// Whether this NAR was sourced from the mesh (already published).
+    /// Callers should skip re-publishing mesh-sourced NARs.
+    pub from_mesh: bool,
+}
 use sha2::{Digest, Sha256};
 use xz2::read::XzDecoder;
 
@@ -134,9 +148,9 @@ impl NixStoreFetcher {
 
     /// Process all pending misses: drain, deduplicate, fetch, import.
     ///
-    /// Returns a list of `(store_path_name, nar_bytes)` for each
-    /// successfully imported path, so callers can publish to the mesh.
-    pub fn process_misses(&mut self, server: &mut NixStoreServer) -> Vec<(String, Vec<u8>)> {
+    /// Returns a list of `(store_path_name, nar_bytes, references, from_mesh)` for each
+    /// successfully imported path. Skip re-publishing entries where `from_mesh` is `true`.
+    pub fn process_misses(&mut self, server: &mut NixStoreServer) -> Vec<ImportedNar> {
         let misses = server.drain_misses();
         self.process_miss_list(misses, |name, nar| {
             // Skip if already imported (race: kernel re-recorded a miss
@@ -154,12 +168,12 @@ impl NixStoreFetcher {
     /// Process misses from a shared (Arc<Mutex>) server, releasing the lock
     /// during HTTP I/O so the kernel thread isn't blocked.
     ///
-    /// Returns a list of `(store_path_name, nar_bytes)` for each
-    /// successfully imported path, so callers can publish to the mesh.
+    /// Returns a list of `(store_path_name, nar_bytes, references, from_mesh)` for each
+    /// successfully imported path. Skip re-publishing entries where `from_mesh` is `true`.
     pub fn process_misses_shared(
         &mut self,
         server: &Arc<Mutex<NixStoreServer>>,
-    ) -> Vec<(String, Vec<u8>)> {
+    ) -> Vec<ImportedNar> {
         let misses = server
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -185,12 +199,10 @@ impl NixStoreFetcher {
     /// on mesh miss (or mesh import failure) the fetcher falls back to
     /// the upstream HTTP cache.
     ///
-    /// Returns `(store_path_name, nar_bytes)` for every *newly* imported path.
-    fn process_miss_list<F>(
-        &mut self,
-        misses: Vec<Arc<str>>,
-        mut import_fn: F,
-    ) -> Vec<(String, Vec<u8>)>
+    /// Returns `(store_path_name, nar_bytes, references, from_mesh)` for every
+    /// *newly* imported path. Callers should skip re-publishing entries where
+    /// `from_mesh` is `true` — those NARs are already on the mesh.
+    fn process_miss_list<F>(&mut self, misses: Vec<Arc<str>>, mut import_fn: F) -> Vec<ImportedNar>
     where
         F: FnMut(&str, Vec<u8>) -> Result<bool, String>,
     {
@@ -202,11 +214,13 @@ impl NixStoreFetcher {
             }
 
             // Try mesh first (if available), tracking data source.
-            let mut nar_bytes = None;
+            let mut nar_bytes: Option<Vec<u8>> = None;
+            let mut nar_refs: Option<Vec<String>> = None;
             let mut from_mesh = false;
             if let Some(ref mesh) = self.mesh {
-                if let Some(mesh_nar) = mesh.fetch_nar(&name_str) {
+                if let Some((mesh_nar, mesh_refs)) = mesh.fetch_nar(&name_str) {
                     nar_bytes = Some(mesh_nar);
+                    nar_refs = mesh_refs;
                     from_mesh = true;
                 }
             }
@@ -214,7 +228,10 @@ impl NixStoreFetcher {
             // Fall back to HTTP if mesh didn't provide data.
             if nar_bytes.is_none() {
                 match self.fetch_nar(&name_str) {
-                    Ok(http_nar) => nar_bytes = Some(http_nar),
+                    Ok((http_nar, http_refs)) => {
+                        nar_bytes = Some(http_nar);
+                        nar_refs = http_refs;
+                    }
                     Err(e) => {
                         eprintln!("[nix-fetcher] fetch failed for {}: {:?}", name_str, e);
                         if !matches!(e, FetchError::Network(_)) {
@@ -228,10 +245,21 @@ impl NixStoreFetcher {
             let nar_bytes = nar_bytes.unwrap();
 
             if from_mesh {
-                // Mesh-sourced: no clone needed — we never return these
-                // for re-publishing (they're already on the mesh).
-                match import_fn(&name_str, nar_bytes) {
-                    Ok(_) => {}
+                // Mesh-sourced NARs are already on the mesh so callers don't
+                // need to re-publish (from_mesh=true), but we still return
+                // them so references can be persisted via .meta sidecars.
+                match import_fn(&name_str, nar_bytes.clone()) {
+                    Ok(true) => {
+                        imported.push(ImportedNar {
+                            store_path: name_str,
+                            nar_bytes,
+                            references: nar_refs,
+                            from_mesh: true,
+                        });
+                    }
+                    Ok(false) => {
+                        // Already present (race) — no .meta write needed.
+                    }
                     Err(e) => {
                         // Mesh data failed import — try HTTP before blacklisting.
                         eprintln!(
@@ -239,19 +267,26 @@ impl NixStoreFetcher {
                             name_str, e
                         );
                         match self.fetch_nar(&name_str) {
-                            Ok(http_nar) => match import_fn(&name_str, http_nar.clone()) {
-                                Ok(true) => {
-                                    imported.push((name_str, http_nar));
-                                    continue;
+                            Ok((http_nar, http_refs)) => {
+                                match import_fn(&name_str, http_nar.clone()) {
+                                    Ok(true) => {
+                                        imported.push(ImportedNar {
+                                            store_path: name_str,
+                                            nar_bytes: http_nar,
+                                            references: http_refs,
+                                            from_mesh: false,
+                                        });
+                                        continue;
+                                    }
+                                    Ok(false) => continue,
+                                    Err(e2) => {
+                                        eprintln!(
+                                            "[nix-fetcher] HTTP import also failed for {}: {}",
+                                            name_str, e2
+                                        );
+                                    }
                                 }
-                                Ok(false) => continue,
-                                Err(e2) => {
-                                    eprintln!(
-                                        "[nix-fetcher] HTTP import also failed for {}: {}",
-                                        name_str, e2
-                                    );
-                                }
-                            },
+                            }
                             Err(e2) => {
                                 eprintln!(
                                     "[nix-fetcher] HTTP fallback fetch failed for {}: {:?}",
@@ -267,11 +302,16 @@ impl NixStoreFetcher {
                     }
                 }
             } else {
-                // HTTP-sourced: clone needed — import_fn consumes the Vec,
-                // but we need the original for the return value.
+                // HTTP-sourced (from_mesh=false): clone needed — import_fn
+                // consumes the Vec, but we need the original for the return value.
                 match import_fn(&name_str, nar_bytes.clone()) {
                     Ok(true) => {
-                        imported.push((name_str, nar_bytes));
+                        imported.push(ImportedNar {
+                            store_path: name_str,
+                            nar_bytes,
+                            references: nar_refs,
+                            from_mesh: false,
+                        });
                     }
                     Ok(false) => {
                         // Already present — skip re-publishing.
@@ -288,8 +328,11 @@ impl NixStoreFetcher {
 
     /// Fetch a single store path: narinfo -> NAR -> decompress -> verify.
     ///
-    /// Returns the decompressed, verified NAR bytes on success.
-    fn fetch_nar(&self, store_path_name: &str) -> Result<Vec<u8>, FetchError> {
+    /// Returns the decompressed, verified NAR bytes and optional references on success.
+    fn fetch_nar(
+        &self,
+        store_path_name: &str,
+    ) -> Result<(Vec<u8>, Option<Vec<String>>), FetchError> {
         // 1. Extract store hash (first 32 chars, followed by `-`).
         if store_path_name.len() < 33 || store_path_name.as_bytes()[32] != b'-' {
             return Err(FetchError::NarInfo(
@@ -305,6 +348,9 @@ impl NixStoreFetcher {
             String::from_utf8(narinfo_bytes).map_err(|e| FetchError::NarInfo(e.to_string()))?;
         let narinfo =
             NarInfo::parse(&narinfo_text).map_err(|e| FetchError::NarInfo(format!("{:?}", e)))?;
+
+        // Capture references before moving narinfo fields.
+        let references = narinfo.references.clone();
 
         // 3. Check compression — we support xz and none (identity).
         if narinfo.compression != "xz" && narinfo.compression != "none" {
@@ -345,7 +391,7 @@ impl NixStoreFetcher {
         // 7. Verify SHA-256 hash.
         verify_nar_hash(&nar_bytes, &narinfo.nar_hash)?;
 
-        Ok(nar_bytes)
+        Ok((nar_bytes, references))
     }
 }
 
@@ -500,7 +546,8 @@ mod tests {
         // Process misses — should fetch and import.
         let imported = fetcher.process_misses(&mut server);
         assert_eq!(imported.len(), 1);
-        assert_eq!(imported[0].0, store_path_name);
+        assert_eq!(imported[0].store_path, store_path_name);
+        assert!(imported[0].references.is_none());
 
         // Verify the store path is now available.
         let qp = server.walk(0, 2, &store_path_name).unwrap();
@@ -672,14 +719,14 @@ mod tests {
         nar: Vec<u8>,
     }
     impl MeshNarFetch for MockMesh {
-        fn fetch_nar(&self, _: &str) -> Option<Vec<u8>> {
-            Some(self.nar.clone())
+        fn fetch_nar(&self, _: &str) -> Option<(Vec<u8>, Option<Vec<String>>)> {
+            Some((self.nar.clone(), None))
         }
     }
 
     struct EmptyMesh;
     impl MeshNarFetch for EmptyMesh {
-        fn fetch_nar(&self, _: &str) -> Option<Vec<u8>> {
+        fn fetch_nar(&self, _: &str) -> Option<(Vec<u8>, Option<Vec<String>>)> {
             None
         }
     }
@@ -710,14 +757,12 @@ mod tests {
         let _ = server.walk(0, 1, store_path_name);
 
         // Process — mesh provides NAR, HTTP is never consulted.
-        // Mesh-sourced NARs are NOT returned for re-publishing (already on mesh).
+        // Mesh-sourced NARs ARE returned so callers can persist references.
         let imported = fetcher.process_misses(&mut server);
-        assert!(
-            imported.is_empty(),
-            "mesh-sourced NARs should not be returned for re-publishing"
-        );
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].store_path, store_path_name);
 
-        // Verify import succeeded — store path is available despite empty return.
+        // Verify import succeeded.
         let qp = server.walk(0, 2, store_path_name).unwrap();
         assert_ne!(qp, 0);
 
@@ -765,7 +810,8 @@ mod tests {
         // Process — mesh misses, HTTP succeeds.
         let imported = fetcher.process_misses(&mut server);
         assert_eq!(imported.len(), 1);
-        assert_eq!(imported[0].0, store_path_name);
+        assert_eq!(imported[0].store_path, store_path_name);
+        assert!(imported[0].references.is_none());
 
         // Verify the store path is now available.
         let qp = server.walk(0, 2, &store_path_name).unwrap();
@@ -811,7 +857,50 @@ mod tests {
 
         let imported = fetcher.process_misses(&mut server);
         assert_eq!(imported.len(), 1);
-        assert_eq!(imported[0].0, store_path_name);
-        assert_eq!(imported[0].1, nar_bytes);
+        assert_eq!(imported[0].store_path, store_path_name);
+        assert_eq!(imported[0].nar_bytes, nar_bytes);
+        assert!(imported[0].references.is_none());
+    }
+
+    // ── Test: fetch propagates references ────────────────────────────
+
+    #[test]
+    fn fetch_propagates_references() {
+        let nar_bytes = build_test_nar(b"ref propagation test");
+        let hash = Sha256::digest(&nar_bytes);
+        let hash_b32 = encode_nix_base32(hash.as_slice());
+        let compressed = compress_xz(&nar_bytes);
+
+        let store_hash = "abc12345678901234567890123456789";
+        let store_path_name = format!("{}-ref-prop", store_hash);
+        let narinfo_text = format!(
+            "StorePath: /nix/store/{}\nURL: nar/rp.nar.xz\nCompression: xz\nNarHash: sha256:{}\nNarSize: {}\nReferences: dep123-glibc dep456-gcc\n",
+            store_path_name, hash_b32, nar_bytes.len()
+        );
+
+        let mut responses = HashMap::new();
+        responses.insert(
+            format!("https://cache.nixos.org/{}.narinfo", store_hash),
+            Ok(narinfo_text.into_bytes()),
+        );
+        responses.insert(
+            "https://cache.nixos.org/nar/rp.nar.xz".to_string(),
+            Ok(compressed),
+        );
+
+        let mock = MockHttp { responses };
+        let mut fetcher = NixStoreFetcher::new(Box::new(mock));
+        let mut server = NixStoreServer::new();
+
+        use harmony_microkernel::FileServer;
+        let _ = server.walk(0, 1, &store_path_name);
+
+        let imported = fetcher.process_misses(&mut server);
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].store_path, store_path_name);
+        assert_eq!(
+            imported[0].references,
+            Some(vec!["dep123-glibc".to_string(), "dep456-gcc".to_string()])
+        );
     }
 }

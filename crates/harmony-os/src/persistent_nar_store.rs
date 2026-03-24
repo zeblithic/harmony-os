@@ -12,6 +12,7 @@
 //! filesystem, so `NixStoreServer` itself remains a pure in-memory 9P
 //! server.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -99,6 +100,7 @@ impl PersistentNarStore {
         server: &mut NixStoreServer,
         name: &str,
         nar_bytes: Vec<u8>,
+        references: Option<Vec<String>>,
     ) -> io::Result<()> {
         // Validate name before any disk I/O — prevents path traversal.
         // Replicates the safety-critical subset of NixStoreServer::import_nar
@@ -127,7 +129,42 @@ impl PersistentNarStore {
         // write the valid data to disk.
         let already_imported = server.has_store_path(name);
         if !already_imported {
+            // Validate references before any disk I/O — avoids a
+            // write-then-delete round-trip on invalid input.
+            if let Some(ref refs) = references {
+                for r in refs {
+                    if r.contains('\n')
+                        || r.contains('\r')
+                        || r.contains('\0')
+                        || r.contains(' ')
+                        || r.contains('\t')
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("reference contains whitespace or control characters: {r:?}"),
+                        ));
+                    }
+                }
+            }
             std::fs::write(&path, &nar_bytes)?;
+            // Write .meta sidecar after .nar — crash between them leaves NAR
+            // loadable but without references (safe degradation).
+            let meta_path = self.dir.join(format!("{name}.meta"));
+            if let Some(ref refs) = references {
+                let meta_content = format!("References: {}\n", refs.join(" "));
+                if let Err(e) = std::fs::write(&meta_path, meta_content.as_bytes()) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(e);
+                }
+            } else {
+                // Remove any stale .meta from a prior import to avoid
+                // returning references that no longer apply on reload.
+                // Note: if import_nar below fails, this deletion is not
+                // rolled back. This is intentional — the stale .meta
+                // belonged to a path not in the in-memory server, so
+                // its data was already unreachable.
+                let _ = std::fs::remove_file(&meta_path);
+            }
         }
 
         // Import into server.
@@ -139,6 +176,11 @@ impl PersistentNarStore {
             // the parse-error skip path handles it.
             if !already_imported {
                 let _ = std::fs::remove_file(&path);
+                // Also clean up the .meta sidecar if it was written in this call.
+                if references.is_some() {
+                    let meta_path = self.dir.join(format!("{name}.meta"));
+                    let _ = std::fs::remove_file(&meta_path);
+                }
             }
             io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}"))
         })
@@ -148,6 +190,95 @@ impl PersistentNarStore {
     pub fn dir(&self) -> &Path {
         &self.dir
     }
+
+    /// Open or create a persistent NAR store, returning the store handle,
+    /// a populated `NixStoreServer`, and a map of store path names to their
+    /// references (only entries with a valid `.meta` sidecar are included).
+    ///
+    /// Missing `.meta` files → the entry is absent from the map (caller
+    /// treats as `None`). Corrupted `.meta` files are logged and skipped.
+    ///
+    /// Note: `ref_map` may contain entries for store paths not present in
+    /// `server` if orphaned `.meta` files exist (e.g. from a prior crash).
+    /// [`BinaryCacheServer::new_with_refs`](crate::nix_binary_cache::BinaryCacheServer::new_with_refs)
+    /// handles this correctly by only consulting `ref_map` for paths that
+    /// exist in the provided server.
+    pub fn open_with_refs(
+        dir: &Path,
+    ) -> io::Result<(Self, NixStoreServer, HashMap<String, Vec<String>>)> {
+        let (store, server) = Self::open(dir)?;
+
+        let mut ref_map: HashMap<String, Vec<String>> = HashMap::new();
+
+        for entry in std::fs::read_dir(dir)? {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!(
+                        "[persistent-nar-store] error reading dir entry for meta scan: {e}, skipping"
+                    );
+                    continue;
+                }
+            };
+            let path = entry.path();
+
+            if path.extension().map_or(true, |ext| ext != "meta") {
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+
+            let name = match path.file_stem().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!(
+                        "[persistent-nar-store] failed to read {}: {e}, skipping",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+
+            match parse_meta_references(&text) {
+                Some(refs) => {
+                    ref_map.insert(name, refs);
+                }
+                None => {
+                    eprintln!(
+                        "[persistent-nar-store] no References field in {}, skipping",
+                        path.display()
+                    );
+                }
+            }
+        }
+
+        Ok((store, server, ref_map))
+    }
+}
+
+/// Parse the `References:` line from a `.meta` sidecar file.
+///
+/// Returns `Some(vec)` if the line is present (empty vec for an empty
+/// references list), `None` if the field is missing or the input cannot
+/// be parsed.
+fn parse_meta_references(text: &str) -> Option<Vec<String>> {
+    for line in text.lines() {
+        if let Some(val) = line.strip_prefix("References: ") {
+            let refs: Vec<String> = val
+                .split_whitespace()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+            return Some(refs);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -199,7 +330,7 @@ mod tests {
 
         let nar = build_test_nar(b"hello persistent nix");
         store
-            .persist_and_import(&mut server, "abc123-hello", nar)
+            .persist_and_import(&mut server, "abc123-hello", nar, None)
             .unwrap();
 
         // NAR file should exist on disk.
@@ -223,7 +354,7 @@ mod tests {
         {
             let (store, mut server) = PersistentNarStore::open(tmp.path()).unwrap();
             store
-                .persist_and_import(&mut server, "rst123-reboot", nar.clone())
+                .persist_and_import(&mut server, "rst123-reboot", nar.clone(), None)
                 .unwrap();
         }
 
@@ -244,10 +375,20 @@ mod tests {
         {
             let (store, mut server) = PersistentNarStore::open(tmp.path()).unwrap();
             store
-                .persist_and_import(&mut server, "aaa123-first", build_test_nar(b"first pkg"))
+                .persist_and_import(
+                    &mut server,
+                    "aaa123-first",
+                    build_test_nar(b"first pkg"),
+                    None,
+                )
                 .unwrap();
             store
-                .persist_and_import(&mut server, "bbb456-second", build_test_nar(b"second pkg"))
+                .persist_and_import(
+                    &mut server,
+                    "bbb456-second",
+                    build_test_nar(b"second pkg"),
+                    None,
+                )
                 .unwrap();
         }
 
@@ -270,11 +411,11 @@ mod tests {
 
         let nar = build_test_nar(b"original");
         store
-            .persist_and_import(&mut server, "dup123-dupe", nar.clone())
+            .persist_and_import(&mut server, "dup123-dupe", nar.clone(), None)
             .unwrap();
 
         // Second import of same name should fail.
-        let result = store.persist_and_import(&mut server, "dup123-dupe", nar);
+        let result = store.persist_and_import(&mut server, "dup123-dupe", nar, None);
         assert!(result.is_err());
 
         // P0 regression: the original .nar file must still exist on disk.
@@ -300,13 +441,13 @@ mod tests {
 
         // Names with path separators must be rejected before any disk write.
         assert!(store
-            .persist_and_import(&mut server, "../escape", nar.clone())
+            .persist_and_import(&mut server, "../escape", nar.clone(), None)
             .is_err());
         assert!(store
-            .persist_and_import(&mut server, "foo/bar", nar.clone())
+            .persist_and_import(&mut server, "foo/bar", nar.clone(), None)
             .is_err());
         assert!(store
-            .persist_and_import(&mut server, "/tmp/evil", nar.clone())
+            .persist_and_import(&mut server, "/tmp/evil", nar.clone(), None)
             .is_err());
 
         // No files should have been created outside the store directory.
@@ -320,7 +461,12 @@ mod tests {
         {
             let (store, mut server) = PersistentNarStore::open(tmp.path()).unwrap();
             store
-                .persist_and_import(&mut server, "good123-valid", build_test_nar(b"valid data"))
+                .persist_and_import(
+                    &mut server,
+                    "good123-valid",
+                    build_test_nar(b"valid data"),
+                    None,
+                )
                 .unwrap();
         }
 
@@ -357,7 +503,7 @@ mod tests {
 
         // Re-persist with valid data — should overwrite the corrupted file.
         store
-            .persist_and_import(&mut server, "crash1-pkg", nar)
+            .persist_and_import(&mut server, "crash1-pkg", nar, None)
             .unwrap();
 
         // Data should be available in memory.
@@ -379,7 +525,7 @@ mod tests {
         {
             let (store, mut server) = PersistentNarStore::open(tmp.path()).unwrap();
             store
-                .persist_and_import(&mut server, "abc123-real", build_test_nar(b"real"))
+                .persist_and_import(&mut server, "abc123-real", build_test_nar(b"real"), None)
                 .unwrap();
         }
 
@@ -389,5 +535,94 @@ mod tests {
 
         let (_store, mut server) = PersistentNarStore::open(tmp.path()).unwrap();
         server.walk(0, 1, "abc123-real").unwrap();
+    }
+
+    #[test]
+    fn persist_with_references_writes_meta() {
+        let tmp = TempDir::new().unwrap();
+        let (store, mut server) = PersistentNarStore::open(tmp.path()).unwrap();
+        let refs = Some(vec!["dep123-glibc".to_string(), "dep456-gcc".to_string()]);
+        store
+            .persist_and_import(&mut server, "abc123-hello", build_test_nar(b"hello"), refs)
+            .unwrap();
+        let meta = std::fs::read_to_string(tmp.path().join("abc123-hello.meta")).unwrap();
+        assert!(meta.contains("References: dep123-glibc dep456-gcc"));
+    }
+
+    #[test]
+    fn persist_without_references_no_meta() {
+        let tmp = TempDir::new().unwrap();
+        let (store, mut server) = PersistentNarStore::open(tmp.path()).unwrap();
+        store
+            .persist_and_import(&mut server, "abc123-hello", build_test_nar(b"hello"), None)
+            .unwrap();
+        assert!(!tmp.path().join("abc123-hello.meta").exists());
+    }
+
+    #[test]
+    fn persist_empty_references_writes_meta() {
+        let tmp = TempDir::new().unwrap();
+        let (store, mut server) = PersistentNarStore::open(tmp.path()).unwrap();
+        store
+            .persist_and_import(
+                &mut server,
+                "abc123-hello",
+                build_test_nar(b"hello"),
+                Some(vec![]),
+            )
+            .unwrap();
+        let meta = std::fs::read_to_string(tmp.path().join("abc123-hello.meta")).unwrap();
+        assert!(meta.starts_with("References: "));
+    }
+
+    #[test]
+    fn reload_restores_references() {
+        let tmp = TempDir::new().unwrap();
+        let refs = vec!["dep123-glibc".to_string()];
+        {
+            let (store, mut server) = PersistentNarStore::open(tmp.path()).unwrap();
+            store
+                .persist_and_import(
+                    &mut server,
+                    "abc123-hello",
+                    build_test_nar(b"hello"),
+                    Some(refs.clone()),
+                )
+                .unwrap();
+        }
+        let (_store, _server, ref_map) = PersistentNarStore::open_with_refs(tmp.path()).unwrap();
+        assert_eq!(ref_map.get("abc123-hello"), Some(&refs));
+    }
+
+    #[test]
+    fn reload_missing_meta_gives_none() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let (store, mut server) = PersistentNarStore::open(tmp.path()).unwrap();
+            store
+                .persist_and_import(&mut server, "abc123-hello", build_test_nar(b"hello"), None)
+                .unwrap();
+        }
+        let (_store, _server, ref_map) = PersistentNarStore::open_with_refs(tmp.path()).unwrap();
+        assert!(!ref_map.contains_key("abc123-hello"));
+    }
+
+    #[test]
+    fn reload_corrupted_meta_skipped() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let (store, mut server) = PersistentNarStore::open(tmp.path()).unwrap();
+            store
+                .persist_and_import(&mut server, "abc123-hello", build_test_nar(b"hello"), None)
+                .unwrap();
+        }
+        std::fs::write(
+            tmp.path().join("abc123-hello.meta"),
+            b"\xff\xfe invalid utf8",
+        )
+        .unwrap();
+        let (_store, mut server, ref_map) = PersistentNarStore::open_with_refs(tmp.path()).unwrap();
+        server.walk(0, 1, "abc123-hello").unwrap();
+        assert!(!ref_map.contains_key("abc123-hello"));
     }
 }

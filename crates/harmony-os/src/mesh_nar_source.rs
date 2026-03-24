@@ -33,14 +33,21 @@ pub trait ContentQuerier {
 
 // ── MeshNarFetch trait ──────────────────────────────────────────────
 
+/// Return type for [`MeshNarFetch::fetch_nar`]: NAR bytes and an optional
+/// list of store path references declared in the mesh announcement payload.
+pub type MeshNarResult = Option<(Vec<u8>, Option<Vec<String>>)>;
+
 /// Trait for fetching NAR bytes from the mesh, used by `NixStoreFetcher`
 /// as an alternative source before falling back to HTTP binary caches.
 pub trait MeshNarFetch {
     /// Attempt to fetch a NAR archive for the given store path name.
     ///
-    /// Returns `Some(nar_bytes)` on success, `None` if the path is not
-    /// available on the mesh or any error occurs.
-    fn fetch_nar(&self, store_path_name: &str) -> Option<Vec<u8>>;
+    /// Returns `Some((nar_bytes, references))` on success, where `references`
+    /// is `None` if the publisher did not include references in the payload
+    /// (backward compat) or `Some(refs)` with the declared store path
+    /// references. Returns `None` if the path is not available on the mesh
+    /// or any error occurs.
+    fn fetch_nar(&self, store_path_name: &str) -> MeshNarResult;
 }
 
 // ── MeshNarSource ───────────────────────────────────────────────────
@@ -75,11 +82,14 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
         Self { querier }
     }
 
-    /// Attempt to fetch a NAR from the mesh, returning the reassembled bytes.
+    /// Attempt to fetch a NAR from the mesh, returning the reassembled bytes
+    /// and any declared references.
     ///
-    /// Returns `Ok(Some(nar_bytes))` on success, `Ok(None)` if the store
-    /// path is not published on the mesh, or `Err` on protocol errors.
-    pub fn try_fetch(&self, store_path_name: &str) -> Result<Option<Vec<u8>>, String> {
+    /// Returns `Ok(Some((nar_bytes, references)))` on success, `Ok(None)` if
+    /// the store path is not published on the mesh, or `Err` on protocol
+    /// errors. `references` is `None` when the publisher used the old
+    /// single-line payload format (backward compat).
+    pub fn try_fetch(&self, store_path_name: &str) -> Result<MeshNarResult, String> {
         // 1. Validate store path format: at least 33 chars, hyphen at position 32.
         if store_path_name.len() < 33 || store_path_name.as_bytes()[32] != b'-' {
             return Ok(None);
@@ -93,17 +103,33 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
             None => return Ok(None), // Not published on the mesh.
         };
 
-        // 3. Decode the root CID from hex.
-        let root_cid_hex = String::from_utf8(root_cid_hex_bytes)
-            .map_err(|e| format!("root CID hex is not valid UTF-8: {e}"))?;
-        let root_cid_bytes: [u8; 32] = hex::decode(&root_cid_hex)
+        // 3. Decode the root CID and parse optional references from the payload.
+        //    Payload format: `<cid_hex>` (old) or `<cid_hex>\n<ref1>\n<ref2>...` (new).
+        let payload_text = String::from_utf8(root_cid_hex_bytes)
+            .map_err(|e| format!("payload is not valid UTF-8: {e}"))?;
+        let mut lines = payload_text.lines();
+        let root_cid_hex = lines
+            .next()
+            .ok_or_else(|| "empty store path payload".to_string())?;
+
+        let references: Vec<String> = lines
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect();
+        let references = if references.is_empty() && !payload_text.contains('\n') {
+            None
+        } else {
+            Some(references)
+        };
+
+        let root_cid_bytes: [u8; 32] = hex::decode(root_cid_hex)
             .map_err(|e| format!("failed to decode root CID hex: {e}"))?
             .try_into()
             .map_err(|v: Vec<u8>| format!("root CID is {} bytes, expected 32", v.len()))?;
         let root_cid = ContentId::from_bytes(root_cid_bytes);
 
         // 4. Fetch the root book/bundle from the mesh.
-        let fetch_key = content::fetch_key(&root_cid_hex);
+        let fetch_key = content::fetch_key(root_cid_hex);
         let root_data = match self.querier.query(&fetch_key)? {
             Some(data) => data,
             None => return Ok(None), // Root book missing from mesh.
@@ -121,7 +147,7 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
         let reassembled = dag::reassemble(&root_cid, &store)
             .map_err(|e| format!("DAG reassembly failed: {e:?}"))?;
 
-        Ok(Some(reassembled))
+        Ok(Some((reassembled, references)))
     }
 
     /// Recursively fetch all DAG children that are not yet in the store.
@@ -187,7 +213,7 @@ impl<Q: ContentQuerier> MeshNarSource<Q> {
 }
 
 impl<Q: ContentQuerier> MeshNarFetch for MeshNarSource<Q> {
-    fn fetch_nar(&self, store_path_name: &str) -> Option<Vec<u8>> {
+    fn fetch_nar(&self, store_path_name: &str) -> MeshNarResult {
         match self.try_fetch(store_path_name) {
             Ok(result) => result,
             Err(e) => {
@@ -346,7 +372,10 @@ mod tests {
         let source = MeshNarSource::new(querier);
 
         let result = source.try_fetch(store_path_name).unwrap();
-        assert_eq!(result, Some(nar_bytes));
+        let (fetched_nar, refs) = result.expect("should have fetched NAR");
+        assert_eq!(fetched_nar, nar_bytes);
+        // Old-format payload (no references) → None.
+        assert_eq!(refs, None);
     }
 
     #[test]
@@ -404,8 +433,8 @@ mod tests {
 
         let store_path_name = "abc12345678901234567890123456789-error-pkg";
         // MeshNarFetch::fetch_nar should return None (not panic) on error.
-        let result = source.fetch_nar(store_path_name);
-        assert_eq!(result, None);
+        let result: MeshNarResult = source.fetch_nar(store_path_name);
+        assert!(result.is_none());
     }
 
     /// End-to-end: publish via NarPublisher, then fetch via MeshNarSource.
@@ -424,7 +453,7 @@ mod tests {
         let store_path = "abc12345678901234567890123456789-e2e-test";
 
         let mut publisher = NarPublisher::new(NoopAnnouncer);
-        let root_cid = publisher.publish(store_path, &nar).unwrap();
+        let root_cid = publisher.publish(store_path, &nar, None).unwrap();
 
         // Populate mock querier with publisher's book store data.
         let mut querier = MockQuerier::new();
@@ -455,6 +484,7 @@ mod tests {
         // Fetch side.
         let source = MeshNarSource::new(querier);
         let fetched = source.fetch_nar(store_path);
-        assert_eq!(fetched, Some(nar));
+        let (fetched_nar, _refs) = fetched.expect("end-to-end fetch should succeed");
+        assert_eq!(fetched_nar, nar);
     }
 }

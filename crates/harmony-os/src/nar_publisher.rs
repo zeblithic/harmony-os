@@ -75,12 +75,14 @@ impl<A: ContentAnnouncer, S: BookStore> NarPublisher<A, S> {
     /// 1. Chunks the NAR via `dag::ingest`
     /// 2. Records the store-path-to-root-CID mapping
     /// 3. Announces the store path mapping on `harmony/nix/store/{store_hash}`
+    ///    (payload = `<cid_hex>` for no refs, or `<cid_hex>\n<ref1>\n<ref2>...`)
     /// 4. Walks the DAG and announces each book on `harmony/announce/{cid_hex}`
     /// 5. If the root is a bundle (multi-chunk), announces the bundle itself
     pub fn publish(
         &mut self,
         store_path_name: &str,
         nar_bytes: &[u8],
+        references: Option<Vec<String>>,
     ) -> Result<ContentId, String> {
         // Validate store path format FIRST — before any mutation.
         if store_path_name.len() < 33 || store_path_name.as_bytes()[32] != b'-' {
@@ -97,11 +99,35 @@ impl<A: ContentAnnouncer, S: BookStore> NarPublisher<A, S> {
             .map_err(|e| format!("ingest failed: {e}"))?;
 
         // Announce store path mapping: key = harmony/nix/store/{store_hash},
-        // payload = root CID as hex.
+        // payload = root CID as hex, optionally followed by newline-separated
+        // references (e.g. `<cid_hex>\n<ref1>\n<ref2>`).
         let root_cid_hex = hex::encode(root_cid.to_bytes());
         let store_key = format!("harmony/nix/store/{store_hash}");
-        self.announcer
-            .announce(&store_key, root_cid_hex.as_bytes())?;
+        let mut payload = root_cid_hex.clone();
+        if let Some(refs) = &references {
+            // Trailing \n distinguishes Some(vec![]) from None:
+            // - None → "cid_hex" (no newline)
+            // - Some(vec![]) → "cid_hex\n" (newline, no refs)
+            // - Some(refs) → "cid_hex\nref1\nref2"
+            payload.push('\n');
+            for (i, r) in refs.iter().enumerate() {
+                if r.contains('\n')
+                    || r.contains('\r')
+                    || r.contains('\0')
+                    || r.contains(' ')
+                    || r.contains('\t')
+                {
+                    return Err(format!(
+                        "reference must not contain whitespace or control characters: {r:?}"
+                    ));
+                }
+                if i > 0 {
+                    payload.push('\n');
+                }
+                payload.push_str(r);
+            }
+        }
+        self.announcer.announce(&store_key, payload.as_bytes())?;
 
         // Walk the DAG to collect all leaf book CIDs.
         let book_cids =
@@ -231,7 +257,7 @@ mod tests {
 
         let nar = build_test_nar(b"hello mesh");
         let store_path = "abc12345678901234567890123456789-test-pkg";
-        let root_cid = publisher.publish(store_path, &nar).unwrap();
+        let root_cid = publisher.publish(store_path, &nar, None).unwrap();
 
         // Root CID must be recorded.
         assert_eq!(publisher.get_root_cid(store_path), Some(&root_cid));
@@ -259,7 +285,7 @@ mod tests {
 
         let nar = build_test_nar(b"check cid");
         let store_path = "xyz12345678901234567890123456789-cid-pkg";
-        let root_cid = publisher.publish(store_path, &nar).unwrap();
+        let root_cid = publisher.publish(store_path, &nar, None).unwrap();
 
         // get_root_cid returns the same CID.
         assert_eq!(publisher.get_root_cid(store_path), Some(&root_cid));
@@ -275,7 +301,7 @@ mod tests {
 
         let nar = build_test_nar(b"key format check");
         let store_path = "fmt12345678901234567890123456789-fmt-pkg";
-        publisher.publish(store_path, &nar).unwrap();
+        publisher.publish(store_path, &nar, None).unwrap();
 
         let announcements = log.borrow();
 
@@ -295,7 +321,7 @@ mod tests {
         let mut publisher = NarPublisher::new(announcer);
 
         let store_path = "emp12345678901234567890123456789-empty-pkg";
-        let result = publisher.publish(store_path, &[]);
+        let result = publisher.publish(store_path, &[], None);
 
         assert!(result.is_err(), "publishing empty data should fail");
     }
@@ -306,7 +332,7 @@ mod tests {
 
         let nar = build_test_nar(b"will fail");
         let store_path = "fail2345678901234567890123456789-fail-pkg";
-        let result = publisher.publish(store_path, &nar);
+        let result = publisher.publish(store_path, &nar, None);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -327,7 +353,7 @@ mod tests {
 
         let nar = build_test_nar(b"round trip data");
         let store_path = "rnd12345678901234567890123456789-round-pkg";
-        let root_cid = publisher.publish(store_path, &nar).unwrap();
+        let root_cid = publisher.publish(store_path, &nar, None).unwrap();
 
         // Reassemble from the publisher's book store should recover original NAR.
         let recovered = dag::reassemble(&root_cid, publisher.book_store()).unwrap();
@@ -341,17 +367,17 @@ mod tests {
         let nar = build_test_nar(b"test");
 
         // Too short.
-        let result = publisher.publish("short", &nar);
+        let result = publisher.publish("short", &nar, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("format"));
 
         // 33+ chars but no hyphen at position 32.
         let no_hyphen = "abcdefghijklmnopqrstuvwxyz012345Xrest";
-        let result = publisher.publish(no_hyphen, &nar);
+        let result = publisher.publish(no_hyphen, &nar, None);
         assert!(result.is_err());
 
         // Exactly 32 chars (missing hyphen + name).
-        let result = publisher.publish("abc12345678901234567890123456789", &nar);
+        let result = publisher.publish("abc12345678901234567890123456789", &nar, None);
         assert!(result.is_err());
     }
 
@@ -362,7 +388,7 @@ mod tests {
         let nar = build_test_nar(b"should not leak");
 
         // Attempt to publish with a malformed store path.
-        let result = publisher.publish("short", &nar);
+        let result = publisher.publish("short", &nar, None);
         assert!(result.is_err());
 
         // No mappings should exist — validation failed before mutation.
@@ -385,7 +411,7 @@ mod tests {
 
         let nar = build_test_nar(b"persistent publish");
         let store_path = "dsk12345678901234567890123456789-disk-pkg";
-        let root_cid = publisher.publish(store_path, &nar).unwrap();
+        let root_cid = publisher.publish(store_path, &nar, None).unwrap();
 
         // Books should be on disk.
         let file_count = std::fs::read_dir(tmp.path()).unwrap().count();
@@ -394,5 +420,37 @@ mod tests {
         // Round-trip: reassemble from persistent store.
         let recovered = dag::reassemble(&root_cid, publisher.book_store()).unwrap();
         assert_eq!(recovered, nar);
+    }
+
+    #[test]
+    fn publish_with_references_encodes_in_payload() {
+        let (announcer, log) = MockAnnouncer::new();
+        let mut publisher = NarPublisher::new(announcer);
+        let nar = build_test_nar(b"ref test");
+        let store_path = "abc12345678901234567890123456789-ref-pkg";
+        let refs = Some(vec!["dep123-glibc".to_string(), "dep456-gcc".to_string()]);
+        publisher.publish(store_path, &nar, refs).unwrap();
+        let announcements = log.borrow();
+        let payload = String::from_utf8(announcements[0].1.clone()).unwrap();
+        let lines: Vec<&str> = payload.lines().collect();
+        assert!(lines.len() >= 3, "expected CID + 2 refs, got {lines:?}");
+        assert_eq!(lines[0].len(), 64); // CID hex
+        assert_eq!(lines[1], "dep123-glibc");
+        assert_eq!(lines[2], "dep456-gcc");
+    }
+
+    #[test]
+    fn publish_without_references_single_line_payload() {
+        let (announcer, log) = MockAnnouncer::new();
+        let mut publisher = NarPublisher::new(announcer);
+        let nar = build_test_nar(b"no ref");
+        let store_path = "abc12345678901234567890123456789-noref-pkg";
+        publisher.publish(store_path, &nar, None).unwrap();
+        let announcements = log.borrow();
+        let payload = String::from_utf8(announcements[0].1.clone()).unwrap();
+        assert!(
+            !payload.contains('\n'),
+            "no-ref payload should be single line"
+        );
     }
 }
