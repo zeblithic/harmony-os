@@ -224,7 +224,7 @@ In `crates/harmony-boot-aarch64/src/platform.rs`:
 pub const XHCI_BASE: usize = 0x1F00D_0000;
 ```
 
-The DesignWare xHCI controller is at RP1 offset `0xD0000` from the RP1 PCIe BAR base (`0x1F000_0000`), same mechanism as GENET at `0x1F005_8000`.
+The DesignWare xHCI controller is at RP1 offset `0xD0000` from the RP1 PCIe BAR base (`0x1F000_0000`), same mechanism as GENET at `0x1F005_8000`. Map 16 pages (~64KB) to cover capability, operational, port, runtime, and doorbell register regions — matches the GENET MMIO entry size.
 
 ### MMIO Region Entry
 
@@ -238,7 +238,7 @@ The boot event loop in `main.rs` will conditionally call `XhciDriver::init()` an
 
 | File | Change |
 |------|--------|
-| `crates/harmony-unikernel/src/drivers/dwc_usb.rs` | Expand: PORTSC constants, `XhciDriver`, `XhciState`, `XhciError`, `UsbSpeed`, `PortStatus`, `init()`, `detect_ports()`, 10 unit tests |
+| `crates/harmony-unikernel/src/drivers/dwc_usb.rs` | Expand: replaces `DwcUsbDriver` placeholder. PORTSC constants, `XhciDriver`, `XhciState`, `XhciError`, `UsbSpeed`, `PortStatus`, `init()`, `detect_ports()`, 10 unit tests |
 | `crates/harmony-boot-aarch64/src/platform.rs` | Add `XHCI_BASE` constant + MMIO region entry (rpi5 only) |
 
 ## Testing Strategy
