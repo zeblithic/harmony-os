@@ -589,7 +589,11 @@ fn parse_csd_capacity(resp: [u32; 4], is_sdhc: bool) -> u32 {
         // Capacity = (C_SIZE + 1) * 512KB = (C_SIZE + 1) * 1024 blocks.
         // Saturate at u32::MAX for 2TB cards (max C_SIZE produces exactly 2^32).
         let blocks = (c_size + 1) * 1024;
-        if blocks > u32::MAX as u64 { u32::MAX } else { blocks as u32 }
+        if blocks > u32::MAX as u64 {
+            u32::MAX
+        } else {
+            blocks as u32
+        }
     } else if !is_sdhc && csd_version == 0 {
         // CSD v1.0 (SDSC):
         // READ_BL_LEN: CSD bits [83:80] → after shift: RESPONSE_2 bits [11:8]
