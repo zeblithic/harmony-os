@@ -17,6 +17,8 @@ pub use types::*;
 pub mod trb;
 pub use trb::*;
 
+mod ring;
+
 use super::register_bank::RegisterBank;
 
 // ── Capability registers (offset from MMIO base) ─────────────────
