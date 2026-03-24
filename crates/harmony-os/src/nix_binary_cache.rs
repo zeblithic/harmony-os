@@ -105,7 +105,8 @@ impl BinaryCacheServer {
             }
             return match self.hash_index.get(hash) {
                 Some(entry) => {
-                    let text = serialize_narinfo(&entry.name, &entry.nar_sha256, entry.nar_size);
+                    let text =
+                        serialize_narinfo(&entry.name, &entry.nar_sha256, entry.nar_size, None);
                     CacheResponse::Narinfo(text)
                 }
                 None => {
