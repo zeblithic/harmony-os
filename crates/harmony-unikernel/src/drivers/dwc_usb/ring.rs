@@ -93,6 +93,101 @@ impl CommandRing {
     }
 }
 
+/// Number of TRB entries in the transfer ring (63 usable + 1 Link).
+pub const TRANSFER_RING_SIZE: usize = 64;
+/// Number of usable transfer slots (last slot is the Link TRB).
+const TRANSFER_RING_USABLE: usize = TRANSFER_RING_SIZE - 1;
+
+/// Transfer ring state — per-endpoint data transfer.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TransferRing {
+    base_phys: u64,
+    enqueue_index: u16,
+    cycle_bit: bool,
+}
+
+impl TransferRing {
+    /// Create a new transfer ring at the given physical base address.
+    pub fn new(base_phys: u64) -> Self {
+        Self {
+            base_phys,
+            enqueue_index: 0,
+            cycle_bit: true,
+        }
+    }
+
+    /// Enqueue a single TRB, handling Link TRB wrap if needed.
+    fn enqueue_one(
+        &mut self,
+        trb_type: u8,
+        parameter: u64,
+        status: u32,
+        extra_flags: u32,
+    ) -> Result<Vec<(u64, Trb)>, XhciError> {
+        let phys = self.base_phys + (self.enqueue_index as u64) * TRB_SIZE;
+        let mut trb = Trb {
+            parameter,
+            status,
+            control: (trb_type as u32) << 10 | extra_flags,
+        };
+        trb.set_cycle_bit(self.cycle_bit);
+
+        let mut entries = Vec::with_capacity(2);
+        entries.push((phys, trb));
+
+        self.enqueue_index += 1;
+
+        if self.enqueue_index >= TRANSFER_RING_USABLE as u16 {
+            let link_phys = self.base_phys + (TRANSFER_RING_USABLE as u64) * TRB_SIZE;
+            let mut link = Trb {
+                parameter: self.base_phys,
+                status: 0,
+                control: (TRB_LINK as u32) << 10 | LINK_TOGGLE_CYCLE,
+            };
+            link.set_cycle_bit(self.cycle_bit);
+            entries.push((link_phys, link));
+
+            self.enqueue_index = 0;
+            self.cycle_bit = !self.cycle_bit;
+        }
+
+        Ok(entries)
+    }
+
+    /// Enqueue a control IN transfer (Setup + Data + Status).
+    ///
+    /// Returns TRB entries to write to DMA. May include Link TRBs
+    /// if the ring wraps mid-sequence.
+    pub fn enqueue_control_in(
+        &mut self,
+        setup_packet: [u8; 8],
+        data_buf_phys: u64,
+        data_len: u16,
+    ) -> Result<Vec<(u64, Trb)>, XhciError> {
+        use super::trb::{
+            DIR_IN, IDT, IOC, TRB_DATA_STAGE, TRB_SETUP_STAGE, TRB_STATUS_STAGE, TRT_IN,
+        };
+
+        let mut all_entries = Vec::new();
+
+        // 1. Setup TRB: parameter = setup packet as u64 LE, status = 8
+        let setup_param = u64::from_le_bytes(setup_packet);
+        let setup_entries = self.enqueue_one(TRB_SETUP_STAGE, setup_param, 8, TRT_IN | IDT)?;
+        all_entries.extend(setup_entries);
+
+        // 2. Data TRB: parameter = data buffer phys, status = data_len, DIR_IN, no IOC
+        let data_entries =
+            self.enqueue_one(TRB_DATA_STAGE, data_buf_phys, data_len as u32, DIR_IN)?;
+        all_entries.extend(data_entries);
+
+        // 3. Status TRB: direction OUT (no DIR_IN), IOC
+        let status_entries = self.enqueue_one(TRB_STATUS_STAGE, 0, 0, IOC)?;
+        all_entries.extend(status_entries);
+
+        Ok(all_entries)
+    }
+}
+
 /// Event ring state — controller enqueues events, host dequeues.
 #[derive(Debug, PartialEq, Eq)]
 pub struct EventRing {
@@ -133,6 +228,9 @@ impl EventRing {
 
 #[cfg(test)]
 mod tests {
+    use super::super::trb::{
+        DIR_IN, IDT, IOC, TRB_DATA_STAGE, TRB_SETUP_STAGE, TRB_STATUS_STAGE, TRT_IN,
+    };
     use super::*;
 
     const BASE: u64 = 0x1000_0000;
@@ -264,5 +362,80 @@ mod tests {
         assert_eq!(ring.dequeue_pointer(), BASE + 16);
         ring.advance();
         assert_eq!(ring.dequeue_pointer(), BASE + 32);
+    }
+
+    // ── TransferRing tests ──────────────────────────────────────────
+
+    #[test]
+    fn transfer_ring_enqueue_control_returns_3_trbs() {
+        let mut ring = TransferRing::new(BASE);
+        let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]; // GET_DESCRIPTOR(Device)
+        let entries = ring.enqueue_control_in(setup, 0xA000_0000, 18).unwrap();
+        // Should be exactly 3 TRBs (Setup, Data, Status) — no Link TRB at start
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].1.trb_type(), TRB_SETUP_STAGE);
+        assert_eq!(entries[1].1.trb_type(), TRB_DATA_STAGE);
+        assert_eq!(entries[2].1.trb_type(), TRB_STATUS_STAGE);
+    }
+
+    #[test]
+    fn transfer_ring_setup_trb_flags() {
+        let mut ring = TransferRing::new(BASE);
+        let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00];
+        let entries = ring.enqueue_control_in(setup, 0xA000_0000, 18).unwrap();
+        let ctrl = entries[0].1.control;
+        // Should have: TRT_IN, IDT, cycle bit
+        assert_ne!(ctrl & TRT_IN, 0, "Setup TRB should have TRT_IN");
+        assert_ne!(ctrl & IDT, 0, "Setup TRB should have IDT (Immediate Data)");
+        assert!(
+            entries[0].1.cycle_bit(),
+            "Setup TRB should have cycle bit set"
+        );
+        // Setup TRB parameter = 8-byte setup packet as u64 LE
+        let pkt_bytes = entries[0].1.parameter.to_le_bytes();
+        assert_eq!(&pkt_bytes, &setup);
+        // Setup TRB status = 8 (transfer length)
+        assert_eq!(entries[0].1.status, 8);
+    }
+
+    #[test]
+    fn transfer_ring_data_trb_fields() {
+        let mut ring = TransferRing::new(BASE);
+        let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00];
+        let entries = ring.enqueue_control_in(setup, 0xA000_0000, 18).unwrap();
+        let data_trb = &entries[1].1;
+        assert_eq!(
+            data_trb.parameter, 0xA000_0000,
+            "Data TRB parameter = data buffer phys"
+        );
+        assert_eq!(data_trb.status, 18, "Data TRB status = data length");
+        assert_ne!(data_trb.control & DIR_IN, 0, "Data TRB should have DIR_IN");
+        // No IOC on Data TRB (only on Status)
+        assert_eq!(data_trb.control & IOC, 0, "Data TRB should NOT have IOC");
+    }
+
+    #[test]
+    fn transfer_ring_status_trb_flags() {
+        let mut ring = TransferRing::new(BASE);
+        let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00];
+        let entries = ring.enqueue_control_in(setup, 0xA000_0000, 18).unwrap();
+        let status_trb = &entries[2].1;
+        assert_ne!(status_trb.control & IOC, 0, "Status TRB should have IOC");
+        // Direction OUT (no DIR_IN flag) — opposite of data phase
+        assert_eq!(
+            status_trb.control & DIR_IN,
+            0,
+            "Status TRB should NOT have DIR_IN (direction OUT)"
+        );
+    }
+
+    #[test]
+    fn transfer_ring_phys_addresses_sequential() {
+        let mut ring = TransferRing::new(BASE);
+        let setup = [0; 8];
+        let entries = ring.enqueue_control_in(setup, 0xA000, 18).unwrap();
+        assert_eq!(entries[0].0, BASE); // Setup at index 0
+        assert_eq!(entries[1].0, BASE + 16); // Data at index 1
+        assert_eq!(entries[2].0, BASE + 32); // Status at index 2
     }
 }
