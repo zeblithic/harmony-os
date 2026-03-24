@@ -122,6 +122,18 @@ impl PersistentNarStore {
 
         let path = self.dir.join(format!("{name}.nar"));
 
+        // Validate references eagerly — before any disk writes.
+        if let Some(ref refs) = references {
+            for r in refs {
+                if r.is_empty() || r.contains('\0') || r.chars().any(|c| c.is_whitespace()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid reference: {r:?}"),
+                    ));
+                }
+            }
+        }
+
         // Gate on server state, not disk state. If the server already has
         // this path imported, it's a true duplicate — skip the write and
         // let import_nar reject it. If the server doesn't have it (even
@@ -129,23 +141,6 @@ impl PersistentNarStore {
         // write the valid data to disk.
         let already_imported = server.has_store_path(name);
         if !already_imported {
-            // Validate references before any disk I/O — avoids a
-            // write-then-delete round-trip on invalid input.
-            if let Some(ref refs) = references {
-                for r in refs {
-                    if r.contains('\n')
-                        || r.contains('\r')
-                        || r.contains('\0')
-                        || r.contains(' ')
-                        || r.contains('\t')
-                    {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("reference contains whitespace or control characters: {r:?}"),
-                        ));
-                    }
-                }
-            }
             std::fs::write(&path, &nar_bytes)?;
             // Write .meta sidecar after .nar — crash between them leaves NAR
             // loadable but without references (safe degradation).

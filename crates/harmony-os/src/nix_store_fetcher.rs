@@ -349,8 +349,7 @@ impl NixStoreFetcher {
         let narinfo =
             NarInfo::parse(&narinfo_text).map_err(|e| FetchError::NarInfo(format!("{:?}", e)))?;
 
-        // Capture references before moving narinfo fields.
-        let references = narinfo.references.clone();
+        let references = narinfo.references;
 
         // 3. Check compression — we support xz and none (identity).
         if narinfo.compression != "xz" && narinfo.compression != "none" {

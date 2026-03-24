@@ -120,12 +120,8 @@ pub fn serialize_narinfo(
     if let Some(refs) = references {
         for r in refs {
             assert!(
-                !r.contains('\n')
-                    && !r.contains('\r')
-                    && !r.contains('\0')
-                    && !r.contains(' ')
-                    && !r.contains('\t'),
-                "reference must not contain whitespace or control characters: {r:?}"
+                !r.is_empty() && !r.contains('\0') && !r.chars().any(|c| c.is_whitespace()),
+                "reference must not be empty or contain whitespace/NUL: {r:?}"
             );
         }
         text.push_str("References: ");
