@@ -205,7 +205,7 @@ impl NixStoreFetcher {
             let mut nar_bytes = None;
             let mut from_mesh = false;
             if let Some(ref mesh) = self.mesh {
-                if let Some(mesh_nar) = mesh.fetch_nar(&name_str) {
+                if let Some((mesh_nar, _mesh_refs)) = mesh.fetch_nar(&name_str) {
                     nar_bytes = Some(mesh_nar);
                     from_mesh = true;
                 }
@@ -672,14 +672,14 @@ mod tests {
         nar: Vec<u8>,
     }
     impl MeshNarFetch for MockMesh {
-        fn fetch_nar(&self, _: &str) -> Option<Vec<u8>> {
-            Some(self.nar.clone())
+        fn fetch_nar(&self, _: &str) -> Option<(Vec<u8>, Option<Vec<String>>)> {
+            Some((self.nar.clone(), None))
         }
     }
 
     struct EmptyMesh;
     impl MeshNarFetch for EmptyMesh {
-        fn fetch_nar(&self, _: &str) -> Option<Vec<u8>> {
+        fn fetch_nar(&self, _: &str) -> Option<(Vec<u8>, Option<Vec<String>>)> {
             None
         }
     }
