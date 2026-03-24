@@ -12,6 +12,8 @@
 extern crate alloc;
 
 #[cfg(feature = "kernel")]
+pub mod config_server;
+#[cfg(feature = "kernel")]
 pub mod content_server;
 pub mod echo;
 #[doc(hidden)] // pub for bench access only — not a stable API
@@ -26,6 +28,8 @@ pub mod namespace;
 pub mod nar;
 #[cfg(feature = "kernel")]
 pub mod nix_store_server;
+#[cfg(feature = "kernel")]
+pub mod node_config;
 pub mod sd_server;
 pub mod serial_server;
 pub mod uart_server;
@@ -37,6 +41,8 @@ pub mod integrity;
 pub mod key_hierarchy;
 #[cfg(feature = "kernel")]
 pub mod pq_capability;
+#[cfg(feature = "kernel")]
+pub mod signed_config;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;

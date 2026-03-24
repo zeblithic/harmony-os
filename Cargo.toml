@@ -50,3 +50,5 @@ rand_core = { version = "0.6", default-features = false }
 # (transitive dep via ml-dsa/ml-kem in harmony core) requires.
 # If you run `cargo update`, verify keccak stays at 0.2.0-rc.2:
 #   cargo update keccak --precise 0.2.0-rc.2
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+ciborium = { version = "0.2", default-features = false }
