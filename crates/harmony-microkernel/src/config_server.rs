@@ -132,18 +132,26 @@ impl ConfigServer {
             return Err(IpcError::InvalidArgument);
         }
 
-        // 6a. Reject duplicate service names — HashMap-based diffing in
-        //     ConfigApplicator silently collapses duplicates.
+        // 6a. Reject oversized service lists — bounds the CAS-probe loop
+        //     below and limits resource consumption from a single config.
+        const MAX_SERVICES: usize = 256;
+        if config.services.len() > MAX_SERVICES {
+            return Err(IpcError::InvalidArgument);
+        }
+
+        // 6b. Reject empty or duplicate service names — empty names are
+        //     never useful, duplicates cause HashMap-based diffing in
+        //     ConfigApplicator to silently collapse entries.
         {
             let mut seen = alloc::collections::BTreeSet::new();
             for svc in &config.services {
-                if !seen.insert(svc.name.as_str()) {
+                if svc.name.is_empty() || !seen.insert(svc.name.as_str()) {
                     return Err(IpcError::InvalidArgument);
                 }
             }
         }
 
-        // 6b. Verify all referenced CIDs exist in CAS.
+        // 6c. Verify all referenced CIDs exist in CAS.
         if !self.cas.has_book(&config.kernel) {
             return Err(IpcError::NotFound);
         }
@@ -816,6 +824,78 @@ mod tests {
                     config: None,
                 },
             ],
+        };
+
+        let signer = PqPrivateIdentity::generate(&mut OsRng);
+        let signed_cid = sign_and_ingest(&mut cas, &config, &signer);
+        let trusted = alloc::vec![signer.public_identity().address_hash];
+        let cas = Arc::new(cas);
+        let mut server = ConfigServer::new(cas, trusted);
+
+        assert_eq!(
+            stage_config(&mut server, &signed_cid),
+            Err(IpcError::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn stage_empty_service_name_rejected() {
+        let mut cas = ContentServer::new();
+        let kernel_cid = ingest_book(&mut cas, b"kernel-bin");
+        let identity_cid = ingest_book(&mut cas, b"identity-bin");
+        let bin = ingest_book(&mut cas, b"binary-one");
+
+        let config = NodeConfig {
+            version: SCHEMA_VERSION,
+            kernel: kernel_cid,
+            identity: identity_cid,
+            network: NetworkConfig {
+                mesh_seeds: alloc::vec![],
+                port: 4242,
+            },
+            services: alloc::vec![ServiceEntry {
+                name: alloc::string::String::new(), // empty
+                binary: bin,
+                config: None,
+            }],
+        };
+
+        let signer = PqPrivateIdentity::generate(&mut OsRng);
+        let signed_cid = sign_and_ingest(&mut cas, &config, &signer);
+        let trusted = alloc::vec![signer.public_identity().address_hash];
+        let cas = Arc::new(cas);
+        let mut server = ConfigServer::new(cas, trusted);
+
+        assert_eq!(
+            stage_config(&mut server, &signed_cid),
+            Err(IpcError::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn stage_too_many_services_rejected() {
+        let mut cas = ContentServer::new();
+        let kernel_cid = ingest_book(&mut cas, b"kernel-bin");
+        let identity_cid = ingest_book(&mut cas, b"identity-bin");
+        let bin = ingest_book(&mut cas, b"binary-one");
+
+        let services: Vec<ServiceEntry> = (0..257)
+            .map(|i| ServiceEntry {
+                name: alloc::format!("svc-{i}"),
+                binary: bin,
+                config: None,
+            })
+            .collect();
+
+        let config = NodeConfig {
+            version: SCHEMA_VERSION,
+            kernel: kernel_cid,
+            identity: identity_cid,
+            network: NetworkConfig {
+                mesh_seeds: alloc::vec![],
+                port: 4242,
+            },
+            services,
         };
 
         let signer = PqPrivateIdentity::generate(&mut OsRng);
