@@ -57,13 +57,15 @@ impl NarInfo {
                     val.parse::<u64>()
                         .map_err(|_| NarInfoError::InvalidNarSize)?,
                 );
-            } else if let Some(val) = line.strip_prefix("References: ") {
-                let refs: Vec<String> = val
-                    .split_whitespace()
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .collect();
-                references = Some(refs);
+            } else if references.is_none() {
+                if let Some(val) = line.strip_prefix("References: ") {
+                    let refs: Vec<String> = val
+                        .split_whitespace()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .collect();
+                    references = Some(refs);
+                }
             }
         }
 

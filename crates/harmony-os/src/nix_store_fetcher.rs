@@ -724,6 +724,16 @@ mod tests {
         }
     }
 
+    struct MockMeshWithRefs {
+        nar: Vec<u8>,
+        refs: Vec<String>,
+    }
+    impl MeshNarFetch for MockMeshWithRefs {
+        fn fetch_nar(&self, _: &str) -> Option<(Vec<u8>, Option<Vec<String>>)> {
+            Some((self.nar.clone(), Some(self.refs.clone())))
+        }
+    }
+
     struct EmptyMesh;
     impl MeshNarFetch for EmptyMesh {
         fn fetch_nar(&self, _: &str) -> Option<(Vec<u8>, Option<Vec<String>>)> {
@@ -901,6 +911,32 @@ mod tests {
         assert_eq!(
             imported[0].references,
             Some(vec!["dep123-glibc".to_string(), "dep456-gcc".to_string()])
+        );
+    }
+
+    #[test]
+    fn mesh_references_propagated_into_imported_nar() {
+        let nar_bytes = build_test_nar(b"mesh-ref content");
+        let mock_mesh = MockMeshWithRefs {
+            nar: nar_bytes,
+            refs: vec!["dep12345678901234567890123456789-glibc".to_string()],
+        };
+        let mock_http = MockHttp {
+            responses: HashMap::new(),
+        };
+        let mut fetcher = NixStoreFetcher::with_mesh(Box::new(mock_http), Box::new(mock_mesh));
+        let mut server = NixStoreServer::new();
+
+        let store_path_name = "abc12345678901234567890123456789-mesh-ref";
+        use harmony_microkernel::FileServer;
+        let _ = server.walk(0, 1, store_path_name);
+
+        let imported = fetcher.process_misses(&mut server);
+        assert_eq!(imported.len(), 1);
+        assert!(imported[0].from_mesh);
+        assert_eq!(
+            imported[0].references,
+            Some(vec!["dep12345678901234567890123456789-glibc".to_string()])
         );
     }
 }

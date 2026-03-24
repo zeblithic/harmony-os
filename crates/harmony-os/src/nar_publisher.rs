@@ -433,7 +433,11 @@ mod tests {
         let announcements = log.borrow();
         let payload = String::from_utf8(announcements[0].1.clone()).unwrap();
         let lines: Vec<&str> = payload.lines().collect();
-        assert!(lines.len() >= 3, "expected CID + 2 refs, got {lines:?}");
+        assert_eq!(
+            lines.len(),
+            3,
+            "expected exactly CID + 2 refs, got {lines:?}"
+        );
         assert_eq!(lines[0].len(), 64); // CID hex
         assert_eq!(lines[1], "dep123-glibc");
         assert_eq!(lines[2], "dep456-gcc");
