@@ -129,10 +129,8 @@ impl PersistentNarStore {
         // write the valid data to disk.
         let already_imported = server.has_store_path(name);
         if !already_imported {
-            std::fs::write(&path, &nar_bytes)?;
-            // Write .meta sidecar after .nar — crash between them leaves NAR
-            // loadable but without references (safe degradation).
-            let meta_path = self.dir.join(format!("{name}.meta"));
+            // Validate references before any disk I/O — avoids a
+            // write-then-delete round-trip on invalid input.
             if let Some(ref refs) = references {
                 for r in refs {
                     if r.contains('\n')
@@ -141,13 +139,18 @@ impl PersistentNarStore {
                         || r.contains(' ')
                         || r.contains('\t')
                     {
-                        let _ = std::fs::remove_file(&path);
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
                             format!("reference contains whitespace or control characters: {r:?}"),
                         ));
                     }
                 }
+            }
+            std::fs::write(&path, &nar_bytes)?;
+            // Write .meta sidecar after .nar — crash between them leaves NAR
+            // loadable but without references (safe degradation).
+            let meta_path = self.dir.join(format!("{name}.meta"));
+            if let Some(ref refs) = references {
                 let meta_content = format!("References: {}\n", refs.join(" "));
                 if let Err(e) = std::fs::write(&meta_path, meta_content.as_bytes()) {
                     let _ = std::fs::remove_file(&path);
