@@ -245,6 +245,91 @@ impl XhciDriver {
         Ok(ports)
     }
 
+    /// Enqueue a No-Op command on the command ring.
+    ///
+    /// Returns WriteTrb actions for the command (and Link TRB if wrapping),
+    /// plus a RingDoorbell action to kick the controller.
+    ///
+    /// Requires `Running` state (call `setup_rings` first).
+    pub fn enqueue_noop(&mut self) -> Result<Vec<XhciAction>, XhciError> {
+        if self.state != XhciState::Running {
+            return Err(XhciError::InvalidState);
+        }
+
+        let cmd_ring = self.command_ring.as_mut().ok_or(XhciError::InvalidState)?;
+        let entries = cmd_ring.enqueue(trb::TRB_NOOP_CMD, 0)?;
+
+        let mut actions: Vec<XhciAction> = entries
+            .into_iter()
+            .map(|(phys, t)| XhciAction::WriteTrb { phys, trb: t })
+            .collect();
+
+        // Ring doorbell 0 (command ring): offset = db_offset + 4 * 0
+        actions.push(XhciAction::RingDoorbell {
+            offset: self.db_offset as usize,
+            value: 0,
+        });
+
+        Ok(actions)
+    }
+
+    /// Check if the next event TRB has a matching cycle bit.
+    ///
+    /// The caller reads the cycle bit from the TRB at the event ring's
+    /// dequeue pointer in DMA memory, then calls this to check if it's
+    /// a new event. If `true`, read the full TRB and pass to `process_event`.
+    pub fn should_process_event(&self, cycle_bit: bool) -> bool {
+        self.event_ring
+            .as_ref()
+            .map(|r| r.should_process(cycle_bit))
+            .unwrap_or(false)
+    }
+
+    /// Process one event TRB from the event ring.
+    ///
+    /// Parses the event type, updates internal state, advances the
+    /// event ring dequeue pointer. Returns the parsed event and actions
+    /// to execute (`UpdateDequeuePointer`).
+    ///
+    /// Requires `Running` state (call `setup_rings` first).
+    pub fn process_event(
+        &mut self,
+        trb: trb::Trb,
+    ) -> Result<(XhciEvent, Vec<XhciAction>), XhciError> {
+        if self.state != XhciState::Running {
+            return Err(XhciError::InvalidState);
+        }
+
+        let event = match trb.trb_type() {
+            trb::TRB_COMMAND_COMPLETION => {
+                let slot_id = (trb.control >> 24) as u8;
+                let completion_code = (trb.status >> 24) as u8;
+                // Record completion in command ring
+                if let Some(cmd_ring) = self.command_ring.as_mut() {
+                    cmd_ring.complete_one();
+                }
+                XhciEvent::CommandCompletion {
+                    slot_id,
+                    completion_code,
+                }
+            }
+            trb::TRB_PORT_STATUS_CHANGE => {
+                let port_id = ((trb.parameter >> 24) & 0xFF) as u8;
+                XhciEvent::PortStatusChange { port_id }
+            }
+            other => XhciEvent::Unknown { trb_type: other },
+        };
+
+        let evt_ring = self.event_ring.as_mut().ok_or(XhciError::InvalidState)?;
+        evt_ring.advance();
+
+        let actions = alloc::vec![XhciAction::UpdateDequeuePointer {
+            phys: evt_ring.dequeue_pointer(),
+        }];
+
+        Ok((event, actions))
+    }
+
     /// Configure command ring, event ring, and start the controller.
     ///
     /// The caller must allocate DMA memory for:
@@ -553,5 +638,138 @@ mod tests {
             driver.setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000),
             Err(XhciError::InvalidState)
         );
+    }
+
+    #[test]
+    fn enqueue_noop_returns_write_and_doorbell() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000)
+            .unwrap();
+
+        let actions = driver.enqueue_noop().unwrap();
+        // Should have: WriteTrb + RingDoorbell (minimum 2)
+        assert!(actions.len() >= 2);
+
+        // First action: WriteTrb for the No-Op command
+        match &actions[0] {
+            XhciAction::WriteTrb { phys, trb } => {
+                assert_eq!(*phys, 0x2000_0000); // base of command ring
+                assert_eq!(trb.trb_type(), trb::TRB_NOOP_CMD);
+                assert!(trb.cycle_bit());
+            }
+            other => panic!("expected WriteTrb, got {:?}", other),
+        }
+
+        // Last action: RingDoorbell
+        let last = actions.last().unwrap();
+        match last {
+            XhciAction::RingDoorbell { offset, value } => {
+                assert_eq!(*offset, 0x1000); // db_offset from mock
+                assert_eq!(*value, 0); // slot 0, endpoint 0
+            }
+            other => panic!("expected RingDoorbell, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn enqueue_before_running_fails() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        // Still in Ready state, not Running
+        assert_eq!(driver.enqueue_noop(), Err(XhciError::InvalidState));
+    }
+
+    #[test]
+    fn process_command_completion() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000)
+            .unwrap();
+        driver.enqueue_noop().unwrap();
+
+        // Simulate controller posting a Command Completion event
+        // slot_id is in control bits 31:24 (xHCI Table 6-38)
+        let slot_id: u8 = 3;
+        let evt_trb = trb::Trb {
+            parameter: 0x2000_0000, // command TRB pointer
+            status: (COMPLETION_SUCCESS as u32) << 24,
+            control: (slot_id as u32) << 24 | (trb::TRB_COMMAND_COMPLETION as u32) << 10 | 1, // cycle bit
+        };
+
+        let (event, actions) = driver.process_event(evt_trb).unwrap();
+        assert_eq!(
+            event,
+            XhciEvent::CommandCompletion {
+                slot_id: 3,
+                completion_code: COMPLETION_SUCCESS,
+            }
+        );
+
+        // Should have UpdateDequeuePointer action
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, XhciAction::UpdateDequeuePointer { .. })));
+    }
+
+    #[test]
+    fn process_port_status_change() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000)
+            .unwrap();
+
+        let evt_trb = trb::Trb {
+            parameter: (3u64) << 24, // port_id = 3 (bits 31:24 of parameter low dword)
+            status: 0,
+            control: (trb::TRB_PORT_STATUS_CHANGE as u32) << 10 | 1,
+        };
+
+        let (event, _) = driver.process_event(evt_trb).unwrap();
+        assert_eq!(event, XhciEvent::PortStatusChange { port_id: 3 });
+    }
+
+    #[test]
+    fn process_unknown_event() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000)
+            .unwrap();
+
+        let evt_trb = trb::Trb {
+            parameter: 0,
+            status: 0,
+            control: (63u32) << 10 | 1, // unknown type 63
+        };
+
+        let (event, _) = driver.process_event(evt_trb).unwrap();
+        assert_eq!(event, XhciEvent::Unknown { trb_type: 63 });
+    }
+
+    #[test]
+    fn should_process_event_delegates_to_event_ring() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000)
+            .unwrap();
+
+        assert!(driver.should_process_event(true)); // initial CCS = true
+        assert!(!driver.should_process_event(false));
+    }
+
+    #[test]
+    fn setup_rings_transitions_to_running() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000)
+            .unwrap();
+        // Enqueue should succeed (Running state)
+        assert!(driver.enqueue_noop().is_ok());
     }
 }
