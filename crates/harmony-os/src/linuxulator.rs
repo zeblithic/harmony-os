@@ -2527,9 +2527,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         let idx = (signum - 1) as usize;
         let action = self.signal_handlers[idx];
 
-        // SA_RESTORER is required on x86_64 — the kernel refuses rt_sigaction
-        // without it, so we should always have it by the time we get here.
-        debug_assert!(
+        assert!(
             action.flags & SA_RESTORER != 0,
             "SA_RESTORER must be set on x86_64"
         );
@@ -2587,8 +2585,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
 
         // ucontext header: uc_flags(u64)=0, uc_link(u64)=0, uc_stack(24 bytes)
-        // uc_stack: ss_sp(u64), ss_flags(i32)+4pad, ss_size(u64) = 24 bytes
-        // These are already zeroed. Write alt stack info if configured.
+        // uc_stack saves the sigaltstack configuration (matching Linux's
+        // __save_altstack), with SS_ONSTACK reflecting pre-delivery state.
         let uc_stack_ptr = ucontext_ptr + 16; // after uc_flags + uc_link
         unsafe {
             core::ptr::write_unaligned(uc_stack_ptr as *mut u64, self.alt_stack_sp);
