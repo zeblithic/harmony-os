@@ -4,7 +4,7 @@
 //!
 //! A `SignedConfig` bundles a CBOR-encoded [`NodeConfig`] with an ML-DSA-65
 //! signature from the operator identity that authorized it. Verification
-//! checks three things in order:
+//! checks four things in order:
 //!
 //! 1. The embedded public key deserializes correctly.
 //! 2. The public key's derived address hash matches the declared `signer` field.

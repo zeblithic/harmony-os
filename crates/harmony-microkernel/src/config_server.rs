@@ -120,7 +120,18 @@ impl ConfigServer {
             return Err(IpcError::InvalidArgument);
         }
 
-        // 6. Verify all referenced CIDs exist in CAS.
+        // 6a. Reject duplicate service names — HashMap-based diffing in
+        //     ConfigApplicator silently collapses duplicates.
+        {
+            let mut seen = alloc::collections::BTreeSet::new();
+            for svc in &config.services {
+                if !seen.insert(svc.name.as_str()) {
+                    return Err(IpcError::InvalidArgument);
+                }
+            }
+        }
+
+        // 6b. Verify all referenced CIDs exist in CAS.
         if !self.cas.has_book(&config.kernel) {
             return Err(IpcError::NotFound);
         }
@@ -148,11 +159,13 @@ impl ConfigServer {
     ///
     /// Requires a pending config to be staged; returns `InvalidArgument` if none.
     fn do_commit(&mut self) -> Result<(), IpcError> {
-        let pending_cid = self.pending_cid.take().ok_or(IpcError::InvalidArgument)?;
-        let pending_config = self
-            .pending_config
-            .take()
-            .ok_or(IpcError::InvalidArgument)?;
+        // Validate both fields present before mutating — avoids silently
+        // dropping pending_cid if pending_config is somehow None.
+        if self.pending_cid.is_none() || self.pending_config.is_none() {
+            return Err(IpcError::InvalidArgument);
+        }
+        let pending_cid = self.pending_cid.take().unwrap();
+        let pending_config = self.pending_config.take().unwrap();
 
         // Rotate: active → previous.
         self.previous_cid = self.active_cid.take();
@@ -367,6 +380,9 @@ impl FileServer for ConfigServer {
             NodeKind::NodeCbor => Ok(FileStat {
                 qpath: NODE_CBOR,
                 name: Arc::from("node.cbor"),
+                // Note: re-serializes CBOR on every stat. Configs are <1KB
+                // and stat on this file is rare, so caching is not worth the
+                // state management complexity. Revisit if this becomes a hot path.
                 size: self
                     .active_config
                     .as_ref()
@@ -766,6 +782,48 @@ mod tests {
         assert_eq!(
             stage_config(&mut server, &signed_cid),
             Err(IpcError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn stage_duplicate_service_names_rejected() {
+        let mut cas = ContentServer::new();
+        let kernel_cid = ingest_book(&mut cas, b"kernel-bin");
+        let identity_cid = ingest_book(&mut cas, b"identity-bin");
+        let bin1 = ingest_book(&mut cas, b"binary-one");
+        let bin2 = ingest_book(&mut cas, b"binary-two");
+
+        let config = NodeConfig {
+            version: SCHEMA_VERSION,
+            kernel: kernel_cid,
+            identity: identity_cid,
+            network: NetworkConfig {
+                mesh_seeds: alloc::vec![],
+                port: 4242,
+            },
+            services: alloc::vec![
+                ServiceEntry {
+                    name: alloc::string::String::from("echo"),
+                    binary: bin1,
+                    config: None,
+                },
+                ServiceEntry {
+                    name: alloc::string::String::from("echo"), // duplicate
+                    binary: bin2,
+                    config: None,
+                },
+            ],
+        };
+
+        let signer = PqPrivateIdentity::generate(&mut OsRng);
+        let signed_cid = sign_and_ingest(&mut cas, &config, &signer);
+        let trusted = alloc::vec![signer.public_identity().address_hash];
+        let cas = Arc::new(cas);
+        let mut server = ConfigServer::new(cas, trusted);
+
+        assert_eq!(
+            stage_config(&mut server, &signed_cid),
+            Err(IpcError::InvalidArgument)
         );
     }
 }
