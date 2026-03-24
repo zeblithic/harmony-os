@@ -701,6 +701,7 @@ fn main() -> Status {
                         let rx_actions =
                             runtime.handle_packet("eth0", payload, now);
                         for action in &rx_actions {
+                            let mut handled = false;
                             // Dispatch TX actions from RX path (e.g., announce responses).
                             if let harmony_unikernel::RuntimeAction::SendOnInterface {
                                 interface_name: _,
@@ -713,15 +714,25 @@ fn main() -> Status {
                                 tx_frame.extend_from_slice(&mac);
                                 tx_frame.extend_from_slice(&0x88B5u16.to_be_bytes());
                                 tx_frame.extend_from_slice(raw);
-                                // Clean TX buffers before send — flush to physical memory.
                                 for j in 0..256usize {
                                     let buf = tx_pool.get(j);
                                     unsafe { cache::clean_range(buf.virt, 2048) };
                                 }
                                 genet_driver.reclaim_tx(&genet_bank, &mut tx_pool);
-                                let _ = genet_driver.send(&mut genet_bank, &tx_frame, &mut tx_pool);
+                                match genet_driver.send(&mut genet_bank, &tx_frame, &mut tx_pool) {
+                                    Ok(()) => {
+                                        handled = true;
+                                        let _ = writeln!(serial, "[TX] {} bytes on eth0 (rx-resp)", raw.len());
+                                    }
+                                    Err(e) => {
+                                        handled = true;
+                                        let _ = writeln!(serial, "[TX] rx-resp send error: {:?}", e);
+                                    }
+                                }
                             }
-                            dispatch_action(action, &mut serial);
+                            if !handled {
+                                dispatch_action(action, &mut serial);
+                            }
                         }
                     }
                 }
