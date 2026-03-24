@@ -921,7 +921,7 @@ mod tests {
         let identity_cid = ingest_book(&mut cas, b"identity-bin");
         let bin = ingest_book(&mut cas, b"binary-one");
 
-        let long_name: alloc::string::String = core::iter::repeat('x').take(65).collect();
+        let long_name: alloc::string::String = alloc::string::String::from("x").repeat(65);
         let config = NodeConfig {
             version: SCHEMA_VERSION,
             kernel: kernel_cid,
