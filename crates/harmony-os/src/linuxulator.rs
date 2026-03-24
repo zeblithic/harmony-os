@@ -2520,6 +2520,10 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// 3. Unless SA_NODEFER, block the signal being handled
     /// 4. SIGKILL/SIGSTOP always remain unblockable
     pub fn setup_signal_frame(&mut self, signum: u32, regs: &SavedRegisters) -> SignalHandlerSetup {
+        assert!(
+            (1..=64).contains(&signum),
+            "signum {signum} out of range [1, 64]"
+        );
         let idx = (signum - 1) as usize;
         let action = self.signal_handlers[idx];
 
@@ -2542,7 +2546,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
             self.on_alt_stack = true;
             self.alt_stack_sp + self.alt_stack_size
         } else {
-            regs.rsp
+            // Subtract 128-byte red zone (x86_64 ABI) to avoid clobbering
+            // leaf-function temporaries stored below RSP.
+            regs.rsp - 128
         };
 
         // ── Compute frame pointer ───────────────────────────────────
