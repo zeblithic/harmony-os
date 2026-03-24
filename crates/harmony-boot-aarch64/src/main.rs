@@ -704,31 +704,34 @@ fn main() -> Status {
                             let mut handled = false;
                             // Dispatch TX actions from RX path (e.g., announce responses).
                             if let harmony_unikernel::RuntimeAction::SendOnInterface {
-                                interface_name: _,
+                                interface_name,
                                 raw,
                             } = action
                             {
-                                let mac = platform::NODE_MAC;
-                                let mut tx_frame = alloc::vec::Vec::with_capacity(14 + raw.len());
-                                tx_frame.extend_from_slice(&[0xFF; 6]);
-                                tx_frame.extend_from_slice(&mac);
-                                tx_frame.extend_from_slice(&0x88B5u16.to_be_bytes());
-                                tx_frame.extend_from_slice(raw);
-                                for j in 0..256usize {
-                                    let buf = tx_pool.get(j);
-                                    unsafe { cache::clean_range(buf.virt, 2048) };
-                                }
-                                genet_driver.reclaim_tx(&genet_bank, &mut tx_pool);
-                                match genet_driver.send(&mut genet_bank, &tx_frame, &mut tx_pool) {
-                                    Ok(()) => {
-                                        handled = true;
-                                        let _ = writeln!(serial, "[TX] {} bytes on eth0 (rx-resp)", raw.len());
+                                if interface_name.as_ref() != "eth0" {
+                                    let _ = writeln!(serial, "[TX] WARN: unknown interface {:?}, skipping", interface_name);
+                                } else {
+                                    let mac = platform::NODE_MAC;
+                                    let mut tx_frame = alloc::vec::Vec::with_capacity(14 + raw.len());
+                                    tx_frame.extend_from_slice(&[0xFF; 6]);
+                                    tx_frame.extend_from_slice(&mac);
+                                    tx_frame.extend_from_slice(&0x88B5u16.to_be_bytes());
+                                    tx_frame.extend_from_slice(raw);
+                                    for j in 0..256usize {
+                                        let buf = tx_pool.get(j);
+                                        unsafe { cache::clean_range(buf.virt, 2048) };
                                     }
-                                    Err(e) => {
-                                        handled = true;
-                                        let _ = writeln!(serial, "[TX] rx-resp send error: {:?}", e);
+                                    genet_driver.reclaim_tx(&genet_bank, &mut tx_pool);
+                                    match genet_driver.send(&mut genet_bank, &tx_frame, &mut tx_pool) {
+                                        Ok(()) => {
+                                            let _ = writeln!(serial, "[TX] {} bytes on eth0 (rx-resp)", tx_frame.len());
+                                        }
+                                        Err(e) => {
+                                            let _ = writeln!(serial, "[TX] rx-resp send error: {:?}", e);
+                                        }
                                     }
                                 }
+                                handled = true;
                             }
                             if !handled {
                                 dispatch_action(action, &mut serial);
@@ -753,35 +756,35 @@ fn main() -> Status {
             {
                 let mut sent = false;
                 if let harmony_unikernel::RuntimeAction::SendOnInterface {
-                    interface_name: _,
+                    interface_name,
                     raw,
                 } = action
                 {
-                    let mac = platform::NODE_MAC;
-                    let mut frame = alloc::vec::Vec::with_capacity(14 + raw.len());
-                    frame.extend_from_slice(&[0xFF; 6]);
-                    frame.extend_from_slice(&mac);
-                    frame.extend_from_slice(&0x88B5u16.to_be_bytes());
-                    frame.extend_from_slice(raw);
+                    sent = true;
+                    if interface_name.as_ref() != "eth0" {
+                        let _ = writeln!(serial, "[TX] WARN: unknown interface {:?}, skipping", interface_name);
+                    } else {
+                        let mac = platform::NODE_MAC;
+                        let mut frame = alloc::vec::Vec::with_capacity(14 + raw.len());
+                        // TODO: broadcast dst is correct for Reticulum announces
+                        // but wrong for unicast responses. Needs neighbor table.
+                        frame.extend_from_slice(&[0xFF; 6]);
+                        frame.extend_from_slice(&mac);
+                        frame.extend_from_slice(&0x88B5u16.to_be_bytes());
+                        frame.extend_from_slice(raw);
 
-                    // Clean TX buffers BEFORE send — flush any previously written
-                    // data to physical memory for GENET's non-coherent PCIe DMA.
-                    for i in 0..256usize {
-                        let buf = tx_pool.get(i);
-                        unsafe { cache::clean_range(buf.virt, 2048) };
-                    }
-                    genet_driver.reclaim_tx(&genet_bank, &mut tx_pool);
-                    // TODO: broadcast dst [0xFF;6] is correct for Reticulum announces
-                    // but wrong for unicast protocol responses. Needs neighbor table
-                    // for unicast MAC resolution.
-                    match genet_driver.send(&mut genet_bank, &frame, &mut tx_pool) {
-                        Ok(()) => {
-                            sent = true;
-                            let _ = writeln!(serial, "[TX] {} bytes on eth0", raw.len());
+                        for i in 0..256usize {
+                            let buf = tx_pool.get(i);
+                            unsafe { cache::clean_range(buf.virt, 2048) };
                         }
-                        Err(e) => {
-                            sent = true;
-                            let _ = writeln!(serial, "[TX] send error: {:?}", e);
+                        genet_driver.reclaim_tx(&genet_bank, &mut tx_pool);
+                        match genet_driver.send(&mut genet_bank, &frame, &mut tx_pool) {
+                            Ok(()) => {
+                                let _ = writeln!(serial, "[TX] {} bytes on eth0", frame.len());
+                            }
+                            Err(e) => {
+                                let _ = writeln!(serial, "[TX] send error: {:?}", e);
+                            }
                         }
                     }
                 }
