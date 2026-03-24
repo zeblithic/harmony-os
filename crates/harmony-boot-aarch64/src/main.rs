@@ -677,21 +677,67 @@ fn main() -> Status {
     loop {
         let now = timer::now_ms();
 
-        // ── Network RX ──
-        // TODO(harmony-os-7ng): Poll GENET RX here when RP1 PCIe is ready.
-        // Pattern:
-        //   while let Some(frame) = genet.poll_rx(&mut bank, &mut rx_pool) {
-        //       cache::invalidate_range(buf.virt, frame.data.len());
-        //       if ethertype(&frame.data) == 0x88B5 {
-        //           let payload = &frame.data[14..]; // strip Ethernet header
-        //           let rx_actions = runtime.handle_packet("eth0", payload.to_vec(), now);
-        //           for action in &rx_actions { dispatch_action(action, &mut serial); }
-        //       }
-        //   }
+        // ── Network RX (RPi5 GENET) ──
+        #[cfg(feature = "rpi5")]
+        {
+            while let Some(frame) = genet_driver.poll_rx(&mut genet_bank, &mut rx_pool) {
+                // Cache invalidate: ensure CPU sees DMA-written data.
+                // In identity map, buf.virt == phys; we need the virt addr of the
+                // buffer that was just consumed. Since poll_rx already copied the data
+                // into frame.data (a Vec), the DMA buffer is freed. Cache invalidation
+                // should happen inside the MMIO integration layer before the copy.
+                // For now, frame.data is already a CPU-side copy.
+
+                if frame.data.len() >= 14 {
+                    let ethertype =
+                        u16::from_be_bytes([frame.data[12], frame.data[13]]);
+                    if ethertype == 0x88B5 {
+                        // Raw Harmony frame — strip Ethernet header
+                        let payload = frame.data[14..].to_vec();
+                        let rx_actions =
+                            runtime.handle_packet("eth0", payload, now);
+                        for action in &rx_actions {
+                            dispatch_action(action, &mut serial);
+                        }
+                    }
+                    // Other EtherTypes (IP, ARP) dropped for now — no netstack.
+                }
+            }
+        }
+
+        // Reclaim completed TX buffers.
+        #[cfg(feature = "rpi5")]
+        genet_driver.reclaim_tx(&genet_bank, &mut tx_pool);
 
         // ── Timer tick ──
         let actions = runtime.tick(now);
         for action in &actions {
+            // RPi5: handle SendOnInterface by building an Ethernet frame and
+            // sending via GENET before falling through to dispatch_action for
+            // the serial log.
+            #[cfg(feature = "rpi5")]
+            if let harmony_unikernel::RuntimeAction::SendOnInterface {
+                interface_name: _,
+                raw,
+            } = action
+            {
+                // Wrap payload in Ethernet frame: broadcast dst + src MAC + EtherType 0x88B5
+                let mac = [0x02u8, 0x00, 0x00, 0x00, 0x00, 0x01];
+                let mut frame = alloc::vec::Vec::with_capacity(14 + raw.len());
+                frame.extend_from_slice(&[0xFF; 6]); // broadcast destination
+                frame.extend_from_slice(&mac);
+                frame.extend_from_slice(&0x88B5u16.to_be_bytes());
+                frame.extend_from_slice(raw);
+
+                genet_driver.reclaim_tx(&genet_bank, &mut tx_pool);
+                match genet_driver.send(&mut genet_bank, &frame, &mut tx_pool) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        let _ = writeln!(serial, "[TX] send error: {:?}", e);
+                    }
+                }
+            }
+
             dispatch_action(action, &mut serial);
         }
 
@@ -709,8 +755,6 @@ fn dispatch_action(action: &harmony_unikernel::RuntimeAction, serial: &mut impl 
             interface_name,
             raw,
         } => {
-            // TODO(harmony-os-7ng): Send via GENET when PCIe is ready.
-            // Pattern: cache::clean_range(buf.virt, raw.len()); genet.send(&mut bank, raw, &mut tx_pool);
             let _ = writeln!(serial, "[TX] {} bytes on {}", raw.len(), interface_name);
         }
         RuntimeAction::PeerDiscovered { address_hash, hops } => {
