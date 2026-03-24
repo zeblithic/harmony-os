@@ -57,19 +57,15 @@ const SIG_SETMASK: i32 = 2;
 const SIGCHLD_NUM: u32 = 17;
 
 // Signal action flags
-const SA_NOCLDSTOP: u64 = 1;
-const SA_NOCLDWAIT: u64 = 2;
 const SA_SIGINFO: u64 = 4;
 const SA_RESTORER: u64 = 0x04000000;
 const SA_ONSTACK: u64 = 0x08000000;
-const SA_RESTART: u64 = 0x10000000;
 const SA_NODEFER: u64 = 0x40000000;
 const SA_RESETHAND: u64 = 0x80000000;
 
 // Alternate signal stack constants
 const SS_ONSTACK: i32 = 1;
 const SS_DISABLE: i32 = 2;
-const SS_AUTODISARM: i32 = 1 << 31;
 const MINSIGSTKSZ: u64 = 2048;
 
 fn ipc_err_to_errno(e: IpcError) -> i64 {
@@ -598,7 +594,10 @@ impl LinuxSyscall {
                 oldset: args[2],
                 sigsetsize: args[3],
             },
-            15 => LinuxSyscall::RtSigreturn { rsp: args[0] },
+            // nr 15 = rt_sigreturn: NOT mapped here. rt_sigreturn takes no
+            // register arguments — the kernel reads RSP from saved pt_regs.
+            // The caller must construct LinuxSyscall::RtSigreturn { rsp }
+            // directly with the actual RSP value.
             16 => LinuxSyscall::Ioctl {
                 fd: args[0] as i32,
                 request: args[1],
@@ -1167,7 +1166,10 @@ impl LinuxSyscall {
                 oldset: args[2],
                 sigsetsize: args[3],
             },
-            139 => LinuxSyscall::RtSigreturn { rsp: args[0] },
+            // nr 139 = rt_sigreturn: NOT mapped here. rt_sigreturn takes no
+            // register arguments — the kernel reads SP from saved pt_regs.
+            // The caller must construct LinuxSyscall::RtSigreturn { rsp }
+            // directly with the actual SP value.
             160 => LinuxSyscall::Uname { buf: args[0] },
             166 => LinuxSyscall::Umask {
                 mask: args[0] as u32,
@@ -2540,8 +2542,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
         };
 
         // ── Compute frame pointer ───────────────────────────────────
-        // Frame is 376 bytes: 8 (retaddr) + 128 (siginfo) + 240 (ucontext)
-        const FRAME_SIZE: u64 = 8 + 128 + 240;
+        // Frame is 440 bytes: 8 (retaddr) + 304 (ucontext) + 128 (siginfo)
+        const FRAME_SIZE: u64 = 8 + 304 + 128;
         let frame_base = stack_top - FRAME_SIZE;
         // Align down to 16 then subtract 8 so handler_rsp ≡ 8 (mod 16),
         // simulating the state after a `call` instruction.
@@ -2556,9 +2558,16 @@ impl<B: SyscallBackend> Linuxulator<B> {
             core::ptr::write_unaligned(retaddr_ptr as *mut u64, action.restorer);
         }
 
+        // ── Write ucontext_t (304 bytes) ────────────────────────────
+        let ucontext_ptr = handler_rsp + 8;
+        // Zero the entire ucontext_t region.
+        unsafe {
+            core::ptr::write_bytes(ucontext_ptr as *mut u8, 0, 304);
+        }
+
         // ── Write siginfo_t (128 bytes) ─────────────────────────────
-        let siginfo_ptr = handler_rsp + 8;
-        // Zero the entire siginfo_t region first.
+        let siginfo_ptr = handler_rsp + 8 + 304; // = handler_rsp + 312
+                                                 // Zero the entire siginfo_t region.
         unsafe {
             core::ptr::write_bytes(siginfo_ptr as *mut u8, 0, 128);
         }
@@ -2567,28 +2576,25 @@ impl<B: SyscallBackend> Linuxulator<B> {
             core::ptr::write_unaligned(siginfo_ptr as *mut i32, signum as i32);
         }
 
-        // ── Write ucontext_t (240 bytes) ────────────────────────────
-        let ucontext_ptr = handler_rsp + 8 + 128; // = handler_rsp + 136
-                                                  // Zero the entire ucontext_t region.
-        unsafe {
-            core::ptr::write_bytes(ucontext_ptr as *mut u8, 0, 240);
-        }
-
         // ucontext header: uc_flags(u64)=0, uc_link(u64)=0, uc_stack(24 bytes)
         // uc_stack: ss_sp(u64), ss_flags(i32)+4pad, ss_size(u64) = 24 bytes
         // These are already zeroed. Write alt stack info if configured.
         let uc_stack_ptr = ucontext_ptr + 16; // after uc_flags + uc_link
         unsafe {
             core::ptr::write_unaligned(uc_stack_ptr as *mut u64, self.alt_stack_sp);
-            core::ptr::write_unaligned((uc_stack_ptr + 8) as *mut i32, self.alt_stack_flags);
+            core::ptr::write_unaligned(
+                (uc_stack_ptr + 8) as *mut i32,
+                self.alt_stack_flags | if self.on_alt_stack { SS_ONSTACK } else { 0 },
+            );
             core::ptr::write_unaligned((uc_stack_ptr + 16) as *mut u64, self.alt_stack_size);
         }
 
         // sigcontext starts at ucontext + 40 (after header).
-        // 24 u64 slots × 8 bytes = 192 bytes.
+        // 32 u64 slots × 8 bytes = 256 bytes.
         // Layout: r8-r15(8), rdi/rsi/rbp/rbx(4), rdx/rax/rcx/rsp(4),
         //         rip/eflags(2), cs_gs_fs_pad(1 packed u64),
-        //         err(1), trapno(1), oldmask(1), cr2(1), fpstate(1)
+        //         err(1), trapno(1), oldmask(1), cr2(1), fpstate(1),
+        //         reserved1[8] (zeroed)
         let sc_ptr = ucontext_ptr + 40;
         unsafe {
             // GPR fields at offsets 0..
@@ -2617,9 +2623,9 @@ impl<B: SyscallBackend> Linuxulator<B> {
             // cr2 at sc+176, fpstate at sc+184 — zeroed
         }
 
-        // uc_sigmask at ucontext offset 232 (= ucontext_ptr + 232)
+        // uc_sigmask at ucontext offset 296 (= ucontext_ptr + 296)
         unsafe {
-            core::ptr::write_unaligned((ucontext_ptr + 232) as *mut u64, saved_mask);
+            core::ptr::write_unaligned((ucontext_ptr + 296) as *mut u64, saved_mask);
         }
 
         // ── Update signal mask for handler execution ────────────────
@@ -5669,7 +5675,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
     /// RSP passed to us = handler_rsp + 8 (retaddr already popped).
     /// siginfo at rsp, ucontext at rsp + 128.
     fn sys_rt_sigreturn(&mut self, rsp: u64) -> i64 {
-        let ucontext_ptr = (rsp + 128) as usize;
+        let ucontext_ptr = rsp as usize; // ucontext is right after retaddr (which was popped)
         let sc = ucontext_ptr + 40; // sigcontext within ucontext
 
         let regs = unsafe {
@@ -5695,8 +5701,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
             }
         };
 
-        // Restore signal mask from uc_sigmask (at ucontext + 232).
-        let uc_sigmask = unsafe { core::ptr::read_unaligned((ucontext_ptr + 232) as *const u64) };
+        // Restore signal mask from uc_sigmask (at ucontext + 296).
+        let uc_sigmask = unsafe { core::ptr::read_unaligned((ucontext_ptr + 296) as *const u64) };
         self.signal_mask = uc_sigmask;
         self.signal_mask &= !(1u64 << (SIGKILL - 1) | 1u64 << (SIGSTOP - 1));
 
@@ -5735,8 +5741,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 (sp, flags, size)
             };
 
-            let valid_flags = SS_DISABLE | SS_AUTODISARM;
-            if flags & !valid_flags != 0 {
+            if flags & !SS_DISABLE != 0 {
                 return EINVAL;
             }
 
