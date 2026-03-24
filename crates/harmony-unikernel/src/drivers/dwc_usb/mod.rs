@@ -16,6 +16,8 @@ pub use types::*;
 
 pub mod trb;
 
+pub mod context;
+
 mod ring;
 
 use super::register_bank::RegisterBank;
