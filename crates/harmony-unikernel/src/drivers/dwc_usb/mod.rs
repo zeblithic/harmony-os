@@ -280,6 +280,95 @@ impl XhciDriver {
         Ok(actions)
     }
 
+    /// Enqueue an Enable Slot command.
+    ///
+    /// After processing the `CommandCompletion` event, the `slot_id`
+    /// field contains the assigned slot number (1-based).
+    ///
+    /// Requires `Running` state (call `setup_rings` first).
+    pub fn enable_slot(&mut self) -> Result<Vec<XhciAction>, XhciError> {
+        if self.state != XhciState::Running {
+            return Err(XhciError::InvalidState);
+        }
+
+        let cmd_ring = self.command_ring.as_mut().ok_or(XhciError::InvalidState)?;
+        let entries = cmd_ring.enqueue(trb::TRB_ENABLE_SLOT, 0)?;
+
+        let mut actions: Vec<XhciAction> = entries
+            .into_iter()
+            .map(|(phys, t)| XhciAction::WriteTrb { phys, trb: t })
+            .collect();
+
+        // Ring doorbell 0 (command ring): offset = db_offset + 4 * 0
+        actions.push(XhciAction::RingDoorbell {
+            offset: self.db_offset as usize,
+            value: 0,
+        });
+
+        Ok(actions)
+    }
+
+    /// Set up a device context and enqueue an Address Device command.
+    ///
+    /// Returns `(actions, input_context_bytes)`. The caller must:
+    /// 1. Write `input_context_bytes` to `input_context_phys` in DMA
+    /// 2. Execute all actions in order
+    /// 3. Process the `CommandCompletion` event
+    ///
+    /// Requires `Running` state and a configured DCBAA (call `setup_rings`
+    /// with a non-zero `dcbaa_phys` first).
+    pub fn address_device(
+        &mut self,
+        slot_id: u8,
+        port: u8,
+        speed: UsbSpeed,
+        input_context_phys: u64,
+        output_context_phys: u64,
+        transfer_ring_phys: u64,
+    ) -> Result<(Vec<XhciAction>, [u8; 96]), XhciError> {
+        if self.state != XhciState::Running {
+            return Err(XhciError::InvalidState);
+        }
+        let dcbaa_phys = self.dcbaa_phys.ok_or(XhciError::InvalidState)?;
+
+        // Build Input Context
+        let input_ctx = context::build_input_context(port, speed, transfer_ring_phys);
+
+        let mut actions = Vec::new();
+
+        // 1. Write Output Context pointer to DCBAA[slot_id]
+        let dcbaa_slot_phys = dcbaa_phys + (slot_id as u64) * 8;
+        actions.push(XhciAction::WriteDma {
+            phys: dcbaa_slot_phys,
+            data: output_context_phys.to_le_bytes().to_vec(),
+        });
+
+        // 2. Enqueue Address Device command
+        // parameter = input_context_phys, slot_id in control bits 31:24
+        let cmd_ring = self.command_ring.as_mut().ok_or(XhciError::InvalidState)?;
+        let entries = cmd_ring.enqueue(trb::TRB_ADDRESS_DEVICE, input_context_phys)?;
+
+        for (phys, mut t) in entries {
+            // Set slot_id in control bits 31:24 for the Address Device TRB
+            // (not for Link TRBs)
+            if t.trb_type() == trb::TRB_ADDRESS_DEVICE {
+                t.control |= (slot_id as u32) << 24;
+            }
+            actions.push(XhciAction::WriteTrb { phys, trb: t });
+        }
+
+        actions.push(XhciAction::RingDoorbell {
+            offset: self.db_offset as usize,
+            value: 0,
+        });
+
+        // Create transfer ring for this slot's EP0
+        self.transfer_rings
+            .insert(slot_id, ring::TransferRing::new(transfer_ring_phys));
+
+        Ok((actions, input_ctx))
+    }
+
     /// Check if the next event TRB has a matching cycle bit.
     ///
     /// The caller reads the cycle bit from the TRB at the event ring's
@@ -770,6 +859,91 @@ mod tests {
 
         let (event, _) = driver.process_event(evt_trb).unwrap();
         assert_eq!(event, XhciEvent::Unknown { trb_type: 63 });
+    }
+
+    #[test]
+    fn enable_slot_enqueues_command() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
+            .unwrap();
+
+        let actions = driver.enable_slot().unwrap();
+        // Should have WriteTrb (Enable Slot cmd) + RingDoorbell
+        assert!(actions.len() >= 2);
+        match &actions[0] {
+            XhciAction::WriteTrb { trb, .. } => {
+                assert_eq!(trb.trb_type(), trb::TRB_ENABLE_SLOT);
+            }
+            other => panic!("expected WriteTrb, got {:?}", other),
+        }
+        match actions.last().unwrap() {
+            XhciAction::RingDoorbell { offset, value } => {
+                assert_eq!(*offset, 0x1000); // db_offset from mock
+                assert_eq!(*value, 0);
+            }
+            other => panic!("expected RingDoorbell, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn address_device_returns_input_context_and_actions() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
+            .unwrap();
+
+        let (actions, input_ctx) = driver
+            .address_device(
+                1, // slot_id
+                2, // port
+                UsbSpeed::HighSpeed,
+                0x6000_0000, // input_context_phys
+                0x7000_0000, // output_context_phys
+                0x8000_0000, // transfer_ring_phys
+            )
+            .unwrap();
+
+        // Input context should be 96 bytes
+        assert_eq!(input_ctx.len(), 96);
+
+        // Should have: WriteDma (DCBAA slot) + WriteTrb (Address Device cmd) + RingDoorbell
+        assert!(actions.len() >= 3);
+
+        // First action: WriteDma for DCBAA slot 1 at dcbaa_phys + 8
+        match &actions[0] {
+            XhciAction::WriteDma { phys, data } => {
+                assert_eq!(*phys, 0x5000_0000 + 8); // slot 1 * 8
+                assert_eq!(data.len(), 8);
+                let ptr = u64::from_le_bytes(data[..8].try_into().unwrap());
+                assert_eq!(ptr, 0x7000_0000); // output_context_phys
+            }
+            other => panic!("expected WriteDma, got {:?}", other),
+        }
+
+        // Address Device command TRB should be present
+        let cmd_action = actions.iter().find(|a| {
+            matches!(a, XhciAction::WriteTrb { trb, .. } if trb.trb_type() == trb::TRB_ADDRESS_DEVICE)
+        });
+        assert!(
+            cmd_action.is_some(),
+            "should have Address Device command TRB"
+        );
+    }
+
+    #[test]
+    fn address_device_without_dcbaa_fails() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        // setup_rings with dcbaa_phys=0 → no DCBAA stored
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0, 0)
+            .unwrap();
+
+        let result = driver.address_device(1, 2, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000);
+        assert_eq!(result, Err(XhciError::InvalidState));
     }
 
     #[test]
