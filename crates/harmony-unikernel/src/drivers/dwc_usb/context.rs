@@ -165,7 +165,15 @@ pub fn parse_configuration_tree(data: &[u8]) -> Result<ConfigurationTree, XhciEr
         match b_desc_type {
             trb::USB_DESC_INTERFACE if b_length >= 9 => {
                 if let Some(iface) = current_iface.take() {
-                    interfaces.push((iface, core::mem::take(&mut current_eps)));
+                    let eps = core::mem::take(&mut current_eps);
+                    debug_assert_eq!(
+                        eps.len() as u8,
+                        iface.num_endpoints,
+                        "endpoint count mismatch: descriptor claimed {}, found {}",
+                        iface.num_endpoints,
+                        eps.len()
+                    );
+                    interfaces.push((iface, eps));
                 }
                 current_iface = Some(InterfaceDescriptor {
                     interface_number: data[pos + 2],
@@ -190,6 +198,13 @@ pub fn parse_configuration_tree(data: &[u8]) -> Result<ConfigurationTree, XhciEr
     }
     // Save last interface
     if let Some(iface) = current_iface.take() {
+        debug_assert_eq!(
+            current_eps.len() as u8,
+            iface.num_endpoints,
+            "endpoint count mismatch: descriptor claimed {}, found {}",
+            iface.num_endpoints,
+            current_eps.len()
+        );
         interfaces.push((iface, current_eps));
     }
 
@@ -295,7 +310,9 @@ pub fn build_configure_endpoint_input_context(
 
         // DWord 1: CErr=3, EP Type, Max Packet Size
         let cerr: u32 = 3 << 1;
-        let mps: u32 = (ep.max_packet_size as u32) << 16;
+        // Mask to bits 10:0 — bits 12:11 encode additional transactions
+        // per microframe for HS interrupt/isoch (not part of packet size).
+        let mps: u32 = ((ep.max_packet_size & 0x07FF) as u32) << 16;
         let ep_dw1 = cerr | (ep_type << 3) | mps;
         ctx[ep_offset + 4..ep_offset + 8].copy_from_slice(&ep_dw1.to_le_bytes());
 
