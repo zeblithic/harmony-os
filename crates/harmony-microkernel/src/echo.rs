@@ -14,6 +14,7 @@ use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
 const ROOT: QPath = 0;
 const HELLO: QPath = 1;
 const ECHO: QPath = 2;
+const STATE: QPath = 3;
 
 const HELLO_GREETING: &[u8] = b"Hello from echo server!";
 
@@ -54,6 +55,7 @@ impl FileServer for EchoServer {
         let qpath = match name {
             "hello" => HELLO,
             "echo" => ECHO,
+            "state" => STATE,
             _ => return Err(IpcError::NotFound),
         };
 
@@ -88,7 +90,7 @@ impl FileServer for EchoServer {
         let data: &[u8] = match qpath {
             ROOT => return Err(IpcError::IsDirectory),
             HELLO => HELLO_GREETING,
-            ECHO => &self.echo_data,
+            ECHO | STATE => &self.echo_data,
             _ => return Err(IpcError::NotFound),
         };
 
@@ -116,7 +118,7 @@ impl FileServer for EchoServer {
         match qpath {
             ROOT => Err(IpcError::IsDirectory),
             HELLO => Err(IpcError::ReadOnly),
-            ECHO => {
+            ECHO | STATE => {
                 let len = u32::try_from(data.len()).map_err(|_| IpcError::ResourceExhausted)?;
                 self.echo_data = data.to_vec();
                 Ok(len)
@@ -152,6 +154,12 @@ impl FileServer for EchoServer {
             ECHO => Ok(FileStat {
                 qpath: ECHO,
                 name: Arc::from("echo"),
+                size: self.echo_data.len() as u64,
+                file_type: FileType::Regular,
+            }),
+            STATE => Ok(FileStat {
+                qpath: STATE,
+                name: Arc::from("state"),
                 size: self.echo_data.len() as u64,
                 file_type: FileType::Regular,
             }),
@@ -311,5 +319,73 @@ mod tests {
         let stat = server.stat(1).unwrap();
         assert_eq!(stat.file_type, FileType::Regular);
         assert_eq!(&*stat.name, "hello");
+    }
+
+    #[test]
+    fn state_walk_exists() {
+        let mut server = EchoServer::new();
+        let qpath = server.walk(0, 1, "state").unwrap();
+        assert_eq!(qpath, STATE);
+    }
+
+    #[test]
+    fn state_read_returns_echo_data() {
+        let mut server = EchoServer::new();
+        // Write some data to the echo file
+        server.walk(0, 1, "echo").unwrap();
+        server.open(1, OpenMode::Write).unwrap();
+        server.write(1, 0, b"preserve me").unwrap();
+        server.clunk(1).unwrap();
+
+        // Read state — should return the echo_data bytes
+        server.walk(0, 2, "state").unwrap();
+        server.open(2, OpenMode::Read).unwrap();
+        let state_bytes = server.read(2, 0, 65536).unwrap();
+        assert_eq!(state_bytes, b"preserve me");
+    }
+
+    #[test]
+    fn state_write_restores_data() {
+        let mut server = EchoServer::new();
+
+        // Write state bytes directly
+        server.walk(0, 1, "state").unwrap();
+        server.open(1, OpenMode::Write).unwrap();
+        server.write(1, 0, b"restored data").unwrap();
+        server.clunk(1).unwrap();
+
+        // Read echo file — should have the restored data
+        server.walk(0, 2, "echo").unwrap();
+        server.open(2, OpenMode::Read).unwrap();
+        let data = server.read(2, 0, 65536).unwrap();
+        assert_eq!(data, b"restored data");
+    }
+
+    #[test]
+    fn state_round_trip() {
+        // Simulate hot-swap: old server → read state → new server → write state
+        let mut old = EchoServer::new();
+        old.walk(0, 1, "echo").unwrap();
+        old.open(1, OpenMode::Write).unwrap();
+        old.write(1, 0, b"round trip data").unwrap();
+        old.clunk(1).unwrap();
+
+        // Read state from old
+        old.walk(0, 2, "state").unwrap();
+        old.open(2, OpenMode::Read).unwrap();
+        let state_bytes = old.read(2, 0, 65536).unwrap();
+
+        // Write state to new
+        let mut new = EchoServer::new();
+        new.walk(0, 1, "state").unwrap();
+        new.open(1, OpenMode::Write).unwrap();
+        new.write(1, 0, &state_bytes).unwrap();
+        new.clunk(1).unwrap();
+
+        // Verify new server has the data
+        new.walk(0, 2, "echo").unwrap();
+        new.open(2, OpenMode::Read).unwrap();
+        let data = new.read(2, 0, 65536).unwrap();
+        assert_eq!(data, b"round trip data");
     }
 }
