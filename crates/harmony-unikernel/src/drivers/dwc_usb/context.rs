@@ -91,7 +91,7 @@ pub fn parse_device_descriptor(data: &[u8]) -> Result<DeviceDescriptor, XhciErro
     if data.len() < trb::USB_DEVICE_DESCRIPTOR_SIZE as usize {
         return Err(XhciError::InvalidDescriptor);
     }
-    if data[1] != trb::USB_DESC_DEVICE {
+    if data[0] != trb::USB_DEVICE_DESCRIPTOR_SIZE || data[1] != trb::USB_DESC_DEVICE {
         return Err(XhciError::InvalidDescriptor);
     }
     Ok(DeviceDescriptor {

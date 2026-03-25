@@ -520,6 +520,11 @@ impl XhciDriver {
             return Err(XhciError::InvalidState);
         }
 
+        // Clamp to hardware max — writing a value > max_slots to CONFIG
+        // is undefined, and accepting slot IDs the hardware doesn't
+        // support produces confusing hardware errors.
+        let max_slots_enabled = max_slots_enabled.min(self.max_slots);
+
         let cmd_ring = ring::CommandRing::new(cmd_ring_phys);
         let evt_ring = ring::EventRing::new(event_ring_phys);
 
