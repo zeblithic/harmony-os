@@ -291,7 +291,9 @@ impl XhciDriver {
     /// field contains the assigned slot number (1-based).
     ///
     /// Requires `Running` state (call `setup_rings` first).
-    pub fn enable_slot(&mut self) -> Result<Vec<XhciAction>, XhciError> {
+    /// `slot_type` must match the Supported Protocol Capability for the
+    /// port being enumerated (xHCI §6.4.3.2). Use 0 for USB 2.x ports.
+    pub fn enable_slot(&mut self, slot_type: u8) -> Result<Vec<XhciAction>, XhciError> {
         if self.state != XhciState::Running {
             return Err(XhciError::InvalidState);
         }
@@ -305,7 +307,13 @@ impl XhciDriver {
 
         let mut actions: Vec<XhciAction> = entries
             .into_iter()
-            .map(|(phys, t)| XhciAction::WriteTrb { phys, trb: t })
+            .map(|(phys, mut t)| {
+                // Set Slot Type in control bits 19:16 for Enable Slot TRBs.
+                if t.trb_type() == trb::TRB_ENABLE_SLOT {
+                    t.control |= (slot_type as u32) << 16;
+                }
+                XhciAction::WriteTrb { phys, trb: t }
+            })
             .collect();
 
         // Ring doorbell 0 (command ring): offset = db_offset + 4 * 0
@@ -517,12 +525,12 @@ impl XhciDriver {
                 let slot_id = (trb.control >> 24) as u8;
                 let endpoint_id = ((trb.control >> 16) & 0x1F) as u8;
                 let completion_code = (trb.status >> 24) as u8;
-                let transfer_length = trb.status & 0x00FF_FFFF;
+                let residual_length = trb.status & 0x00FF_FFFF;
                 XhciEvent::TransferEvent {
                     slot_id,
                     endpoint_id,
                     completion_code,
-                    transfer_length,
+                    residual_length,
                     trb_pointer: trb.parameter,
                 }
             }
@@ -1007,8 +1015,8 @@ mod tests {
             .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
             .unwrap();
 
-        let actions = driver.enable_slot().unwrap();
-        // Should have WriteTrb (Enable Slot cmd) + RingDoorbell
+        let actions = driver.enable_slot(0).unwrap(); // slot_type=0 for USB 2.x
+                                                      // Should have WriteTrb (Enable Slot cmd) + RingDoorbell
         assert!(actions.len() >= 2);
         match &actions[0] {
             XhciAction::WriteTrb { trb, .. } => {
@@ -1221,7 +1229,7 @@ mod tests {
                 slot_id: 1,
                 endpoint_id: 1,
                 completion_code: trb::COMPLETION_SUCCESS,
-                transfer_length: 0,
+                residual_length: 0,
                 trb_pointer: 0x8000_0010,
             }
         );
