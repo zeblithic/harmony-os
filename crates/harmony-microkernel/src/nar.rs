@@ -14,6 +14,9 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 
+#[cfg(feature = "kernel")]
+use serde::{Deserialize, Serialize};
+
 // ── Error type ──────────────────────────────────────────────────────
 
 /// Errors that can occur when parsing a NAR archive.
@@ -53,6 +56,7 @@ const MAX_NESTING_DEPTH: usize = 256;
 /// File contents use zero-copy: `contents_offset` and `contents_len`
 /// point into the original NAR blob rather than holding a copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "kernel", derive(Serialize, Deserialize))]
 pub enum NarEntry {
     /// A regular file.
     Regular {
@@ -350,6 +354,7 @@ fn parse_directory(data: &[u8], pos: usize, depth: usize) -> Result<(NarEntry, u
 /// Holds the recursive directory tree. File contents are referenced by
 /// offset into the original NAR blob (zero-copy).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "kernel", derive(Serialize, Deserialize))]
 pub struct NarArchive {
     /// The root entry of the archive.
     pub root: NarEntry,

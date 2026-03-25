@@ -16,6 +16,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use serde::{Deserialize, Serialize};
+
 use crate::fid_tracker::FidTracker;
 use crate::nar::{NarArchive, NarEntry, NarError};
 use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
@@ -27,6 +29,7 @@ use std::sync::Mutex;
 
 /// A single imported store path: the raw NAR blob (for zero-copy reads)
 /// plus the parsed archive (for directory traversal).
+#[derive(Serialize, Deserialize)]
 struct StorePath {
     nar_blob: Vec<u8>,
     archive: NarArchive,
