@@ -1,6 +1,11 @@
 {
   description = "Harmony OS — mesh-native operating system dev environment";
 
+  nixConfig = {
+    extra-substituters = [ "https://zeblithic.cachix.org" ];
+    extra-trusted-public-keys = [ "zeblithic.cachix.org-1:aS8HanVPr6MQxxqDq3UbgVhI8WxXzYHyYeb6xjE+UQk=" ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     fenix = {
