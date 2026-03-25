@@ -529,6 +529,12 @@ impl XhciDriver {
         // support produces confusing hardware errors.
         let max_slots_enabled = max_slots_enabled.min(self.max_slots);
 
+        // If slots are enabled, DCBAA must be provided — the controller
+        // dereferences DCBAAP for slot context pointers.
+        if max_slots_enabled > 0 && dcbaa_phys == 0 {
+            return Err(XhciError::InvalidState);
+        }
+
         let cmd_ring = ring::CommandRing::new(cmd_ring_phys);
         let evt_ring = ring::EventRing::new(event_ring_phys);
 

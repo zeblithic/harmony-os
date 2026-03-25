@@ -64,6 +64,12 @@ pub fn build_input_context(port: u8, speed: UsbSpeed, transfer_ring_phys: u64) -
     ctx[68..72].copy_from_slice(&ep_dw1.to_le_bytes());
 
     // DWord 2-3: TR Dequeue Pointer (64-bit) | DCS=1
+    // Bits 3:1 are RsvdP — pointer must be 16-byte aligned (xHCI §6.2.3).
+    debug_assert!(
+        transfer_ring_phys & 0xF == 0,
+        "TR Dequeue Pointer must be 16-byte aligned, got {:#x}",
+        transfer_ring_phys
+    );
     let tr_ptr = transfer_ring_phys | 1; // DCS (Dequeue Cycle State) = 1
     ctx[72..76].copy_from_slice(&(tr_ptr as u32).to_le_bytes());
     ctx[76..80].copy_from_slice(&((tr_ptr >> 32) as u32).to_le_bytes());

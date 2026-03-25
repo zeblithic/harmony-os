@@ -165,7 +165,7 @@ impl TransferRing {
         data_len: u16,
     ) -> Result<Vec<(u64, Trb)>, XhciError> {
         use super::trb::{
-            DIR_IN, IDT, IOC, TRB_DATA_STAGE, TRB_SETUP_STAGE, TRB_STATUS_STAGE, TRT_IN,
+            DIR_IN, IDT, IOC, ISP, TRB_DATA_STAGE, TRB_SETUP_STAGE, TRB_STATUS_STAGE, TRT_IN,
         };
 
         let mut all_entries = Vec::new();
@@ -175,9 +175,10 @@ impl TransferRing {
         let setup_entries = self.enqueue_one(TRB_SETUP_STAGE, setup_param, 8, TRT_IN | IDT)?;
         all_entries.extend(setup_entries);
 
-        // 2. Data TRB: parameter = data buffer phys, status = data_len, DIR_IN, no IOC
+        // 2. Data TRB: parameter = data buffer phys, status = data_len, DIR_IN + ISP
+        // ISP ensures a Transfer Event on short packets (device returns less than requested).
         let data_entries =
-            self.enqueue_one(TRB_DATA_STAGE, data_buf_phys, data_len as u32, DIR_IN)?;
+            self.enqueue_one(TRB_DATA_STAGE, data_buf_phys, data_len as u32, DIR_IN | ISP)?;
         all_entries.extend(data_entries);
 
         // 3. Status TRB: direction OUT (no DIR_IN), IOC
@@ -229,7 +230,7 @@ impl EventRing {
 #[cfg(test)]
 mod tests {
     use super::super::trb::{
-        DIR_IN, IDT, IOC, TRB_DATA_STAGE, TRB_LINK, TRB_NOOP_CMD, TRB_SETUP_STAGE,
+        DIR_IN, IDT, IOC, ISP, TRB_DATA_STAGE, TRB_LINK, TRB_NOOP_CMD, TRB_SETUP_STAGE,
         TRB_STATUS_STAGE, TRT_IN,
     };
     use super::*;
@@ -411,6 +412,7 @@ mod tests {
         );
         assert_eq!(data_trb.status, 18, "Data TRB status = data length");
         assert_ne!(data_trb.control & DIR_IN, 0, "Data TRB should have DIR_IN");
+        assert_ne!(data_trb.control & ISP, 0, "Data TRB should have ISP");
         // No IOC on Data TRB (only on Status)
         assert_eq!(data_trb.control & IOC, 0, "Data TRB should NOT have IOC");
     }

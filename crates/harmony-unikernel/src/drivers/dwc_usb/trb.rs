@@ -44,6 +44,8 @@ pub const DIR_IN: u32 = 1 << 16;
 pub const IDT: u32 = 1 << 6;
 /// Interrupt On Completion (bit 5) — generate Transfer Event on completion.
 pub const IOC: u32 = 1 << 5;
+/// Interrupt on Short Packet (bit 2) — generate Transfer Event on short packet.
+pub const ISP: u32 = 1 << 2;
 
 // ── USB request/descriptor constants ─────────────────────────────
 
