@@ -101,7 +101,12 @@ fn build_minimal_elf() -> Vec<u8> {
     elf.push(0); // EI_OSABI: ELFOSABI_NONE
     elf.extend_from_slice(&[0; 8]); // padding
     elf.extend_from_slice(&2u16.to_le_bytes()); // e_type: ET_EXEC
+    #[cfg(target_arch = "x86_64")]
     elf.extend_from_slice(&0x3Eu16.to_le_bytes()); // e_machine: EM_X86_64
+    #[cfg(target_arch = "aarch64")]
+    elf.extend_from_slice(&0xB7u16.to_le_bytes()); // e_machine: EM_AARCH64
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    elf.extend_from_slice(&0x3Eu16.to_le_bytes()); // e_machine: fallback to x86_64
     elf.extend_from_slice(&1u32.to_le_bytes()); // e_version
     elf.extend_from_slice(&0x40_1000u64.to_le_bytes()); // e_entry
     elf.extend_from_slice(&64u64.to_le_bytes()); // e_phoff (phdr starts right after ehdr)
