@@ -158,7 +158,7 @@ pub fn parse_configuration_tree(data: &[u8]) -> Result<ConfigurationTree, XhciEr
             return Err(XhciError::InvalidDescriptor);
         }
         if pos + b_length > total {
-            break;
+            return Err(XhciError::InvalidDescriptor);
         }
         let b_desc_type = data[pos + 1];
 
@@ -307,6 +307,17 @@ pub fn build_configure_endpoint_input_context(
             (3, true) => 7,  // Interrupt IN
             _ => 2,          // fallback to Bulk OUT
         };
+
+        // DWord 0: Interval (bits 23:16) — only relevant for interrupt/isoch.
+        // For bulk, Interval must be 0 (already zeroed). For interrupt/isoch,
+        // write the USB descriptor's bInterval directly. Note: xHCI §6.2.3.1
+        // defines speed-specific exponent encoding; this direct assignment is
+        // correct for FS/LS linear encoding but may need conversion for HS/SS.
+        // Full conversion deferred to Phase 3b (harmony-os-ho8).
+        if transfer_type == 1 || transfer_type == 3 {
+            let interval_dw0: u32 = (ep.interval as u32) << 16;
+            ctx[ep_offset..ep_offset + 4].copy_from_slice(&interval_dw0.to_le_bytes());
+        }
 
         // DWord 1: CErr=3, EP Type, Max Packet Size
         let cerr: u32 = 3 << 1;
