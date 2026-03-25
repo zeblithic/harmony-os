@@ -829,6 +829,7 @@ dependencies = [
 name = "harmony-unikernel"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "harmony-crypto",
  "harmony-identity",
  "harmony-platform",

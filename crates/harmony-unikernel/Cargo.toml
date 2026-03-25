@@ -26,3 +26,19 @@ std = [
 test-utils = []
 
 [dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "event_loop"
+harness = false
+required-features = ["std"]
+
+[[bench]]
+name = "register_bank"
+harness = false
+required-features = ["test-utils"]
+
+[[bench]]
+name = "node_routing"
+harness = false
+required-features = ["std"]
