@@ -115,13 +115,12 @@ fn build_minimal_elf() -> Vec<u8> {
     elf.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
 
     // Program header: PT_LOAD (56 bytes)
-    let phdr_offset = elf.len();
+    // Program header: PT_LOAD (56 bytes)
     elf.extend_from_slice(&1u32.to_le_bytes()); // p_type: PT_LOAD
     elf.extend_from_slice(&5u32.to_le_bytes()); // p_flags: PF_R | PF_X
     elf.extend_from_slice(&0u64.to_le_bytes()); // p_offset
     elf.extend_from_slice(&0x40_0000u64.to_le_bytes()); // p_vaddr
     elf.extend_from_slice(&0x40_0000u64.to_le_bytes()); // p_paddr
-    let _ = phdr_offset; // suppress unused warning
 
     // File size and mem size = total ELF size (header + phdr + code)
     let total_size = 64 + 56 + 4; // ehdr + phdr + tiny code

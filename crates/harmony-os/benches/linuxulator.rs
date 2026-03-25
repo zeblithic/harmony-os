@@ -69,8 +69,9 @@ fn bench_write_stdout(c: &mut Criterion) {
     let mut lx = Linuxulator::new(BenchBackend);
     lx.init_stdio().unwrap();
 
-    // write(fd=1, buf=0x1000, count=64)
-    let args = [1u64, 0x1000, 64, 0, 0, 0];
+    // write(fd=1, buf=<valid stack buffer>, count=64)
+    let write_buf = [0u8; 64];
+    let args = [1u64, write_buf.as_ptr() as u64, 64, 0, 0, 0];
 
     c.bench_function("linuxulator/write_stdout", |b| {
         b.iter(|| {
