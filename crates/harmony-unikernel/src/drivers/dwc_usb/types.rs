@@ -7,6 +7,7 @@
 extern crate alloc;
 
 use super::trb::Trb;
+use alloc::vec::Vec;
 
 // ── xHCI speed IDs ───────────────────────────────────────────────
 const SPEED_FULL: u8 = 1; // 12 Mbps
@@ -164,6 +165,45 @@ pub struct DeviceDescriptor {
     pub device_version: u16,
     /// Number of possible configurations.
     pub num_configurations: u8,
+}
+
+/// Parsed USB Configuration Descriptor (9-byte header).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigDescriptor {
+    pub total_length: u16,
+    pub num_interfaces: u8,
+    pub config_value: u8,
+    pub attributes: u8,
+    pub max_power: u8,
+}
+
+/// Parsed USB Interface Descriptor (9 bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceDescriptor {
+    pub interface_number: u8,
+    pub alternate_setting: u8,
+    pub num_endpoints: u8,
+    pub interface_class: u8,
+    pub interface_subclass: u8,
+    pub interface_protocol: u8,
+}
+
+/// Parsed USB Endpoint Descriptor (7 bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointDescriptor {
+    /// Bit 7 = direction (1=IN, 0=OUT), bits 3:0 = endpoint number.
+    pub endpoint_address: u8,
+    /// Bits 1:0 = transfer type (0=control, 1=iso, 2=bulk, 3=interrupt).
+    pub attributes: u8,
+    pub max_packet_size: u16,
+    pub interval: u8,
+}
+
+/// Complete parsed USB configuration with interfaces and endpoints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigurationTree {
+    pub config: ConfigDescriptor,
+    pub interfaces: Vec<(InterfaceDescriptor, Vec<EndpointDescriptor>)>,
 }
 
 #[cfg(test)]

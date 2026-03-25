@@ -138,8 +138,13 @@ pub struct XhciDriver {
     /// Configured max slots (from setup_rings, written to CONFIG register).
     /// Slot IDs must be 1..=max_slots_enabled.
     max_slots_enabled: u8,
-    /// Transfer rings keyed by slot ID (populated during device enumeration).
-    transfer_rings: BTreeMap<u8, ring::TransferRing>,
+    /// Transfer rings keyed by (slot_id << 8 | endpoint_id).
+    transfer_rings: BTreeMap<u16, ring::TransferRing>,
+}
+
+/// Compute transfer ring map key: (slot_id << 8) | endpoint_id.
+fn ring_key(slot_id: u8, endpoint_id: u8) -> u16 {
+    (slot_id as u16) << 8 | endpoint_id as u16
 }
 
 impl XhciDriver {
@@ -362,7 +367,7 @@ impl XhciDriver {
 
         // Reject if slot already has a ring — must guard before any
         // mutation (cmd_ring.enqueue advances index + pending_count).
-        if self.transfer_rings.contains_key(&slot_id) {
+        if self.transfer_rings.contains_key(&ring_key(slot_id, 1)) {
             return Err(XhciError::InvalidState);
         }
 
@@ -414,19 +419,22 @@ impl XhciDriver {
         });
 
         // Create transfer ring for this slot's EP0.
-        self.transfer_rings
-            .insert(slot_id, ring::TransferRing::new(transfer_ring_phys));
+        self.transfer_rings.insert(
+            ring_key(slot_id, 1),
+            ring::TransferRing::new(transfer_ring_phys),
+        );
 
         Ok(actions)
     }
 
-    /// Remove the transfer ring for a slot.
+    /// Remove all transfer rings for a slot (EP0 + any configured endpoints).
     ///
-    /// Call this after a failed Address Device command completion to
-    /// allow retrying `address_device` for the same slot. Without
-    /// this, the duplicate-slot guard permanently blocks the slot.
+    /// Call this after a failed Address Device or Configure Endpoint
+    /// command completion to allow retrying. Removes all rings sharing
+    /// the slot ID prefix, not just EP0.
     pub fn remove_transfer_ring(&mut self, slot_id: u8) {
-        self.transfer_rings.remove(&slot_id);
+        let prefix = (slot_id as u16) << 8;
+        self.transfer_rings.retain(|&k, _| k & 0xFF00 != prefix);
     }
 
     /// Enqueue a GET_DESCRIPTOR(Device) control transfer on a slot's EP0.
@@ -453,7 +461,7 @@ impl XhciDriver {
 
         let xfer_ring = self
             .transfer_rings
-            .get_mut(&slot_id)
+            .get_mut(&ring_key(slot_id, 1))
             .ok_or(XhciError::NoTransferRing)?;
 
         let setup = context::get_descriptor_setup_packet(
@@ -669,6 +677,209 @@ impl XhciDriver {
 
         Ok(actions)
     }
+
+    /// Enqueue GET_DESCRIPTOR(Configuration) for the 9-byte header.
+    ///
+    /// After execution, poll for `TransferEvent`, then read 9 bytes from
+    /// `data_buf_phys` and pass to `parse_config_descriptor`.
+    ///
+    /// Requires `Running` state and a transfer ring for `slot_id`
+    /// (call `address_device` first).
+    pub fn get_config_descriptor_header(
+        &mut self,
+        slot_id: u8,
+        config_index: u8,
+        data_buf_phys: u64,
+    ) -> Result<Vec<XhciAction>, XhciError> {
+        if self.state != XhciState::Running || slot_id == 0 || slot_id > self.max_slots_enabled {
+            return Err(XhciError::InvalidState);
+        }
+        debug_assert!(
+            data_buf_phys & 0x3 == 0,
+            "data buffer must be DWORD-aligned, got {:#x}",
+            data_buf_phys
+        );
+        let xfer_ring = self
+            .transfer_rings
+            .get_mut(&ring_key(slot_id, 1))
+            .ok_or(XhciError::NoTransferRing)?;
+
+        let setup = context::get_descriptor_setup_packet(
+            trb::USB_DESC_CONFIGURATION,
+            config_index,
+            trb::USB_CONFIG_DESCRIPTOR_HEADER_SIZE,
+        );
+        let entries = xfer_ring.enqueue_control_in(
+            setup,
+            data_buf_phys,
+            trb::USB_CONFIG_DESCRIPTOR_HEADER_SIZE,
+        )?;
+
+        let mut actions: Vec<XhciAction> = entries
+            .into_iter()
+            .map(|(phys, t)| XhciAction::WriteTrb { phys, trb: t })
+            .collect();
+
+        actions.push(XhciAction::RingDoorbell {
+            offset: self.db_offset as usize + 4 * (slot_id as usize),
+            value: 1,
+        });
+
+        Ok(actions)
+    }
+
+    /// Enqueue GET_DESCRIPTOR(Configuration) for the full descriptor tree.
+    ///
+    /// The caller must first call `get_config_descriptor_header` to read
+    /// `total_length`, then call this with that value to fetch the complete
+    /// configuration descriptor.
+    ///
+    /// Requires `Running` state and a transfer ring for `slot_id`
+    /// (call `address_device` first).
+    pub fn get_config_descriptor_full(
+        &mut self,
+        slot_id: u8,
+        config_index: u8,
+        data_buf_phys: u64,
+        total_length: u16,
+    ) -> Result<Vec<XhciAction>, XhciError> {
+        if self.state != XhciState::Running || slot_id == 0 || slot_id > self.max_slots_enabled {
+            return Err(XhciError::InvalidState);
+        }
+        debug_assert!(
+            data_buf_phys & 0x3 == 0,
+            "data buffer must be DWORD-aligned, got {:#x}",
+            data_buf_phys
+        );
+        let xfer_ring = self
+            .transfer_rings
+            .get_mut(&ring_key(slot_id, 1))
+            .ok_or(XhciError::NoTransferRing)?;
+
+        let setup = context::get_descriptor_setup_packet(
+            trb::USB_DESC_CONFIGURATION,
+            config_index,
+            total_length,
+        );
+        let entries = xfer_ring.enqueue_control_in(setup, data_buf_phys, total_length)?;
+
+        let mut actions: Vec<XhciAction> = entries
+            .into_iter()
+            .map(|(phys, t)| XhciAction::WriteTrb { phys, trb: t })
+            .collect();
+
+        actions.push(XhciAction::RingDoorbell {
+            offset: self.db_offset as usize + 4 * (slot_id as usize),
+            value: 1,
+        });
+
+        Ok(actions)
+    }
+
+    /// Enqueue SET_CONFIGURATION control transfer (no data stage).
+    ///
+    /// Sends a host-to-device SET_CONFIGURATION request for the specified
+    /// configuration value. Uses a Setup + Status (no Data) sequence.
+    ///
+    /// Requires `Running` state and a transfer ring for `slot_id`
+    /// (call `address_device` first).
+    pub fn set_configuration(
+        &mut self,
+        slot_id: u8,
+        config_value: u8,
+    ) -> Result<Vec<XhciAction>, XhciError> {
+        if self.state != XhciState::Running || slot_id == 0 || slot_id > self.max_slots_enabled {
+            return Err(XhciError::InvalidState);
+        }
+        let xfer_ring = self
+            .transfer_rings
+            .get_mut(&ring_key(slot_id, 1))
+            .ok_or(XhciError::NoTransferRing)?;
+
+        let setup = context::set_configuration_setup_packet(config_value);
+        let entries = xfer_ring.enqueue_control_no_data(setup)?;
+
+        let mut actions: Vec<XhciAction> = entries
+            .into_iter()
+            .map(|(phys, t)| XhciAction::WriteTrb { phys, trb: t })
+            .collect();
+
+        actions.push(XhciAction::RingDoorbell {
+            offset: self.db_offset as usize + 4 * (slot_id as usize),
+            value: 1,
+        });
+
+        Ok(actions)
+    }
+
+    /// Enqueue Configure Endpoint xHCI command.
+    ///
+    /// Sets up transfer rings for the specified endpoints after
+    /// SET_CONFIGURATION succeeds. Writes the Input Context and enqueues
+    /// a Configure Endpoint command on the command ring.
+    ///
+    /// `slot_context` is the 32-byte Slot Context from the Output Device
+    /// Context (read after Address Device succeeds). Per xHCI §4.6.6, the
+    /// Input Context Slot Context must be a copy with Context Entries updated.
+    ///
+    /// `xfer_ring_phys` is a slice of `(endpoint_id, ring_phys)` pairs.
+    ///
+    /// Requires `Running` state (call `setup_rings` first).
+    pub fn configure_endpoint(
+        &mut self,
+        slot_id: u8,
+        slot_context: &[u8],
+        endpoints: &[EndpointDescriptor],
+        input_ctx_phys: u64,
+        xfer_ring_phys: &[(u8, u64)],
+    ) -> Result<Vec<XhciAction>, XhciError> {
+        if self.state != XhciState::Running || slot_id == 0 || slot_id > self.max_slots_enabled {
+            return Err(XhciError::InvalidState);
+        }
+        debug_assert!(
+            input_ctx_phys & 0x3F == 0,
+            "Input Context must be 64-byte aligned, got {:#x}",
+            input_ctx_phys
+        );
+
+        let input_ctx = context::build_configure_endpoint_input_context(
+            slot_context,
+            endpoints,
+            xfer_ring_phys,
+        );
+
+        let mut actions = Vec::new();
+
+        // 1. Write Input Context to DMA
+        actions.push(XhciAction::WriteDma {
+            phys: input_ctx_phys,
+            data: input_ctx,
+        });
+
+        // 2. Enqueue Configure Endpoint command
+        let cmd_ring = self.command_ring.as_mut().ok_or(XhciError::InvalidState)?;
+        let entries = cmd_ring.enqueue(trb::TRB_CONFIGURE_ENDPOINT, input_ctx_phys)?;
+
+        for (phys, mut t) in entries {
+            if t.trb_type() == trb::TRB_CONFIGURE_ENDPOINT {
+                t.control |= (slot_id as u32) << 24;
+            }
+            actions.push(XhciAction::WriteTrb { phys, trb: t });
+        }
+
+        actions.push(XhciAction::RingDoorbell {
+            offset: self.db_offset as usize,
+            value: 0, // command doorbell
+        });
+
+        // 3. Create transfer rings for each endpoint
+        for &(ep_id, ring_phys) in xfer_ring_phys {
+            self.transfer_rings
+                .insert(ring_key(slot_id, ep_id), ring::TransferRing::new(ring_phys));
+        }
+
+        Ok(actions)
+    }
 }
 
 #[cfg(test)]
@@ -676,6 +887,26 @@ mod tests {
     use super::*;
     use crate::drivers::register_bank::mock::MockRegisterBank;
     use alloc::vec;
+
+    /// Helper: create a Running driver with a slot addressed and ready for transfers.
+    fn make_running_driver_with_slot(slot_id: u8) -> XhciDriver {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
+            .unwrap();
+        driver
+            .address_device(
+                slot_id,
+                1,
+                UsbSpeed::HighSpeed,
+                0x6000_0000,
+                0x7000_0000,
+                0x8000_0000,
+            )
+            .unwrap();
+        driver
+    }
 
     #[test]
     fn usb_speed_from_id() {
@@ -1295,5 +1526,120 @@ mod tests {
             .unwrap();
         // Enqueue should succeed (Running state)
         assert!(driver.enqueue_noop().is_ok());
+    }
+
+    // ── Task 4 tests ────────────────────────────────────────────────
+
+    #[test]
+    fn get_config_descriptor_header_produces_trbs() {
+        let mut driver = make_running_driver_with_slot(1);
+        let actions = driver
+            .get_config_descriptor_header(1, 0, 0xB000_0000)
+            .unwrap();
+        // 3 TRBs (Setup/Data/Status) + 1 RingDoorbell = 4 actions
+        let trb_count = actions
+            .iter()
+            .filter(|a| matches!(a, XhciAction::WriteTrb { .. }))
+            .count();
+        assert_eq!(trb_count, 3);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, XhciAction::RingDoorbell { .. })));
+    }
+
+    #[test]
+    fn get_config_descriptor_full_uses_total_length() {
+        let mut driver = make_running_driver_with_slot(1);
+        let total_length: u16 = 0x0042;
+        let actions = driver
+            .get_config_descriptor_full(1, 0, 0xB000_0000, total_length)
+            .unwrap();
+        // Verify wLength in the Setup TRB parameter matches total_length
+        let setup_action = actions
+            .iter()
+            .find(|a| {
+                matches!(a, XhciAction::WriteTrb { trb, .. }
+                    if trb.trb_type() == trb::TRB_SETUP_STAGE)
+            })
+            .unwrap();
+        if let XhciAction::WriteTrb { trb, .. } = setup_action {
+            // Setup packet is stored as u64 LE in parameter
+            let pkt = trb.parameter.to_le_bytes();
+            let wlength = u16::from_le_bytes([pkt[6], pkt[7]]);
+            assert_eq!(wlength, total_length, "wLength should match total_length");
+        }
+        // 3 TRBs + doorbell
+        let trb_count = actions
+            .iter()
+            .filter(|a| matches!(a, XhciAction::WriteTrb { .. }))
+            .count();
+        assert_eq!(trb_count, 3);
+    }
+
+    #[test]
+    fn set_configuration_produces_two_trbs() {
+        let mut driver = make_running_driver_with_slot(1);
+        let actions = driver.set_configuration(1, 1).unwrap();
+        let trb_count = actions
+            .iter()
+            .filter(|a| matches!(a, XhciAction::WriteTrb { .. }))
+            .count();
+        assert_eq!(trb_count, 2, "Setup + Status, no Data stage");
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, XhciAction::RingDoorbell { .. })));
+    }
+
+    #[test]
+    fn configure_endpoint_creates_rings_and_command() {
+        let mut driver = make_running_driver_with_slot(1);
+        let eps = alloc::vec![
+            EndpointDescriptor {
+                endpoint_address: 0x02,
+                attributes: 0x02,
+                max_packet_size: 512,
+                interval: 0,
+            },
+            EndpointDescriptor {
+                endpoint_address: 0x82,
+                attributes: 0x02,
+                max_packet_size: 512,
+                interval: 0,
+            },
+        ];
+        let rings = alloc::vec![(4u8, 0xA000_0000u64), (5u8, 0xB000_0000u64)];
+        // Fake 32-byte Slot Context (simulates existing Device Context)
+        let mut slot_ctx = [0u8; 32];
+        // DWord 0: speed=3 (HighSpeed) in bits 23:20, Context Entries=1 in bits 31:27
+        let slot_dw0: u32 = (1 << 27) | (3 << 20);
+        slot_ctx[0..4].copy_from_slice(&slot_dw0.to_le_bytes());
+        // DWord 1: Root Hub Port = 1 in bits 23:16
+        slot_ctx[4..8].copy_from_slice(&(1u32 << 16).to_le_bytes());
+
+        let actions = driver
+            .configure_endpoint(1, &slot_ctx, &eps, 0xC000_0000, &rings)
+            .unwrap();
+
+        // Should have: WriteDma (input ctx) + WriteTrb (command) + RingDoorbell
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, XhciAction::WriteDma { .. })));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            XhciAction::RingDoorbell {
+                offset: _,
+                value: 0
+            }
+        )));
+
+        // Transfer rings should be created for both endpoints
+        assert!(
+            driver.transfer_rings.contains_key(&ring_key(1, 4)),
+            "should have ring for slot 1 EP4 (bulk OUT)"
+        );
+        assert!(
+            driver.transfer_rings.contains_key(&ring_key(1, 5)),
+            "should have ring for slot 1 EP5 (bulk IN)"
+        );
     }
 }

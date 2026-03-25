@@ -6,7 +6,12 @@
 //! and parse USB standard descriptors. No driver state needed.
 
 use super::trb;
-use super::types::{DeviceDescriptor, UsbSpeed, XhciError};
+use super::types::{
+    ConfigDescriptor, ConfigurationTree, DeviceDescriptor, EndpointDescriptor, InterfaceDescriptor,
+    UsbSpeed, XhciError,
+};
+
+extern crate alloc;
 
 /// Return the default EP0 max packet size for a given link speed.
 pub fn max_packet_size_for_speed(speed: UsbSpeed) -> u16 {
@@ -114,8 +119,230 @@ pub fn parse_device_descriptor(data: &[u8]) -> Result<DeviceDescriptor, XhciErro
     })
 }
 
+/// Parse a 9-byte USB Configuration Descriptor header.
+pub fn parse_config_descriptor(data: &[u8]) -> Result<ConfigDescriptor, XhciError> {
+    if data.len() < 9 {
+        return Err(XhciError::InvalidDescriptor);
+    }
+    if data[0] != 9 || data[1] != trb::USB_DESC_CONFIGURATION {
+        return Err(XhciError::InvalidDescriptor);
+    }
+    Ok(ConfigDescriptor {
+        total_length: u16::from_le_bytes([data[2], data[3]]),
+        num_interfaces: data[4],
+        config_value: data[5],
+        attributes: data[7],
+        max_power: data[8],
+    })
+}
+
+/// Parse a full USB configuration descriptor tree.
+pub fn parse_configuration_tree(data: &[u8]) -> Result<ConfigurationTree, XhciError> {
+    let config = parse_config_descriptor(data)?;
+    let total = config.total_length as usize;
+    if total < 9 || data.len() < total {
+        return Err(XhciError::InvalidDescriptor);
+    }
+
+    let mut interfaces = alloc::vec::Vec::new();
+    let mut current_iface: Option<InterfaceDescriptor> = None;
+    let mut current_eps = alloc::vec::Vec::new();
+    let mut pos = 9; // skip config header
+
+    while pos < total {
+        if pos + 1 >= total {
+            break;
+        }
+        let b_length = data[pos] as usize;
+        if b_length == 0 {
+            return Err(XhciError::InvalidDescriptor);
+        }
+        if pos + b_length > total {
+            return Err(XhciError::InvalidDescriptor);
+        }
+        let b_desc_type = data[pos + 1];
+
+        match b_desc_type {
+            trb::USB_DESC_INTERFACE if b_length >= 9 => {
+                if let Some(iface) = current_iface.take() {
+                    let eps = core::mem::take(&mut current_eps);
+                    debug_assert_eq!(
+                        eps.len() as u8,
+                        iface.num_endpoints,
+                        "endpoint count mismatch: descriptor claimed {}, found {}",
+                        iface.num_endpoints,
+                        eps.len()
+                    );
+                    interfaces.push((iface, eps));
+                }
+                current_iface = Some(InterfaceDescriptor {
+                    interface_number: data[pos + 2],
+                    alternate_setting: data[pos + 3],
+                    num_endpoints: data[pos + 4],
+                    interface_class: data[pos + 5],
+                    interface_subclass: data[pos + 6],
+                    interface_protocol: data[pos + 7],
+                });
+            }
+            trb::USB_DESC_ENDPOINT if b_length >= 7 => {
+                current_eps.push(EndpointDescriptor {
+                    endpoint_address: data[pos + 2],
+                    attributes: data[pos + 3],
+                    max_packet_size: u16::from_le_bytes([data[pos + 4], data[pos + 5]]),
+                    interval: data[pos + 6],
+                });
+            }
+            _ => {} // skip unknown descriptors
+        }
+        pos += b_length;
+    }
+    // Save last interface
+    if let Some(iface) = current_iface.take() {
+        debug_assert_eq!(
+            current_eps.len() as u8,
+            iface.num_endpoints,
+            "endpoint count mismatch: descriptor claimed {}, found {}",
+            iface.num_endpoints,
+            current_eps.len()
+        );
+        interfaces.push((iface, current_eps));
+    }
+
+    Ok(ConfigurationTree { config, interfaces })
+}
+
+/// Convert USB endpoint address byte to xHCI endpoint ID (DCI).
+///
+/// Formula: `2 * endpoint_number + direction` where direction = 1 for IN, 0 for OUT.
+/// EP0 is always DCI 1 (handled separately by address_device).
+pub fn endpoint_id_from_address(address: u8) -> u8 {
+    let ep_num = address & 0x0F;
+    if ep_num == 0 {
+        return 1; // EP0 is always DCI 1 (Default Control Endpoint)
+    }
+    let dir = if address & 0x80 != 0 { 1u8 } else { 0u8 };
+    2 * ep_num + dir
+}
+
+/// Build an 8-byte SETUP packet for SET_CONFIGURATION (no data stage).
+pub fn set_configuration_setup_packet(config_value: u8) -> [u8; 8] {
+    let mut pkt = [0u8; 8];
+    pkt[0] = 0x00; // bmRequestType: host-to-device, standard, device
+    pkt[1] = trb::USB_REQ_SET_CONFIGURATION;
+    pkt[2] = config_value; // wValue low byte
+                           // pkt[3] = 0 (wValue high byte)
+                           // wIndex = 0, wLength = 0 (all zeros already)
+    pkt
+}
+
+/// Build Input Context for Configure Endpoint command.
+///
+/// Layout: Input Control Context (32B) + Slot Context (32B) + EP Contexts (32B each).
+///
+/// Per xHCI §4.6.6, the Slot Context in the Input Context must be a copy
+/// of the existing Device Context's Slot Context, with the Context Entries
+/// field updated to reflect the new endpoint set. `slot_context` should be
+/// the 32-byte Slot Context read from the Output Device Context.
+pub fn build_configure_endpoint_input_context(
+    slot_context: &[u8],
+    endpoints: &[EndpointDescriptor],
+    xfer_ring_phys: &[(u8, u64)], // (endpoint_id, ring_phys)
+) -> alloc::vec::Vec<u8> {
+    // Find max DCI to size the context
+    let max_dci = endpoints
+        .iter()
+        .map(|ep| endpoint_id_from_address(ep.endpoint_address))
+        .max()
+        .unwrap_or(1);
+
+    // Context size: 32B per entry (Input Control + Slot + EP0..max_dci)
+    let num_entries = 2 + max_dci as usize; // Input Control + Slot + endpoints
+    let ctx_size = num_entries * 32;
+    let mut ctx = alloc::vec![0u8; ctx_size];
+
+    // Input Control Context (bytes 0..31)
+    // DWord 1 (offset 4): Add Context Flags — set bit for Slot (0) and each endpoint
+    let mut add_flags: u32 = 0x01; // Slot context (bit 0)
+    for ep in endpoints {
+        let dci = endpoint_id_from_address(ep.endpoint_address);
+        add_flags |= 1u32 << dci;
+    }
+    ctx[4..8].copy_from_slice(&add_flags.to_le_bytes());
+
+    // Slot Context (bytes 32..63) — copy from existing Device Context,
+    // then update Context Entries field (xHCI §4.6.6).
+    let copy_len = slot_context.len().min(32);
+    ctx[32..32 + copy_len].copy_from_slice(&slot_context[..copy_len]);
+    // Update DWord 0 bits 31:27 with new Context Entries = max_dci
+    let mut slot_dw0 = u32::from_le_bytes(ctx[32..36].try_into().unwrap());
+    slot_dw0 = (slot_dw0 & 0x07FF_FFFF) | ((max_dci as u32) << 27);
+    ctx[32..36].copy_from_slice(&slot_dw0.to_le_bytes());
+
+    // Endpoint Contexts (each 32 bytes, starting at offset 64)
+    // EP context for DCI n starts at byte 32 * (1 + n) from ctx start
+    for ep in endpoints {
+        let dci = endpoint_id_from_address(ep.endpoint_address);
+        let ep_offset = 32 * (1 + dci as usize);
+        if ep_offset + 32 > ctx_size {
+            continue;
+        }
+
+        // Look up the ring phys for this endpoint
+        let ring_phys = xfer_ring_phys
+            .iter()
+            .find(|(id, _)| *id == dci)
+            .map(|(_, phys)| *phys)
+            .unwrap_or(0);
+
+        // EP Type: bulk OUT = 2, bulk IN = 6 (see xHCI Table 6-9)
+        let is_in = ep.endpoint_address & 0x80 != 0;
+        let transfer_type = ep.attributes & 0x03;
+        let ep_type: u32 = match (transfer_type, is_in) {
+            (2, false) => 2, // Bulk OUT
+            (2, true) => 6,  // Bulk IN
+            (0, _) => 4,     // Control
+            (1, false) => 1, // Isoch OUT
+            (1, true) => 5,  // Isoch IN
+            (3, false) => 3, // Interrupt OUT
+            (3, true) => 7,  // Interrupt IN
+            _ => 2,          // fallback to Bulk OUT
+        };
+
+        // DWord 0: Interval (bits 23:16) — only relevant for interrupt/isoch.
+        // For bulk, Interval must be 0 (already zeroed). For interrupt/isoch,
+        // write the USB descriptor's bInterval directly. Note: xHCI §6.2.3.1
+        // defines speed-specific exponent encoding; this direct assignment is
+        // correct for FS/LS linear encoding but may need conversion for HS/SS.
+        // Full conversion deferred to Phase 3b (harmony-os-ho8).
+        if transfer_type == 1 || transfer_type == 3 {
+            let interval_dw0: u32 = (ep.interval as u32) << 16;
+            ctx[ep_offset..ep_offset + 4].copy_from_slice(&interval_dw0.to_le_bytes());
+        }
+
+        // DWord 1: CErr=3, EP Type, Max Packet Size
+        let cerr: u32 = 3 << 1;
+        // Mask to bits 10:0 — bits 12:11 encode additional transactions
+        // per microframe for HS interrupt/isoch (not part of packet size).
+        let mps: u32 = ((ep.max_packet_size & 0x07FF) as u32) << 16;
+        let ep_dw1 = cerr | (ep_type << 3) | mps;
+        ctx[ep_offset + 4..ep_offset + 8].copy_from_slice(&ep_dw1.to_le_bytes());
+
+        // DWord 2-3: TR Dequeue Pointer | DCS=1
+        let tr_ptr = ring_phys | 1;
+        ctx[ep_offset + 8..ep_offset + 12].copy_from_slice(&(tr_ptr as u32).to_le_bytes());
+        ctx[ep_offset + 12..ep_offset + 16].copy_from_slice(&((tr_ptr >> 32) as u32).to_le_bytes());
+
+        // DWord 4: Average TRB Length (512 for bulk, 8 for control)
+        let avg_trb = if transfer_type == 2 { 512u32 } else { 8u32 };
+        ctx[ep_offset + 16..ep_offset + 20].copy_from_slice(&avg_trb.to_le_bytes());
+    }
+
+    ctx
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::trb;
     use super::*;
 
     #[test]
@@ -250,6 +477,149 @@ mod tests {
         assert_eq!(
             parse_device_descriptor(&data),
             Err(XhciError::InvalidDescriptor)
+        );
+    }
+
+    #[test]
+    fn parse_config_descriptor_valid() {
+        let data: [u8; 9] = [
+            9, // bLength
+            2, // bDescriptorType = Configuration
+            0x20, 0x00, // wTotalLength = 32
+            1,    // bNumInterfaces
+            1,    // bConfigurationValue
+            0,    // iConfiguration (string index)
+            0x80, // bmAttributes (bus-powered)
+            50,   // bMaxPower (100mA)
+        ];
+        let desc = parse_config_descriptor(&data).unwrap();
+        assert_eq!(desc.total_length, 32);
+        assert_eq!(desc.num_interfaces, 1);
+        assert_eq!(desc.config_value, 1);
+        assert_eq!(desc.attributes, 0x80);
+        assert_eq!(desc.max_power, 50);
+    }
+
+    #[test]
+    fn parse_config_descriptor_too_short() {
+        assert_eq!(
+            parse_config_descriptor(&[0u8; 8]),
+            Err(XhciError::InvalidDescriptor)
+        );
+    }
+
+    #[test]
+    fn parse_config_descriptor_wrong_type() {
+        let mut data = [0u8; 9];
+        data[0] = 9;
+        data[1] = 1; // Device, not Configuration
+        assert_eq!(
+            parse_config_descriptor(&data),
+            Err(XhciError::InvalidDescriptor)
+        );
+    }
+
+    #[test]
+    fn parse_configuration_tree_valid() {
+        // Config(9) + Interface(9) + Endpoint(7) + Endpoint(7) = 32 bytes
+        let data: [u8; 32] = [
+            // Config descriptor
+            9, 2, 32, 0, 1, 1, 0, 0x80, 50, // Interface descriptor
+            9, 4, 0, 0, 2, 0x08, 0x06, 0x50, 0, // Endpoint descriptor (bulk OUT 0x02)
+            7, 5, 0x02, 0x02, 0x00, 0x02, 0, // Endpoint descriptor (bulk IN 0x82)
+            7, 5, 0x82, 0x02, 0x00, 0x02, 0,
+        ];
+        let tree = parse_configuration_tree(&data).unwrap();
+        assert_eq!(tree.config.config_value, 1);
+        assert_eq!(tree.interfaces.len(), 1);
+        let (iface, eps) = &tree.interfaces[0];
+        assert_eq!(iface.interface_class, 0x08); // Mass Storage
+        assert_eq!(eps.len(), 2);
+        assert_eq!(eps[0].endpoint_address, 0x02); // bulk OUT
+        assert_eq!(eps[1].endpoint_address, 0x82); // bulk IN
+    }
+
+    #[test]
+    fn parse_configuration_tree_zero_blength_guard() {
+        let mut data = [0u8; 16];
+        data[0] = 9;
+        data[1] = 2;
+        data[2] = 16; // config header, total=16
+                      // byte 9: bLength=0 would cause infinite loop
+        assert_eq!(
+            parse_configuration_tree(&data),
+            Err(XhciError::InvalidDescriptor)
+        );
+    }
+
+    #[test]
+    fn endpoint_id_mapping() {
+        assert_eq!(endpoint_id_from_address(0x00), 1); // EP0 → DCI 1
+        assert_eq!(endpoint_id_from_address(0x80), 1); // EP0 IN → DCI 1
+        assert_eq!(endpoint_id_from_address(0x01), 2); // OUT EP1
+        assert_eq!(endpoint_id_from_address(0x81), 3); // IN EP1
+        assert_eq!(endpoint_id_from_address(0x02), 4); // OUT EP2
+        assert_eq!(endpoint_id_from_address(0x82), 5); // IN EP2
+    }
+
+    #[test]
+    fn set_configuration_setup_packet_layout() {
+        let pkt = set_configuration_setup_packet(1);
+        assert_eq!(pkt[0], 0x00, "bmRequestType: host-to-device");
+        assert_eq!(pkt[1], trb::USB_REQ_SET_CONFIGURATION);
+        assert_eq!(pkt[2], 1, "wValue = config_value");
+        assert_eq!(u16::from_le_bytes([pkt[6], pkt[7]]), 0, "wLength = 0");
+    }
+
+    #[test]
+    fn configure_endpoint_input_context_bulk_pair() {
+        use super::super::types::EndpointDescriptor;
+        let eps = alloc::vec![
+            EndpointDescriptor {
+                endpoint_address: 0x02,
+                attributes: 0x02,
+                max_packet_size: 512,
+                interval: 0,
+            },
+            EndpointDescriptor {
+                endpoint_address: 0x82,
+                attributes: 0x02,
+                max_packet_size: 512,
+                interval: 0,
+            },
+        ];
+        let rings = alloc::vec![(4u8, 0xA000_0000u64), (5u8, 0xB000_0000u64)];
+        // Fake existing Slot Context: speed=3 (HighSpeed), port=1
+        let mut slot_ctx = [0u8; 32];
+        let slot_dw0_orig: u32 = (1 << 27) | (3 << 20);
+        slot_ctx[0..4].copy_from_slice(&slot_dw0_orig.to_le_bytes());
+        slot_ctx[4..8].copy_from_slice(&(1u32 << 16).to_le_bytes());
+
+        let ctx = build_configure_endpoint_input_context(&slot_ctx, &eps, &rings);
+
+        // Add flags: bit 0 (Slot) + bit 4 (EP2 OUT) + bit 5 (EP2 IN)
+        let flags = u32::from_le_bytes(ctx[4..8].try_into().unwrap());
+        assert_eq!(flags, 0x01 | (1 << 4) | (1 << 5));
+
+        // Slot Context Entries = 5 (max DCI), speed preserved from original
+        let slot_dw0 = u32::from_le_bytes(ctx[32..36].try_into().unwrap());
+        assert_eq!(
+            (slot_dw0 >> 27) & 0x1F,
+            5,
+            "Context Entries should be max DCI"
+        );
+        assert_eq!(
+            (slot_dw0 >> 20) & 0xF,
+            3,
+            "Speed should be preserved from original"
+        );
+
+        // Slot Context DWord 1: port should be preserved from original
+        let slot_dw1 = u32::from_le_bytes(ctx[36..40].try_into().unwrap());
+        assert_eq!(
+            (slot_dw1 >> 16) & 0xFF,
+            1,
+            "Port should be preserved from original"
         );
     }
 }
