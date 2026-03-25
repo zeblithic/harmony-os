@@ -11,6 +11,8 @@ use alloc::vec::Vec;
 /// Parsed NARInfo — the fields needed for lazy fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NarInfo {
+    /// Full store path (e.g. `/nix/store/abc123-hello-2.10`).
+    pub store_path: Option<String>,
     /// Relative URL to the NAR file (e.g. `nar/1234abcd.nar.xz`).
     pub url: String,
     /// Compression type (e.g. `"xz"`, `"bzip2"`, `"none"`).
@@ -42,6 +44,7 @@ pub enum NarInfoError {
 impl NarInfo {
     /// Parse a NARInfo response body.
     pub fn parse(input: &str) -> Result<Self, NarInfoError> {
+        let mut store_path = None;
         let mut url = None;
         let mut compression = None;
         let mut nar_hash = None;
@@ -50,7 +53,9 @@ impl NarInfo {
         let mut sigs = Vec::new();
 
         for line in input.lines() {
-            if let Some(val) = line.strip_prefix("URL: ") {
+            if let Some(val) = line.strip_prefix("StorePath: ") {
+                store_path = Some(val.to_string());
+            } else if let Some(val) = line.strip_prefix("URL: ") {
                 url = Some(val.to_string());
             } else if let Some(val) = line.strip_prefix("Compression: ") {
                 compression = Some(val.to_string());
@@ -76,6 +81,7 @@ impl NarInfo {
         }
 
         Ok(NarInfo {
+            store_path,
             url: url.ok_or(NarInfoError::MissingField("URL"))?,
             compression: compression.unwrap_or_else(|| "bzip2".to_string()),
             nar_hash: nar_hash.ok_or(NarInfoError::MissingField("NarHash"))?,

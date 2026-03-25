@@ -576,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn signing_skipped_when_no_references() {
+    fn signing_skipped_when_references_unknown() {
         use harmony_identity::PrivateIdentity;
         use rand::rngs::OsRng;
 
@@ -593,7 +593,10 @@ mod tests {
         let resp = srv.handle_request("/abc12345678901234567890123456789.narinfo");
         match resp {
             CacheResponse::Narinfo(text) => {
-                assert!(!text.contains("Sig:"), "should not sign without references");
+                assert!(
+                    !text.contains("Sig:"),
+                    "should not sign when references are unknown (None)"
+                );
             }
             other => panic!("expected Narinfo, got {other:?}"),
         }
