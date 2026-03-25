@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
+use crate::content_server::slice_data;
 use crate::fid_tracker::FidTracker;
 use crate::nar::{NarArchive, NarEntry, NarError};
 use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
@@ -29,10 +30,25 @@ use std::sync::Mutex;
 
 /// A single imported store path: the raw NAR blob (for zero-copy reads)
 /// plus the parsed archive (for directory traversal).
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct StorePath {
     nar_blob: Vec<u8>,
     archive: NarArchive,
+}
+
+/// Fixed QPath for the `/state` pseudo-file.
+///
+/// Chosen to avoid collision with FNV-1a hashes (which always have bit 0
+/// set via `h | 1`) and with the root QPath (0).
+const STATE_QPATH: QPath = 0x7FFF_FFFF_FFFF_FFFE;
+
+/// Serializable snapshot of NixStoreServer state for hot-swap.
+///
+/// Only `store_paths` is transferred; `misses` is a session-scoped
+/// optimization cache and is intentionally excluded.
+#[derive(Serialize, Deserialize)]
+struct NixStoreServerState {
+    store_paths: Vec<(String, StorePath)>,
 }
 
 /// Per-fid payload identifying what a fid points to.
@@ -47,6 +63,8 @@ enum NixFidPayload {
         store_name: Arc<str>,
         path: Arc<str>,
     },
+    /// The `/state` pseudo-file for hot-swap serialization.
+    State,
 }
 
 /// A read-only 9P file server backed by NAR archives.
@@ -196,6 +214,9 @@ impl NixStoreServer {
                 s.push_str(path);
                 s
             }
+            // State uses a fixed QPath; this arm is never reached for qpath
+            // computation but must be exhaustive.
+            NixFidPayload::State => String::from("store/state"),
         }
     }
 
@@ -258,13 +279,18 @@ impl FileServer for NixStoreServer {
 
         let new_payload = match &payload {
             NixFidPayload::Root => {
-                // Walk from root to a store path.
-                let key: Arc<str> = Arc::from(name);
-                if !self.store_paths.contains_key(&key) {
-                    self.misses.insert(Arc::clone(&key));
-                    return Err(IpcError::NotFound);
+                // Intercept "state" before the dynamic store-path lookup.
+                if name == "state" {
+                    NixFidPayload::State
+                } else {
+                    // Walk from root to a store path.
+                    let key: Arc<str> = Arc::from(name);
+                    if !self.store_paths.contains_key(&key) {
+                        self.misses.insert(Arc::clone(&key));
+                        return Err(IpcError::NotFound);
+                    }
+                    NixFidPayload::StorePathRoot { name: key }
                 }
-                NixFidPayload::StorePathRoot { name: key }
             }
             NixFidPayload::StorePathRoot { name: store_name } => {
                 // Walk from store path root into the NAR tree.
@@ -304,16 +330,23 @@ impl FileServer for NixStoreServer {
                     path: Arc::from(child_path.as_str()),
                 }
             }
+            // State is a regular file — cannot walk into it.
+            NixFidPayload::State => return Err(IpcError::NotDirectory),
         };
 
-        let qp = qpath_for(&Self::full_path(&new_payload));
+        let qp = match &new_payload {
+            NixFidPayload::State => STATE_QPATH,
+            _ => qpath_for(&Self::full_path(&new_payload)),
+        };
         self.tracker.insert(new_fid, qp, new_payload)?;
         Ok(qp)
     }
 
     fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
         let entry = self.tracker.begin_open(fid)?;
-        if mode != OpenMode::Read {
+        // State allows any open mode (read for snapshot, write for restore).
+        // All other entries are read-only.
+        if !matches!(entry.payload, NixFidPayload::State) && mode != OpenMode::Read {
             return Err(IpcError::ReadOnly);
         }
         entry.mark_open(mode);
@@ -353,11 +386,40 @@ impl FileServer for NixStoreServer {
                 let nar_entry = sp.archive.lookup(path).ok_or(IpcError::NotFound)?;
                 Ok(self.read_entry_data(sp, nar_entry, offset, count))
             }
+            NixFidPayload::State => {
+                let state = NixStoreServerState {
+                    store_paths: self
+                        .store_paths
+                        .iter()
+                        .map(|(k, v)| (String::from(k.as_ref()), v.clone()))
+                        .collect(),
+                };
+                let mut buf = Vec::new();
+                ciborium::into_writer(&state, &mut buf).map_err(|_| IpcError::ResourceExhausted)?;
+                Ok(slice_data(&buf, offset, count))
+            }
         }
     }
 
-    fn write(&mut self, _fid: Fid, _offset: u64, _data: &[u8]) -> Result<u32, IpcError> {
-        Err(IpcError::ReadOnly)
+    fn write(&mut self, fid: Fid, _offset: u64, data: &[u8]) -> Result<u32, IpcError> {
+        let entry = self.tracker.get(fid)?;
+        if !entry.is_open() {
+            return Err(IpcError::NotOpen);
+        }
+        let payload = entry.payload.clone();
+        match &payload {
+            NixFidPayload::State => {
+                let state: NixStoreServerState =
+                    ciborium::from_reader(data).map_err(|_| IpcError::InvalidArgument)?;
+                self.store_paths = state
+                    .store_paths
+                    .into_iter()
+                    .map(|(k, v)| (Arc::from(k.as_str()), v))
+                    .collect();
+                Ok(u32::try_from(data.len()).unwrap_or(u32::MAX))
+            }
+            _ => Err(IpcError::ReadOnly),
+        }
     }
 
     fn clunk(&mut self, fid: Fid) -> Result<(), IpcError> {
@@ -403,6 +465,12 @@ impl FileServer for NixStoreServer {
                     file_type: file_type_of(nar_entry),
                 })
             }
+            NixFidPayload::State => Ok(FileStat {
+                qpath: STATE_QPATH,
+                name: Arc::from("state"),
+                size: 0,
+                file_type: FileType::Regular,
+            }),
         }
     }
 
@@ -833,6 +901,61 @@ mod tests {
         srv.walk(0, 1, "abc123-hello").unwrap();
         let misses = srv.drain_misses();
         assert!(misses.is_empty());
+    }
+
+    // ── /state tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn state_walk_exists() {
+        let mut server = NixStoreServer::new();
+        server.walk(0, 1, "state").unwrap();
+    }
+
+    #[test]
+    fn state_round_trip() {
+        let mut old = NixStoreServer::new();
+        let nar = nar_regular_file(b"hello nix", false);
+        old.import_nar("abc123-hello", nar).unwrap();
+
+        // Read state.
+        old.walk(0, 1, "state").unwrap();
+        old.open(1, OpenMode::Read).unwrap();
+        let state_bytes = old.read(1, 0, 4 * 1024 * 1024).unwrap();
+        old.clunk(1).unwrap();
+
+        // Write state to new server.
+        let mut new_srv = NixStoreServer::new();
+        new_srv.walk(0, 1, "state").unwrap();
+        new_srv.open(1, OpenMode::Write).unwrap();
+        new_srv.write(1, 0, &state_bytes).unwrap();
+        new_srv.clunk(1).unwrap();
+
+        // Verify the store path transferred.
+        assert!(new_srv.has_store_path("abc123-hello"));
+    }
+
+    #[test]
+    fn state_misses_not_transferred() {
+        let mut old = NixStoreServer::new();
+        // Walk a non-existent path to generate a miss.
+        assert!(old.walk(0, 1, "nonexistent-path").is_err());
+        let misses = old.drain_misses();
+        assert!(!misses.is_empty());
+
+        // Read + write state.
+        old.walk(0, 2, "state").unwrap();
+        old.open(2, OpenMode::Read).unwrap();
+        let state_bytes = old.read(2, 0, 4 * 1024 * 1024).unwrap();
+        old.clunk(2).unwrap();
+
+        let mut new_srv = NixStoreServer::new();
+        new_srv.walk(0, 1, "state").unwrap();
+        new_srv.open(1, OpenMode::Write).unwrap();
+        new_srv.write(1, 0, &state_bytes).unwrap();
+        new_srv.clunk(1).unwrap();
+
+        // Misses are session-scoped and must NOT be transferred.
+        assert!(new_srv.drain_misses().is_empty());
     }
 
     // ── Kernel integration tests ─────────────────────────────────────
