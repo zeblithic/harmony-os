@@ -47,4 +47,5 @@ base64 = "0.22"
 [dev-dependencies]
 harmony-identity = { workspace = true, features = ["std"] }
 harmony-unikernel = { workspace = true, features = ["std"] }
+rand = { version = "0.8", features = ["std"] }
 tempfile = "3"

@@ -8,12 +8,15 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use harmony_identity::PrivateIdentity;
 use sha2::{Digest, Sha256};
 
 use harmony_microkernel::nar::NarError;
 use harmony_microkernel::nix_store_server::NixStoreServer;
 
-use crate::narinfo::serialize_narinfo;
+use crate::narinfo::{compute_narinfo_fingerprint, serialize_narinfo};
+use crate::nix_base32::encode_nix_base32;
 
 /// Response from a binary cache request.
 #[derive(Debug, PartialEq, Eq)]
@@ -48,6 +51,7 @@ pub struct BinaryCacheServer {
     /// 32-char store hash → precomputed narinfo data.
     hash_index: HashMap<String, IndexEntry>,
     misses: BTreeSet<String>,
+    signing: Option<(String, PrivateIdentity)>,
 }
 
 /// Validate that a hash string is 32 lowercase-alphanumeric characters.
@@ -123,7 +127,20 @@ impl BinaryCacheServer {
             server,
             hash_index,
             misses: BTreeSet::new(),
+            signing: None,
         }
+    }
+
+    /// Create a binary cache server with signing and pre-populated references.
+    pub fn new_with_signing(
+        server: NixStoreServer,
+        ref_map: std::collections::HashMap<String, Vec<String>>,
+        key_name: String,
+        identity: PrivateIdentity,
+    ) -> Self {
+        let mut srv = Self::new_with_refs(server, ref_map);
+        srv.signing = Some((key_name, identity));
+        srv
     }
 
     /// Handle a binary cache request path.
@@ -143,12 +160,25 @@ impl BinaryCacheServer {
             }
             return match self.hash_index.get(hash) {
                 Some(entry) => {
+                    let sig = self.signing.as_ref().and_then(|(key_name, identity)| {
+                        let hash_b32 = encode_nix_base32(&entry.nar_sha256);
+                        let nar_hash = format!("sha256:{hash_b32}");
+                        let fingerprint = compute_narinfo_fingerprint(
+                            &entry.name,
+                            &nar_hash,
+                            entry.nar_size,
+                            entry.references.as_deref(),
+                        )?;
+                        let sig_bytes = identity.sign(fingerprint.as_bytes());
+                        let sig_b64 = BASE64.encode(sig_bytes);
+                        Some(format!("{key_name}:{sig_b64}"))
+                    });
                     let text = serialize_narinfo(
                         &entry.name,
                         &entry.nar_sha256,
                         entry.nar_size,
                         entry.references.as_deref(),
-                        None,
+                        sig.as_deref(),
                     );
                     CacheResponse::Narinfo(text)
                 }
@@ -485,5 +515,122 @@ mod tests {
             }
             other => panic!("expected Narinfo, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn signed_narinfo_contains_sig_line() {
+        use harmony_identity::PrivateIdentity;
+        use rand::rngs::OsRng;
+
+        let identity = PrivateIdentity::generate(&mut OsRng);
+        let name = "abc12345678901234567890123456789-hello";
+        let refs = vec!["dep12345678901234567890123456789-glibc".to_string()];
+
+        let mut nix = NixStoreServer::new();
+        nix.import_nar(name, build_test_nar(b"data")).unwrap();
+        let mut ref_map = std::collections::HashMap::new();
+        ref_map.insert(name.to_string(), refs);
+        let mut srv =
+            BinaryCacheServer::new_with_signing(nix, ref_map, "test-key-1".to_string(), identity);
+        let resp = srv.handle_request("/abc12345678901234567890123456789.narinfo");
+        match resp {
+            CacheResponse::Narinfo(text) => {
+                assert!(
+                    text.contains("Sig: test-key-1:"),
+                    "missing Sig line: {text}"
+                );
+                let sig_line = text.lines().find(|l| l.starts_with("Sig: ")).unwrap();
+                let sig_value = sig_line.strip_prefix("Sig: ").unwrap();
+                assert!(sig_value.contains(':'), "sig should be keyname:base64");
+            }
+            other => panic!("expected Narinfo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsigned_server_no_sig_line() {
+        let name = "abc12345678901234567890123456789-hello";
+        let mut srv = build_server_with_nar(name, b"data");
+        let resp = srv.handle_request("/abc12345678901234567890123456789.narinfo");
+        match resp {
+            CacheResponse::Narinfo(text) => {
+                assert!(
+                    !text.contains("Sig:"),
+                    "should not have Sig without signing key"
+                );
+            }
+            other => panic!("expected Narinfo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signing_skipped_when_no_references() {
+        use harmony_identity::PrivateIdentity;
+        use rand::rngs::OsRng;
+
+        let identity = PrivateIdentity::generate(&mut OsRng);
+        let mut nix = NixStoreServer::new();
+        let name = "abc12345678901234567890123456789-noref";
+        nix.import_nar(name, build_test_nar(b"data")).unwrap();
+        let mut srv = BinaryCacheServer::new_with_signing(
+            nix,
+            std::collections::HashMap::new(),
+            "test-key-1".to_string(),
+            identity,
+        );
+        let resp = srv.handle_request("/abc12345678901234567890123456789.narinfo");
+        match resp {
+            CacheResponse::Narinfo(text) => {
+                assert!(!text.contains("Sig:"), "should not sign without references");
+            }
+            other => panic!("expected Narinfo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signature_verifies_against_public_key() {
+        use crate::narinfo::{compute_narinfo_fingerprint, NarInfo};
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+        use harmony_identity::PrivateIdentity;
+        use rand::rngs::OsRng;
+
+        let identity = PrivateIdentity::generate(&mut OsRng);
+        let public = identity.identity.clone();
+        let name = "abc12345678901234567890123456789-verify";
+        let refs = vec!["dep12345678901234567890123456789-glibc".to_string()];
+
+        let mut nix = NixStoreServer::new();
+        nix.import_nar(name, build_test_nar(b"verify data"))
+            .unwrap();
+        let mut ref_map = std::collections::HashMap::new();
+        ref_map.insert(name.to_string(), refs);
+        let mut srv = BinaryCacheServer::new_with_signing(
+            nix,
+            ref_map,
+            "harmony-test-1".to_string(),
+            identity,
+        );
+        let resp = srv.handle_request("/abc12345678901234567890123456789.narinfo");
+        let text = match resp {
+            CacheResponse::Narinfo(t) => t,
+            other => panic!("expected Narinfo, got {other:?}"),
+        };
+
+        let parsed = NarInfo::parse(&text).unwrap();
+        let sig_str = parsed.sig.expect("expected Sig field");
+        let (_key_name, sig_b64) = sig_str.split_once(':').expect("sig format is key:base64");
+        let sig_bytes: [u8; 64] = BASE64.decode(sig_b64).unwrap().try_into().unwrap();
+
+        let fingerprint = compute_narinfo_fingerprint(
+            name,
+            &parsed.nar_hash,
+            parsed.nar_size,
+            parsed.references.as_deref(),
+        )
+        .unwrap();
+
+        public
+            .verify(fingerprint.as_bytes(), &sig_bytes)
+            .expect("signature should verify");
     }
 }
