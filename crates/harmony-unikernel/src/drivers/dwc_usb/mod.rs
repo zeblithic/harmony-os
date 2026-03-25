@@ -329,6 +329,11 @@ impl XhciDriver {
         if self.state != XhciState::Running {
             return Err(XhciError::InvalidState);
         }
+        // Slot 0 is reserved for the Scratchpad Buffer Array pointer.
+        // Valid slot IDs from Enable Slot are 1..=max_slots.
+        if slot_id == 0 {
+            return Err(XhciError::InvalidState);
+        }
         let dcbaa_phys = self.dcbaa_phys.ok_or(XhciError::InvalidState)?;
 
         // Build Input Context
@@ -387,7 +392,7 @@ impl XhciDriver {
         slot_id: u8,
         data_buf_phys: u64,
     ) -> Result<Vec<XhciAction>, XhciError> {
-        if self.state != XhciState::Running {
+        if self.state != XhciState::Running || slot_id == 0 {
             return Err(XhciError::InvalidState);
         }
 
@@ -1014,6 +1019,18 @@ mod tests {
             .unwrap();
 
         let result = driver.address_device(1, 2, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000);
+        assert_eq!(result, Err(XhciError::InvalidState));
+    }
+
+    #[test]
+    fn address_device_slot_zero_rejected() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
+            .unwrap();
+        // Slot 0 is reserved for scratchpad — must be rejected
+        let result = driver.address_device(0, 2, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000);
         assert_eq!(result, Err(XhciError::InvalidState));
     }
 
