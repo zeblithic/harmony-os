@@ -780,6 +780,7 @@ dependencies = [
 name = "harmony-os"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "harmony-compute",
  "harmony-content",
  "harmony-crypto",
@@ -790,6 +791,7 @@ dependencies = [
  "harmony-workflow",
  "harmony-zenoh",
  "hex",
+ "rand",
  "sha2",
  "tempfile",
  "ureq",

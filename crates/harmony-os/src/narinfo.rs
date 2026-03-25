@@ -100,7 +100,12 @@ pub fn compute_narinfo_fingerprint(
     references: Option<&[String]>,
 ) -> Option<String> {
     let refs = references?;
-    let comma_refs = refs.join(",");
+    // Nix fingerprint requires full store paths for each reference.
+    let comma_refs: String = refs
+        .iter()
+        .map(|r| format!("/nix/store/{r}"))
+        .collect::<Vec<_>>()
+        .join(",");
     Some(format!(
         "1;/nix/store/{store_path_name};{nar_hash};{nar_size};{comma_refs}"
     ))
@@ -158,6 +163,10 @@ pub fn serialize_narinfo(
         text.push('\n');
     }
     if let Some(s) = sig {
+        assert!(
+            !s.contains('\n') && !s.contains('\r') && !s.contains('\0'),
+            "sig must not contain control characters: {s:?}"
+        );
         text.push_str("Sig: ");
         text.push_str(s);
         text.push('\n');
@@ -317,7 +326,7 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
         );
         assert_eq!(
             fp.unwrap(),
-            "1;/nix/store/abc123-hello;sha256:1b8m03r63zqhnjf7l5wnldhh7c134p5vpj0850gk224669lcr3yq;12345;dep456-glibc,ghi789-gcc"
+            "1;/nix/store/abc123-hello;sha256:1b8m03r63zqhnjf7l5wnldhh7c134p5vpj0850gk224669lcr3yq;12345;/nix/store/dep456-glibc,/nix/store/ghi789-gcc"
         );
     }
 
