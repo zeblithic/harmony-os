@@ -95,17 +95,22 @@ ContentServer can hold up to BOOK_MAX_SIZE (1MB) per ingested book, with up to 4
 
 ### Serde derives needed
 
-In `nar.rs`, add to `NarEntry`:
+In `nar.rs`, add to both `NarEntry` and `NarArchive`:
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NarEntry { ... }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NarArchive { ... }
 ```
 
-In `nix_store_server.rs`, add to `StorePath` (or its constituent types):
+In `nix_store_server.rs`, add to `StorePath`:
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StorePath { ... }
 ```
+
+`StorePath` contains `NarArchive`, which contains `NarEntry` — all three need serde derives.
 
 Note: `NarEntry` contains `Arc<str>` (for symlink targets and directory entry keys). Serde handles `Arc<str>` as a string — serializes to string, deserializes back to `Arc<str>`. This works correctly with ciborium.
 
@@ -127,7 +132,7 @@ struct NixStoreServerState {
 
 ### Size consideration
 
-A typical Nix store with 50 imported paths: ~50-200KB serialized. Well within MAX_STATE_SIZE.
+`StorePath` contains `nar_blob: Vec<u8>` (raw NAR bytes) which dominates serialized size. A typical Nix store with 50 imported paths of ~100KB each = ~5MB — potentially exceeding `MAX_STATE_SIZE` (4MB). For small/medium stores this works. Large Nix stores should use persistent backing storage (disk-backed `PersistentNarStore`) rather than in-memory state transfer. The 4MB limit naturally enforces this ceiling — the `/state` read returns a truncated result and the write handler can reject it.
 
 ## ConfigServer /state
 
@@ -161,7 +166,7 @@ Tiny — 3 optional NodeConfigs (each <1KB) + a few CID hashes + operator list. 
 | File | Change |
 |------|--------|
 | `Cargo.toml` (workspace root) | Enable `serde` feature on `harmony-athenaeum` workspace dep |
-| `harmony-microkernel/src/nar.rs` | Add `Serialize`/`Deserialize` derives to `NarEntry` |
+| `harmony-microkernel/src/nar.rs` | Add `Serialize`/`Deserialize` derives to `NarEntry` and `NarArchive` |
 | `harmony-microkernel/src/nix_store_server.rs` | Add serde derives to `StorePath`, add STATE qpath + walk/read/write/stat |
 | `harmony-microkernel/src/content_server.rs` | Add STATE qpath + walk/read/write/stat with `ContentServerState` |
 | `harmony-microkernel/src/config_server.rs` | Add STATE qpath + walk/read/write/stat with `ConfigServerState` |
