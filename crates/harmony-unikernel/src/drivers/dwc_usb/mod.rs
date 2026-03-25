@@ -312,9 +312,9 @@ impl XhciDriver {
         let mut actions: Vec<XhciAction> = entries
             .into_iter()
             .map(|(phys, mut t)| {
-                // Set Slot Type in control bits 24:20 for Enable Slot TRBs (xHCI §6.4.3.2).
+                // Set Slot Type in control bits 19:16 for Enable Slot TRBs (xHCI §6.4.3.2 Table 6-10).
                 if t.trb_type() == trb::TRB_ENABLE_SLOT {
-                    t.control |= (slot_type as u32) << 20;
+                    t.control |= (slot_type as u32) << 16;
                 }
                 XhciAction::WriteTrb { phys, trb: t }
             })
