@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! EchoServer — a trivial FileServer for testing IPC.
+//!
+//! Exposes a `/state` pseudo-file for hot-swap state transfer. The kernel
+//! reads `/state` from the old server and writes it to the new server during
+//! `hot_swap`. Note: `/state` is also accessible via normal IPC (any client
+//! with an endpoint capability can read/write it). This is by design for
+//! EchoServer; production servers may want to restrict `/state` access.
 
 extern crate alloc;
 

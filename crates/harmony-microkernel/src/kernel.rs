@@ -1051,6 +1051,10 @@ impl<P: PageTable> Kernel<P> {
         // 2b. Transfer state from old → new via /state files.
         // If either server is stateless (no /state file), skip silently.
         // If transfer fails, rollback: destroy new process.
+        //
+        // SAFETY: single-threaded kernel — no IPC can interleave between
+        // try_transfer_state and set_mount_state(Swapping). If concurrency
+        // is ever added, quiesce the old server *before* reading state.
         match self.try_transfer_state(old_pid, new_pid) {
             Ok(_) => {} // transferred or stateless — either way, proceed
             Err(e) => {
