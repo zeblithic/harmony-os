@@ -448,6 +448,10 @@ impl<P: PageTable> Kernel<P> {
         let (target_pid, server_root_fid, remainder, accepted_nonce) = {
             let process = self.processes.get(&from_pid).ok_or(IpcError::NotFound)?;
             let (mount, remainder) = process.namespace.resolve(path).ok_or(IpcError::NotFound)?;
+            // Reject requests to mounts being hot-swapped.
+            if mount.state == crate::namespace::MountState::Swapping {
+                return Err(IpcError::NotReady);
+            }
             let target_pid = mount.target_pid;
             let server_root_fid = mount.root_fid;
             let remainder = remainder.to_owned();
@@ -2679,5 +2683,25 @@ mod tests {
         // Walk should still succeed via the kernel capability path
         // (returns Ok(None) — no nonce to record).
         assert!(kernel.walk(client, "/echo/hello", 0, 1, 0).is_ok());
+    }
+
+    #[test]
+    fn walk_to_swapping_mount_returns_not_ready() {
+        let (mut kernel, client, _server) = setup_kernel_with_echo();
+
+        // Mark the /echo mount in the client's namespace as Swapping.
+        kernel
+            .processes
+            .get_mut(&client)
+            .unwrap()
+            .namespace
+            .set_mount_state("/echo", crate::namespace::MountState::Swapping)
+            .unwrap();
+
+        // Walk should be rejected with NotReady before capability check.
+        assert_eq!(
+            kernel.walk(client, "/echo/hello", 0, 1, 0),
+            Err(IpcError::NotReady)
+        );
     }
 }
