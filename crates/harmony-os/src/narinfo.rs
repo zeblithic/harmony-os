@@ -166,6 +166,10 @@ pub fn serialize_narinfo(
             !s.contains('\n') && !s.contains('\r') && !s.contains('\0'),
             "sig must not contain control characters: {s:?}"
         );
+        assert!(
+            s.contains(':'),
+            "sig must be in <keyname>:<base64sig> format: {s:?}"
+        );
         text.push_str("Sig: ");
         text.push_str(s);
         text.push('\n');
