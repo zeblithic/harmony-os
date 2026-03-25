@@ -139,11 +139,12 @@ impl BinaryCacheServer {
         identity: PrivateIdentity,
     ) -> Self {
         assert!(
-            !key_name.contains(':')
+            !key_name.is_empty()
+                && !key_name.contains(':')
                 && !key_name.contains('\n')
                 && !key_name.contains('\r')
                 && !key_name.contains('\0'),
-            "key_name must not contain ':' or control characters: {key_name:?}"
+            "key_name must not be empty or contain ':' or control characters: {key_name:?}"
         );
         let mut srv = Self::new_with_refs(server, ref_map);
         srv.signing = Some((key_name, identity));
