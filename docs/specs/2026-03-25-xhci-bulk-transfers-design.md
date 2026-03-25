@@ -26,12 +26,13 @@ pub fn enqueue_bulk(
     &mut self,
     data_buf_phys: u64,
     data_len: u32,
+    flags: u32,
 ) -> Result<Vec<(u64, Trb)>, XhciError>
 ```
 
-Enqueues a single Normal TRB with `IOC | ISP` flags. ISP ensures a
-Transfer Event on short packets (device returns less data than the
-buffer size). Returns TRB entries to write to DMA.
+Enqueues a single Normal TRB with caller-supplied `flags` (e.g. `IOC`
+for OUT, `IOC | ISP` for IN). Returns `Err(TransferTooLarge)` if
+`data_len > 0x1_FFFF`. Returns TRB entries to write to DMA.
 
 ## New Driver Methods
 

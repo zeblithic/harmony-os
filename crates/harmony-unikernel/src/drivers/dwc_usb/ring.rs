@@ -218,10 +218,11 @@ impl TransferRing {
     ///
     /// `data_buf_phys` is the DMA buffer physical address.
     /// `data_len` is the transfer length in bytes.
+    /// `flags` is caller-provided TRB control flags (e.g. `IOC` for OUT,
+    /// `IOC | ISP` for IN transfers).
     ///
-    /// Sets IOC (Interrupt On Completion) and ISP (Interrupt on Short
-    /// Packet) so the caller gets a Transfer Event for both full and
-    /// short completions.
+    /// Returns `Err(TransferTooLarge)` if `data_len` exceeds the 17-bit
+    /// TRB field limit (131,071 bytes).
     pub fn enqueue_bulk(
         &mut self,
         data_buf_phys: u64,
