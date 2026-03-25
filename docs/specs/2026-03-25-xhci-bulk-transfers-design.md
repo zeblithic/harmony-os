@@ -97,7 +97,7 @@ Actual bytes transferred = `data_len - residual_length`.
 
 ## Testing
 
-- `enqueue_bulk` produces 1 Normal TRB with IOC + ISP flags
+- `enqueue_bulk` produces 1 Normal TRB with caller-supplied flags (`IOC` for OUT, `IOC | ISP` for IN)
 - `bulk_transfer_out` produces 1 WriteTrb + RingDoorbell(target=ep_id)
 - `bulk_transfer_in` same pattern
 - State guard: InvalidState when not Running
