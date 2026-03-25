@@ -35,6 +35,8 @@ pub enum XhciError {
     NoTransferRing,
     /// Received descriptor data is malformed or too short to parse.
     InvalidDescriptor,
+    /// Transfer length exceeds the TRB field limit (17-bit, max 131071 bytes).
+    TransferTooLarge,
 }
 
 // ── USB speed ────────────────────────────────────────────────────

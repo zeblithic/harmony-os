@@ -898,8 +898,8 @@ impl XhciDriver {
         data_buf_phys: u64,
         data_len: u32,
     ) -> Result<Vec<XhciAction>, XhciError> {
-        // OUT endpoints have even DCI (2*n).
-        if endpoint_id % 2 != 0 {
+        // OUT endpoints have even DCI (2*n), minimum DCI 2. DCI 0 is reserved.
+        if endpoint_id % 2 != 0 || endpoint_id < 2 {
             return Err(XhciError::InvalidState);
         }
         self.enqueue_bulk(slot_id, endpoint_id, data_buf_phys, data_len)

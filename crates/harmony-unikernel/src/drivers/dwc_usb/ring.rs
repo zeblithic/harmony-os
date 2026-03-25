@@ -228,6 +228,11 @@ impl TransferRing {
         data_len: u32,
     ) -> Result<Vec<(u64, Trb)>, XhciError> {
         use super::trb::{IOC, ISP, TRB_NORMAL};
+        // xHCI §6.4.1.1: Transfer Buffer Length is bits 16:0 (17-bit, max 131071).
+        // Larger values spill into TD Size / Interrupter Target fields.
+        if data_len > 0x1_FFFF {
+            return Err(XhciError::TransferTooLarge);
+        }
         self.enqueue_one(TRB_NORMAL, data_buf_phys, data_len, IOC | ISP)
     }
 }
