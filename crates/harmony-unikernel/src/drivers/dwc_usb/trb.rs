@@ -57,10 +57,15 @@ pub const USB_REQ_GET_DESCRIPTOR: u8 = 6;
 pub const USB_DESC_DEVICE: u8 = 1;
 /// Size in bytes of the standard USB Device Descriptor (bLength field = 18).
 pub const USB_DEVICE_DESCRIPTOR_SIZE: u8 = 18;
+/// SET_CONFIGURATION standard USB request code (bRequest = 9).
 pub const USB_REQ_SET_CONFIGURATION: u8 = 9;
+/// Configuration Descriptor type (wValue high byte = 2).
 pub const USB_DESC_CONFIGURATION: u8 = 2;
+/// Interface Descriptor type (bDescriptorType = 4).
 pub const USB_DESC_INTERFACE: u8 = 4;
+/// Endpoint Descriptor type (bDescriptorType = 5).
 pub const USB_DESC_ENDPOINT: u8 = 5;
+/// Size in bytes of the standard USB Configuration Descriptor header (bLength = 9).
 pub const USB_CONFIG_DESCRIPTOR_HEADER_SIZE: u16 = 9;
 
 // ── Completion codes ─────────────────────────────────────────────

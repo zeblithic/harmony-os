@@ -693,6 +693,11 @@ impl XhciDriver {
         if self.state != XhciState::Running || slot_id == 0 || slot_id > self.max_slots_enabled {
             return Err(XhciError::InvalidState);
         }
+        debug_assert!(
+            data_buf_phys & 0x3 == 0,
+            "data buffer must be DWORD-aligned, got {:#x}",
+            data_buf_phys
+        );
         let xfer_ring = self
             .transfer_rings
             .get_mut(&ring_key(slot_id, 1))
@@ -740,6 +745,11 @@ impl XhciDriver {
         if self.state != XhciState::Running || slot_id == 0 || slot_id > self.max_slots_enabled {
             return Err(XhciError::InvalidState);
         }
+        debug_assert!(
+            data_buf_phys & 0x3 == 0,
+            "data buffer must be DWORD-aligned, got {:#x}",
+            data_buf_phys
+        );
         let xfer_ring = self
             .transfer_rings
             .get_mut(&ring_key(slot_id, 1))
@@ -807,12 +817,17 @@ impl XhciDriver {
     /// SET_CONFIGURATION succeeds. Writes the Input Context and enqueues
     /// a Configure Endpoint command on the command ring.
     ///
+    /// `slot_context` is the 32-byte Slot Context from the Output Device
+    /// Context (read after Address Device succeeds). Per xHCI §4.6.6, the
+    /// Input Context Slot Context must be a copy with Context Entries updated.
+    ///
     /// `xfer_ring_phys` is a slice of `(endpoint_id, ring_phys)` pairs.
     ///
     /// Requires `Running` state (call `setup_rings` first).
     pub fn configure_endpoint(
         &mut self,
         slot_id: u8,
+        slot_context: &[u8],
         endpoints: &[EndpointDescriptor],
         input_ctx_phys: u64,
         xfer_ring_phys: &[(u8, u64)],
@@ -820,8 +835,17 @@ impl XhciDriver {
         if self.state != XhciState::Running || slot_id == 0 || slot_id > self.max_slots_enabled {
             return Err(XhciError::InvalidState);
         }
+        debug_assert!(
+            input_ctx_phys & 0x3F == 0,
+            "Input Context must be 64-byte aligned, got {:#x}",
+            input_ctx_phys
+        );
 
-        let input_ctx = context::build_configure_endpoint_input_context(endpoints, xfer_ring_phys);
+        let input_ctx = context::build_configure_endpoint_input_context(
+            slot_context,
+            endpoints,
+            xfer_ring_phys,
+        );
 
         let mut actions = Vec::new();
 
@@ -1583,8 +1607,16 @@ mod tests {
             },
         ];
         let rings = alloc::vec![(4u8, 0xA000_0000u64), (5u8, 0xB000_0000u64)];
+        // Fake 32-byte Slot Context (simulates existing Device Context)
+        let mut slot_ctx = [0u8; 32];
+        // DWord 0: speed=3 (HighSpeed) in bits 23:20, Context Entries=1 in bits 31:27
+        let slot_dw0: u32 = (1 << 27) | (3 << 20);
+        slot_ctx[0..4].copy_from_slice(&slot_dw0.to_le_bytes());
+        // DWord 1: Root Hub Port = 1 in bits 23:16
+        slot_ctx[4..8].copy_from_slice(&(1u32 << 16).to_le_bytes());
+
         let actions = driver
-            .configure_endpoint(1, &eps, 0xC000_0000, &rings)
+            .configure_endpoint(1, &slot_ctx, &eps, 0xC000_0000, &rings)
             .unwrap();
 
         // Should have: WriteDma (input ctx) + WriteTrb (command) + RingDoorbell

@@ -124,7 +124,7 @@ pub fn parse_config_descriptor(data: &[u8]) -> Result<ConfigDescriptor, XhciErro
     if data.len() < 9 {
         return Err(XhciError::InvalidDescriptor);
     }
-    if data[1] != trb::USB_DESC_CONFIGURATION {
+    if data[0] != 9 || data[1] != trb::USB_DESC_CONFIGURATION {
         return Err(XhciError::InvalidDescriptor);
     }
     Ok(ConfigDescriptor {
@@ -202,6 +202,9 @@ pub fn parse_configuration_tree(data: &[u8]) -> Result<ConfigurationTree, XhciEr
 /// EP0 is always DCI 1 (handled separately by address_device).
 pub fn endpoint_id_from_address(address: u8) -> u8 {
     let ep_num = address & 0x0F;
+    if ep_num == 0 {
+        return 1; // EP0 is always DCI 1 (Default Control Endpoint)
+    }
     let dir = if address & 0x80 != 0 { 1u8 } else { 0u8 };
     2 * ep_num + dir
 }
@@ -220,8 +223,13 @@ pub fn set_configuration_setup_packet(config_value: u8) -> [u8; 8] {
 /// Build Input Context for Configure Endpoint command.
 ///
 /// Layout: Input Control Context (32B) + Slot Context (32B) + EP Contexts (32B each).
-/// xHCI §6.2.2.2: Context Entries in Slot Context must be ≥ largest endpoint DCI.
+///
+/// Per xHCI §4.6.6, the Slot Context in the Input Context must be a copy
+/// of the existing Device Context's Slot Context, with the Context Entries
+/// field updated to reflect the new endpoint set. `slot_context` should be
+/// the 32-byte Slot Context read from the Output Device Context.
 pub fn build_configure_endpoint_input_context(
+    slot_context: &[u8],
     endpoints: &[EndpointDescriptor],
     xfer_ring_phys: &[(u8, u64)], // (endpoint_id, ring_phys)
 ) -> alloc::vec::Vec<u8> {
@@ -246,9 +254,13 @@ pub fn build_configure_endpoint_input_context(
     }
     ctx[4..8].copy_from_slice(&add_flags.to_le_bytes());
 
-    // Slot Context (bytes 32..63)
-    // DWord 0: Context Entries = max_dci (bits 31:27)
-    let slot_dw0: u32 = (max_dci as u32) << 27;
+    // Slot Context (bytes 32..63) — copy from existing Device Context,
+    // then update Context Entries field (xHCI §4.6.6).
+    let copy_len = slot_context.len().min(32);
+    ctx[32..32 + copy_len].copy_from_slice(&slot_context[..copy_len]);
+    // Update DWord 0 bits 31:27 with new Context Entries = max_dci
+    let mut slot_dw0 = u32::from_le_bytes(ctx[32..36].try_into().unwrap());
+    slot_dw0 = (slot_dw0 & 0x07FF_FFFF) | ((max_dci as u32) << 27);
     ctx[32..36].copy_from_slice(&slot_dw0.to_le_bytes());
 
     // Endpoint Contexts (each 32 bytes, starting at offset 64)
@@ -514,6 +526,8 @@ mod tests {
 
     #[test]
     fn endpoint_id_mapping() {
+        assert_eq!(endpoint_id_from_address(0x00), 1); // EP0 → DCI 1
+        assert_eq!(endpoint_id_from_address(0x80), 1); // EP0 IN → DCI 1
         assert_eq!(endpoint_id_from_address(0x01), 2); // OUT EP1
         assert_eq!(endpoint_id_from_address(0x81), 3); // IN EP1
         assert_eq!(endpoint_id_from_address(0x02), 4); // OUT EP2
@@ -547,14 +561,37 @@ mod tests {
             },
         ];
         let rings = alloc::vec![(4u8, 0xA000_0000u64), (5u8, 0xB000_0000u64)];
-        let ctx = build_configure_endpoint_input_context(&eps, &rings);
+        // Fake existing Slot Context: speed=3 (HighSpeed), port=1
+        let mut slot_ctx = [0u8; 32];
+        let slot_dw0_orig: u32 = (1 << 27) | (3 << 20);
+        slot_ctx[0..4].copy_from_slice(&slot_dw0_orig.to_le_bytes());
+        slot_ctx[4..8].copy_from_slice(&(1u32 << 16).to_le_bytes());
+
+        let ctx = build_configure_endpoint_input_context(&slot_ctx, &eps, &rings);
 
         // Add flags: bit 0 (Slot) + bit 4 (EP2 OUT) + bit 5 (EP2 IN)
         let flags = u32::from_le_bytes(ctx[4..8].try_into().unwrap());
         assert_eq!(flags, 0x01 | (1 << 4) | (1 << 5));
 
-        // Slot Context Entries = 5 (max DCI)
+        // Slot Context Entries = 5 (max DCI), speed preserved from original
         let slot_dw0 = u32::from_le_bytes(ctx[32..36].try_into().unwrap());
-        assert_eq!((slot_dw0 >> 27) & 0x1F, 5);
+        assert_eq!(
+            (slot_dw0 >> 27) & 0x1F,
+            5,
+            "Context Entries should be max DCI"
+        );
+        assert_eq!(
+            (slot_dw0 >> 20) & 0xF,
+            3,
+            "Speed should be preserved from original"
+        );
+
+        // Slot Context DWord 1: port should be preserved from original
+        let slot_dw1 = u32::from_le_bytes(ctx[36..40].try_into().unwrap());
+        assert_eq!(
+            (slot_dw1 >> 16) & 0xFF,
+            1,
+            "Port should be preserved from original"
+        );
     }
 }
