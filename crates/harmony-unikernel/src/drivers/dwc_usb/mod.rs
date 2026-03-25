@@ -314,7 +314,7 @@ impl XhciDriver {
             .map(|(phys, mut t)| {
                 // Set Slot Type in control bits 19:16 for Enable Slot TRBs (xHCI §6.4.3.2 Table 6-10).
                 if t.trb_type() == trb::TRB_ENABLE_SLOT {
-                    t.control |= (slot_type as u32) << 16;
+                    t.control |= ((slot_type as u32) & 0xF) << 16;
                 }
                 XhciAction::WriteTrb { phys, trb: t }
             })
