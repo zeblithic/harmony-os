@@ -890,6 +890,12 @@ impl<P: PageTable> Kernel<P> {
     ///
     /// On failure at any step, the old server remains active (no service
     /// disruption). The new process is destroyed if spawned before failure.
+    ///
+    /// **Postcondition:** Callers must grant endpoint capabilities for the
+    /// new PID to any clients that need to walk the swapped mount. Existing
+    /// PID-specific capabilities encode the old PID and will fail with
+    /// `PermissionDenied` after the swap. Call `grant_endpoint_cap(client_pid,
+    /// new_pid, ...)` for each client that accesses this mount.
     pub fn hot_swap(
         &mut self,
         client_pid: u32,
@@ -941,6 +947,8 @@ impl<P: PageTable> Kernel<P> {
                 .processes
                 .get_mut(&client_pid)
                 .ok_or(IpcError::NotFound)?;
+            // Root fid 0: all FileServer implementations use fid 0 as root
+            // (FidTracker::new passes root qpath at fid 0).
             match process.namespace.rebind(mount_path, new_pid, 0) {
                 Ok(old_mount) => old_mount.target_pid,
                 Err(e) => {
@@ -2904,5 +2912,57 @@ mod tests {
         let result = kernel.hot_swap(client_pid, "/srv/echo", new_echo, "echo");
         // Must fail — already swapping.
         assert!(result.is_err(), "hot_swap on Swapping mount must fail");
+    }
+
+    #[test]
+    fn hot_swap_walk_after_swap_requires_new_cap() {
+        let mut entropy = make_test_entropy();
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
+
+        let old_pid = kernel
+            .spawn_process("old-echo", Box::new(EchoServer::new()), &[], None)
+            .unwrap();
+        let client_pid = kernel
+            .spawn_process(
+                "client",
+                Box::new(EchoServer::new()),
+                &[("/srv/echo", old_pid, 0)],
+                None,
+            )
+            .unwrap();
+
+        // Grant cap for old server and verify walk works
+        kernel
+            .grant_endpoint_cap(&mut entropy, client_pid, old_pid, 1)
+            .unwrap();
+        assert!(kernel.walk(client_pid, "/srv/echo", 0, 100, 2).is_ok());
+
+        // Hot-swap to new server
+        let new_echo = Box::new(EchoServer::new());
+        kernel
+            .hot_swap(client_pid, "/srv/echo", new_echo, "new-echo")
+            .unwrap();
+
+        // Walk fails — old cap doesn't cover new PID
+        let result = kernel.walk(client_pid, "/srv/echo", 0, 200, 3);
+        assert_eq!(result, Err(IpcError::PermissionDenied));
+
+        // Find new PID from the mount
+        let new_pid = kernel
+            .processes
+            .get(&client_pid)
+            .unwrap()
+            .namespace
+            .resolve("/srv/echo")
+            .unwrap()
+            .0
+            .target_pid;
+
+        // Grant cap for new server — walk now succeeds
+        kernel
+            .grant_endpoint_cap(&mut entropy, client_pid, new_pid, 4)
+            .unwrap();
+        assert!(kernel.walk(client_pid, "/srv/echo", 0, 300, 5).is_ok());
     }
 }
