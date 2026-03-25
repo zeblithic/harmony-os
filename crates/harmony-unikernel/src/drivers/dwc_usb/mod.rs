@@ -885,6 +885,9 @@ impl XhciDriver {
 
     /// Enqueue a bulk OUT (host-to-device) transfer.
     ///
+    /// `endpoint_id` must be an even DCI (OUT endpoint). `data_buf_phys`
+    /// must be DWORD-aligned (xHCI §4.11.1).
+    ///
     /// Requires a configured bulk endpoint (call `configure_endpoint` first).
     /// After execution, poll for `TransferEvent` with matching `slot_id` and
     /// `endpoint_id`. Actual bytes sent = `data_len - residual_length`.
@@ -895,10 +898,17 @@ impl XhciDriver {
         data_buf_phys: u64,
         data_len: u32,
     ) -> Result<Vec<XhciAction>, XhciError> {
+        // OUT endpoints have even DCI (2*n).
+        if endpoint_id % 2 != 0 {
+            return Err(XhciError::InvalidState);
+        }
         self.enqueue_bulk(slot_id, endpoint_id, data_buf_phys, data_len)
     }
 
     /// Enqueue a bulk IN (device-to-host) transfer.
+    ///
+    /// `endpoint_id` must be an odd DCI (IN endpoint). `data_buf_phys`
+    /// must be DWORD-aligned (xHCI §4.11.1).
     ///
     /// Requires a configured bulk endpoint (call `configure_endpoint` first).
     /// After execution, poll for `TransferEvent` with matching `slot_id` and
@@ -910,6 +920,10 @@ impl XhciDriver {
         data_buf_phys: u64,
         data_len: u32,
     ) -> Result<Vec<XhciAction>, XhciError> {
+        // IN endpoints have odd DCI (2*n + 1). DCI 1 is EP0 (control), not bulk.
+        if endpoint_id % 2 == 0 || endpoint_id < 2 {
+            return Err(XhciError::InvalidState);
+        }
         self.enqueue_bulk(slot_id, endpoint_id, data_buf_phys, data_len)
     }
 
@@ -924,11 +938,10 @@ impl XhciDriver {
         if self.state != XhciState::Running || slot_id == 0 || slot_id > self.max_slots_enabled {
             return Err(XhciError::InvalidState);
         }
-        debug_assert!(
-            data_buf_phys & 0x3 == 0,
-            "data buffer must be DWORD-aligned, got {:#x}",
-            data_buf_phys
-        );
+        // DMA buffer must be DWORD-aligned (xHCI §4.11.1).
+        if data_buf_phys & 0x3 != 0 {
+            return Err(XhciError::InvalidState);
+        }
 
         let xfer_ring = self
             .transfer_rings
@@ -1803,6 +1816,46 @@ mod tests {
         // Ready state, not Running — should fail.
         assert_eq!(
             driver.bulk_transfer_out(1, 4, 0xD000_0000, 512),
+            Err(XhciError::InvalidState)
+        );
+    }
+
+    #[test]
+    fn bulk_transfer_out_rejects_in_endpoint() {
+        let mut driver = make_driver_with_bulk_endpoints();
+        // DCI 5 is odd (IN) — bulk_transfer_out requires even (OUT).
+        assert_eq!(
+            driver.bulk_transfer_out(1, 5, 0xD000_0000, 512),
+            Err(XhciError::InvalidState)
+        );
+    }
+
+    #[test]
+    fn bulk_transfer_in_rejects_out_endpoint() {
+        let mut driver = make_driver_with_bulk_endpoints();
+        // DCI 4 is even (OUT) — bulk_transfer_in requires odd (IN).
+        assert_eq!(
+            driver.bulk_transfer_in(1, 4, 0xD000_0000, 512),
+            Err(XhciError::InvalidState)
+        );
+    }
+
+    #[test]
+    fn bulk_transfer_in_rejects_ep0() {
+        let mut driver = make_driver_with_bulk_endpoints();
+        // DCI 1 is EP0 (control), not a bulk endpoint.
+        assert_eq!(
+            driver.bulk_transfer_in(1, 1, 0xD000_0000, 512),
+            Err(XhciError::InvalidState)
+        );
+    }
+
+    #[test]
+    fn bulk_transfer_rejects_unaligned_buffer() {
+        let mut driver = make_driver_with_bulk_endpoints();
+        // Buffer not DWORD-aligned (0xD000_0001).
+        assert_eq!(
+            driver.bulk_transfer_out(1, 4, 0xD000_0001, 512),
             Err(XhciError::InvalidState)
         );
     }

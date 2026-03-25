@@ -22,11 +22,10 @@ pub const TRB_ADDRESS_DEVICE: u8 = 11;
 /// Configure Endpoint Command TRB — sets up non-zero endpoints.
 pub const TRB_CONFIGURE_ENDPOINT: u8 = 12;
 
-/// Normal TRB — bulk/interrupt data transfer.
-pub const TRB_NORMAL: u8 = 1;
-
 // ── Transfer TRB types ───────────────────────────────────────────
 
+/// Normal TRB — bulk/interrupt data transfer.
+pub const TRB_NORMAL: u8 = 1;
 /// Setup Stage TRB — first TRB in a control transfer (SETUP packet).
 pub const TRB_SETUP_STAGE: u8 = 2;
 /// Data Stage TRB — optional data phase of a control transfer.
