@@ -295,6 +295,10 @@ impl XhciDriver {
         if self.state != XhciState::Running {
             return Err(XhciError::InvalidState);
         }
+        // No point issuing Enable Slot if no slots are configured.
+        if self.max_slots_enabled == 0 {
+            return Err(XhciError::InvalidState);
+        }
 
         let cmd_ring = self.command_ring.as_mut().ok_or(XhciError::InvalidState)?;
         let entries = cmd_ring.enqueue(trb::TRB_ENABLE_SLOT, 0)?;
@@ -428,6 +432,12 @@ impl XhciDriver {
         if self.state != XhciState::Running || slot_id == 0 || slot_id > self.max_slots_enabled {
             return Err(XhciError::InvalidState);
         }
+        // Data buffer for DMA must be at least DWORD-aligned (xHCI §4.11.1).
+        debug_assert!(
+            data_buf_phys & 0x3 == 0,
+            "data buffer must be DWORD-aligned, got {:#x}",
+            data_buf_phys
+        );
 
         let xfer_ring = self
             .transfer_rings
@@ -1101,6 +1111,32 @@ mod tests {
         // slot_id=5 exceeds max_slots_enabled=4
         let result = driver.address_device(5, 2, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000);
         assert_eq!(result, Err(XhciError::InvalidState));
+    }
+
+    #[test]
+    fn remove_transfer_ring_allows_retry() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
+            .unwrap();
+
+        // First address_device succeeds (creates transfer ring)
+        driver
+            .address_device(1, 1, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000)
+            .unwrap();
+
+        // Second call blocked by duplicate-slot guard
+        assert_eq!(
+            driver.address_device(1, 1, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000),
+            Err(XhciError::InvalidState)
+        );
+
+        // After remove_transfer_ring, retry succeeds
+        driver.remove_transfer_ring(1);
+        assert!(driver
+            .address_device(1, 1, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000)
+            .is_ok());
     }
 
     #[test]
