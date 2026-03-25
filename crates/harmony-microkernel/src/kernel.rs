@@ -40,6 +40,9 @@ const DEFAULT_CAP_TTL: u64 = 1_000_000_000;
 /// new user-capability bindings are accepted until the next reboot.
 const MAX_BINDING_NONCES: usize = 4096;
 
+/// Maximum state transfer size during hot_swap (4 MB).
+const MAX_STATE_SIZE: u32 = 4 * 1024 * 1024;
+
 /// A process in the microkernel.
 pub struct Process {
     pub pid: u32,
@@ -881,15 +884,117 @@ impl<P: PageTable> Kernel<P> {
         &self.vm
     }
 
+    /// Try to transfer state from one server to another via their `/state` files.
+    ///
+    /// Uses the 9P walk→open→read/write→clunk sequence directly on the
+    /// `FileServer` trait objects. If either server doesn't expose a `state`
+    /// file (walk returns `NotFound`), returns `Ok(false)` (stateless swap).
+    ///
+    /// Returns `Ok(true)` if state was transferred, `Err` if transfer failed.
+    fn try_transfer_state(&mut self, old_pid: u32, new_pid: u32) -> Result<bool, IpcError> {
+        // Allocate ALL fids before borrowing self.processes mutably.
+        // Old server fids.
+        let old_clone_fid = self.allocate_server_fid()?;
+        let old_state_fid = self.allocate_server_fid()?;
+
+        // ── Read state from old server ──────────────────────────────
+
+        let old_server = &mut self
+            .processes
+            .get_mut(&old_pid)
+            .ok_or(IpcError::NotFound)?
+            .server;
+
+        // clone_fid(root=0) to get a walk-able fid without consuming root.
+        old_server.clone_fid(0, old_clone_fid)?;
+
+        // Walk to "state" — NotFound means server is stateless.
+        match old_server.walk(old_clone_fid, old_state_fid, "state") {
+            Err(IpcError::NotFound) => {
+                let _ = old_server.clunk(old_clone_fid);
+                return Ok(false); // stateless — skip transfer
+            }
+            Err(e) => {
+                let _ = old_server.clunk(old_clone_fid);
+                return Err(e);
+            }
+            Ok(_) => {}
+        }
+        let _ = old_server.clunk(old_clone_fid);
+
+        // Open for read + read all state bytes.
+        // Clunk on error to avoid leaking the walked fid in the old server's tracker.
+        if let Err(e) = old_server.open(old_state_fid, OpenMode::Read) {
+            let _ = old_server.clunk(old_state_fid);
+            return Err(e);
+        }
+        let state_bytes = match old_server.read(old_state_fid, 0, MAX_STATE_SIZE) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let _ = old_server.clunk(old_state_fid);
+                return Err(e);
+            }
+        };
+        let _ = old_server.clunk(old_state_fid);
+
+        // Drop the old server borrow so we can borrow new server separately.
+        // (Both are in the same BTreeMap — can't hold &mut to both at once.)
+
+        // Allocate new server fids.
+        let new_clone_fid = self.allocate_server_fid()?;
+        let new_state_fid = self.allocate_server_fid()?;
+
+        // ── Write state to new server ───────────────────────────────
+
+        let new_server = &mut self
+            .processes
+            .get_mut(&new_pid)
+            .ok_or(IpcError::NotFound)?
+            .server;
+
+        new_server.clone_fid(0, new_clone_fid)?;
+
+        match new_server.walk(new_clone_fid, new_state_fid, "state") {
+            Err(IpcError::NotFound) => {
+                let _ = new_server.clunk(new_clone_fid);
+                // New server doesn't expose /state — state read from old server
+                // is silently discarded. This is intentional per the /state
+                // convention: if the new server doesn't accept state, it owns
+                // its own initialization. Proceeds as a stateless swap.
+                return Ok(false);
+            }
+            Err(e) => {
+                let _ = new_server.clunk(new_clone_fid);
+                return Err(e);
+            }
+            Ok(_) => {}
+        }
+        let _ = new_server.clunk(new_clone_fid);
+
+        if let Err(e) = new_server.open(new_state_fid, OpenMode::Write) {
+            let _ = new_server.clunk(new_state_fid);
+            return Err(e);
+        }
+        if let Err(e) = new_server.write(new_state_fid, 0, &state_bytes) {
+            let _ = new_server.clunk(new_state_fid);
+            return Err(e);
+        }
+        let _ = new_server.clunk(new_state_fid);
+
+        Ok(true)
+    }
+
     /// Atomically replace a running 9P service with a new one.
     ///
     /// Steps:
     /// 1. Validate mount exists, is Active, and `mount_path` is an exact mount
     ///    path (not a sub-path).
     /// 2. Spawn new process with the replacement server.
-    /// 3. Mark mount as Swapping (new requests → `NotReady`).
-    /// 4. Rebind mount to new process (resets state to Active).
-    /// 5. Destroy old process.
+    /// 3. Transfer state: read `/state` from old server, write to new server.
+    ///    Skipped silently if either server doesn't expose `/state`.
+    /// 4. Mark mount as Swapping (new requests → `NotReady`).
+    /// 5. Rebind mount to new process (resets state to Active).
+    /// 6. Destroy old process.
     ///
     /// On failure at any step, the old server remains active (no service
     /// disruption). The new process is destroyed if spawned before failure.
@@ -919,7 +1024,8 @@ impl<P: PageTable> Kernel<P> {
         };
 
         // 1. Validate mount exists, is Active, and is an exact mount path.
-        {
+        //    Extract old_pid here so it's available for state transfer after spawn.
+        let old_pid = {
             let process = self.processes.get(&client_pid).ok_or(IpcError::NotFound)?;
             let (mount, remainder) = process
                 .namespace
@@ -936,10 +1042,26 @@ impl<P: PageTable> Kernel<P> {
             if mount.target_pid == client_pid {
                 return Err(IpcError::InvalidArgument);
             }
-        }
+            mount.target_pid
+        };
 
         // 2. Spawn new process (empty mounts, no VM).
         let new_pid = self.spawn_process(new_server_name, new_server, &[], None)?;
+
+        // 2b. Transfer state from old → new via /state files.
+        // If either server is stateless (no /state file), skip silently.
+        // If transfer fails, rollback: destroy new process.
+        //
+        // SAFETY: single-threaded kernel — no IPC can interleave between
+        // try_transfer_state and set_mount_state(Swapping). If concurrency
+        // is ever added, quiesce the old server *before* reading state.
+        match self.try_transfer_state(old_pid, new_pid) {
+            Ok(_) => {} // transferred or stateless — either way, proceed
+            Err(e) => {
+                let _ = self.destroy_process(new_pid);
+                return Err(e);
+            }
+        }
 
         // 3. Mark mount as Swapping. On failure, destroy the new process.
         // All error paths after spawn must clean up new_pid.
@@ -962,7 +1084,7 @@ impl<P: PageTable> Kernel<P> {
 
         // 4. Rebind mount to new process. On failure, restore Active state
         //    and destroy the new process.
-        let old_pid = {
+        {
             let process = match self.processes.get_mut(&client_pid) {
                 Some(p) => p,
                 None => {
@@ -972,18 +1094,15 @@ impl<P: PageTable> Kernel<P> {
             };
             // Root fid 0: all FileServer implementations use fid 0 as root
             // (FidTracker::new passes root qpath at fid 0).
-            match process.namespace.rebind(mount_path, new_pid, 0) {
-                Ok(old_mount) => old_mount.target_pid,
-                Err(e) => {
-                    let _ = process
-                        .namespace
-                        .set_mount_state(mount_path, crate::namespace::MountState::Active);
-                    // NLL ends process borrow here; destroy new process for rollback.
-                    let _ = self.destroy_process(new_pid);
-                    return Err(e);
-                }
+            if let Err(e) = process.namespace.rebind(mount_path, new_pid, 0) {
+                let _ = process
+                    .namespace
+                    .set_mount_state(mount_path, crate::namespace::MountState::Active);
+                // NLL ends process borrow here; destroy new process for rollback.
+                let _ = self.destroy_process(new_pid);
+                return Err(e);
             }
-        };
+        }
 
         // 5. Destroy old process. Best-effort — if already gone, ignore.
         let _ = self.destroy_process(old_pid);
@@ -3030,6 +3149,156 @@ mod tests {
         assert_eq!(
             kernel.read(client_pid, fid, 0, 64),
             Err(IpcError::InvalidFid)
+        );
+    }
+
+    #[test]
+    fn hot_swap_transfers_state() {
+        let mut entropy = make_test_entropy();
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
+
+        // Spawn old echo server (pid 0).
+        let old_pid = kernel
+            .spawn_process("old-echo", Box::new(EchoServer::new()), &[], None)
+            .unwrap();
+
+        // Spawn client (pid 1) with old echo mounted at /srv/echo.
+        let client_pid = kernel
+            .spawn_process(
+                "client",
+                Box::new(EchoServer::new()),
+                &[("/srv/echo", old_pid, 0)],
+                None,
+            )
+            .unwrap();
+
+        // Grant cap so client can walk to old server.
+        kernel
+            .grant_endpoint_cap(&mut entropy, client_pid, old_pid, 1)
+            .unwrap();
+
+        // Write state data to old echo server's echo file via IPC.
+        kernel
+            .walk(client_pid, "/srv/echo/echo", 0, 100, 2)
+            .unwrap();
+        kernel.open(client_pid, 100, OpenMode::Write).unwrap();
+        kernel.write(client_pid, 100, 0, b"hot swap state").unwrap();
+        kernel.clunk(client_pid, 100).unwrap();
+
+        // Hot-swap with new echo server.
+        let new_echo = Box::new(EchoServer::new());
+        kernel
+            .hot_swap(client_pid, "/srv/echo", new_echo, "new-echo")
+            .unwrap();
+
+        // Find new PID from the rebounded mount.
+        let new_pid = kernel
+            .processes
+            .get(&client_pid)
+            .unwrap()
+            .namespace
+            .resolve("/srv/echo")
+            .unwrap()
+            .0
+            .target_pid;
+
+        // Grant cap for new server.
+        kernel
+            .grant_endpoint_cap(&mut entropy, client_pid, new_pid, 3)
+            .unwrap();
+
+        // Read from new server's echo file — state should have been transferred.
+        kernel
+            .walk(client_pid, "/srv/echo/echo", 0, 200, 4)
+            .unwrap();
+        kernel.open(client_pid, 200, OpenMode::Read).unwrap();
+        let data = kernel.read(client_pid, 200, 0, 65536).unwrap();
+        assert_eq!(data, b"hot swap state");
+    }
+
+    #[test]
+    fn hot_swap_stateless_server_succeeds() {
+        use crate::fid_tracker::FidTracker;
+
+        /// A minimal FileServer that doesn't expose /state.
+        /// walk() always returns NotFound for any name.
+        struct NullServer {
+            tracker: FidTracker<()>,
+        }
+        impl NullServer {
+            fn new() -> Self {
+                Self {
+                    tracker: FidTracker::new(0, ()),
+                }
+            }
+        }
+        impl FileServer for NullServer {
+            fn walk(&mut self, fid: Fid, _new_fid: Fid, _name: &str) -> Result<QPath, IpcError> {
+                // Validate fid exists, then always return NotFound.
+                let _ = self.tracker.get(fid)?;
+                Err(IpcError::NotFound)
+            }
+            fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
+                let entry = self.tracker.begin_open(fid)?;
+                entry.mark_open(mode);
+                Ok(())
+            }
+            fn read(&mut self, _fid: Fid, _offset: u64, _count: u32) -> Result<Vec<u8>, IpcError> {
+                Err(IpcError::NotFound)
+            }
+            fn write(&mut self, _fid: Fid, _offset: u64, _data: &[u8]) -> Result<u32, IpcError> {
+                Err(IpcError::NotFound)
+            }
+            fn clunk(&mut self, fid: Fid) -> Result<(), IpcError> {
+                self.tracker.clunk(fid)
+            }
+            fn stat(&mut self, _fid: Fid) -> Result<crate::FileStat, IpcError> {
+                Ok(crate::FileStat {
+                    qpath: 0,
+                    name: Arc::from("/"),
+                    size: 0,
+                    file_type: crate::FileType::Directory,
+                })
+            }
+            fn clone_fid(&mut self, fid: Fid, new_fid: Fid) -> Result<QPath, IpcError> {
+                self.tracker.clone_fid(fid, new_fid)
+            }
+        }
+
+        let mut entropy = make_test_entropy();
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
+
+        // Spawn NullServer (pid 0).
+        let old_pid = kernel
+            .spawn_process("null", Box::new(NullServer::new()), &[], None)
+            .unwrap();
+
+        // Spawn client (pid 1) with null server mounted at /srv/null.
+        let client_pid = kernel
+            .spawn_process(
+                "client",
+                Box::new(EchoServer::new()),
+                &[("/srv/null", old_pid, 0)],
+                None,
+            )
+            .unwrap();
+
+        // Hot-swap with another NullServer — should succeed (no state transfer).
+        kernel
+            .hot_swap(
+                client_pid,
+                "/srv/null",
+                Box::new(NullServer::new()),
+                "new-null",
+            )
+            .unwrap();
+
+        // Old server gone, new server mounted — swap completed without crash.
+        assert!(
+            !kernel.processes.contains_key(&old_pid),
+            "old NullServer process should be destroyed after hot_swap"
         );
     }
 }

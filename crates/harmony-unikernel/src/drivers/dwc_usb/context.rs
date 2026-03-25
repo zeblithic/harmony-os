@@ -154,7 +154,10 @@ pub fn parse_configuration_tree(data: &[u8]) -> Result<ConfigurationTree, XhciEr
             break;
         }
         let b_length = data[pos] as usize;
-        if b_length == 0 {
+        if b_length < 2 {
+            // bLength < 2 is invalid: every descriptor needs at least
+            // bLength (1 byte) + bDescriptorType (1 byte). bLength == 1
+            // would read bDescriptorType from the next descriptor's data.
             return Err(XhciError::InvalidDescriptor);
         }
         if pos + b_length > total {
@@ -271,6 +274,11 @@ pub fn build_configure_endpoint_input_context(
 
     // Slot Context (bytes 32..63) — copy from existing Device Context,
     // then update Context Entries field (xHCI §4.6.6).
+    debug_assert_eq!(
+        slot_context.len(),
+        32,
+        "slot_context must be the full 32-byte Output Device Context Slot Context"
+    );
     let copy_len = slot_context.len().min(32);
     ctx[32..32 + copy_len].copy_from_slice(&slot_context[..copy_len]);
     // Update DWord 0 bits 31:27 with new Context Entries = max_dci
