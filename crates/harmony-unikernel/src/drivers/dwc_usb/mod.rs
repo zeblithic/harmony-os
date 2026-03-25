@@ -18,6 +18,7 @@ pub use types::*;
 pub mod trb;
 
 pub mod context;
+pub use context::parse_device_descriptor;
 
 mod ring;
 
@@ -369,6 +370,52 @@ impl XhciDriver {
         Ok((actions, input_ctx))
     }
 
+    /// Enqueue a GET_DESCRIPTOR(Device) control transfer on a slot's EP0.
+    ///
+    /// After execution, poll for `TransferEvent`, then read 18 bytes from
+    /// `data_buf_phys` and pass to `parse_device_descriptor`.
+    ///
+    /// Requires `Running` state and a transfer ring for `slot_id`
+    /// (call `address_device` first).
+    pub fn get_device_descriptor(
+        &mut self,
+        slot_id: u8,
+        data_buf_phys: u64,
+    ) -> Result<Vec<XhciAction>, XhciError> {
+        if self.state != XhciState::Running {
+            return Err(XhciError::InvalidState);
+        }
+
+        let xfer_ring = self
+            .transfer_rings
+            .get_mut(&slot_id)
+            .ok_or(XhciError::NoTransferRing)?;
+
+        let setup = context::get_descriptor_setup_packet(
+            trb::USB_DESC_DEVICE,
+            0,
+            trb::USB_DEVICE_DESCRIPTOR_SIZE as u16,
+        );
+        let entries = xfer_ring.enqueue_control_in(
+            setup,
+            data_buf_phys,
+            trb::USB_DEVICE_DESCRIPTOR_SIZE as u16,
+        )?;
+
+        let mut actions: Vec<XhciAction> = entries
+            .into_iter()
+            .map(|(phys, t)| XhciAction::WriteTrb { phys, trb: t })
+            .collect();
+
+        // Ring doorbell for this slot's EP0: value = 1 (default control endpoint)
+        actions.push(XhciAction::RingDoorbell {
+            offset: self.db_offset as usize + 4 * (slot_id as usize),
+            value: 1, // EP0 doorbell target = 1
+        });
+
+        Ok(actions)
+    }
+
     /// Check if the next event TRB has a matching cycle bit.
     ///
     /// The caller reads the cycle bit from the TRB at the event ring's
@@ -412,6 +459,18 @@ impl XhciDriver {
             trb::TRB_PORT_STATUS_CHANGE => {
                 let port_id = ((trb.parameter >> 24) & 0xFF) as u8;
                 XhciEvent::PortStatusChange { port_id }
+            }
+            trb::TRB_TRANSFER_EVENT => {
+                let slot_id = (trb.control >> 24) as u8;
+                let endpoint_id = ((trb.control >> 16) & 0x1F) as u8;
+                let completion_code = (trb.status >> 24) as u8;
+                let transfer_length = trb.status & 0x00FF_FFFF;
+                XhciEvent::TransferEvent {
+                    slot_id,
+                    endpoint_id,
+                    completion_code,
+                    transfer_length,
+                }
             }
             other => XhciEvent::Unknown { trb_type: other },
         };
@@ -944,6 +1003,116 @@ mod tests {
 
         let result = driver.address_device(1, 2, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000);
         assert_eq!(result, Err(XhciError::InvalidState));
+    }
+
+    #[test]
+    fn get_device_descriptor_enqueues_3_trbs_and_doorbell() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
+            .unwrap();
+        driver
+            .address_device(1, 2, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000)
+            .unwrap();
+
+        let actions = driver.get_device_descriptor(1, 0x9000_0000).unwrap();
+
+        // Count WriteTrb actions (should be 3: Setup, Data, Status)
+        let write_trbs: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, XhciAction::WriteTrb { .. }))
+            .collect();
+        assert_eq!(write_trbs.len(), 3);
+
+        // Last action should be RingDoorbell for slot 1
+        match actions.last().unwrap() {
+            XhciAction::RingDoorbell { offset, value } => {
+                assert_eq!(*offset, 0x1000 + 4); // db_offset + 4 * slot_id
+                assert_eq!(*value, 1); // endpoint 0 doorbell value = 1
+            }
+            other => panic!("expected RingDoorbell, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn get_device_descriptor_without_transfer_ring_fails() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
+            .unwrap();
+        // No address_device call → no transfer ring for slot 1
+        assert_eq!(
+            driver.get_device_descriptor(1, 0x9000),
+            Err(XhciError::NoTransferRing)
+        );
+    }
+
+    #[test]
+    fn process_transfer_event() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
+            .unwrap();
+
+        let slot_id: u8 = 1;
+        let endpoint_id: u8 = 1; // EP0 = endpoint ID 1 in xHCI
+        let evt_trb = trb::Trb {
+            parameter: 0x8000_0010, // TRB pointer (not parsed in Phase 2b)
+            status: (trb::COMPLETION_SUCCESS as u32) << 24, // 0 residual
+            control: (slot_id as u32) << 24
+                | (endpoint_id as u32) << 16
+                | (trb::TRB_TRANSFER_EVENT as u32) << 10
+                | 1, // cycle bit
+        };
+
+        let (event, actions) = driver.process_event(evt_trb).unwrap();
+        assert_eq!(
+            event,
+            XhciEvent::TransferEvent {
+                slot_id: 1,
+                endpoint_id: 1,
+                completion_code: trb::COMPLETION_SUCCESS,
+                transfer_length: 0,
+            }
+        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, XhciAction::UpdateDequeuePointer { .. })));
+    }
+
+    #[test]
+    fn parse_device_descriptor_integration() {
+        let data: [u8; 18] = [
+            18, 1, 0x10, 0x02, 0x00, 0x00, 0x00, 64, 0x6B,
+            0x1D, // vendor = 0x1D6B (Linux Foundation)
+            0x02, 0x00, // product = 0x0002
+            0x10, 0x05, // version = 5.10
+            1, 2, 3, 1, // string indices + num_configurations
+        ];
+        let desc = context::parse_device_descriptor(&data).unwrap();
+        assert_eq!(desc.vendor_id, 0x1D6B);
+        assert_eq!(desc.product_id, 0x0002);
+        assert_eq!(desc.usb_version, 0x0210);
+        assert_eq!(desc.num_configurations, 1);
+    }
+
+    #[test]
+    fn address_device_creates_transfer_ring() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
+            .unwrap();
+
+        driver
+            .address_device(1, 2, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000)
+            .unwrap();
+
+        // get_device_descriptor should now work for slot 1
+        assert!(driver.get_device_descriptor(1, 0x9000).is_ok());
     }
 
     #[test]
