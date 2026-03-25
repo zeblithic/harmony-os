@@ -350,7 +350,12 @@ impl XhciDriver {
             return Err(XhciError::InvalidState);
         }
 
-        // Output context must be 64-byte aligned (xHCI §6.1).
+        // Both context pointers must be 64-byte aligned (xHCI §6.1, §6.4.3.4).
+        debug_assert!(
+            input_context_phys & 0x3F == 0,
+            "Input Context must be 64-byte aligned, got {:#x}",
+            input_context_phys
+        );
         debug_assert!(
             output_context_phys & 0x3F == 0,
             "Output Device Context must be 64-byte aligned, got {:#x}",
@@ -1053,14 +1058,23 @@ mod tests {
 
     #[test]
     fn address_device_without_dcbaa_fails() {
-        let mut bank = mock_init_success();
-        let mut driver = XhciDriver::init(&mut bank).unwrap();
-        // setup_rings with dcbaa_phys=0 → no DCBAA stored
-        driver
-            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0, 0)
-            .unwrap();
+        // Directly construct a Running driver with max_slots_enabled > 0
+        // but dcbaa_phys = None to test the DCBAA-absence guard specifically.
+        let mut driver = XhciDriver {
+            max_ports: 4,
+            max_slots: 32,
+            cap_length: 0x20,
+            rts_offset: 0x2000,
+            db_offset: 0x1000,
+            state: XhciState::Running,
+            command_ring: Some(ring::CommandRing::new(0x2000_0000)),
+            event_ring: Some(ring::EventRing::new(0x3000_0000)),
+            dcbaa_phys: None,
+            max_slots_enabled: 4,
+            transfer_rings: BTreeMap::new(),
+        };
 
-        let result = driver.address_device(1, 2, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000);
+        let result = driver.address_device(1, 1, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000);
         assert_eq!(result, Err(XhciError::InvalidState));
     }
 
