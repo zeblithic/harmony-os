@@ -910,10 +910,13 @@ impl<P: PageTable> Kernel<P> {
         new_server: Box<dyn FileServer>,
         new_server_name: &str,
     ) -> Result<(), IpcError> {
-        // Normalize: strip trailing slash so resolve() and set_mount_state()
-        // use the same key. resolve() tolerates trailing slashes via
-        // strip_prefix, but set_mount_state/rebind do exact BTreeMap lookups.
-        let mount_path = mount_path.trim_end_matches('/');
+        // Normalize: strip trailing slashes so resolve() and set_mount_state()
+        // use the same key — but preserve "/" (the root mount).
+        let mount_path = if mount_path == "/" {
+            "/"
+        } else {
+            mount_path.trim_end_matches('/')
+        };
 
         // 1. Validate mount exists, is Active, and is an exact mount path.
         {
@@ -926,6 +929,11 @@ impl<P: PageTable> Kernel<P> {
                 return Err(IpcError::NotFound);
             }
             if mount.state != crate::namespace::MountState::Active {
+                return Err(IpcError::InvalidArgument);
+            }
+            // Reject self-mount: destroying target_pid == client_pid would
+            // kill the caller's own process.
+            if mount.target_pid == client_pid {
                 return Err(IpcError::InvalidArgument);
             }
         }
@@ -2803,7 +2811,7 @@ mod tests {
             .set_mount_state("/echo", crate::namespace::MountState::Swapping)
             .unwrap();
 
-        // Walk should be rejected with NotReady before capability check.
+        // Walk should be rejected with NotReady (cap check passes, swap guard fires).
         assert_eq!(
             kernel.walk(client, "/echo/hello", 0, 1, 0),
             Err(IpcError::NotReady)
