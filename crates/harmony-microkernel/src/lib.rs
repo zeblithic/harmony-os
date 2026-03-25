@@ -92,6 +92,8 @@ pub enum IpcError {
     /// The per-session nonce table is full — no more user-capability
     /// bindings can be accepted until the next reboot.
     NonceLimitExceeded,
+    /// The target service is being hot-swapped — retry after a short delay.
+    NotReady,
 }
 
 // ── File metadata ────────────────────────────────────────────────────

@@ -82,6 +82,7 @@ fn ipc_err_to_errno(e: IpcError) -> i64 {
         IpcError::NotSupported => -38,       // ENOSYS
         IpcError::InvalidArgument => -22,    // EINVAL
         IpcError::NonceLimitExceeded => -11, // EAGAIN
+        IpcError::NotReady => -11,           // EAGAIN — hot-swap in progress, retry
     }
 }
 
