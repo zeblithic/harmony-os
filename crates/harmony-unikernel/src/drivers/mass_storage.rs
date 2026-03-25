@@ -125,14 +125,7 @@ pub struct ModeSenseData {
 pub enum MassStorageError {
     /// CSW signature is not 0x53425355 ("USBS").
     InvalidCsw,
-    /// CSW tag does not match the expected CBW tag.
-    CswTagMismatch {
-        /// Tag value sent in the CBW.
-        expected: u32,
-        /// Tag value received in the CSW.
-        got: u32,
-    },
-    /// Command failed: status 1 (Failed) or 2 (Phase Error).
+    /// CSW status byte is a reserved value (> 2).
     CommandFailed {
         /// The raw bCSWStatus value.
         status: u8,
@@ -170,6 +163,11 @@ impl MassStorageDevice {
             DataDirection::Out | DataDirection::None => CBW_FLAG_OUT,
         };
 
+        debug_assert!(
+            !command.is_empty() && command.len() <= 16,
+            "CDB length must be 1–16, got {}",
+            command.len()
+        );
         let cb_len = command.len() as u8;
 
         let mut cbw = [0u8; 31];
@@ -320,8 +318,9 @@ impl MassStorageDevice {
 
 /// Parse a 13-byte Command Status Wrapper (CSW).
 ///
-/// Validates the "USBS" signature and returns an error for wrong
-/// signature, too-short buffer, or status > 2 (invalid).
+/// Validates the "USBS" signature. Returns `InvalidCsw` for wrong
+/// signature, `ResponseTooShort` for < 13 bytes, `CommandFailed` for
+/// reserved status values (> 2).
 ///
 /// Note: callers that need tag validation should compare `csw.tag`
 /// against the tag from their CBW.
@@ -340,7 +339,7 @@ pub fn parse_csw(data: &[u8]) -> Result<CswStatus, MassStorageError> {
     let status = data[12];
 
     if status > 2 {
-        return Err(MassStorageError::InvalidCsw);
+        return Err(MassStorageError::CommandFailed { status });
     }
 
     Ok(CswStatus {
@@ -818,7 +817,10 @@ mod tests {
         let mut data = [0u8; 13];
         data[0..4].copy_from_slice(&CSW_SIGNATURE.to_le_bytes());
         data[12] = 3; // Invalid — reserved
-        assert_eq!(parse_csw(&data), Err(MassStorageError::InvalidCsw));
+        assert_eq!(
+            parse_csw(&data),
+            Err(MassStorageError::CommandFailed { status: 3 })
+        );
     }
 
     #[test]
