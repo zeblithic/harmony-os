@@ -19,6 +19,8 @@ pub const TRB_PORT_STATUS_CHANGE: u8 = 34;
 pub const TRB_ENABLE_SLOT: u8 = 9;
 /// Address Device Command TRB — assigns USB address and transitions to Addressed state.
 pub const TRB_ADDRESS_DEVICE: u8 = 11;
+/// Configure Endpoint Command TRB — sets up non-zero endpoints.
+pub const TRB_CONFIGURE_ENDPOINT: u8 = 12;
 
 // ── Transfer TRB types ───────────────────────────────────────────
 
@@ -55,6 +57,11 @@ pub const USB_REQ_GET_DESCRIPTOR: u8 = 6;
 pub const USB_DESC_DEVICE: u8 = 1;
 /// Size in bytes of the standard USB Device Descriptor (bLength field = 18).
 pub const USB_DEVICE_DESCRIPTOR_SIZE: u8 = 18;
+pub const USB_REQ_SET_CONFIGURATION: u8 = 9;
+pub const USB_DESC_CONFIGURATION: u8 = 2;
+pub const USB_DESC_INTERFACE: u8 = 4;
+pub const USB_DESC_ENDPOINT: u8 = 5;
+pub const USB_CONFIG_DESCRIPTOR_HEADER_SIZE: u16 = 9;
 
 // ── Completion codes ─────────────────────────────────────────────
 
