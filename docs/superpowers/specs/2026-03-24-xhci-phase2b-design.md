@@ -133,7 +133,8 @@ Packs a 96-byte Input Context:
 
 **Endpoint 0 Context** (bytes 64..95):
 - DWord 1: EP Type = Control Bidirectional = 4 (bits 5:3), Max Packet Size (bits 31:16)
-  - Max Packet Size: 8 (LowSpeed), 64 (FullSpeed/HighSpeed), 512 (SuperSpeed/SuperSpeedPlus)
+  - Max Packet Size: 8 (LowSpeed/FullSpeed), 64 (HighSpeed), 512 (SuperSpeed/SuperSpeedPlus)
+  - FullSpeed uses 8 as conservative initial default (USB 2.0 §9.6.1 allows 8/16/32/64); update from bMaxPacketSize0 after GET_DESCRIPTOR
 - DWord 2 (low 32 bits of TR Dequeue Pointer): `transfer_ring_phys as u32 | 1` (DCS = 1)
 - DWord 3 (high 32 bits): `(transfer_ring_phys >> 32) as u32`
 - DWord 4: Average TRB Length = 8 (bits 15:0)

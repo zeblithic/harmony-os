@@ -338,6 +338,10 @@ impl XhciDriver {
         if slot_id == 0 || slot_id > self.max_slots_enabled {
             return Err(XhciError::InvalidState);
         }
+        // Port 0 is reserved — valid ports are 1..=max_ports (xHCI §6.2.2).
+        if port == 0 {
+            return Err(XhciError::InvalidState);
+        }
         let dcbaa_phys = self.dcbaa_phys.ok_or(XhciError::InvalidState)?;
 
         // Reject if slot already has a ring — must guard before any
@@ -345,6 +349,13 @@ impl XhciDriver {
         if self.transfer_rings.contains_key(&slot_id) {
             return Err(XhciError::InvalidState);
         }
+
+        // Output context must be 64-byte aligned (xHCI §6.1).
+        debug_assert!(
+            output_context_phys & 0x3F == 0,
+            "Output Device Context must be 64-byte aligned, got {:#x}",
+            output_context_phys
+        );
 
         // Build Input Context
         let input_ctx = context::build_input_context(port, speed, transfer_ring_phys);
@@ -386,6 +397,15 @@ impl XhciDriver {
             .insert(slot_id, ring::TransferRing::new(transfer_ring_phys));
 
         Ok(actions)
+    }
+
+    /// Remove the transfer ring for a slot.
+    ///
+    /// Call this after a failed Address Device command completion to
+    /// allow retrying `address_device` for the same slot. Without
+    /// this, the duplicate-slot guard permanently blocks the slot.
+    pub fn remove_transfer_ring(&mut self, slot_id: u8) {
+        self.transfer_rings.remove(&slot_id);
     }
 
     /// Enqueue a GET_DESCRIPTOR(Device) control transfer on a slot's EP0.
