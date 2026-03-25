@@ -880,6 +880,76 @@ impl XhciDriver {
 
         Ok(actions)
     }
+
+    // ── Bulk data transfers ─────────────────────────────────────────
+
+    /// Enqueue a bulk OUT (host-to-device) transfer.
+    ///
+    /// Requires a configured bulk endpoint (call `configure_endpoint` first).
+    /// After execution, poll for `TransferEvent` with matching `slot_id` and
+    /// `endpoint_id`. Actual bytes sent = `data_len - residual_length`.
+    pub fn bulk_transfer_out(
+        &mut self,
+        slot_id: u8,
+        endpoint_id: u8,
+        data_buf_phys: u64,
+        data_len: u32,
+    ) -> Result<Vec<XhciAction>, XhciError> {
+        self.enqueue_bulk(slot_id, endpoint_id, data_buf_phys, data_len)
+    }
+
+    /// Enqueue a bulk IN (device-to-host) transfer.
+    ///
+    /// Requires a configured bulk endpoint (call `configure_endpoint` first).
+    /// After execution, poll for `TransferEvent` with matching `slot_id` and
+    /// `endpoint_id`. Actual bytes received = `data_len - residual_length`.
+    pub fn bulk_transfer_in(
+        &mut self,
+        slot_id: u8,
+        endpoint_id: u8,
+        data_buf_phys: u64,
+        data_len: u32,
+    ) -> Result<Vec<XhciAction>, XhciError> {
+        self.enqueue_bulk(slot_id, endpoint_id, data_buf_phys, data_len)
+    }
+
+    /// Shared bulk transfer enqueue logic.
+    fn enqueue_bulk(
+        &mut self,
+        slot_id: u8,
+        endpoint_id: u8,
+        data_buf_phys: u64,
+        data_len: u32,
+    ) -> Result<Vec<XhciAction>, XhciError> {
+        if self.state != XhciState::Running || slot_id == 0 || slot_id > self.max_slots_enabled {
+            return Err(XhciError::InvalidState);
+        }
+        debug_assert!(
+            data_buf_phys & 0x3 == 0,
+            "data buffer must be DWORD-aligned, got {:#x}",
+            data_buf_phys
+        );
+
+        let xfer_ring = self
+            .transfer_rings
+            .get_mut(&ring_key(slot_id, endpoint_id))
+            .ok_or(XhciError::NoTransferRing)?;
+
+        let entries = xfer_ring.enqueue_bulk(data_buf_phys, data_len)?;
+
+        let mut actions: Vec<XhciAction> = entries
+            .into_iter()
+            .map(|(phys, t)| XhciAction::WriteTrb { phys, trb: t })
+            .collect();
+
+        // Doorbell target = endpoint DCI for non-EP0 endpoints.
+        actions.push(XhciAction::RingDoorbell {
+            offset: self.db_offset as usize + 4 * (slot_id as usize),
+            value: endpoint_id as u32,
+        });
+
+        Ok(actions)
+    }
 }
 
 #[cfg(test)]
@@ -1640,6 +1710,100 @@ mod tests {
         assert!(
             driver.transfer_rings.contains_key(&ring_key(1, 5)),
             "should have ring for slot 1 EP5 (bulk IN)"
+        );
+    }
+
+    // ── Bulk transfer tests ─────────────────────────────────────────
+
+    /// Helper: create a driver with slot 1 addressed + bulk endpoints configured.
+    fn make_driver_with_bulk_endpoints() -> XhciDriver {
+        let mut driver = make_running_driver_with_slot(1);
+        let eps = alloc::vec![
+            EndpointDescriptor {
+                endpoint_address: 0x02,
+                attributes: 0x02,
+                max_packet_size: 512,
+                interval: 0,
+            },
+            EndpointDescriptor {
+                endpoint_address: 0x82,
+                attributes: 0x02,
+                max_packet_size: 512,
+                interval: 0,
+            },
+        ];
+        let mut slot_ctx = [0u8; 32];
+        let slot_dw0: u32 = (1 << 27) | (3 << 20);
+        slot_ctx[0..4].copy_from_slice(&slot_dw0.to_le_bytes());
+        slot_ctx[4..8].copy_from_slice(&(1u32 << 16).to_le_bytes());
+        let rings = alloc::vec![(4u8, 0xA000_0000u64), (5u8, 0xB000_0000u64)];
+        driver
+            .configure_endpoint(1, &slot_ctx, &eps, 0xC000_0000, &rings)
+            .unwrap();
+        driver
+    }
+
+    #[test]
+    fn bulk_transfer_out_produces_trb_and_doorbell() {
+        let mut driver = make_driver_with_bulk_endpoints();
+        let actions = driver.bulk_transfer_out(1, 4, 0xD000_0000, 512).unwrap();
+
+        let trb_count = actions
+            .iter()
+            .filter(|a| matches!(a, XhciAction::WriteTrb { .. }))
+            .count();
+        assert_eq!(trb_count, 1, "should produce 1 Normal TRB");
+
+        // Doorbell target = endpoint_id (4 for bulk OUT EP2)
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            XhciAction::RingDoorbell {
+                offset: _,
+                value: 4,
+            }
+        )));
+    }
+
+    #[test]
+    fn bulk_transfer_in_produces_trb_and_doorbell() {
+        let mut driver = make_driver_with_bulk_endpoints();
+        let actions = driver.bulk_transfer_in(1, 5, 0xD000_0000, 512).unwrap();
+
+        let trb_count = actions
+            .iter()
+            .filter(|a| matches!(a, XhciAction::WriteTrb { .. }))
+            .count();
+        assert_eq!(trb_count, 1);
+
+        // Doorbell target = endpoint_id (5 for bulk IN EP2)
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            XhciAction::RingDoorbell {
+                offset: _,
+                value: 5,
+            }
+        )));
+    }
+
+    #[test]
+    fn bulk_transfer_no_ring_returns_error() {
+        let mut driver = make_running_driver_with_slot(1);
+        // No configure_endpoint called — endpoint 4 has no ring.
+        assert_eq!(
+            driver.bulk_transfer_out(1, 4, 0xD000_0000, 512),
+            Err(XhciError::NoTransferRing)
+        );
+    }
+
+    #[test]
+    fn bulk_transfer_invalid_state() {
+        let mut bank = mock_init_success();
+        let driver_result = XhciDriver::init(&mut bank);
+        let mut driver = driver_result.unwrap();
+        // Ready state, not Running — should fail.
+        assert_eq!(
+            driver.bulk_transfer_out(1, 4, 0xD000_0000, 512),
+            Err(XhciError::InvalidState)
         );
     }
 }
