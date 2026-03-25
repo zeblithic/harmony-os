@@ -213,6 +213,33 @@ impl TransferRing {
 
         Ok(all_entries)
     }
+
+    /// Enqueue a bulk data transfer (single Normal TRB).
+    ///
+    /// `data_buf_phys` is the DMA buffer physical address.
+    /// `data_len` is the transfer length in bytes.
+    /// `flags` is caller-provided TRB control flags (e.g. `IOC` for OUT,
+    /// `IOC | ISP` for IN transfers).
+    ///
+    /// Returns `Err(TransferTooLarge)` if `data_len` exceeds the 17-bit
+    /// TRB field limit (131,071 bytes).
+    pub fn enqueue_bulk(
+        &mut self,
+        data_buf_phys: u64,
+        data_len: u32,
+        flags: u32,
+    ) -> Result<Vec<(u64, Trb)>, XhciError> {
+        use super::trb::TRB_NORMAL;
+        // DMA buffer must be DWORD-aligned (xHCI §4.11.1).
+        if data_buf_phys & 0x3 != 0 {
+            return Err(XhciError::InvalidState);
+        }
+        // xHCI §6.4.1.1: Transfer Buffer Length is bits 16:0 (17-bit, max 131071).
+        if data_len > 0x1_FFFF {
+            return Err(XhciError::TransferTooLarge);
+        }
+        self.enqueue_one(TRB_NORMAL, data_buf_phys, data_len, flags)
+    }
 }
 
 /// Event ring state — controller enqueues events, host dequeues.
@@ -256,7 +283,7 @@ impl EventRing {
 #[cfg(test)]
 mod tests {
     use super::super::trb::{
-        DIR_IN, IDT, IOC, ISP, TRB_DATA_STAGE, TRB_LINK, TRB_NOOP_CMD, TRB_SETUP_STAGE,
+        DIR_IN, IDT, IOC, ISP, TRB_DATA_STAGE, TRB_LINK, TRB_NOOP_CMD, TRB_NORMAL, TRB_SETUP_STAGE,
         TRB_STATUS_STAGE, TRT_IN,
     };
     use super::*;
@@ -506,5 +533,21 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].1.trb_type(), TRB_SETUP_STAGE);
         assert_eq!(entries[1].1.trb_type(), TRB_STATUS_STAGE);
+    }
+
+    #[test]
+    fn enqueue_bulk_produces_one_normal_trb() {
+        let mut ring = TransferRing::new(0x9000_0000);
+        let entries = ring.enqueue_bulk(0xD000_0000, 512, IOC | ISP).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.trb_type(), TRB_NORMAL);
+        // IOC (bit 5) + ISP (bit 2) should be set
+        let flags = entries[0].1.control & 0xFF;
+        assert_ne!(flags & (1 << 5), 0, "IOC should be set");
+        assert_ne!(flags & (1 << 2), 0, "ISP should be set");
+        // Status field = data length
+        assert_eq!(entries[0].1.status, 512);
+        // Parameter = buffer physical address
+        assert_eq!(entries[0].1.parameter, 0xD000_0000);
     }
 }

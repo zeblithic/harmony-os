@@ -24,6 +24,8 @@ pub const TRB_CONFIGURE_ENDPOINT: u8 = 12;
 
 // ── Transfer TRB types ───────────────────────────────────────────
 
+/// Normal TRB — bulk/interrupt data transfer.
+pub const TRB_NORMAL: u8 = 1;
 /// Setup Stage TRB — first TRB in a control transfer (SETUP packet).
 pub const TRB_SETUP_STAGE: u8 = 2;
 /// Data Stage TRB — optional data phase of a control transfer.

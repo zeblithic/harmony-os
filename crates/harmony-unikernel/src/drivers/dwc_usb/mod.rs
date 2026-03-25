@@ -880,6 +880,98 @@ impl XhciDriver {
 
         Ok(actions)
     }
+
+    // ── Bulk data transfers ─────────────────────────────────────────
+
+    /// Enqueue a bulk OUT (host-to-device) transfer.
+    ///
+    /// `endpoint_id` must be an even DCI (OUT endpoint). `data_buf_phys`
+    /// must be DWORD-aligned (xHCI §4.11.1).
+    ///
+    /// Requires a configured bulk endpoint (call `configure_endpoint` first).
+    /// After execution, poll for `TransferEvent` with matching `slot_id` and
+    /// `endpoint_id`. Actual bytes sent = `data_len - residual_length`.
+    pub fn bulk_transfer_out(
+        &mut self,
+        slot_id: u8,
+        endpoint_id: u8,
+        data_buf_phys: u64,
+        data_len: u32,
+    ) -> Result<Vec<XhciAction>, XhciError> {
+        // OUT endpoints have even DCI (2*n), minimum DCI 2. DCI 0 is reserved.
+        if endpoint_id % 2 != 0 || endpoint_id < 2 {
+            return Err(XhciError::InvalidState);
+        }
+        // OUT: IOC only — ISP is meaningless on host-to-device transfers.
+        self.enqueue_bulk_with_flags(slot_id, endpoint_id, data_buf_phys, data_len, trb::IOC)
+    }
+
+    /// Enqueue a bulk IN (device-to-host) transfer.
+    ///
+    /// `endpoint_id` must be an odd DCI (IN endpoint). `data_buf_phys`
+    /// must be DWORD-aligned (xHCI §4.11.1).
+    ///
+    /// Requires a configured bulk endpoint (call `configure_endpoint` first).
+    /// After execution, poll for `TransferEvent` with matching `slot_id` and
+    /// `endpoint_id`. Actual bytes received = `data_len - residual_length`.
+    pub fn bulk_transfer_in(
+        &mut self,
+        slot_id: u8,
+        endpoint_id: u8,
+        data_buf_phys: u64,
+        data_len: u32,
+    ) -> Result<Vec<XhciAction>, XhciError> {
+        // IN endpoints have odd DCI (2*n + 1). DCI 1 is EP0 (control), not bulk.
+        if endpoint_id % 2 == 0 || endpoint_id < 2 {
+            return Err(XhciError::InvalidState);
+        }
+        // IN: IOC + ISP — short-packet events expected on device-to-host.
+        self.enqueue_bulk_with_flags(
+            slot_id,
+            endpoint_id,
+            data_buf_phys,
+            data_len,
+            trb::IOC | trb::ISP,
+        )
+    }
+
+    /// Shared bulk transfer enqueue logic.
+    fn enqueue_bulk_with_flags(
+        &mut self,
+        slot_id: u8,
+        endpoint_id: u8,
+        data_buf_phys: u64,
+        data_len: u32,
+        flags: u32,
+    ) -> Result<Vec<XhciAction>, XhciError> {
+        if self.state != XhciState::Running || slot_id == 0 || slot_id > self.max_slots_enabled {
+            return Err(XhciError::InvalidState);
+        }
+        // DMA buffer must be DWORD-aligned (xHCI §4.11.1).
+        if data_buf_phys & 0x3 != 0 {
+            return Err(XhciError::InvalidState);
+        }
+
+        let xfer_ring = self
+            .transfer_rings
+            .get_mut(&ring_key(slot_id, endpoint_id))
+            .ok_or(XhciError::NoTransferRing)?;
+
+        let entries = xfer_ring.enqueue_bulk(data_buf_phys, data_len, flags)?;
+
+        let mut actions: Vec<XhciAction> = entries
+            .into_iter()
+            .map(|(phys, t)| XhciAction::WriteTrb { phys, trb: t })
+            .collect();
+
+        // Doorbell target = endpoint DCI for non-EP0 endpoints.
+        actions.push(XhciAction::RingDoorbell {
+            offset: self.db_offset as usize + 4 * (slot_id as usize),
+            value: endpoint_id as u32,
+        });
+
+        Ok(actions)
+    }
 }
 
 #[cfg(test)]
@@ -1640,6 +1732,140 @@ mod tests {
         assert!(
             driver.transfer_rings.contains_key(&ring_key(1, 5)),
             "should have ring for slot 1 EP5 (bulk IN)"
+        );
+    }
+
+    // ── Bulk transfer tests ─────────────────────────────────────────
+
+    /// Helper: create a driver with slot 1 addressed + bulk endpoints configured.
+    fn make_driver_with_bulk_endpoints() -> XhciDriver {
+        let mut driver = make_running_driver_with_slot(1);
+        let eps = alloc::vec![
+            EndpointDescriptor {
+                endpoint_address: 0x02,
+                attributes: 0x02,
+                max_packet_size: 512,
+                interval: 0,
+            },
+            EndpointDescriptor {
+                endpoint_address: 0x82,
+                attributes: 0x02,
+                max_packet_size: 512,
+                interval: 0,
+            },
+        ];
+        let mut slot_ctx = [0u8; 32];
+        let slot_dw0: u32 = (1 << 27) | (3 << 20);
+        slot_ctx[0..4].copy_from_slice(&slot_dw0.to_le_bytes());
+        slot_ctx[4..8].copy_from_slice(&(1u32 << 16).to_le_bytes());
+        let rings = alloc::vec![(4u8, 0xA000_0000u64), (5u8, 0xB000_0000u64)];
+        driver
+            .configure_endpoint(1, &slot_ctx, &eps, 0xC000_0000, &rings)
+            .unwrap();
+        driver
+    }
+
+    #[test]
+    fn bulk_transfer_out_produces_trb_and_doorbell() {
+        let mut driver = make_driver_with_bulk_endpoints();
+        let actions = driver.bulk_transfer_out(1, 4, 0xD000_0000, 512).unwrap();
+
+        let trb_count = actions
+            .iter()
+            .filter(|a| matches!(a, XhciAction::WriteTrb { .. }))
+            .count();
+        assert_eq!(trb_count, 1, "should produce 1 Normal TRB");
+
+        // Doorbell target = endpoint_id (4 for bulk OUT EP2)
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            XhciAction::RingDoorbell {
+                offset: _,
+                value: 4,
+            }
+        )));
+    }
+
+    #[test]
+    fn bulk_transfer_in_produces_trb_and_doorbell() {
+        let mut driver = make_driver_with_bulk_endpoints();
+        let actions = driver.bulk_transfer_in(1, 5, 0xD000_0000, 512).unwrap();
+
+        let trb_count = actions
+            .iter()
+            .filter(|a| matches!(a, XhciAction::WriteTrb { .. }))
+            .count();
+        assert_eq!(trb_count, 1);
+
+        // Doorbell target = endpoint_id (5 for bulk IN EP2)
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            XhciAction::RingDoorbell {
+                offset: _,
+                value: 5,
+            }
+        )));
+    }
+
+    #[test]
+    fn bulk_transfer_no_ring_returns_error() {
+        let mut driver = make_running_driver_with_slot(1);
+        // No configure_endpoint called — endpoint 4 has no ring.
+        assert_eq!(
+            driver.bulk_transfer_out(1, 4, 0xD000_0000, 512),
+            Err(XhciError::NoTransferRing)
+        );
+    }
+
+    #[test]
+    fn bulk_transfer_invalid_state() {
+        let mut bank = mock_init_success();
+        let driver_result = XhciDriver::init(&mut bank);
+        let mut driver = driver_result.unwrap();
+        // Ready state, not Running — should fail.
+        assert_eq!(
+            driver.bulk_transfer_out(1, 4, 0xD000_0000, 512),
+            Err(XhciError::InvalidState)
+        );
+    }
+
+    #[test]
+    fn bulk_transfer_out_rejects_in_endpoint() {
+        let mut driver = make_driver_with_bulk_endpoints();
+        // DCI 5 is odd (IN) — bulk_transfer_out requires even (OUT).
+        assert_eq!(
+            driver.bulk_transfer_out(1, 5, 0xD000_0000, 512),
+            Err(XhciError::InvalidState)
+        );
+    }
+
+    #[test]
+    fn bulk_transfer_in_rejects_out_endpoint() {
+        let mut driver = make_driver_with_bulk_endpoints();
+        // DCI 4 is even (OUT) — bulk_transfer_in requires odd (IN).
+        assert_eq!(
+            driver.bulk_transfer_in(1, 4, 0xD000_0000, 512),
+            Err(XhciError::InvalidState)
+        );
+    }
+
+    #[test]
+    fn bulk_transfer_in_rejects_ep0() {
+        let mut driver = make_driver_with_bulk_endpoints();
+        // DCI 1 is EP0 (control), not a bulk endpoint.
+        assert_eq!(
+            driver.bulk_transfer_in(1, 1, 0xD000_0000, 512),
+            Err(XhciError::InvalidState)
+        );
+    }
+
+    #[test]
+    fn bulk_transfer_rejects_unaligned_buffer() {
+        let mut driver = make_driver_with_bulk_endpoints();
+        // Buffer not DWORD-aligned (0xD000_0001).
+        assert_eq!(
+            driver.bulk_transfer_out(1, 4, 0xD000_0001, 512),
+            Err(XhciError::InvalidState)
         );
     }
 }
