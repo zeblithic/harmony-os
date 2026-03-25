@@ -135,6 +135,9 @@ pub struct XhciDriver {
     event_ring: Option<ring::EventRing>,
     /// Physical address of the DCBAA (set after setup_rings).
     dcbaa_phys: Option<u64>,
+    /// Configured max slots (from setup_rings, written to CONFIG register).
+    /// Slot IDs must be 1..=max_slots_enabled.
+    max_slots_enabled: u8,
     /// Transfer rings keyed by slot ID (populated during device enumeration).
     transfer_rings: BTreeMap<u8, ring::TransferRing>,
 }
@@ -210,6 +213,7 @@ impl XhciDriver {
             command_ring: None,
             event_ring: None,
             dcbaa_phys: None,
+            max_slots_enabled: 0,
             transfer_rings: BTreeMap::new(),
         })
     }
@@ -331,7 +335,7 @@ impl XhciDriver {
         }
         // Valid slot IDs are 1..=max_slots (xHCI §4.6.3).
         // Slot 0 is reserved for the Scratchpad Buffer Array pointer.
-        if slot_id == 0 || slot_id > self.max_slots {
+        if slot_id == 0 || slot_id > self.max_slots_enabled {
             return Err(XhciError::InvalidState);
         }
         let dcbaa_phys = self.dcbaa_phys.ok_or(XhciError::InvalidState)?;
@@ -392,7 +396,7 @@ impl XhciDriver {
         slot_id: u8,
         data_buf_phys: u64,
     ) -> Result<Vec<XhciAction>, XhciError> {
-        if self.state != XhciState::Running || slot_id == 0 || slot_id > self.max_slots {
+        if self.state != XhciState::Running || slot_id == 0 || slot_id > self.max_slots_enabled {
             return Err(XhciError::InvalidState);
         }
 
@@ -586,6 +590,7 @@ impl XhciDriver {
         } else {
             None
         };
+        self.max_slots_enabled = max_slots_enabled;
         self.state = XhciState::Running;
 
         Ok(actions)
@@ -765,6 +770,7 @@ mod tests {
             command_ring: None,
             event_ring: None,
             dcbaa_phys: None,
+            max_slots_enabled: 0,
             transfer_rings: BTreeMap::new(),
         };
         let bank = MockRegisterBank::new();
@@ -812,6 +818,7 @@ mod tests {
             command_ring: None,
             event_ring: None,
             dcbaa_phys: None,
+            max_slots_enabled: 0,
             transfer_rings: BTreeMap::new(),
         };
         assert_eq!(
@@ -1038,12 +1045,12 @@ mod tests {
     fn address_device_slot_above_max_rejected() {
         let mut bank = mock_init_success();
         let mut driver = XhciDriver::init(&mut bank).unwrap();
-        // max_slots from mock = 32 (HCSPARAMS1 = 0x0400_0020, bits 7:0 = 0x20 = 32)
+        // max_slots_enabled=4 (configured limit, not hardware max of 32)
         driver
             .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
             .unwrap();
-        // slot_id=33 exceeds max_slots=32
-        let result = driver.address_device(33, 2, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000);
+        // slot_id=5 exceeds max_slots_enabled=4
+        let result = driver.address_device(5, 2, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000);
         assert_eq!(result, Err(XhciError::InvalidState));
     }
 

@@ -229,7 +229,8 @@ impl EventRing {
 #[cfg(test)]
 mod tests {
     use super::super::trb::{
-        DIR_IN, IDT, IOC, TRB_DATA_STAGE, TRB_SETUP_STAGE, TRB_STATUS_STAGE, TRT_IN,
+        DIR_IN, IDT, IOC, TRB_DATA_STAGE, TRB_LINK, TRB_NOOP_CMD, TRB_SETUP_STAGE,
+        TRB_STATUS_STAGE, TRT_IN,
     };
     use super::*;
 
@@ -437,5 +438,34 @@ mod tests {
         assert_eq!(entries[0].0, BASE); // Setup at index 0
         assert_eq!(entries[1].0, BASE + 16); // Data at index 1
         assert_eq!(entries[2].0, BASE + 32); // Status at index 2
+    }
+
+    #[test]
+    fn transfer_ring_control_in_wraps_mid_sequence() {
+        let mut ring = TransferRing::new(BASE);
+        // Advance to index 61 by enqueuing 61 dummy TRBs
+        for _ in 0..61 {
+            ring.enqueue_one(TRB_NOOP_CMD, 0, 0, 0).unwrap();
+        }
+        // Now at index 61. Control transfer needs 3 slots (61, 62, wrap+0).
+        // Data TRB at index 62 triggers Link TRB at 63, then Status wraps to 0.
+        let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00];
+        let entries = ring.enqueue_control_in(setup, 0xA000, 18).unwrap();
+
+        // Should have: Setup(61) + Data(62) + Link(63) + Status(0)
+        assert!(
+            entries.len() >= 4,
+            "wrap should produce at least 4 entries (3 TRBs + Link), got {}",
+            entries.len()
+        );
+
+        let types: alloc::vec::Vec<u8> = entries.iter().map(|e| e.1.trb_type()).collect();
+        assert_eq!(types[0], TRB_SETUP_STAGE);
+        assert_eq!(types[1], TRB_DATA_STAGE);
+        assert_eq!(types[2], TRB_LINK);
+        assert_eq!(types[3], TRB_STATUS_STAGE);
+
+        // Status TRB should be at the base (wrapped around)
+        assert_eq!(entries[3].0, BASE);
     }
 }
