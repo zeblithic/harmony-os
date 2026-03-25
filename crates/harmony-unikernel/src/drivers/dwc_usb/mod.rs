@@ -9,12 +9,16 @@
 //! the driver is a pure state machine with no embedded I/O.
 
 extern crate alloc;
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 pub mod types;
 pub use types::*;
 
 pub mod trb;
+
+pub mod context;
+pub use context::parse_device_descriptor;
 
 mod ring;
 
@@ -129,6 +133,13 @@ pub struct XhciDriver {
     command_ring: Option<ring::CommandRing>,
     /// Event ring state (set after setup_rings).
     event_ring: Option<ring::EventRing>,
+    /// Physical address of the DCBAA (set after setup_rings).
+    dcbaa_phys: Option<u64>,
+    /// Configured max slots (from setup_rings, written to CONFIG register).
+    /// Slot IDs must be 1..=max_slots_enabled.
+    max_slots_enabled: u8,
+    /// Transfer rings keyed by slot ID (populated during device enumeration).
+    transfer_rings: BTreeMap<u8, ring::TransferRing>,
 }
 
 impl XhciDriver {
@@ -201,6 +212,9 @@ impl XhciDriver {
             state: XhciState::Ready,
             command_ring: None,
             event_ring: None,
+            dcbaa_phys: None,
+            max_slots_enabled: 0,
+            transfer_rings: BTreeMap::new(),
         })
     }
 
@@ -226,14 +240,18 @@ impl XhciDriver {
         }
 
         let mut ports = Vec::with_capacity(self.max_ports as usize);
-        for i in 0..self.max_ports {
-            let offset = self.cap_length + PORTSC_BASE + PORTSC_STRIDE * (i as usize);
+        // xHCI ports are 1-based in the Slot Context (§6.2.2), so we
+        // report 1-based port numbers. PORTSC registers are 0-indexed
+        // (port N at PORTSC_BASE + PORTSC_STRIDE * (N-1)).
+        for port_num in 1..=self.max_ports {
+            let reg_index = (port_num - 1) as usize;
+            let offset = self.cap_length + PORTSC_BASE + PORTSC_STRIDE * reg_index;
             let portsc = bank.read(offset);
 
             let speed_id = ((portsc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT) as u8;
 
             ports.push(PortStatus {
-                port: i,
+                port: port_num,
                 connected: portsc & PORTSC_CCS != 0,
                 enabled: portsc & PORTSC_PED != 0,
                 speed: UsbSpeed::from_id(speed_id),
@@ -266,6 +284,198 @@ impl XhciDriver {
         actions.push(XhciAction::RingDoorbell {
             offset: self.db_offset as usize,
             value: 0,
+        });
+
+        Ok(actions)
+    }
+
+    /// Enqueue an Enable Slot command.
+    ///
+    /// After processing the `CommandCompletion` event, the `slot_id`
+    /// field contains the assigned slot number (1-based).
+    ///
+    /// Requires `Running` state (call `setup_rings` first).
+    /// `slot_type` must match the Supported Protocol Capability for the
+    /// port being enumerated (xHCI §6.4.3.2). Use 0 for USB 2.x ports.
+    pub fn enable_slot(&mut self, slot_type: u8) -> Result<Vec<XhciAction>, XhciError> {
+        if self.state != XhciState::Running {
+            return Err(XhciError::InvalidState);
+        }
+        // No point issuing Enable Slot if no slots are configured.
+        if self.max_slots_enabled == 0 {
+            return Err(XhciError::InvalidState);
+        }
+
+        let cmd_ring = self.command_ring.as_mut().ok_or(XhciError::InvalidState)?;
+        let entries = cmd_ring.enqueue(trb::TRB_ENABLE_SLOT, 0)?;
+
+        let mut actions: Vec<XhciAction> = entries
+            .into_iter()
+            .map(|(phys, mut t)| {
+                // Set Slot Type in control bits 19:16 for Enable Slot TRBs (xHCI §6.4.3.2 Table 6-10).
+                if t.trb_type() == trb::TRB_ENABLE_SLOT {
+                    t.control |= ((slot_type as u32) & 0xF) << 16;
+                }
+                XhciAction::WriteTrb { phys, trb: t }
+            })
+            .collect();
+
+        // Ring doorbell 0 (command ring): offset = db_offset + 4 * 0
+        actions.push(XhciAction::RingDoorbell {
+            offset: self.db_offset as usize,
+            value: 0,
+        });
+
+        Ok(actions)
+    }
+
+    /// Set up a device context and enqueue an Address Device command.
+    ///
+    /// All DMA writes (Input Context, DCBAA slot) are included in the
+    /// action list. The caller executes all actions in order, then
+    /// processes the `CommandCompletion` event.
+    ///
+    /// Requires `Running` state and a configured DCBAA (call `setup_rings`
+    /// with a non-zero `dcbaa_phys` first).
+    pub fn address_device(
+        &mut self,
+        slot_id: u8,
+        port: u8,
+        speed: UsbSpeed,
+        input_context_phys: u64,
+        output_context_phys: u64,
+        transfer_ring_phys: u64,
+    ) -> Result<Vec<XhciAction>, XhciError> {
+        if self.state != XhciState::Running {
+            return Err(XhciError::InvalidState);
+        }
+        // Valid slot IDs are 1..=max_slots (xHCI §4.6.3).
+        // Slot 0 is reserved for the Scratchpad Buffer Array pointer.
+        if slot_id == 0 || slot_id > self.max_slots_enabled {
+            return Err(XhciError::InvalidState);
+        }
+        // Port 0 is reserved — valid ports are 1..=max_ports (xHCI §6.2.2).
+        if port == 0 {
+            return Err(XhciError::InvalidState);
+        }
+        let dcbaa_phys = self.dcbaa_phys.ok_or(XhciError::InvalidState)?;
+
+        // Reject if slot already has a ring — must guard before any
+        // mutation (cmd_ring.enqueue advances index + pending_count).
+        if self.transfer_rings.contains_key(&slot_id) {
+            return Err(XhciError::InvalidState);
+        }
+
+        // Both context pointers must be 64-byte aligned (xHCI §6.1, §6.4.3.4).
+        debug_assert!(
+            input_context_phys & 0x3F == 0,
+            "Input Context must be 64-byte aligned, got {:#x}",
+            input_context_phys
+        );
+        debug_assert!(
+            output_context_phys & 0x3F == 0,
+            "Output Device Context must be 64-byte aligned, got {:#x}",
+            output_context_phys
+        );
+
+        // Build Input Context
+        let input_ctx = context::build_input_context(port, speed, transfer_ring_phys);
+
+        let mut actions = Vec::new();
+
+        // 1. Write Input Context to DMA (must happen before doorbell)
+        actions.push(XhciAction::WriteDma {
+            phys: input_context_phys,
+            data: input_ctx.to_vec(),
+        });
+
+        // 2. Write Output Context pointer to DCBAA[slot_id]
+        let dcbaa_slot_phys = dcbaa_phys + (slot_id as u64) * 8;
+        actions.push(XhciAction::WriteDma {
+            phys: dcbaa_slot_phys,
+            data: output_context_phys.to_le_bytes().to_vec(),
+        });
+
+        // 3. Enqueue Address Device command
+        // parameter = input_context_phys, slot_id in control bits 31:24
+        let cmd_ring = self.command_ring.as_mut().ok_or(XhciError::InvalidState)?;
+        let entries = cmd_ring.enqueue(trb::TRB_ADDRESS_DEVICE, input_context_phys)?;
+
+        for (phys, mut t) in entries {
+            if t.trb_type() == trb::TRB_ADDRESS_DEVICE {
+                t.control |= (slot_id as u32) << 24;
+            }
+            actions.push(XhciAction::WriteTrb { phys, trb: t });
+        }
+
+        actions.push(XhciAction::RingDoorbell {
+            offset: self.db_offset as usize,
+            value: 0,
+        });
+
+        // Create transfer ring for this slot's EP0.
+        self.transfer_rings
+            .insert(slot_id, ring::TransferRing::new(transfer_ring_phys));
+
+        Ok(actions)
+    }
+
+    /// Remove the transfer ring for a slot.
+    ///
+    /// Call this after a failed Address Device command completion to
+    /// allow retrying `address_device` for the same slot. Without
+    /// this, the duplicate-slot guard permanently blocks the slot.
+    pub fn remove_transfer_ring(&mut self, slot_id: u8) {
+        self.transfer_rings.remove(&slot_id);
+    }
+
+    /// Enqueue a GET_DESCRIPTOR(Device) control transfer on a slot's EP0.
+    ///
+    /// After execution, poll for `TransferEvent`, then read 18 bytes from
+    /// `data_buf_phys` and pass to `parse_device_descriptor`.
+    ///
+    /// Requires `Running` state and a transfer ring for `slot_id`
+    /// (call `address_device` first).
+    pub fn get_device_descriptor(
+        &mut self,
+        slot_id: u8,
+        data_buf_phys: u64,
+    ) -> Result<Vec<XhciAction>, XhciError> {
+        if self.state != XhciState::Running || slot_id == 0 || slot_id > self.max_slots_enabled {
+            return Err(XhciError::InvalidState);
+        }
+        // Data buffer for DMA must be at least DWORD-aligned (xHCI §4.11.1).
+        debug_assert!(
+            data_buf_phys & 0x3 == 0,
+            "data buffer must be DWORD-aligned, got {:#x}",
+            data_buf_phys
+        );
+
+        let xfer_ring = self
+            .transfer_rings
+            .get_mut(&slot_id)
+            .ok_or(XhciError::NoTransferRing)?;
+
+        let setup = context::get_descriptor_setup_packet(
+            trb::USB_DESC_DEVICE,
+            0,
+            trb::USB_DEVICE_DESCRIPTOR_SIZE as u16,
+        );
+        let entries = xfer_ring.enqueue_control_in(
+            setup,
+            data_buf_phys,
+            trb::USB_DEVICE_DESCRIPTOR_SIZE as u16,
+        )?;
+
+        let mut actions: Vec<XhciAction> = entries
+            .into_iter()
+            .map(|(phys, t)| XhciAction::WriteTrb { phys, trb: t })
+            .collect();
+
+        // Ring doorbell for this slot's EP0: value = 1 (default control endpoint)
+        actions.push(XhciAction::RingDoorbell {
+            offset: self.db_offset as usize + 4 * (slot_id as usize),
+            value: 1, // EP0 doorbell target = 1
         });
 
         Ok(actions)
@@ -315,6 +525,19 @@ impl XhciDriver {
                 let port_id = ((trb.parameter >> 24) & 0xFF) as u8;
                 XhciEvent::PortStatusChange { port_id }
             }
+            trb::TRB_TRANSFER_EVENT => {
+                let slot_id = (trb.control >> 24) as u8;
+                let endpoint_id = ((trb.control >> 16) & 0x1F) as u8;
+                let completion_code = (trb.status >> 24) as u8;
+                let residual_length = trb.status & 0x00FF_FFFF;
+                XhciEvent::TransferEvent {
+                    slot_id,
+                    endpoint_id,
+                    completion_code,
+                    residual_length,
+                    trb_pointer: trb.parameter,
+                }
+            }
             other => XhciEvent::Unknown { trb_type: other },
         };
 
@@ -342,9 +565,30 @@ impl XhciDriver {
         cmd_ring_phys: u64,
         event_ring_phys: u64,
         erst_phys: u64,
+        dcbaa_phys: u64,
+        max_slots_enabled: u8,
     ) -> Result<Vec<XhciAction>, XhciError> {
         if self.state != XhciState::Ready {
             return Err(XhciError::InvalidState);
+        }
+
+        // Clamp to hardware max — writing a value > max_slots to CONFIG
+        // is undefined, and accepting slot IDs the hardware doesn't
+        // support produces confusing hardware errors.
+        let max_slots_enabled = max_slots_enabled.min(self.max_slots);
+
+        // If slots are enabled, DCBAA must be provided — the controller
+        // dereferences DCBAAP for slot context pointers.
+        if max_slots_enabled > 0 && dcbaa_phys == 0 {
+            return Err(XhciError::InvalidState);
+        }
+        // DCBAAP must be 64-byte aligned (xHCI §5.4.6, bits 5:0 are RsvdP).
+        if dcbaa_phys != 0 {
+            debug_assert!(
+                dcbaa_phys & 0x3F == 0,
+                "DCBAA must be 64-byte aligned, got {:#x}",
+                dcbaa_phys
+            );
         }
 
         let cmd_ring = ring::CommandRing::new(cmd_ring_phys);
@@ -354,17 +598,20 @@ impl XhciDriver {
         let op = self.cap_length;
         let intr = self.rts_offset as usize + INTERRUPTER_0_BASE;
 
-        // 1. CONFIG: MaxSlotsEn = 0 (Phase 2a doesn't need slots)
+        // 1. CONFIG: MaxSlotsEn
         actions.push(XhciAction::WriteRegister {
             offset: op + CONFIG,
-            value: 0,
+            value: max_slots_enabled as u32,
         });
 
-        // 2. DCBAAP = 0 (valid because MaxSlotsEn = 0)
-        actions.push(XhciAction::WriteRegister64 {
-            offset_lo: op + DCBAAP_LO,
-            value: 0,
-        });
+        // 2. DCBAAP — only write when non-zero to avoid pointing the
+        // controller at physical address 0 (exception vector table on RPi5).
+        if dcbaa_phys != 0 {
+            actions.push(XhciAction::WriteRegister64 {
+                offset_lo: op + DCBAAP_LO,
+                value: dcbaa_phys,
+            });
+        }
 
         // 3. CRCR: command ring base + cycle bit
         actions.push(XhciAction::WriteRegister64 {
@@ -412,6 +659,12 @@ impl XhciDriver {
 
         self.command_ring = Some(cmd_ring);
         self.event_ring = Some(evt_ring);
+        self.dcbaa_phys = if dcbaa_phys != 0 {
+            Some(dcbaa_phys)
+        } else {
+            None
+        };
+        self.max_slots_enabled = max_slots_enabled;
         self.state = XhciState::Running;
 
         Ok(actions)
@@ -535,7 +788,7 @@ mod tests {
         let mut bank = mock_with_ports(0x20, &[portsc, 0, 0, 0]);
         let driver = XhciDriver::init(&mut bank).unwrap();
         let ports = driver.detect_ports(&bank).unwrap();
-        assert_eq!(ports[0].port, 0);
+        assert_eq!(ports[0].port, 1); // 1-based port numbers
         assert!(ports[0].connected);
         assert!(ports[0].enabled);
         assert_eq!(ports[0].speed, UsbSpeed::HighSpeed);
@@ -590,6 +843,9 @@ mod tests {
             state: XhciState::Error(XhciError::HaltTimeout),
             command_ring: None,
             event_ring: None,
+            dcbaa_phys: None,
+            max_slots_enabled: 0,
+            transfer_rings: BTreeMap::new(),
         };
         let bank = MockRegisterBank::new();
         assert_eq!(driver.detect_ports(&bank), Err(XhciError::InvalidState));
@@ -600,15 +856,15 @@ mod tests {
         let mut bank = mock_init_success();
         let mut driver = XhciDriver::init(&mut bank).unwrap();
         let actions = driver
-            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000)
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0, 0)
             .unwrap();
 
-        // Should contain: CONFIG, DCBAAP(64), CRCR(64), ERST entry(WriteTrb),
-        // ERSTSZ, ERSTBA(64), ERDP(64), USBCMD(RUN|INTE)
-        // That's at least 8 actions
+        // With dcbaa_phys=0, DCBAAP is skipped. Should contain:
+        // CONFIG, CRCR(64), ERST entry(WriteTrb), ERSTSZ, ERSTBA(64), ERDP(64), USBCMD
+        // That's at least 7 actions
         assert!(
-            actions.len() >= 8,
-            "expected at least 8 setup actions, got {}",
+            actions.len() >= 7,
+            "expected at least 7 setup actions, got {}",
             actions.len()
         );
 
@@ -635,9 +891,12 @@ mod tests {
             state: XhciState::Error(XhciError::HaltTimeout),
             command_ring: None,
             event_ring: None,
+            dcbaa_phys: None,
+            max_slots_enabled: 0,
+            transfer_rings: BTreeMap::new(),
         };
         assert_eq!(
-            driver.setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000),
+            driver.setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0, 0),
             Err(XhciError::InvalidState)
         );
     }
@@ -647,7 +906,7 @@ mod tests {
         let mut bank = mock_init_success();
         let mut driver = XhciDriver::init(&mut bank).unwrap();
         driver
-            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000)
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0, 0)
             .unwrap();
 
         let actions = driver.enqueue_noop().unwrap();
@@ -688,7 +947,7 @@ mod tests {
         let mut bank = mock_init_success();
         let mut driver = XhciDriver::init(&mut bank).unwrap();
         driver
-            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000)
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0, 0)
             .unwrap();
         driver.enqueue_noop().unwrap();
 
@@ -721,7 +980,7 @@ mod tests {
         let mut bank = mock_init_success();
         let mut driver = XhciDriver::init(&mut bank).unwrap();
         driver
-            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000)
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0, 0)
             .unwrap();
 
         let evt_trb = trb::Trb {
@@ -739,7 +998,7 @@ mod tests {
         let mut bank = mock_init_success();
         let mut driver = XhciDriver::init(&mut bank).unwrap();
         driver
-            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000)
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0, 0)
             .unwrap();
 
         let evt_trb = trb::Trb {
@@ -753,11 +1012,274 @@ mod tests {
     }
 
     #[test]
+    fn enable_slot_enqueues_command() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
+            .unwrap();
+
+        let actions = driver.enable_slot(0).unwrap(); // slot_type=0 for USB 2.x
+                                                      // Should have WriteTrb (Enable Slot cmd) + RingDoorbell
+        assert!(actions.len() >= 2);
+        match &actions[0] {
+            XhciAction::WriteTrb { trb, .. } => {
+                assert_eq!(trb.trb_type(), trb::TRB_ENABLE_SLOT);
+            }
+            other => panic!("expected WriteTrb, got {:?}", other),
+        }
+        match actions.last().unwrap() {
+            XhciAction::RingDoorbell { offset, value } => {
+                assert_eq!(*offset, 0x1000); // db_offset from mock
+                assert_eq!(*value, 0);
+            }
+            other => panic!("expected RingDoorbell, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn address_device_returns_input_context_and_actions() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
+            .unwrap();
+
+        let actions = driver
+            .address_device(
+                1, // slot_id
+                2, // port
+                UsbSpeed::HighSpeed,
+                0x6000_0000, // input_context_phys
+                0x7000_0000, // output_context_phys
+                0x8000_0000, // transfer_ring_phys
+            )
+            .unwrap();
+
+        // Should have: WriteDma (Input Context) + WriteDma (DCBAA slot)
+        //            + WriteTrb (Address Device cmd) + RingDoorbell
+        assert!(actions.len() >= 4);
+
+        // First action: WriteDma for Input Context (96 bytes)
+        match &actions[0] {
+            XhciAction::WriteDma { phys, data } => {
+                assert_eq!(*phys, 0x6000_0000); // input_context_phys
+                assert_eq!(data.len(), 96);
+            }
+            other => panic!("expected WriteDma for Input Context, got {:?}", other),
+        }
+
+        // Second action: WriteDma for DCBAA slot 1 at dcbaa_phys + 8
+        match &actions[1] {
+            XhciAction::WriteDma { phys, data } => {
+                assert_eq!(*phys, 0x5000_0000 + 8); // slot 1 * 8
+                assert_eq!(data.len(), 8);
+                let ptr = u64::from_le_bytes(data[..8].try_into().unwrap());
+                assert_eq!(ptr, 0x7000_0000); // output_context_phys
+            }
+            other => panic!("expected WriteDma for DCBAA, got {:?}", other),
+        }
+
+        // Address Device command TRB should be present
+        let cmd_action = actions.iter().find(|a| {
+            matches!(a, XhciAction::WriteTrb { trb, .. } if trb.trb_type() == trb::TRB_ADDRESS_DEVICE)
+        });
+        assert!(
+            cmd_action.is_some(),
+            "should have Address Device command TRB"
+        );
+    }
+
+    #[test]
+    fn address_device_without_dcbaa_fails() {
+        // Directly construct a Running driver with max_slots_enabled > 0
+        // but dcbaa_phys = None to test the DCBAA-absence guard specifically.
+        let mut driver = XhciDriver {
+            max_ports: 4,
+            max_slots: 32,
+            cap_length: 0x20,
+            rts_offset: 0x2000,
+            db_offset: 0x1000,
+            state: XhciState::Running,
+            command_ring: Some(ring::CommandRing::new(0x2000_0000)),
+            event_ring: Some(ring::EventRing::new(0x3000_0000)),
+            dcbaa_phys: None,
+            max_slots_enabled: 4,
+            transfer_rings: BTreeMap::new(),
+        };
+
+        let result = driver.address_device(1, 1, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000);
+        assert_eq!(result, Err(XhciError::InvalidState));
+    }
+
+    #[test]
+    fn address_device_slot_zero_rejected() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
+            .unwrap();
+        // Slot 0 is reserved for scratchpad — must be rejected
+        let result = driver.address_device(0, 2, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000);
+        assert_eq!(result, Err(XhciError::InvalidState));
+    }
+
+    #[test]
+    fn address_device_slot_above_max_rejected() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        // max_slots_enabled=4 (configured limit, not hardware max of 32)
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
+            .unwrap();
+        // slot_id=5 exceeds max_slots_enabled=4
+        let result = driver.address_device(5, 2, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000);
+        assert_eq!(result, Err(XhciError::InvalidState));
+    }
+
+    #[test]
+    fn remove_transfer_ring_allows_retry() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
+            .unwrap();
+
+        // First address_device succeeds (creates transfer ring)
+        driver
+            .address_device(1, 1, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000)
+            .unwrap();
+
+        // Second call blocked by duplicate-slot guard
+        assert_eq!(
+            driver.address_device(1, 1, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000),
+            Err(XhciError::InvalidState)
+        );
+
+        // After remove_transfer_ring, retry succeeds
+        driver.remove_transfer_ring(1);
+        assert!(driver
+            .address_device(1, 1, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000)
+            .is_ok());
+    }
+
+    #[test]
+    fn get_device_descriptor_enqueues_3_trbs_and_doorbell() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
+            .unwrap();
+        driver
+            .address_device(1, 2, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000)
+            .unwrap();
+
+        let actions = driver.get_device_descriptor(1, 0x9000_0000).unwrap();
+
+        // Count WriteTrb actions (should be 3: Setup, Data, Status)
+        let write_trbs: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, XhciAction::WriteTrb { .. }))
+            .collect();
+        assert_eq!(write_trbs.len(), 3);
+
+        // Last action should be RingDoorbell for slot 1
+        match actions.last().unwrap() {
+            XhciAction::RingDoorbell { offset, value } => {
+                assert_eq!(*offset, 0x1000 + 4); // db_offset + 4 * slot_id
+                assert_eq!(*value, 1); // endpoint 0 doorbell value = 1
+            }
+            other => panic!("expected RingDoorbell, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn get_device_descriptor_without_transfer_ring_fails() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
+            .unwrap();
+        // No address_device call → no transfer ring for slot 1
+        assert_eq!(
+            driver.get_device_descriptor(1, 0x9000),
+            Err(XhciError::NoTransferRing)
+        );
+    }
+
+    #[test]
+    fn process_transfer_event() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
+            .unwrap();
+
+        let slot_id: u8 = 1;
+        let endpoint_id: u8 = 1; // EP0 = endpoint ID 1 in xHCI
+        let evt_trb = trb::Trb {
+            parameter: 0x8000_0010, // TRB pointer (not parsed in Phase 2b)
+            status: (trb::COMPLETION_SUCCESS as u32) << 24, // 0 residual
+            control: (slot_id as u32) << 24
+                | (endpoint_id as u32) << 16
+                | (trb::TRB_TRANSFER_EVENT as u32) << 10
+                | 1, // cycle bit
+        };
+
+        let (event, actions) = driver.process_event(evt_trb).unwrap();
+        assert_eq!(
+            event,
+            XhciEvent::TransferEvent {
+                slot_id: 1,
+                endpoint_id: 1,
+                completion_code: trb::COMPLETION_SUCCESS,
+                residual_length: 0,
+                trb_pointer: 0x8000_0010,
+            }
+        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, XhciAction::UpdateDequeuePointer { .. })));
+    }
+
+    #[test]
+    fn parse_device_descriptor_integration() {
+        let data: [u8; 18] = [
+            18, 1, 0x10, 0x02, 0x00, 0x00, 0x00, 64, 0x6B,
+            0x1D, // vendor = 0x1D6B (Linux Foundation)
+            0x02, 0x00, // product = 0x0002
+            0x10, 0x05, // version = 5.10
+            1, 2, 3, 1, // string indices + num_configurations
+        ];
+        let desc = context::parse_device_descriptor(&data).unwrap();
+        assert_eq!(desc.vendor_id, 0x1D6B);
+        assert_eq!(desc.product_id, 0x0002);
+        assert_eq!(desc.usb_version, 0x0210);
+        assert_eq!(desc.num_configurations, 1);
+    }
+
+    #[test]
+    fn address_device_creates_transfer_ring() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
+            .unwrap();
+
+        driver
+            .address_device(1, 2, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000)
+            .unwrap();
+
+        // get_device_descriptor should now work for slot 1
+        assert!(driver.get_device_descriptor(1, 0x9000).is_ok());
+    }
+
+    #[test]
     fn should_process_event_delegates_to_event_ring() {
         let mut bank = mock_init_success();
         let mut driver = XhciDriver::init(&mut bank).unwrap();
         driver
-            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000)
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0, 0)
             .unwrap();
 
         assert!(driver.should_process_event(true)); // initial CCS = true
@@ -769,7 +1291,7 @@ mod tests {
         let mut bank = mock_init_success();
         let mut driver = XhciDriver::init(&mut bank).unwrap();
         driver
-            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000)
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0, 0)
             .unwrap();
         // Enqueue should succeed (Running state)
         assert!(driver.enqueue_noop().is_ok());

@@ -13,6 +13,49 @@ pub const TRB_COMMAND_COMPLETION: u8 = 33;
 /// Port Status Change Event TRB.
 pub const TRB_PORT_STATUS_CHANGE: u8 = 34;
 
+// ── Command TRB types ────────────────────────────────────────────
+
+/// Enable Slot Command TRB — allocates a device slot.
+pub const TRB_ENABLE_SLOT: u8 = 9;
+/// Address Device Command TRB — assigns USB address and transitions to Addressed state.
+pub const TRB_ADDRESS_DEVICE: u8 = 11;
+
+// ── Transfer TRB types ───────────────────────────────────────────
+
+/// Setup Stage TRB — first TRB in a control transfer (SETUP packet).
+pub const TRB_SETUP_STAGE: u8 = 2;
+/// Data Stage TRB — optional data phase of a control transfer.
+pub const TRB_DATA_STAGE: u8 = 3;
+/// Status Stage TRB — final handshake TRB of a control transfer.
+pub const TRB_STATUS_STAGE: u8 = 4;
+
+// ── Event TRB types ──────────────────────────────────────────────
+
+/// Transfer Event TRB — signals completion (or error) of a transfer TRB.
+pub const TRB_TRANSFER_EVENT: u8 = 32;
+
+// ── Transfer control flags ────────────────────────────────────────
+
+/// Transfer Type IN (bits 17:16 = 11) — control read from device.
+pub const TRT_IN: u32 = 3 << 16;
+/// Direction IN (bit 16) — Data Stage direction bit for device-to-host.
+pub const DIR_IN: u32 = 1 << 16;
+/// Immediate Data (bit 6) — TRB data is inline in the parameter field.
+pub const IDT: u32 = 1 << 6;
+/// Interrupt On Completion (bit 5) — generate Transfer Event on completion.
+pub const IOC: u32 = 1 << 5;
+/// Interrupt on Short Packet (bit 2) — generate Transfer Event on short packet.
+pub const ISP: u32 = 1 << 2;
+
+// ── USB request/descriptor constants ─────────────────────────────
+
+/// GET_DESCRIPTOR standard USB request code (bmRequest=0x80, bRequest=6).
+pub const USB_REQ_GET_DESCRIPTOR: u8 = 6;
+/// Device Descriptor type (wValue high byte = 1).
+pub const USB_DESC_DEVICE: u8 = 1;
+/// Size in bytes of the standard USB Device Descriptor (bLength field = 18).
+pub const USB_DEVICE_DESCRIPTOR_SIZE: u8 = 18;
+
 // ── Completion codes ─────────────────────────────────────────────
 
 pub const COMPLETION_SUCCESS: u8 = 1;
