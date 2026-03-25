@@ -902,7 +902,8 @@ impl XhciDriver {
         if endpoint_id % 2 != 0 || endpoint_id < 2 {
             return Err(XhciError::InvalidState);
         }
-        self.enqueue_bulk(slot_id, endpoint_id, data_buf_phys, data_len)
+        // OUT: IOC only — ISP is meaningless on host-to-device transfers.
+        self.enqueue_bulk_with_flags(slot_id, endpoint_id, data_buf_phys, data_len, trb::IOC)
     }
 
     /// Enqueue a bulk IN (device-to-host) transfer.
@@ -924,16 +925,24 @@ impl XhciDriver {
         if endpoint_id % 2 == 0 || endpoint_id < 2 {
             return Err(XhciError::InvalidState);
         }
-        self.enqueue_bulk(slot_id, endpoint_id, data_buf_phys, data_len)
+        // IN: IOC + ISP — short-packet events expected on device-to-host.
+        self.enqueue_bulk_with_flags(
+            slot_id,
+            endpoint_id,
+            data_buf_phys,
+            data_len,
+            trb::IOC | trb::ISP,
+        )
     }
 
     /// Shared bulk transfer enqueue logic.
-    fn enqueue_bulk(
+    fn enqueue_bulk_with_flags(
         &mut self,
         slot_id: u8,
         endpoint_id: u8,
         data_buf_phys: u64,
         data_len: u32,
+        flags: u32,
     ) -> Result<Vec<XhciAction>, XhciError> {
         if self.state != XhciState::Running || slot_id == 0 || slot_id > self.max_slots_enabled {
             return Err(XhciError::InvalidState);
@@ -948,7 +957,7 @@ impl XhciDriver {
             .get_mut(&ring_key(slot_id, endpoint_id))
             .ok_or(XhciError::NoTransferRing)?;
 
-        let entries = xfer_ring.enqueue_bulk(data_buf_phys, data_len)?;
+        let entries = xfer_ring.enqueue_bulk(data_buf_phys, data_len, flags)?;
 
         let mut actions: Vec<XhciAction> = entries
             .into_iter()

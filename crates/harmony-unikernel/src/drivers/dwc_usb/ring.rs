@@ -226,14 +226,15 @@ impl TransferRing {
         &mut self,
         data_buf_phys: u64,
         data_len: u32,
+        flags: u32,
     ) -> Result<Vec<(u64, Trb)>, XhciError> {
-        use super::trb::{IOC, ISP, TRB_NORMAL};
+        use super::trb::TRB_NORMAL;
         // xHCI §6.4.1.1: Transfer Buffer Length is bits 16:0 (17-bit, max 131071).
         // Larger values spill into TD Size / Interrupter Target fields.
         if data_len > 0x1_FFFF {
             return Err(XhciError::TransferTooLarge);
         }
-        self.enqueue_one(TRB_NORMAL, data_buf_phys, data_len, IOC | ISP)
+        self.enqueue_one(TRB_NORMAL, data_buf_phys, data_len, flags)
     }
 }
 
@@ -533,7 +534,7 @@ mod tests {
     #[test]
     fn enqueue_bulk_produces_one_normal_trb() {
         let mut ring = TransferRing::new(0x9000_0000);
-        let entries = ring.enqueue_bulk(0xD000_0000, 512).unwrap();
+        let entries = ring.enqueue_bulk(0xD000_0000, 512, IOC | ISP).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].1.trb_type(), TRB_NORMAL);
         // IOC (bit 5) + ISP (bit 2) should be set

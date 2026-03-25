@@ -68,16 +68,16 @@ Enqueues a bulk IN (device-to-host) transfer. Same pattern as OUT.
 ### Shared Logic
 
 Both methods:
-1. Validate Running state, slot_id range
+1. Validate Running state, slot_id range, DCI parity (even=OUT, odd=IN)
 2. Look up `ring_key(slot_id, endpoint_id)` in `transfer_rings`
-3. `debug_assert!` DWORD-alignment on `data_buf_phys`
-4. Call `xfer_ring.enqueue_bulk(data_buf_phys, data_len)`
+3. Validate DWORD-alignment of `data_buf_phys` — returns `Err` in all
+   build profiles if unaligned
+4. Call `xfer_ring.enqueue_bulk(data_buf_phys, data_len, flags)`
 5. Convert entries to `Vec<XhciAction::WriteTrb>`
 6. Append `XhciAction::RingDoorbell` with target = endpoint_id
 
-Since bulk IN and OUT use the same Normal TRB (direction is determined
-by the endpoint's configuration, not the TRB), a single internal
-method can serve both. The two public methods exist for API clarity.
+Direction-specific flags: OUT sets `IOC` only (ISP is meaningless on
+host-to-device). IN sets `IOC | ISP` for short-packet events.
 
 ## Doorbell Target
 
