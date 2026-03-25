@@ -40,6 +40,9 @@ const DEFAULT_CAP_TTL: u64 = 1_000_000_000;
 /// new user-capability bindings are accepted until the next reboot.
 const MAX_BINDING_NONCES: usize = 4096;
 
+/// Maximum state transfer size during hot_swap (4 MB).
+const MAX_STATE_SIZE: u32 = 4 * 1024 * 1024;
+
 /// A process in the microkernel.
 pub struct Process {
     pub pid: u32,
@@ -879,6 +882,90 @@ impl<P: PageTable> Kernel<P> {
     /// capability tracker state, and per-process region tables.
     pub fn vm_manager(&self) -> &AddressSpaceManager<P> {
         &self.vm
+    }
+
+    /// Try to transfer state from one server to another via their `/state` files.
+    ///
+    /// Uses the 9P walk→open→read/write→clunk sequence directly on the
+    /// `FileServer` trait objects. If either server doesn't expose a `state`
+    /// file (walk returns `NotFound`), returns `Ok(false)` (stateless swap).
+    ///
+    /// Returns `Ok(true)` if state was transferred, `Err` if transfer failed.
+    fn try_transfer_state(
+        &mut self,
+        old_pid: u32,
+        new_pid: u32,
+    ) -> Result<bool, IpcError> {
+        // Allocate ALL fids before borrowing self.processes mutably.
+        // Old server fids.
+        let old_clone_fid = self.allocate_server_fid()?;
+        let old_state_fid = self.allocate_server_fid()?;
+
+        // ── Read state from old server ──────────────────────────────
+
+        let old_server = &mut self
+            .processes
+            .get_mut(&old_pid)
+            .ok_or(IpcError::NotFound)?
+            .server;
+
+        // clone_fid(root=0) to get a walk-able fid without consuming root.
+        old_server.clone_fid(0, old_clone_fid)?;
+
+        // Walk to "state" — NotFound means server is stateless.
+        match old_server.walk(old_clone_fid, old_state_fid, "state") {
+            Err(IpcError::NotFound) => {
+                let _ = old_server.clunk(old_clone_fid);
+                return Ok(false); // stateless — skip transfer
+            }
+            Err(e) => {
+                let _ = old_server.clunk(old_clone_fid);
+                return Err(e);
+            }
+            Ok(_) => {}
+        }
+        let _ = old_server.clunk(old_clone_fid);
+
+        // Open for read + read all state bytes.
+        old_server.open(old_state_fid, OpenMode::Read)?;
+        let state_bytes = old_server.read(old_state_fid, 0, MAX_STATE_SIZE)?;
+        let _ = old_server.clunk(old_state_fid);
+
+        // Drop the old server borrow so we can borrow new server separately.
+        // (Both are in the same BTreeMap — can't hold &mut to both at once.)
+
+        // Allocate new server fids.
+        let new_clone_fid = self.allocate_server_fid()?;
+        let new_state_fid = self.allocate_server_fid()?;
+
+        // ── Write state to new server ───────────────────────────────
+
+        let new_server = &mut self
+            .processes
+            .get_mut(&new_pid)
+            .ok_or(IpcError::NotFound)?
+            .server;
+
+        new_server.clone_fid(0, new_clone_fid)?;
+
+        match new_server.walk(new_clone_fid, new_state_fid, "state") {
+            Err(IpcError::NotFound) => {
+                let _ = new_server.clunk(new_clone_fid);
+                return Ok(false); // new server doesn't accept state
+            }
+            Err(e) => {
+                let _ = new_server.clunk(new_clone_fid);
+                return Err(e);
+            }
+            Ok(_) => {}
+        }
+        let _ = new_server.clunk(new_clone_fid);
+
+        new_server.open(new_state_fid, OpenMode::Write)?;
+        new_server.write(new_state_fid, 0, &state_bytes)?;
+        let _ = new_server.clunk(new_state_fid);
+
+        Ok(true)
     }
 
     /// Atomically replace a running 9P service with a new one.
