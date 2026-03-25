@@ -448,14 +448,17 @@ impl<P: PageTable> Kernel<P> {
         let (target_pid, server_root_fid, remainder, accepted_nonce) = {
             let process = self.processes.get(&from_pid).ok_or(IpcError::NotFound)?;
             let (mount, remainder) = process.namespace.resolve(path).ok_or(IpcError::NotFound)?;
-            // Reject requests to mounts being hot-swapped.
-            if mount.state == crate::namespace::MountState::Swapping {
-                return Err(IpcError::NotReady);
-            }
             let target_pid = mount.target_pid;
             let server_root_fid = mount.root_fid;
+            let mount_state = mount.state;
             let remainder = remainder.to_owned();
+            // Capability check first — unauthorized callers get PermissionDenied,
+            // never information about internal swap state.
             let accepted_nonce = self.check_endpoint_cap(process, target_pid, now)?;
+            // Reject requests to mounts being hot-swapped (after cap check).
+            if mount_state == crate::namespace::MountState::Swapping {
+                return Err(IpcError::NotReady);
+            }
             (target_pid, server_root_fid, remainder, accepted_nonce)
         };
 
@@ -891,11 +894,15 @@ impl<P: PageTable> Kernel<P> {
     /// On failure at any step, the old server remains active (no service
     /// disruption). The new process is destroyed if spawned before failure.
     ///
-    /// **Postcondition:** Callers must grant endpoint capabilities for the
-    /// new PID to any clients that need to walk the swapped mount. Existing
-    /// PID-specific capabilities encode the old PID and will fail with
-    /// `PermissionDenied` after the swap. Call `grant_endpoint_cap(client_pid,
-    /// new_pid, ...)` for each client that accesses this mount.
+    /// **Postconditions:**
+    /// - Callers must grant endpoint capabilities for the new PID to any
+    ///   clients that need to walk the swapped mount. Existing PID-specific
+    ///   capabilities encode the old PID and will fail with `PermissionDenied`
+    ///   after the swap.
+    /// - Only `client_pid`'s namespace is rebound. Other processes that
+    ///   independently mounted `old_pid` will get `NotFound` when walking
+    ///   (the old PID is destroyed). Callers must rebind those namespaces
+    ///   separately if needed.
     pub fn hot_swap(
         &mut self,
         client_pid: u32,
@@ -903,6 +910,11 @@ impl<P: PageTable> Kernel<P> {
         new_server: Box<dyn FileServer>,
         new_server_name: &str,
     ) -> Result<(), IpcError> {
+        // Normalize: strip trailing slash so resolve() and set_mount_state()
+        // use the same key. resolve() tolerates trailing slashes via
+        // strip_prefix, but set_mount_state/rebind do exact BTreeMap lookups.
+        let mount_path = mount_path.trim_end_matches('/');
+
         // 1. Validate mount exists, is Active, and is an exact mount path.
         {
             let process = self.processes.get(&client_pid).ok_or(IpcError::NotFound)?;
@@ -910,8 +922,6 @@ impl<P: PageTable> Kernel<P> {
                 .namespace
                 .resolve(mount_path)
                 .ok_or(IpcError::NotFound)?;
-            // Must be an exact mount path — sub-paths resolve to the parent mount
-            // with a non-empty remainder.
             if !remainder.is_empty() {
                 return Err(IpcError::NotFound);
             }
@@ -923,30 +933,35 @@ impl<P: PageTable> Kernel<P> {
         // 2. Spawn new process (empty mounts, no VM).
         let new_pid = self.spawn_process(new_server_name, new_server, &[], None)?;
 
-        // 3. Mark mount as Swapping. On failure, destroy the new process and
-        //    return the error — the old server stays Active.
+        // 3. Mark mount as Swapping. On failure, destroy the new process.
+        // All error paths after spawn must clean up new_pid.
         {
-            let process = self
-                .processes
-                .get_mut(&client_pid)
-                .ok_or(IpcError::NotFound)?;
+            let process = match self.processes.get_mut(&client_pid) {
+                Some(p) => p,
+                None => {
+                    let _ = self.destroy_process(new_pid);
+                    return Err(IpcError::NotFound);
+                }
+            };
             if let Err(e) = process
                 .namespace
                 .set_mount_state(mount_path, crate::namespace::MountState::Swapping)
             {
-                // NLL ends process borrow here; destroy new process for rollback.
                 let _ = self.destroy_process(new_pid);
                 return Err(e);
             }
         }
 
-        // 4. Rebind mount to new process. On failure, restore Active state and
-        //    destroy the new process.
+        // 4. Rebind mount to new process. On failure, restore Active state
+        //    and destroy the new process.
         let old_pid = {
-            let process = self
-                .processes
-                .get_mut(&client_pid)
-                .ok_or(IpcError::NotFound)?;
+            let process = match self.processes.get_mut(&client_pid) {
+                Some(p) => p,
+                None => {
+                    let _ = self.destroy_process(new_pid);
+                    return Err(IpcError::NotFound);
+                }
+            };
             // Root fid 0: all FileServer implementations use fid 0 as root
             // (FidTracker::new passes root qpath at fid 0).
             match process.namespace.rebind(mount_path, new_pid, 0) {
