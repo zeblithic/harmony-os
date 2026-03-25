@@ -138,8 +138,13 @@ pub struct XhciDriver {
     /// Configured max slots (from setup_rings, written to CONFIG register).
     /// Slot IDs must be 1..=max_slots_enabled.
     max_slots_enabled: u8,
-    /// Transfer rings keyed by slot ID (populated during device enumeration).
-    transfer_rings: BTreeMap<u8, ring::TransferRing>,
+    /// Transfer rings keyed by (slot_id << 8 | endpoint_id).
+    transfer_rings: BTreeMap<u16, ring::TransferRing>,
+}
+
+/// Compute transfer ring map key: (slot_id << 8) | endpoint_id.
+fn ring_key(slot_id: u8, endpoint_id: u8) -> u16 {
+    (slot_id as u16) << 8 | endpoint_id as u16
 }
 
 impl XhciDriver {
@@ -362,7 +367,7 @@ impl XhciDriver {
 
         // Reject if slot already has a ring — must guard before any
         // mutation (cmd_ring.enqueue advances index + pending_count).
-        if self.transfer_rings.contains_key(&slot_id) {
+        if self.transfer_rings.contains_key(&ring_key(slot_id, 1)) {
             return Err(XhciError::InvalidState);
         }
 
@@ -414,8 +419,10 @@ impl XhciDriver {
         });
 
         // Create transfer ring for this slot's EP0.
-        self.transfer_rings
-            .insert(slot_id, ring::TransferRing::new(transfer_ring_phys));
+        self.transfer_rings.insert(
+            ring_key(slot_id, 1),
+            ring::TransferRing::new(transfer_ring_phys),
+        );
 
         Ok(actions)
     }
@@ -426,7 +433,7 @@ impl XhciDriver {
     /// allow retrying `address_device` for the same slot. Without
     /// this, the duplicate-slot guard permanently blocks the slot.
     pub fn remove_transfer_ring(&mut self, slot_id: u8) {
-        self.transfer_rings.remove(&slot_id);
+        self.transfer_rings.remove(&ring_key(slot_id, 1));
     }
 
     /// Enqueue a GET_DESCRIPTOR(Device) control transfer on a slot's EP0.
@@ -453,7 +460,7 @@ impl XhciDriver {
 
         let xfer_ring = self
             .transfer_rings
-            .get_mut(&slot_id)
+            .get_mut(&ring_key(slot_id, 1))
             .ok_or(XhciError::NoTransferRing)?;
 
         let setup = context::get_descriptor_setup_packet(
@@ -676,6 +683,27 @@ mod tests {
     use super::*;
     use crate::drivers::register_bank::mock::MockRegisterBank;
     use alloc::vec;
+
+    /// Helper: create a Running driver with a slot addressed and ready for transfers.
+    #[allow(dead_code)]
+    fn make_running_driver_with_slot(slot_id: u8) -> XhciDriver {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        driver
+            .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
+            .unwrap();
+        driver
+            .address_device(
+                slot_id,
+                1,
+                UsbSpeed::HighSpeed,
+                0x6000_0000,
+                0x7000_0000,
+                0x8000_0000,
+            )
+            .unwrap();
+        driver
+    }
 
     #[test]
     fn usb_speed_from_id() {

@@ -187,6 +187,32 @@ impl TransferRing {
 
         Ok(all_entries)
     }
+
+    /// Enqueue a control transfer with no data stage (Setup + Status).
+    ///
+    /// Used for SET_CONFIGURATION and similar host-to-device requests
+    /// where wLength = 0.
+    pub fn enqueue_control_no_data(
+        &mut self,
+        setup_packet: [u8; 8],
+    ) -> Result<Vec<(u64, Trb)>, XhciError> {
+        use super::trb::{IDT, IOC, TRB_SETUP_STAGE, TRB_STATUS_STAGE};
+
+        let mut all_entries = Vec::new();
+
+        // 1. Setup TRB: parameter = setup packet as u64 LE, status = 8
+        // TRT = 0 (No Data Stage) — bits 17:16 = 00
+        let setup_param = u64::from_le_bytes(setup_packet);
+        let setup_entries = self.enqueue_one(TRB_SETUP_STAGE, setup_param, 8, IDT)?;
+        all_entries.extend(setup_entries);
+
+        // 2. Status TRB: direction IN (device sends zero-length ACK), IOC
+        // For no-data control transfers, Status stage direction is IN.
+        let status_entries = self.enqueue_one(TRB_STATUS_STAGE, 0, 0, super::trb::DIR_IN | IOC)?;
+        all_entries.extend(status_entries);
+
+        Ok(all_entries)
+    }
 }
 
 /// Event ring state — controller enqueues events, host dequeues.
@@ -469,5 +495,16 @@ mod tests {
 
         // Status TRB should be at the base (wrapped around)
         assert_eq!(entries[3].0, BASE);
+    }
+
+    #[test]
+    fn control_no_data_produces_two_trbs() {
+        let mut ring = TransferRing::new(0x9000_0000);
+        let setup = [0u8; 8];
+        let entries = ring.enqueue_control_no_data(setup).unwrap();
+        // Setup + Status = 2 TRBs minimum (no Link wraps at index 0)
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].1.trb_type(), TRB_SETUP_STAGE);
+        assert_eq!(entries[1].1.trb_type(), TRB_STATUS_STAGE);
     }
 }
