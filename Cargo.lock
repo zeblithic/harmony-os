@@ -781,6 +781,7 @@ name = "harmony-os"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "criterion",
  "harmony-compute",
  "harmony-content",
  "harmony-crypto",

@@ -50,3 +50,16 @@ harmony-identity = { workspace = true, features = ["std"] }
 harmony-unikernel = { workspace = true, features = ["std"] }
 rand = { version = "0.8", features = ["std"] }
 tempfile = "3"
+criterion = { workspace = true }
+
+[[bench]]
+name = "linuxulator"
+harness = false
+
+[[bench]]
+name = "elf_loader"
+harness = false
+
+[[bench]]
+name = "nar_parse"
+harness = false
