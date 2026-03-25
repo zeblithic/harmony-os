@@ -173,8 +173,8 @@ pub fn serialize_narinfo(
             "sig must not contain control characters: {s:?}"
         );
         assert!(
-            s.contains(':'),
-            "sig must be in <keyname>:<base64sig> format: {s:?}"
+            s.split_once(':').is_some_and(|(k, _)| !k.is_empty()),
+            "sig must be in <keyname>:<base64sig> format with non-empty keyname: {s:?}"
         );
         text.push_str("Sig: ");
         text.push_str(s);
