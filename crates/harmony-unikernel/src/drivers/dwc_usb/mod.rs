@@ -523,6 +523,7 @@ impl XhciDriver {
                     endpoint_id,
                     completion_code,
                     transfer_length,
+                    trb_pointer: trb.parameter,
                 }
             }
             other => XhciEvent::Unknown { trb_type: other },
@@ -569,6 +570,14 @@ impl XhciDriver {
         if max_slots_enabled > 0 && dcbaa_phys == 0 {
             return Err(XhciError::InvalidState);
         }
+        // DCBAAP must be 64-byte aligned (xHCI §5.4.6, bits 5:0 are RsvdP).
+        if dcbaa_phys != 0 {
+            debug_assert!(
+                dcbaa_phys & 0x3F == 0,
+                "DCBAA must be 64-byte aligned, got {:#x}",
+                dcbaa_phys
+            );
+        }
 
         let cmd_ring = ring::CommandRing::new(cmd_ring_phys);
         let evt_ring = ring::EventRing::new(event_ring_phys);
@@ -583,11 +592,14 @@ impl XhciDriver {
             value: max_slots_enabled as u32,
         });
 
-        // 2. DCBAAP
-        actions.push(XhciAction::WriteRegister64 {
-            offset_lo: op + DCBAAP_LO,
-            value: dcbaa_phys,
-        });
+        // 2. DCBAAP — only write when non-zero to avoid pointing the
+        // controller at physical address 0 (exception vector table on RPi5).
+        if dcbaa_phys != 0 {
+            actions.push(XhciAction::WriteRegister64 {
+                offset_lo: op + DCBAAP_LO,
+                value: dcbaa_phys,
+            });
+        }
 
         // 3. CRCR: command ring base + cycle bit
         actions.push(XhciAction::WriteRegister64 {
@@ -835,12 +847,12 @@ mod tests {
             .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0, 0)
             .unwrap();
 
-        // Should contain: CONFIG, DCBAAP(64), CRCR(64), ERST entry(WriteTrb),
-        // ERSTSZ, ERSTBA(64), ERDP(64), USBCMD(RUN|INTE)
-        // That's at least 8 actions
+        // With dcbaa_phys=0, DCBAAP is skipped. Should contain:
+        // CONFIG, CRCR(64), ERST entry(WriteTrb), ERSTSZ, ERSTBA(64), ERDP(64), USBCMD
+        // That's at least 7 actions
         assert!(
-            actions.len() >= 8,
-            "expected at least 8 setup actions, got {}",
+            actions.len() >= 7,
+            "expected at least 7 setup actions, got {}",
             actions.len()
         );
 
@@ -1210,6 +1222,7 @@ mod tests {
                 endpoint_id: 1,
                 completion_code: trb::COMPLETION_SUCCESS,
                 transfer_length: 0,
+                trb_pointer: 0x8000_0010,
             }
         );
         assert!(actions

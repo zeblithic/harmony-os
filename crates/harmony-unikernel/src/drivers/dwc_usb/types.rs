@@ -131,6 +131,8 @@ pub enum XhciEvent {
         completion_code: u8,
         /// Number of bytes NOT transferred (residual length from TRB status).
         transfer_length: u32,
+        /// Physical address of the TRB that completed (for event-to-transfer matching).
+        trb_pointer: u64,
     },
     /// Unrecognized event TRB type.
     Unknown { trb_type: u8 },
@@ -209,6 +211,7 @@ mod tests {
             endpoint_id: 2,
             completion_code: 1,
             transfer_length: 0,
+            trb_pointer: 0x8000,
         };
         let _unk = XhciEvent::Unknown { trb_type: 99 };
     }
