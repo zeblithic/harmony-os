@@ -377,7 +377,12 @@ impl XhciDriver {
             value: 0,
         });
 
-        // Create transfer ring for this slot's EP0
+        // Create transfer ring for this slot's EP0.
+        // Reject if slot already has a ring — replacing it would drop
+        // a ring the controller may still be consuming.
+        if self.transfer_rings.contains_key(&slot_id) {
+            return Err(XhciError::InvalidState);
+        }
         self.transfer_rings
             .insert(slot_id, ring::TransferRing::new(transfer_ring_phys));
 
