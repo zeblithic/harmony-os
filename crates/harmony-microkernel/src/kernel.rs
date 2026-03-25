@@ -877,6 +877,88 @@ impl<P: PageTable> Kernel<P> {
     pub fn vm_manager(&self) -> &AddressSpaceManager<P> {
         &self.vm
     }
+
+    /// Atomically replace a running 9P service with a new one.
+    ///
+    /// Steps:
+    /// 1. Validate mount exists, is Active, and `mount_path` is an exact mount
+    ///    path (not a sub-path).
+    /// 2. Spawn new process with the replacement server.
+    /// 3. Mark mount as Swapping (new requests → `NotReady`).
+    /// 4. Rebind mount to new process (resets state to Active).
+    /// 5. Destroy old process.
+    ///
+    /// On failure at any step, the old server remains active (no service
+    /// disruption). The new process is destroyed if spawned before failure.
+    pub fn hot_swap(
+        &mut self,
+        client_pid: u32,
+        mount_path: &str,
+        new_server: Box<dyn FileServer>,
+        new_server_name: &str,
+    ) -> Result<(), IpcError> {
+        // 1. Validate mount exists, is Active, and is an exact mount path.
+        {
+            let process = self.processes.get(&client_pid).ok_or(IpcError::NotFound)?;
+            let (mount, remainder) = process
+                .namespace
+                .resolve(mount_path)
+                .ok_or(IpcError::NotFound)?;
+            // Must be an exact mount path — sub-paths resolve to the parent mount
+            // with a non-empty remainder.
+            if !remainder.is_empty() {
+                return Err(IpcError::NotFound);
+            }
+            if mount.state != crate::namespace::MountState::Active {
+                return Err(IpcError::InvalidArgument);
+            }
+        }
+
+        // 2. Spawn new process (empty mounts, no VM).
+        let new_pid = self.spawn_process(new_server_name, new_server, &[], None)?;
+
+        // 3. Mark mount as Swapping. On failure, destroy the new process and
+        //    return the error — the old server stays Active.
+        {
+            let process = self
+                .processes
+                .get_mut(&client_pid)
+                .ok_or(IpcError::NotFound)?;
+            if let Err(e) = process
+                .namespace
+                .set_mount_state(mount_path, crate::namespace::MountState::Swapping)
+            {
+                // NLL ends process borrow here; destroy new process for rollback.
+                let _ = self.destroy_process(new_pid);
+                return Err(e);
+            }
+        }
+
+        // 4. Rebind mount to new process. On failure, restore Active state and
+        //    destroy the new process.
+        let old_pid = {
+            let process = self
+                .processes
+                .get_mut(&client_pid)
+                .ok_or(IpcError::NotFound)?;
+            match process.namespace.rebind(mount_path, new_pid, 0) {
+                Ok(old_mount) => old_mount.target_pid,
+                Err(e) => {
+                    let _ = process
+                        .namespace
+                        .set_mount_state(mount_path, crate::namespace::MountState::Active);
+                    // NLL ends process borrow here; destroy new process for rollback.
+                    let _ = self.destroy_process(new_pid);
+                    return Err(e);
+                }
+            }
+        };
+
+        // 5. Destroy old process. Best-effort — if already gone, ignore.
+        let _ = self.destroy_process(old_pid);
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2703,5 +2785,124 @@ mod tests {
             kernel.walk(client, "/echo/hello", 0, 1, 0),
             Err(IpcError::NotReady)
         );
+    }
+
+    // ── hot_swap tests ────────────────────────────────────────────────
+
+    #[test]
+    fn hot_swap_replaces_server() {
+        let mut entropy = make_test_entropy();
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
+
+        // Spawn old echo server (pid 0).
+        let old_pid = kernel
+            .spawn_process("old-echo", Box::new(EchoServer::new()), &[], None)
+            .unwrap();
+
+        // Spawn client (pid 1) that mounts old echo at /srv/echo.
+        let client_pid = kernel
+            .spawn_process(
+                "client",
+                Box::new(EchoServer::new()),
+                &[("/srv/echo", old_pid, 0)],
+                None,
+            )
+            .unwrap();
+
+        // Hot-swap with a new echo server.
+        let new_echo = Box::new(EchoServer::new());
+        kernel
+            .hot_swap(client_pid, "/srv/echo", new_echo, "new-echo")
+            .unwrap();
+
+        // Resolve /srv/echo — should point to new server (different PID).
+        let (mp, _) = kernel
+            .processes
+            .get(&client_pid)
+            .unwrap()
+            .namespace
+            .resolve("/srv/echo")
+            .unwrap();
+        assert_ne!(mp.target_pid, old_pid, "mount should point to new server");
+    }
+
+    #[test]
+    fn hot_swap_destroys_old_process() {
+        let mut entropy = make_test_entropy();
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
+
+        let old_pid = kernel
+            .spawn_process("old-echo", Box::new(EchoServer::new()), &[], None)
+            .unwrap();
+        let client_pid = kernel
+            .spawn_process(
+                "client",
+                Box::new(EchoServer::new()),
+                &[("/srv/echo", old_pid, 0)],
+                None,
+            )
+            .unwrap();
+
+        let new_echo = Box::new(EchoServer::new());
+        kernel
+            .hot_swap(client_pid, "/srv/echo", new_echo, "new-echo")
+            .unwrap();
+
+        // Old PID should be gone from the process table.
+        assert!(
+            !kernel.processes.contains_key(&old_pid),
+            "old process should be destroyed after hot_swap"
+        );
+    }
+
+    #[test]
+    fn hot_swap_nonexistent_mount_fails() {
+        let mut entropy = make_test_entropy();
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
+
+        // Spawn a client with no mounts.
+        let client_pid = kernel
+            .spawn_process("client", Box::new(EchoServer::new()), &[], None)
+            .unwrap();
+
+        let new_echo = Box::new(EchoServer::new());
+        let result = kernel.hot_swap(client_pid, "/nonexistent", new_echo, "echo");
+        assert_eq!(result, Err(IpcError::NotFound));
+    }
+
+    #[test]
+    fn hot_swap_during_swapping_fails() {
+        let mut entropy = make_test_entropy();
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
+
+        let old_pid = kernel
+            .spawn_process("echo", Box::new(EchoServer::new()), &[], None)
+            .unwrap();
+        let client_pid = kernel
+            .spawn_process(
+                "client",
+                Box::new(EchoServer::new()),
+                &[("/srv/echo", old_pid, 0)],
+                None,
+            )
+            .unwrap();
+
+        // Manually mark the mount as Swapping to simulate an in-progress swap.
+        kernel
+            .processes
+            .get_mut(&client_pid)
+            .unwrap()
+            .namespace
+            .set_mount_state("/srv/echo", crate::namespace::MountState::Swapping)
+            .unwrap();
+
+        let new_echo = Box::new(EchoServer::new());
+        let result = kernel.hot_swap(client_pid, "/srv/echo", new_echo, "echo");
+        // Must fail — already swapping.
+        assert!(result.is_err(), "hot_swap on Swapping mount must fail");
     }
 }
