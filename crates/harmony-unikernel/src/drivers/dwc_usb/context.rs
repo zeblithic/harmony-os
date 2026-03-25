@@ -140,7 +140,7 @@ pub fn parse_config_descriptor(data: &[u8]) -> Result<ConfigDescriptor, XhciErro
 pub fn parse_configuration_tree(data: &[u8]) -> Result<ConfigurationTree, XhciError> {
     let config = parse_config_descriptor(data)?;
     let total = config.total_length as usize;
-    if data.len() < total {
+    if total < 9 || data.len() < total {
         return Err(XhciError::InvalidDescriptor);
     }
 

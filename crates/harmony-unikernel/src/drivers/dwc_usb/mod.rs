@@ -427,13 +427,14 @@ impl XhciDriver {
         Ok(actions)
     }
 
-    /// Remove the transfer ring for a slot.
+    /// Remove all transfer rings for a slot (EP0 + any configured endpoints).
     ///
-    /// Call this after a failed Address Device command completion to
-    /// allow retrying `address_device` for the same slot. Without
-    /// this, the duplicate-slot guard permanently blocks the slot.
+    /// Call this after a failed Address Device or Configure Endpoint
+    /// command completion to allow retrying. Removes all rings sharing
+    /// the slot ID prefix, not just EP0.
     pub fn remove_transfer_ring(&mut self, slot_id: u8) {
-        self.transfer_rings.remove(&ring_key(slot_id, 1));
+        let prefix = (slot_id as u16) << 8;
+        self.transfer_rings.retain(|&k, _| k & 0xFF00 != prefix);
     }
 
     /// Enqueue a GET_DESCRIPTOR(Device) control transfer on a slot's EP0.
