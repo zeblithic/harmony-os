@@ -95,7 +95,10 @@ impl Namespace {
         new_root_fid: Fid,
     ) -> Result<MountPoint, crate::IpcError> {
         let mount = self.mounts.get_mut(path).ok_or(crate::IpcError::NotFound)?;
-        let old = mount.clone();
+        let mut old = mount.clone();
+        // Normalize: the old server was logically Active before the swap
+        // window. Returning Swapping would mislead callers inspecting state.
+        old.state = MountState::Active;
         mount.target_pid = new_pid;
         mount.root_fid = new_root_fid;
         mount.state = MountState::Active;

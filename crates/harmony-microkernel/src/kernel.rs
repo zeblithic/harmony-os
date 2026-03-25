@@ -2988,4 +2988,48 @@ mod tests {
             .unwrap();
         assert!(kernel.walk(client_pid, "/srv/echo", 0, 300, 5).is_ok());
     }
+
+    #[test]
+    fn hot_swap_invalidates_old_server_fids() {
+        let mut entropy = make_test_entropy();
+        let (hw, session, attestation) = make_test_hierarchy(&mut entropy);
+        let mut kernel = Kernel::new(hw, session, attestation, make_test_vm());
+
+        let old_pid = kernel
+            .spawn_process("old-echo", Box::new(EchoServer::new()), &[], None)
+            .unwrap();
+        let client_pid = kernel
+            .spawn_process(
+                "client",
+                Box::new(EchoServer::new()),
+                &[("/srv/echo", old_pid, 0)],
+                None,
+            )
+            .unwrap();
+
+        // Grant cap and walk to a readable file
+        kernel
+            .grant_endpoint_cap(&mut entropy, client_pid, old_pid, 1)
+            .unwrap();
+        let fid = 100;
+        kernel
+            .walk(client_pid, "/srv/echo/hello", 0, fid, 2)
+            .unwrap();
+
+        // Open and verify read works before swap
+        kernel.open(client_pid, fid, crate::OpenMode::Read).unwrap();
+        assert!(kernel.read(client_pid, fid, 0, 64).is_ok());
+
+        // Hot-swap
+        let new_echo = Box::new(EchoServer::new());
+        kernel
+            .hot_swap(client_pid, "/srv/echo", new_echo, "new-echo")
+            .unwrap();
+
+        // Pre-swap fid is now invalid — old server destroyed, fid_owners purged
+        assert_eq!(
+            kernel.read(client_pid, fid, 0, 64),
+            Err(IpcError::InvalidFid)
+        );
+    }
 }
