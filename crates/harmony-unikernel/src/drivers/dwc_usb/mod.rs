@@ -340,6 +340,12 @@ impl XhciDriver {
         }
         let dcbaa_phys = self.dcbaa_phys.ok_or(XhciError::InvalidState)?;
 
+        // Reject if slot already has a ring — must guard before any
+        // mutation (cmd_ring.enqueue advances index + pending_count).
+        if self.transfer_rings.contains_key(&slot_id) {
+            return Err(XhciError::InvalidState);
+        }
+
         // Build Input Context
         let input_ctx = context::build_input_context(port, speed, transfer_ring_phys);
 
@@ -364,8 +370,6 @@ impl XhciDriver {
         let entries = cmd_ring.enqueue(trb::TRB_ADDRESS_DEVICE, input_context_phys)?;
 
         for (phys, mut t) in entries {
-            // Set slot_id in control bits 31:24 for the Address Device TRB
-            // (not for Link TRBs)
             if t.trb_type() == trb::TRB_ADDRESS_DEVICE {
                 t.control |= (slot_id as u32) << 24;
             }
@@ -378,11 +382,6 @@ impl XhciDriver {
         });
 
         // Create transfer ring for this slot's EP0.
-        // Reject if slot already has a ring — replacing it would drop
-        // a ring the controller may still be consuming.
-        if self.transfer_rings.contains_key(&slot_id) {
-            return Err(XhciError::InvalidState);
-        }
         self.transfer_rings
             .insert(slot_id, ring::TransferRing::new(transfer_ring_phys));
 
