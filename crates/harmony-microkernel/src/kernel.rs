@@ -923,8 +923,18 @@ impl<P: PageTable> Kernel<P> {
         let _ = old_server.clunk(old_clone_fid);
 
         // Open for read + read all state bytes.
-        old_server.open(old_state_fid, OpenMode::Read)?;
-        let state_bytes = old_server.read(old_state_fid, 0, MAX_STATE_SIZE)?;
+        // Clunk on error to avoid leaking the walked fid in the old server's tracker.
+        if let Err(e) = old_server.open(old_state_fid, OpenMode::Read) {
+            let _ = old_server.clunk(old_state_fid);
+            return Err(e);
+        }
+        let state_bytes = match old_server.read(old_state_fid, 0, MAX_STATE_SIZE) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let _ = old_server.clunk(old_state_fid);
+                return Err(e);
+            }
+        };
         let _ = old_server.clunk(old_state_fid);
 
         // Drop the old server borrow so we can borrow new server separately.
@@ -947,7 +957,11 @@ impl<P: PageTable> Kernel<P> {
         match new_server.walk(new_clone_fid, new_state_fid, "state") {
             Err(IpcError::NotFound) => {
                 let _ = new_server.clunk(new_clone_fid);
-                return Ok(false); // new server doesn't accept state
+                // New server doesn't expose /state — state read from old server
+                // is silently discarded. This is intentional per the /state
+                // convention: if the new server doesn't accept state, it owns
+                // its own initialization. Proceeds as a stateless swap.
+                return Ok(false);
             }
             Err(e) => {
                 let _ = new_server.clunk(new_clone_fid);
@@ -957,8 +971,14 @@ impl<P: PageTable> Kernel<P> {
         }
         let _ = new_server.clunk(new_clone_fid);
 
-        new_server.open(new_state_fid, OpenMode::Write)?;
-        new_server.write(new_state_fid, 0, &state_bytes)?;
+        if let Err(e) = new_server.open(new_state_fid, OpenMode::Write) {
+            let _ = new_server.clunk(new_state_fid);
+            return Err(e);
+        }
+        if let Err(e) = new_server.write(new_state_fid, 0, &state_bytes) {
+            let _ = new_server.clunk(new_state_fid);
+            return Err(e);
+        }
         let _ = new_server.clunk(new_state_fid);
 
         Ok(true)
@@ -970,9 +990,11 @@ impl<P: PageTable> Kernel<P> {
     /// 1. Validate mount exists, is Active, and `mount_path` is an exact mount
     ///    path (not a sub-path).
     /// 2. Spawn new process with the replacement server.
-    /// 3. Mark mount as Swapping (new requests → `NotReady`).
-    /// 4. Rebind mount to new process (resets state to Active).
-    /// 5. Destroy old process.
+    /// 3. Transfer state: read `/state` from old server, write to new server.
+    ///    Skipped silently if either server doesn't expose `/state`.
+    /// 4. Mark mount as Swapping (new requests → `NotReady`).
+    /// 5. Rebind mount to new process (resets state to Active).
+    /// 6. Destroy old process.
     ///
     /// On failure at any step, the old server remains active (no service
     /// disruption). The new process is destroyed if spawned before failure.
