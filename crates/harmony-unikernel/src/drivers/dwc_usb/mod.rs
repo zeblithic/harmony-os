@@ -240,14 +240,18 @@ impl XhciDriver {
         }
 
         let mut ports = Vec::with_capacity(self.max_ports as usize);
-        for i in 0..self.max_ports {
-            let offset = self.cap_length + PORTSC_BASE + PORTSC_STRIDE * (i as usize);
+        // xHCI ports are 1-based in the Slot Context (§6.2.2), so we
+        // report 1-based port numbers. PORTSC registers are 0-indexed
+        // (port N at PORTSC_BASE + PORTSC_STRIDE * (N-1)).
+        for port_num in 1..=self.max_ports {
+            let reg_index = (port_num - 1) as usize;
+            let offset = self.cap_length + PORTSC_BASE + PORTSC_STRIDE * reg_index;
             let portsc = bank.read(offset);
 
             let speed_id = ((portsc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT) as u8;
 
             ports.push(PortStatus {
-                port: i,
+                port: port_num,
                 connected: portsc & PORTSC_CCS != 0,
                 enabled: portsc & PORTSC_PED != 0,
                 speed: UsbSpeed::from_id(speed_id),
@@ -308,9 +312,9 @@ impl XhciDriver {
         let mut actions: Vec<XhciAction> = entries
             .into_iter()
             .map(|(phys, mut t)| {
-                // Set Slot Type in control bits 19:16 for Enable Slot TRBs.
+                // Set Slot Type in control bits 24:20 for Enable Slot TRBs (xHCI §6.4.3.2).
                 if t.trb_type() == trb::TRB_ENABLE_SLOT {
-                    t.control |= (slot_type as u32) << 16;
+                    t.control |= (slot_type as u32) << 20;
                 }
                 XhciAction::WriteTrb { phys, trb: t }
             })
@@ -784,7 +788,7 @@ mod tests {
         let mut bank = mock_with_ports(0x20, &[portsc, 0, 0, 0]);
         let driver = XhciDriver::init(&mut bank).unwrap();
         let ports = driver.detect_ports(&bank).unwrap();
-        assert_eq!(ports[0].port, 0);
+        assert_eq!(ports[0].port, 1); // 1-based port numbers
         assert!(ports[0].connected);
         assert!(ports[0].enabled);
         assert_eq!(ports[0].speed, UsbSpeed::HighSpeed);

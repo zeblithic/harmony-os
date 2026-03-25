@@ -74,7 +74,7 @@ impl UsbSpeed {
 /// Status of a single USB port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortStatus {
-    /// Zero-based port index.
+    /// 1-based port number (matches xHCI Root Hub Port Number in §6.2.2).
     pub port: u8,
     /// Whether a device is connected (PORTSC.CCS).
     pub connected: bool,
