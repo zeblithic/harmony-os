@@ -12,7 +12,8 @@ use super::types::{DeviceDescriptor, UsbSpeed, XhciError};
 pub fn max_packet_size_for_speed(speed: UsbSpeed) -> u16 {
     match speed {
         UsbSpeed::LowSpeed => 8,
-        UsbSpeed::FullSpeed | UsbSpeed::HighSpeed => 64,
+        UsbSpeed::FullSpeed => 8, // safe default; update from bMaxPacketSize0 after GET_DESCRIPTOR
+        UsbSpeed::HighSpeed => 64,
         UsbSpeed::SuperSpeed | UsbSpeed::SuperSpeedPlus => 512,
         UsbSpeed::Unknown(_) => 8, // safe minimum
     }
@@ -53,10 +54,13 @@ pub fn build_input_context(port: u8, speed: UsbSpeed, transfer_ring_phys: u64) -
     ctx[36..40].copy_from_slice(&slot_dw1.to_le_bytes());
 
     // ── Endpoint 0 Context (bytes 64..95) ────────────────────────
-    // DWord 1: EP Type=4 (Control Bidir, bits 5:3), Max Packet Size (bits 31:16)
+    // DWord 1: CErr=3 (bits 2:1), EP Type=4 (Control Bidir, bits 5:3), Max Packet Size (bits 31:16)
+    // CErr=3: retry up to 3 times on USB bus errors before reporting failure.
+    // CErr=0 would cause infinite retries, hanging the controller.
+    let cerr: u32 = 3 << 1;
     let ep_type: u32 = 4 << 3;
     let mps: u32 = (max_packet_size_for_speed(speed) as u32) << 16;
-    let ep_dw1 = ep_type | mps;
+    let ep_dw1 = cerr | ep_type | mps;
     ctx[68..72].copy_from_slice(&ep_dw1.to_le_bytes());
 
     // DWord 2-3: TR Dequeue Pointer (64-bit) | DCS=1
@@ -139,7 +143,7 @@ mod tests {
     fn input_context_ep0_max_packet_per_speed() {
         for (speed, expected) in [
             (UsbSpeed::LowSpeed, 8u16),
-            (UsbSpeed::FullSpeed, 64),
+            (UsbSpeed::FullSpeed, 8),
             (UsbSpeed::HighSpeed, 64),
             (UsbSpeed::SuperSpeed, 512),
             (UsbSpeed::SuperSpeedPlus, 512),

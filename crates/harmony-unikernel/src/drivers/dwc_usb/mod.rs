@@ -311,10 +311,9 @@ impl XhciDriver {
 
     /// Set up a device context and enqueue an Address Device command.
     ///
-    /// Returns `(actions, input_context_bytes)`. The caller must:
-    /// 1. Write `input_context_bytes` to `input_context_phys` in DMA
-    /// 2. Execute all actions in order
-    /// 3. Process the `CommandCompletion` event
+    /// All DMA writes (Input Context, DCBAA slot) are included in the
+    /// action list. The caller executes all actions in order, then
+    /// processes the `CommandCompletion` event.
     ///
     /// Requires `Running` state and a configured DCBAA (call `setup_rings`
     /// with a non-zero `dcbaa_phys` first).
@@ -326,7 +325,7 @@ impl XhciDriver {
         input_context_phys: u64,
         output_context_phys: u64,
         transfer_ring_phys: u64,
-    ) -> Result<(Vec<XhciAction>, [u8; 96]), XhciError> {
+    ) -> Result<Vec<XhciAction>, XhciError> {
         if self.state != XhciState::Running {
             return Err(XhciError::InvalidState);
         }
@@ -337,14 +336,20 @@ impl XhciDriver {
 
         let mut actions = Vec::new();
 
-        // 1. Write Output Context pointer to DCBAA[slot_id]
+        // 1. Write Input Context to DMA (must happen before doorbell)
+        actions.push(XhciAction::WriteDma {
+            phys: input_context_phys,
+            data: input_ctx.to_vec(),
+        });
+
+        // 2. Write Output Context pointer to DCBAA[slot_id]
         let dcbaa_slot_phys = dcbaa_phys + (slot_id as u64) * 8;
         actions.push(XhciAction::WriteDma {
             phys: dcbaa_slot_phys,
             data: output_context_phys.to_le_bytes().to_vec(),
         });
 
-        // 2. Enqueue Address Device command
+        // 3. Enqueue Address Device command
         // parameter = input_context_phys, slot_id in control bits 31:24
         let cmd_ring = self.command_ring.as_mut().ok_or(XhciError::InvalidState)?;
         let entries = cmd_ring.enqueue(trb::TRB_ADDRESS_DEVICE, input_context_phys)?;
@@ -367,7 +372,7 @@ impl XhciDriver {
         self.transfer_rings
             .insert(slot_id, ring::TransferRing::new(transfer_ring_phys));
 
-        Ok((actions, input_ctx))
+        Ok(actions)
     }
 
     /// Enqueue a GET_DESCRIPTOR(Device) control transfer on a slot's EP0.
@@ -954,7 +959,7 @@ mod tests {
             .setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 4)
             .unwrap();
 
-        let (actions, input_ctx) = driver
+        let actions = driver
             .address_device(
                 1, // slot_id
                 2, // port
@@ -965,21 +970,28 @@ mod tests {
             )
             .unwrap();
 
-        // Input context should be 96 bytes
-        assert_eq!(input_ctx.len(), 96);
+        // Should have: WriteDma (Input Context) + WriteDma (DCBAA slot)
+        //            + WriteTrb (Address Device cmd) + RingDoorbell
+        assert!(actions.len() >= 4);
 
-        // Should have: WriteDma (DCBAA slot) + WriteTrb (Address Device cmd) + RingDoorbell
-        assert!(actions.len() >= 3);
-
-        // First action: WriteDma for DCBAA slot 1 at dcbaa_phys + 8
+        // First action: WriteDma for Input Context (96 bytes)
         match &actions[0] {
+            XhciAction::WriteDma { phys, data } => {
+                assert_eq!(*phys, 0x6000_0000); // input_context_phys
+                assert_eq!(data.len(), 96);
+            }
+            other => panic!("expected WriteDma for Input Context, got {:?}", other),
+        }
+
+        // Second action: WriteDma for DCBAA slot 1 at dcbaa_phys + 8
+        match &actions[1] {
             XhciAction::WriteDma { phys, data } => {
                 assert_eq!(*phys, 0x5000_0000 + 8); // slot 1 * 8
                 assert_eq!(data.len(), 8);
                 let ptr = u64::from_le_bytes(data[..8].try_into().unwrap());
                 assert_eq!(ptr, 0x7000_0000); // output_context_phys
             }
-            other => panic!("expected WriteDma, got {:?}", other),
+            other => panic!("expected WriteDma for DCBAA, got {:?}", other),
         }
 
         // Address Device command TRB should be present
