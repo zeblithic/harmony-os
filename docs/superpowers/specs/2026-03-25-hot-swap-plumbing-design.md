@@ -133,7 +133,7 @@ pub fn hot_swap(
 
 1. Look up `mount_path` in `client_pid`'s namespace. Verify it exists and is `Active`. Return `InvalidArgument` if not found. Return `InvalidState` if already `Swapping`.
 
-2. Spawn new process: `spawn_process(new_server_name, new_server, ...)` → `new_pid`. If spawn fails, return error (mount unchanged).
+2. Spawn new process: `spawn_process(new_server_name, new_server, &[], None)` → `new_pid`. Empty mount table (server process doesn't need mounts), no VM config (Ring 2 service). If spawn fails, return error (mount unchanged).
 
 3. Mark swapping: `namespace.set_mount_state(mount_path, Swapping)`.
 
@@ -156,6 +156,11 @@ If step 4 fails (defensive — shouldn't happen since we validated in step 1):
 - Add `hot_swap()` method to the kernel impl.
 - In the IPC dispatch path (where the kernel resolves a path and dispatches to the target server), add a check: if the resolved mount has `state == Swapping`, return `IpcError::NotReady`.
 
+### lib.rs changes
+
+- Add `NotReady` variant to `IpcError` — returned when requests hit a `Swapping` mount.
+- Note: `InvalidState` already exists in `IpcError` (used by xHCI driver). If not present, add it.
+
 ### namespace.rs changes
 
 - Add `MountState` enum.
@@ -174,6 +179,7 @@ The `FileServer` trait is unchanged. Hot-swap is entirely a kernel/namespace con
 
 | File | Change |
 |------|--------|
+| `harmony-microkernel/src/lib.rs` | Add `NotReady` variant to `IpcError` (if not present) |
 | `harmony-microkernel/src/namespace.rs` | Add `MountState`, update `MountPoint`, add `set_mount_state()`, `rebind()` |
 | `harmony-microkernel/src/kernel.rs` | Add `hot_swap()`, add `Swapping` check in IPC dispatch |
 
