@@ -148,6 +148,7 @@ impl BinaryCacheServer {
                         &entry.nar_sha256,
                         entry.nar_size,
                         entry.references.as_deref(),
+                        None,
                     );
                     CacheResponse::Narinfo(text)
                 }
