@@ -160,25 +160,30 @@ impl BinaryCacheServer {
             }
             return match self.hash_index.get(hash) {
                 Some(entry) => {
-                    let sig = self.signing.as_ref().and_then(|(key_name, identity)| {
-                        let hash_b32 = encode_nix_base32(&entry.nar_sha256);
-                        let nar_hash = format!("sha256:{hash_b32}");
-                        let fingerprint = compute_narinfo_fingerprint(
-                            &entry.name,
-                            &nar_hash,
-                            entry.nar_size,
-                            entry.references.as_deref(),
-                        )?;
-                        let sig_bytes = identity.sign(fingerprint.as_bytes());
-                        let sig_b64 = BASE64.encode(sig_bytes);
-                        Some(format!("{key_name}:{sig_b64}"))
-                    });
+                    let sigs: Vec<String> = self
+                        .signing
+                        .as_ref()
+                        .and_then(|(key_name, identity)| {
+                            let hash_b32 = encode_nix_base32(&entry.nar_sha256);
+                            let nar_hash = format!("sha256:{hash_b32}");
+                            let fingerprint = compute_narinfo_fingerprint(
+                                &entry.name,
+                                &nar_hash,
+                                entry.nar_size,
+                                entry.references.as_deref(),
+                            )?;
+                            let sig_bytes = identity.sign(fingerprint.as_bytes());
+                            let sig_b64 = BASE64.encode(sig_bytes);
+                            Some(format!("{key_name}:{sig_b64}"))
+                        })
+                        .into_iter()
+                        .collect();
                     let text = serialize_narinfo(
                         &entry.name,
                         &entry.nar_sha256,
                         entry.nar_size,
                         entry.references.as_deref(),
-                        sig.as_deref(),
+                        &sigs,
                     );
                     CacheResponse::Narinfo(text)
                 }
@@ -617,7 +622,8 @@ mod tests {
         };
 
         let parsed = NarInfo::parse(&text).unwrap();
-        let sig_str = parsed.sig.expect("expected Sig field");
+        assert_eq!(parsed.sigs.len(), 1, "expected exactly one Sig field");
+        let sig_str = &parsed.sigs[0];
         let (_key_name, sig_b64) = sig_str.split_once(':').expect("sig format is key:base64");
         let sig_bytes: [u8; 64] = BASE64.decode(sig_b64).unwrap().try_into().unwrap();
 

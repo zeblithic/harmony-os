@@ -25,8 +25,9 @@ pub struct NarInfo {
     /// `Some(vec![])` — field was present but empty (zero dependencies).
     /// `Some(names)` — full list of runtime dependency store path names.
     pub references: Option<Vec<String>>,
-    /// Ed25519 signature in `<keyname>:<base64sig>` format.
-    pub sig: Option<String>,
+    /// Ed25519 signatures in `<keyname>:<base64sig>` format.
+    /// Nix supports multiple signatures per narinfo (one per trusted key).
+    pub sigs: Vec<String>,
 }
 
 /// Errors from parsing NARInfo.
@@ -46,7 +47,7 @@ impl NarInfo {
         let mut nar_hash = None;
         let mut nar_size = None;
         let mut references = None;
-        let mut sig = None;
+        let mut sigs = Vec::new();
 
         for line in input.lines() {
             if let Some(val) = line.strip_prefix("URL: ") {
@@ -70,9 +71,7 @@ impl NarInfo {
                     references = Some(refs);
                 }
             } else if let Some(val) = line.strip_prefix("Sig: ") {
-                if sig.is_none() {
-                    sig = Some(val.to_string());
-                }
+                sigs.push(val.to_string());
             }
         }
 
@@ -82,7 +81,7 @@ impl NarInfo {
             nar_hash: nar_hash.ok_or(NarInfoError::MissingField("NarHash"))?,
             nar_size: nar_size.ok_or(NarInfoError::MissingField("NarSize"))?,
             references,
-            sig,
+            sigs,
         })
     }
 }
@@ -132,7 +131,7 @@ pub fn serialize_narinfo(
     nar_sha256: &[u8; 32],
     nar_size: u64,
     references: Option<&[String]>,
-    sig: Option<&str>,
+    sigs: &[String],
 ) -> String {
     use crate::nix_base32::encode_nix_base32;
 
@@ -162,7 +161,7 @@ pub fn serialize_narinfo(
         text.push_str(&refs.join(" "));
         text.push('\n');
     }
-    if let Some(s) = sig {
+    for s in sigs {
         assert!(
             !s.contains('\n') && !s.contains('\r') && !s.contains('\0'),
             "sig must not contain control characters: {s:?}"
@@ -304,16 +303,26 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
             "URL: nar/a.nar\nNarHash: sha256:abc\nNarSize: 10\nSig: cache.nixos.org-1:GrGV/abc123==\n";
         let info = NarInfo::parse(input).unwrap();
         assert_eq!(
-            info.sig,
-            Some("cache.nixos.org-1:GrGV/abc123==".to_string())
+            info.sigs,
+            vec!["cache.nixos.org-1:GrGV/abc123==".to_string()]
         );
     }
 
     #[test]
-    fn parse_missing_sig_is_none() {
+    fn parse_multiple_sig_fields() {
+        let input = "URL: nar/a.nar\nNarHash: sha256:abc\nNarSize: 10\nSig: key1:AAAA==\nSig: key2:BBBB==\n";
+        let info = NarInfo::parse(input).unwrap();
+        assert_eq!(
+            info.sigs,
+            vec!["key1:AAAA==".to_string(), "key2:BBBB==".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_missing_sig_is_empty() {
         let input = "URL: nar/a.nar\nNarHash: sha256:abc\nNarSize: 10\n";
         let info = NarInfo::parse(input).unwrap();
-        assert_eq!(info.sig, None);
+        assert!(info.sigs.is_empty());
     }
 
     #[test]
@@ -349,7 +358,7 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
         #[test]
         fn serialize_minimal_narinfo() {
             let hash = sha2::Sha256::digest(b"test nar data");
-            let text = serialize_narinfo("abc123-hello", &hash.into(), 13, None, None);
+            let text = serialize_narinfo("abc123-hello", &hash.into(), 13, None, &[]);
 
             assert!(text.contains("StorePath: /nix/store/abc123-hello\n"));
             assert!(text.contains("URL: nar/abc123-hello.nar\n"));
@@ -367,7 +376,7 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
                 &hash.into(),
                 nar_data.len() as u64,
                 None,
-                None,
+                &[],
             );
 
             // Parse it back with the existing parser.
@@ -381,7 +390,7 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
         #[test]
         fn serialize_store_path_format() {
             let hash = sha2::Sha256::digest(b"data");
-            let text = serialize_narinfo("test123-pkg", &hash.into(), 4, None, None);
+            let text = serialize_narinfo("test123-pkg", &hash.into(), 4, None, &[]);
             let store_line = text.lines().find(|l| l.starts_with("StorePath:")).unwrap();
             assert_eq!(store_line, "StorePath: /nix/store/test123-pkg");
         }
@@ -395,7 +404,7 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
                 &hash.into(),
                 4,
                 None,
-                None,
+                &[],
             );
         }
 
@@ -406,7 +415,7 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
                 "def456-glibc-2.39".to_string(),
                 "ghi789-gcc-lib".to_string(),
             ];
-            let text = serialize_narinfo("abc123-hello", &hash.into(), 8, Some(&refs), None);
+            let text = serialize_narinfo("abc123-hello", &hash.into(), 8, Some(&refs), &[]);
             assert!(text.contains("References: def456-glibc-2.39 ghi789-gcc-lib\n"));
             let parsed = NarInfo::parse(&text).unwrap();
             assert_eq!(parsed.references, Some(refs));
@@ -415,14 +424,14 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
         #[test]
         fn serialize_without_references() {
             let hash = sha2::Sha256::digest(b"no ref test");
-            let text = serialize_narinfo("abc123-hello", &hash.into(), 11, None, None);
+            let text = serialize_narinfo("abc123-hello", &hash.into(), 11, None, &[]);
             assert!(!text.contains("References"));
         }
 
         #[test]
         fn serialize_with_empty_references() {
             let hash = sha2::Sha256::digest(b"empty ref");
-            let text = serialize_narinfo("abc123-hello", &hash.into(), 9, Some(&[]), None);
+            let text = serialize_narinfo("abc123-hello", &hash.into(), 9, Some(&[]), &[]);
             assert!(text.contains("References: \n"));
             let parsed = NarInfo::parse(&text).unwrap();
             assert_eq!(parsed.references, Some(vec![]));
@@ -431,20 +440,27 @@ Sig: cache.nixos.org-1:abcdef1234567890\n";
         #[test]
         fn serialize_with_sig() {
             let hash = sha2::Sha256::digest(b"sig test");
-            let text = serialize_narinfo(
-                "abc123-hello",
-                &hash.into(),
-                8,
-                None,
-                Some("mykey-1:AAAA=="),
-            );
+            let sigs = vec!["mykey-1:AAAA==".to_string()];
+            let text = serialize_narinfo("abc123-hello", &hash.into(), 8, None, &sigs);
             assert!(text.contains("Sig: mykey-1:AAAA==\n"));
+        }
+
+        #[test]
+        fn serialize_multiple_sigs() {
+            let hash = sha2::Sha256::digest(b"multi sig");
+            let sigs = vec!["key1:AAAA==".to_string(), "key2:BBBB==".to_string()];
+            let text = serialize_narinfo("abc123-hello", &hash.into(), 9, None, &sigs);
+            assert!(text.contains("Sig: key1:AAAA==\n"));
+            assert!(text.contains("Sig: key2:BBBB==\n"));
+
+            let parsed = NarInfo::parse(&text).unwrap();
+            assert_eq!(parsed.sigs, sigs);
         }
 
         #[test]
         fn serialize_without_sig() {
             let hash = sha2::Sha256::digest(b"no sig");
-            let text = serialize_narinfo("abc123-hello", &hash.into(), 6, None, None);
+            let text = serialize_narinfo("abc123-hello", &hash.into(), 6, None, &[]);
             assert!(!text.contains("Sig:"));
         }
     }
