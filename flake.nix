@@ -3,7 +3,7 @@
 
   nixConfig = {
     extra-substituters = [ "https://zeblithic.cachix.org" ];
-    extra-trusted-public-keys = [ "zeblithic.cachix.org-1:PLACEHOLDER_KEY_WILL_BE_SET_AFTER_CACHIX_SETUP" ];
+    extra-trusted-public-keys = [ "zeblithic.cachix.org-1:aS8HanVPr6MQxxqDq3UbgVhI8WxXzYHyYeb6xjE+UQk=" ];
   };
 
   inputs = {
