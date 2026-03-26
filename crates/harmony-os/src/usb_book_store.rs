@@ -113,6 +113,10 @@ impl UsbBookStore {
     /// Call [`Self::load_superblock`] and [`Self::load_index`] with the data
     /// read by those actions before using the store.
     pub fn new(block_size: u32) -> (Self, Vec<UsbStoreAction>) {
+        assert!(
+            block_size >= INDEX_ENTRY_SIZE as u32,
+            "block_size must be at least {INDEX_ENTRY_SIZE}"
+        );
         let store = UsbBookStore {
             cache: HashMap::new(),
             index: Vec::new(),
@@ -231,6 +235,10 @@ impl UsbBookStore {
     /// Returns a new store and the [`UsbStoreAction`]s to write the superblock
     /// and the full zeroed index to the device.
     pub fn format(block_size: u32) -> (Self, Vec<UsbStoreAction>) {
+        assert!(
+            block_size >= INDEX_ENTRY_SIZE as u32,
+            "block_size must be at least {INDEX_ENTRY_SIZE}"
+        );
         let store = UsbBookStore {
             cache: HashMap::new(),
             index: Vec::new(),
