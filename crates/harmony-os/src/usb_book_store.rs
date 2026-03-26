@@ -472,14 +472,18 @@ impl UsbBookStore {
     /// Called by both `insert_with_flags` and `store`.
     fn try_add_book(&mut self, cid: ContentId, data: &[u8]) -> Result<(), ContentError> {
         // Check index for existing CID — avoid creating a duplicate entry.
-        if let Some(entry) = self.index.iter().find(|e| e.cid == cid) {
+        if let Some(idx) = self.index.iter().position(|e| e.cid == cid) {
             let was_in_cache = self.cache.contains_key(&cid);
             self.cache.insert(cid, data.to_vec());
             if !was_in_cache {
                 // CID is in the index but wasn't in the cache — load_book
-                // previously rejected it (hash mismatch). Queue a corrective
-                // write so the on-disk data is repaired for next cold start.
-                self.queue_book_write(entry.start_sector, entry.on_disk_slot, data);
+                // previously rejected it (hash mismatch). Update byte_length
+                // to correct any on-disk metadata corruption, then queue a
+                // corrective write for both data and index sectors.
+                let correct_len = u32::try_from(data.len()).unwrap_or(self.index[idx].byte_length);
+                self.index[idx].byte_length = correct_len;
+                let (start, slot) = (self.index[idx].start_sector, self.index[idx].on_disk_slot);
+                self.queue_book_write(start, slot, data);
             }
             return Ok(());
         }
