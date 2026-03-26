@@ -28,3 +28,5 @@ pub mod nix_binary_cache;
 pub mod nix_store_fetcher;
 #[cfg(feature = "std")]
 pub mod persistent_nar_store;
+#[cfg(feature = "std")]
+pub mod usb_book_store;
