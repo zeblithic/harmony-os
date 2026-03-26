@@ -27,16 +27,19 @@ pub struct Hypervisor {
     _host_ctx: VCpuContext,
     /// Converts PA → writable pointer (for Stage-2 table manipulation).
     phys_to_virt: fn(PhysAddr) -> *mut u8,
+    /// Returns owned frames to the physical allocator when VMs are destroyed.
+    frame_dealloc: fn(PhysAddr),
 }
 
 impl Hypervisor {
-    pub fn new(phys_to_virt: fn(PhysAddr) -> *mut u8) -> Self {
+    pub fn new(phys_to_virt: fn(PhysAddr) -> *mut u8, frame_dealloc: fn(PhysAddr)) -> Self {
         Self {
             vmid_alloc: VmIdAllocator::new(),
             vms: BTreeMap::new(),
             active_vmid: None,
             _host_ctx: VCpuContext::default(),
             phys_to_virt,
+            frame_dealloc,
         }
     }
 
@@ -121,8 +124,13 @@ impl Hypervisor {
 
     fn hvc_vm_destroy(&mut self, x1: u64) -> Result<HypervisorAction, HypervisorError> {
         let vmid = VmId(x1 as u8);
-        if self.vms.remove(&vmid.0).is_none() {
-            return Err(HypervisorError::InvalidVmId(vmid));
+        let vm = self
+            .vms
+            .remove(&vmid.0)
+            .ok_or(HypervisorError::InvalidVmId(vmid))?;
+        // Free all Stage-2 table frames (root + intermediates).
+        for frame in vm.stage2.into_owned_frames() {
+            (self.frame_dealloc)(frame);
         }
         self.vmid_alloc.free(vmid);
         if self.active_vmid == Some(vmid) {
@@ -176,6 +184,17 @@ impl Hypervisor {
             },
         };
 
+        // Guard against IPA/PA overflow before the mapping loop.
+        let total_bytes = (page_count as u64)
+            .checked_mul(4096)
+            .ok_or(HypervisorError::InvalidAddress)?;
+        ipa_base
+            .checked_add(total_bytes)
+            .ok_or(HypervisorError::InvalidAddress)?;
+        pa_base
+            .checked_add(total_bytes)
+            .ok_or(HypervisorError::InvalidAddress)?;
+
         let vm = self
             .vms
             .get_mut(&vmid.0)
@@ -183,9 +202,14 @@ impl Hypervisor {
         for i in 0..page_count as u64 {
             let ipa = ipa_base + i * 4096;
             let pa = PhysAddr(pa_base + i * 4096);
-            vm.stage2
-                .map(ipa, pa, flags, frame_alloc)
-                .map_err(HypervisorError::Stage2MapFailed)?;
+            if let Err(e) = vm.stage2.map(ipa, pa, flags, frame_alloc) {
+                // Rollback: unmap all successfully mapped pages.
+                for j in 0..i {
+                    let rollback_ipa = ipa_base + j * 4096;
+                    let _ = vm.stage2.unmap(rollback_ipa);
+                }
+                return Err(HypervisorError::Stage2MapFailed(e));
+            }
         }
         Ok(HypervisorAction::HvcResult { x0: 0 })
     }
@@ -205,6 +229,9 @@ impl Hypervisor {
         ipa: u64,
         access: AccessType,
     ) -> Result<HypervisorAction, HypervisorError> {
+        // All data aborts require an active guest — reject early if host-only.
+        let vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
+
         if ipa == VIRTUAL_UART_IPA {
             return match access {
                 AccessType::Write { value } => Ok(HypervisorAction::EmitChar { ch: value as u8 }),
@@ -214,7 +241,6 @@ impl Hypervisor {
         }
         // Unknown IPA — kill the guest. Clear active_vmid atomically with the
         // DestroyVm decision, matching the WFI and guest_exit paths.
-        let vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
         if let Some(vm) = self.vms.get_mut(&vmid.0) {
             vm.state = VmState::Halted;
         }
@@ -253,16 +279,18 @@ mod tests {
     }
 
     fn make_hypervisor() -> Hypervisor {
-        Hypervisor::new(|pa| pa.0 as *mut u8)
+        Hypervisor::new(|pa| pa.0 as *mut u8, |_| {})
     }
 
-    /// Helper: creates a hypervisor with heap-backed arena for page table operations.
+    /// Helper: creates a page-aligned bump allocator over a heap-backed arena.
+    /// The arena must be allocated with +1 page to absorb alignment padding.
     fn make_arena_alloc(arena: &[u8]) -> impl FnMut() -> Option<PhysAddr> + '_ {
-        let arena_base = arena.as_ptr() as u64;
-        let arena_end = arena_base + arena.len() as u64;
-        let mut bump = arena_base;
+        let base = arena.as_ptr() as u64;
+        let aligned_base = (base + 4095) & !4095; // page-align up
+        let arena_end = base + arena.len() as u64;
+        let mut bump = aligned_base;
         move || {
-            if bump >= arena_end {
+            if bump + 4096 > arena_end {
                 return None;
             }
             let addr = bump;
@@ -275,7 +303,7 @@ mod tests {
     #[test]
     fn create_vm_returns_vmid() {
         let mut hyp = make_hypervisor();
-        let arena = vec![0u8; 64 * 4096];
+        let arena = vec![0u8; 65 * 4096];
         let mut alloc = make_arena_alloc(&arena);
         let action = hyp
             .handle(
@@ -294,7 +322,7 @@ mod tests {
     #[test]
     fn create_vm_allocates_stage2_root() {
         let mut hyp = make_hypervisor();
-        let arena = vec![0u8; 64 * 4096];
+        let arena = vec![0u8; 65 * 4096];
         let arena_base = arena.as_ptr() as u64;
         let arena_end = arena_base + arena.len() as u64;
         let mut bump_ptr = arena_base;
@@ -359,7 +387,7 @@ mod tests {
     #[test]
     fn vm_map_adds_stage2_entry() {
         let mut hyp = make_hypervisor();
-        let arena = vec![0u8; 64 * 4096];
+        let arena = vec![0u8; 65 * 4096];
         let mut alloc = make_arena_alloc(&arena);
         hyp.handle(
             TrapEvent::HvcCall {
@@ -389,7 +417,7 @@ mod tests {
     #[test]
     fn vm_start_returns_enter_guest() {
         let mut hyp = make_hypervisor();
-        let arena = vec![0u8; 64 * 4096];
+        let arena = vec![0u8; 65 * 4096];
         let mut alloc = make_arena_alloc(&arena);
         hyp.handle(
             TrapEvent::HvcCall {
@@ -420,8 +448,29 @@ mod tests {
 
     #[test]
     fn data_abort_at_uart_emits_char() {
-        let mut hyp = make_hypervisor();
-        let mut alloc = BumpAlloc::new(0x10_0000, 0x10_0000);
+        let arena = vec![0u8; 65 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_START,
+                x1: 1,
+                x2: 0x4000_0000,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
         let action = hyp
             .handle(
                 TrapEvent::DataAbort {
@@ -429,7 +478,7 @@ mod tests {
                     access: AccessType::Write { value: b'H' as u64 },
                     width: 1,
                 },
-                &mut || alloc.alloc(),
+                &mut alloc,
             )
             .unwrap();
         assert_eq!(action, HypervisorAction::EmitChar { ch: b'H' });
@@ -437,9 +486,9 @@ mod tests {
 
     #[test]
     fn data_abort_at_unknown_ipa_destroys_vm() {
-        let arena = vec![0u8; 64 * 4096];
+        let arena = vec![0u8; 65 * 4096];
         let mut alloc = make_arena_alloc(&arena);
-        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
         hyp.handle(
             TrapEvent::HvcCall {
                 x0: HVC_VM_CREATE,
@@ -475,9 +524,9 @@ mod tests {
 
     #[test]
     fn wfi_halts_guest() {
-        let arena = vec![0u8; 64 * 4096];
+        let arena = vec![0u8; 65 * 4096];
         let mut alloc = make_arena_alloc(&arena);
-        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
         hyp.handle(
             TrapEvent::HvcCall {
                 x0: HVC_VM_CREATE,
@@ -528,9 +577,9 @@ mod tests {
 
     #[test]
     fn guest_exit_hvc_halts() {
-        let arena = vec![0u8; 64 * 4096];
+        let arena = vec![0u8; 65 * 4096];
         let mut alloc = make_arena_alloc(&arena);
-        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
         hyp.handle(
             TrapEvent::HvcCall {
                 x0: HVC_VM_CREATE,
@@ -590,10 +639,10 @@ mod tests {
 
     #[test]
     fn full_guest_stub_lifecycle() {
-        let arena = vec![0u8; 128 * 4096];
+        let arena = vec![0u8; 129 * 4096];
         let mut alloc = make_arena_alloc(&arena);
 
-        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
 
         // 1. Create VM
         let action = hyp
@@ -717,9 +766,9 @@ mod tests {
 
     #[test]
     fn uart_read_returns_resume_guest() {
-        let arena = vec![0u8; 64 * 4096];
+        let arena = vec![0u8; 65 * 4096];
         let mut alloc = make_arena_alloc(&arena);
-        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
         hyp.handle(
             TrapEvent::HvcCall {
                 x0: HVC_VM_CREATE,
@@ -755,9 +804,9 @@ mod tests {
 
     #[test]
     fn vm_start_rejects_when_another_vm_active() {
-        let arena = vec![0u8; 128 * 4096];
+        let arena = vec![0u8; 129 * 4096];
         let mut alloc = make_arena_alloc(&arena);
-        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
         // Create two VMs
         hyp.handle(
             TrapEvent::HvcCall {
@@ -808,9 +857,9 @@ mod tests {
 
     #[test]
     fn double_map_same_ipa_rejected() {
-        let arena = vec![0u8; 64 * 4096];
+        let arena = vec![0u8; 65 * 4096];
         let mut alloc = make_arena_alloc(&arena);
-        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
         hyp.handle(
             TrapEvent::HvcCall {
                 x0: HVC_VM_CREATE,

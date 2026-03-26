@@ -137,6 +137,8 @@ pub enum HypervisorError {
     OutOfMemory,
     /// A trap arrived but no guest VM is active (active_vmid is None).
     NoActiveVm,
+    /// IPA or PA range overflows u64 address space.
+    InvalidAddress,
 }
 
 #[cfg(test)]
