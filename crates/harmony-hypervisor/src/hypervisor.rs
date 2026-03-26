@@ -51,6 +51,10 @@ impl Hypervisor {
             TrapEvent::DataAbort { ipa, access, .. } => self.handle_data_abort(ipa, access),
             TrapEvent::InstructionAbort { ipa: _ } => {
                 let vmid = self.active_vmid.unwrap_or(VmId(0));
+                if let Some(vm) = self.vms.get_mut(&vmid.0) {
+                    vm.state = VmState::Halted;
+                }
+                self.active_vmid = None;
                 Ok(HypervisorAction::DestroyVm { vmid })
             }
             TrapEvent::WfiWfe => {
