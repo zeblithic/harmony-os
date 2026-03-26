@@ -51,8 +51,6 @@ pub enum UsbStoreError {
     InvalidMagic,
     /// Superblock version is not supported (expected `VERSION = 1`).
     UnsupportedVersion,
-    /// Index is full (3,072 entries).
-    IndexFull,
     /// Data buffer is too short for the expected structure.
     DataTooShort,
 }
@@ -164,29 +162,43 @@ impl UsbBookStore {
     /// caller can match each read action to the CID it should `load_book` with.
     pub fn load_index(&mut self, data: &[u8]) -> Vec<(ContentId, UsbStoreAction)> {
         let mut actions = Vec::new();
-        let mut offset = 0;
-        while offset + INDEX_ENTRY_SIZE <= data.len() {
-            if let Some(entry) = Self::parse_index_entry(&data[offset..offset + INDEX_ENTRY_SIZE]) {
-                let sectors_needed = entry.byte_length.div_ceil(self.block_size);
-                // Skip books too large for a single ReadSectors (>32MB at 512B sectors).
-                let Ok(count) = u16::try_from(sectors_needed) else {
-                    eprintln!(
-                        "[usb-book-store] book at sector {} too large ({} sectors), skipping",
-                        entry.start_sector, sectors_needed
-                    );
-                    continue;
-                };
-                let cid = entry.cid;
-                actions.push((
-                    cid,
-                    UsbStoreAction::ReadSectors {
-                        start_lba: entry.start_sector,
-                        count,
-                    },
-                ));
-                self.index.push(entry);
+        let bs = self.block_size as usize;
+        let entries_per_sector = bs / INDEX_ENTRY_SIZE;
+
+        // Walk sector by sector, then entry by entry within each sector.
+        // Each sector has `entries_per_sector` entries followed by padding.
+        for sector in 0..INDEX_SECTOR_COUNT as usize {
+            let sector_base = sector * bs;
+            if sector_base >= data.len() {
+                break;
             }
-            offset += INDEX_ENTRY_SIZE;
+            for slot in 0..entries_per_sector {
+                let offset = sector_base + slot * INDEX_ENTRY_SIZE;
+                if offset + INDEX_ENTRY_SIZE > data.len() {
+                    break;
+                }
+                if let Some(entry) =
+                    Self::parse_index_entry(&data[offset..offset + INDEX_ENTRY_SIZE])
+                {
+                    let sectors_needed = entry.byte_length.div_ceil(self.block_size);
+                    let Ok(count) = u16::try_from(sectors_needed) else {
+                        eprintln!(
+                            "[usb-book-store] book at sector {} too large ({} sectors), skipping",
+                            entry.start_sector, sectors_needed
+                        );
+                        continue;
+                    };
+                    let cid = entry.cid;
+                    actions.push((
+                        cid,
+                        UsbStoreAction::ReadSectors {
+                            start_lba: entry.start_sector,
+                            count,
+                        },
+                    ));
+                    self.index.push(entry);
+                }
+            }
         }
         actions
     }
@@ -365,13 +377,18 @@ impl BookStore for UsbBookStore {
                     max: MAX_BOOKS,
                 });
             }
-            let sectors_needed = (data.len() as u32).div_ceil(self.block_size);
+            let byte_length =
+                u32::try_from(data.len()).map_err(|_| ContentError::PayloadTooLarge {
+                    size: data.len(),
+                    max: u32::MAX as usize,
+                })?;
+            let sectors_needed = byte_length.div_ceil(self.block_size);
             let start_sector = self.next_free_sector;
 
             self.index.push(IndexEntry {
                 cid,
                 start_sector,
-                byte_length: data.len() as u32,
+                byte_length,
             });
             self.book_count += 1;
             self.next_free_sector += sectors_needed;
@@ -392,13 +409,17 @@ impl BookStore for UsbBookStore {
                 eprintln!("[usb-book-store] index full, cannot store book");
                 return;
             }
-            let sectors_needed = (data.len() as u32).div_ceil(self.block_size);
+            let Ok(byte_length) = u32::try_from(data.len()) else {
+                eprintln!("[usb-book-store] book too large for u32 byte_length, skipping");
+                return;
+            };
+            let sectors_needed = byte_length.div_ceil(self.block_size);
             let start_sector = self.next_free_sector;
 
             self.index.push(IndexEntry {
                 cid,
                 start_sector,
-                byte_length: data.len() as u32,
+                byte_length,
             });
             self.book_count += 1;
             self.next_free_sector += sectors_needed;
