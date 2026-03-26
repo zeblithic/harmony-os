@@ -160,16 +160,30 @@ impl UsbBookStore {
     ///
     /// `data` should be the raw bytes of sectors 1-256 (`256 * block_size`
     /// bytes).
-    pub fn load_index(&mut self, data: &[u8]) -> Vec<UsbStoreAction> {
+    /// Parse the index and return `(ContentId, ReadSectors)` pairs so the
+    /// caller can match each read action to the CID it should `load_book` with.
+    pub fn load_index(&mut self, data: &[u8]) -> Vec<(ContentId, UsbStoreAction)> {
         let mut actions = Vec::new();
         let mut offset = 0;
         while offset + INDEX_ENTRY_SIZE <= data.len() {
             if let Some(entry) = Self::parse_index_entry(&data[offset..offset + INDEX_ENTRY_SIZE]) {
                 let sectors_needed = entry.byte_length.div_ceil(self.block_size);
-                actions.push(UsbStoreAction::ReadSectors {
-                    start_lba: entry.start_sector,
-                    count: sectors_needed as u16,
-                });
+                // Skip books too large for a single ReadSectors (>32MB at 512B sectors).
+                let Ok(count) = u16::try_from(sectors_needed) else {
+                    eprintln!(
+                        "[usb-book-store] book at sector {} too large ({} sectors), skipping",
+                        entry.start_sector, sectors_needed
+                    );
+                    continue;
+                };
+                let cid = entry.cid;
+                actions.push((
+                    cid,
+                    UsbStoreAction::ReadSectors {
+                        start_lba: entry.start_sector,
+                        count,
+                    },
+                ));
                 self.index.push(entry);
             }
             offset += INDEX_ENTRY_SIZE;
@@ -273,6 +287,10 @@ impl UsbBookStore {
         let cid = ContentId::from_bytes(cid_bytes);
         let start_sector = u32::from_le_bytes(data[32..36].try_into().ok()?);
         let byte_length = u32::from_le_bytes(data[36..40].try_into().ok()?);
+        // Reject entries pointing into superblock or index area.
+        if start_sector < DATA_START_SECTOR {
+            return None;
+        }
         Some(IndexEntry {
             cid,
             start_sector,
@@ -341,6 +359,12 @@ impl BookStore for UsbBookStore {
     ) -> Result<ContentId, ContentError> {
         let cid = ContentId::for_book(data, flags)?;
         if !self.cache.contains_key(&cid) {
+            if self.is_full() {
+                return Err(ContentError::PayloadTooLarge {
+                    size: self.book_count as usize,
+                    max: MAX_BOOKS,
+                });
+            }
             let sectors_needed = (data.len() as u32).div_ceil(self.block_size);
             let start_sector = self.next_free_sector;
 
@@ -364,6 +388,10 @@ impl BookStore for UsbBookStore {
 
     fn store(&mut self, cid: ContentId, data: Vec<u8>) {
         if !self.cache.contains_key(&cid) {
+            if self.is_full() {
+                eprintln!("[usb-book-store] index full, cannot store book");
+                return;
+            }
             let sectors_needed = (data.len() as u32).div_ceil(self.block_size);
             let start_sector = self.next_free_sector;
 
@@ -563,7 +591,7 @@ mod tests {
                 } else {
                     let book_reads = store2.load_index(&data);
                     // Execute book reads
-                    for book_action in &book_reads {
+                    for (book_cid, book_action) in &book_reads {
                         if let UsbStoreAction::ReadSectors {
                             start_lba: blba,
                             count: bcnt,
@@ -572,7 +600,7 @@ mod tests {
                             let book_bytes = read_sectors(&disk, BLOCK_SIZE, *blba, *bcnt);
                             // Trim to actual byte_length from index
                             let trimmed = book_bytes[..book_data.len()].to_vec();
-                            store2.load_book(cid, trimmed);
+                            store2.load_book(*book_cid, trimmed);
                         }
                     }
                 }
@@ -750,15 +778,15 @@ mod tests {
         let idx_data = read_sectors(&disk, block_size, INDEX_START_SECTOR, INDEX_SECTOR_COUNT);
         let book_reads = store2.load_index(&idx_data);
 
-        // We need to match each ReadSectors action to the right CID.
-        // The index preserves insertion order, so iterate over index entries.
+        // Each action is paired with its CID — no need to re-parse index.
         let _ = init_actions;
-        for (i, book_action) in book_reads.iter().enumerate() {
+        for (book_cid, book_action) in &book_reads {
             if let UsbStoreAction::ReadSectors { start_lba, count } = book_action {
                 let raw = read_sectors(&disk, block_size, *start_lba, *count);
-                let (cid, original) = cids[i];
+                // Find original data length for this CID
+                let original = cids.iter().find(|(c, _)| c == book_cid).unwrap().1;
                 let trimmed = raw[..original.len()].to_vec();
-                store2.load_book(cid, trimmed);
+                store2.load_book(*book_cid, trimmed);
             }
         }
 
