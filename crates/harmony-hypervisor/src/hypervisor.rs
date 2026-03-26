@@ -566,4 +566,102 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn full_guest_stub_lifecycle() {
+        let arena = vec![0u8; 128 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8);
+
+        // 1. Create VM
+        let action = hyp
+            .handle(
+                TrapEvent::HvcCall {
+                    x0: HVC_VM_CREATE,
+                    x1: 0,
+                    x2: 0,
+                    x3: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        let vmid = match action {
+            HypervisorAction::HvcResult { x0 } => x0 as u8,
+            _ => panic!("expected HvcResult"),
+        };
+        assert_eq!(vmid, 1);
+
+        // 2. Map 8 pages of guest RAM at IPA 0x4000_0000
+        let x1 = pack_vm_map_x1(vmid, 0b00_000_111, 8);
+        let action = hyp
+            .handle(
+                TrapEvent::HvcCall {
+                    x0: HVC_VM_MAP,
+                    x1,
+                    x2: 0x4000_0000,
+                    x3: 0xA000_0000,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        assert_eq!(action, HypervisorAction::HvcResult { x0: 0 });
+
+        // 3. Start VM at entry IPA
+        let action = hyp
+            .handle(
+                TrapEvent::HvcCall {
+                    x0: HVC_VM_START,
+                    x1: vmid as u64,
+                    x2: 0x4000_0000,
+                    x3: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        assert!(matches!(action, HypervisorAction::EnterGuest { vmid: VmId(1) }));
+
+        // 4. Guest writes "Hi" to virtual UART
+        for &ch in b"Hi" {
+            let action = hyp
+                .handle(
+                    TrapEvent::DataAbort {
+                        ipa: VIRTUAL_UART_IPA,
+                        access: AccessType::Write { value: ch as u64 },
+                        width: 1,
+                    },
+                    &mut alloc,
+                )
+                .unwrap();
+            assert_eq!(action, HypervisorAction::EmitChar { ch });
+        }
+
+        // 5. Guest exits via HVC
+        let action = hyp
+            .handle(
+                TrapEvent::HvcCall {
+                    x0: HVC_GUEST_EXIT,
+                    x1: 0,
+                    x2: 0,
+                    x3: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        assert_eq!(action, HypervisorAction::HvcResult { x0: 0 });
+
+        // 6. Destroy VM
+        let action = hyp
+            .handle(
+                TrapEvent::HvcCall {
+                    x0: HVC_VM_DESTROY,
+                    x1: vmid as u64,
+                    x2: 0,
+                    x3: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        assert_eq!(action, HypervisorAction::HvcResult { x0: 0 });
+    }
 }
