@@ -2,7 +2,7 @@
 //! Trap event/action types, HVC constants, and error enum.
 
 use crate::vmid::VmId;
-use harmony_microkernel::vm::{PhysAddr, VmError};
+use harmony_microkernel::vm::VmError;
 
 // ── HVC Function IDs ─────────────────────────────────────────────────
 
@@ -73,8 +73,6 @@ pub enum AccessType {
 /// + ISB) after any `HvcResult` returned from `HVC_VM_MAP`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HypervisorAction {
-    ResumeGuest,
-    CreateVm { vmid: VmId, stage2_root: PhysAddr },
     DestroyVm { vmid: VmId },
     EmitChar { ch: u8 },
     ForwardSmc { x0: u64, x1: u64, x2: u64, x3: u64 },

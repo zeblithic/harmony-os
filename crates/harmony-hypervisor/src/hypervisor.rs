@@ -95,7 +95,13 @@ impl Hypervisor {
             .vmid_alloc
             .alloc()
             .ok_or(HypervisorError::VmLimitReached)?;
-        let root = frame_alloc().ok_or(HypervisorError::OutOfMemory)?;
+        let root = match frame_alloc() {
+            Some(r) => r,
+            None => {
+                self.vmid_alloc.free(vmid);
+                return Err(HypervisorError::OutOfMemory);
+            }
+        };
         let ptr = (self.phys_to_virt)(root);
         unsafe { core::ptr::write_bytes(ptr, 0, 4096) };
         let stage2 = Stage2PageTable::new(root, vmid, self.phys_to_virt);
@@ -130,6 +136,10 @@ impl Hypervisor {
             .ok_or(HypervisorError::InvalidVmId(vmid))?;
         if vm.state == VmState::Running {
             return Err(HypervisorError::VmAlreadyRunning(vmid));
+        }
+        // Cold-restart: reset register file so halted VMs don't start with stale state.
+        if vm.state == VmState::Halted {
+            vm.vcpu = VCpuContext::default();
         }
         vm.vcpu.elr_el2 = entry_ipa;
         vm.vcpu.spsr_el2 = 0x3C5; // EL1h + DAIF masked
@@ -186,7 +196,7 @@ impl Hypervisor {
     }
 
     fn handle_data_abort(
-        &self,
+        &mut self,
         ipa: u64,
         access: AccessType,
     ) -> Result<HypervisorAction, HypervisorError> {
@@ -197,7 +207,13 @@ impl Hypervisor {
             };
             return Ok(HypervisorAction::EmitChar { ch });
         }
+        // Unknown IPA — kill the guest. Clear active_vmid atomically with the
+        // DestroyVm decision, matching the WFI and guest_exit paths.
         let vmid = self.active_vmid.unwrap_or(VmId(0));
+        if let Some(vm) = self.vms.get_mut(&vmid.0) {
+            vm.state = VmState::Halted;
+        }
+        self.active_vmid = None;
         Ok(HypervisorAction::DestroyVm { vmid })
     }
 }
@@ -619,7 +635,10 @@ mod tests {
                 &mut alloc,
             )
             .unwrap();
-        assert!(matches!(action, HypervisorAction::EnterGuest { vmid: VmId(1) }));
+        assert!(matches!(
+            action,
+            HypervisorAction::EnterGuest { vmid: VmId(1) }
+        ));
 
         // 4. Guest writes "Hi" to virtual UART
         for &ch in b"Hi" {
