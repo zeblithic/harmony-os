@@ -60,7 +60,7 @@ enum NodeKind {
 /// Serializable snapshot of ContentServer state for hot-swap.
 #[derive(Serialize, Deserialize)]
 struct ContentServerState {
-    pages: Vec<(u32, PageAddr, Vec<u8>)>,
+    pages: Vec<(PageAddr, Vec<u8>)>,
     books: Vec<([u8; 32], Book)>,
 }
 
@@ -505,7 +505,7 @@ impl FileServer for ContentServer {
                     pages: self
                         .pages
                         .iter()
-                        .map(|(&k, (addr, data))| (k, *addr, data.clone()))
+                        .map(|(_, (addr, data))| (*addr, data.clone()))
                         .collect(),
                     books: self.books.iter().map(|(&k, v)| (k, v.clone())).collect(),
                 };
@@ -558,7 +558,7 @@ impl FileServer for ContentServer {
                     // Re-derive key from addr.hash_bits() rather than trusting
                     // the serialized key — prevents inconsistent map keys with
                     // malformed CBOR.
-                    .map(|(_k, addr, page_data)| (addr.hash_bits(), (addr, page_data)))
+                    .map(|(addr, page_data)| (addr.hash_bits(), (addr, page_data)))
                     .collect();
                 self.books = state.books.into_iter().collect();
                 u32::try_from(data.len()).map_err(|_| IpcError::ResourceExhausted)

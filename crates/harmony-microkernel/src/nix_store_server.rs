@@ -371,8 +371,9 @@ impl FileServer for NixStoreServer {
 
         match &payload {
             NixFidPayload::Root => {
-                // Root directory listing: sorted store path names.
+                // Root directory listing: sorted store path names + pseudo-files.
                 let mut listing = String::new();
+                listing.push_str("state\n");
                 for name in self.store_paths.keys() {
                     listing.push_str(name);
                     listing.push('\n');
@@ -835,7 +836,7 @@ mod tests {
         srv.open(0, OpenMode::Read).unwrap();
         let data = srv.read(0, 0, 4096).unwrap();
         let listing = core::str::from_utf8(&data).unwrap();
-        assert_eq!(listing, "aaa-first\nzzz-last\n");
+        assert_eq!(listing, "state\naaa-first\nzzz-last\n");
     }
 
     #[test]
