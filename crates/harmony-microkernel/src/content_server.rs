@@ -561,7 +561,7 @@ impl FileServer for ContentServer {
                     .map(|(_k, addr, page_data)| (addr.hash_bits(), (addr, page_data)))
                     .collect();
                 self.books = state.books.into_iter().collect();
-                Ok(u32::try_from(data.len()).unwrap_or(u32::MAX))
+                u32::try_from(data.len()).map_err(|_| IpcError::ResourceExhausted)
             }
         }
     }

@@ -445,7 +445,7 @@ impl FileServer for NixStoreServer {
                     .into_iter()
                     .map(|(k, v)| (Arc::from(k.as_str()), v))
                     .collect();
-                Ok(u32::try_from(data.len()).unwrap_or(u32::MAX))
+                u32::try_from(data.len()).map_err(|_| IpcError::ResourceExhausted)
             }
             _ => Err(IpcError::ReadOnly),
         }
