@@ -83,13 +83,21 @@ impl Hypervisor {
         x3: u64,
         frame_alloc: &mut dyn FnMut() -> Option<PhysAddr>,
     ) -> Result<HypervisorAction, HypervisorError> {
+        // Guest-allowed HVCs: exit and ping. Always permitted.
+        match x0 {
+            HVC_GUEST_EXIT => return self.hvc_guest_exit(x1),
+            HVC_PING => return Ok(HypervisorAction::HvcResult { x0: HVC_PONG }),
+            _ => {}
+        }
+        // Management HVCs: host-only. Reject if a guest is active.
+        if self.active_vmid.is_some() {
+            return Err(HypervisorError::InvalidHvc(x0));
+        }
         match x0 {
             HVC_VM_CREATE => self.hvc_vm_create(frame_alloc),
             HVC_VM_DESTROY => self.hvc_vm_destroy(x1),
             HVC_VM_START => self.hvc_vm_start(x1, x2),
             HVC_VM_MAP => self.hvc_vm_map(x1, x2, x3, frame_alloc),
-            HVC_GUEST_EXIT => self.hvc_guest_exit(x1),
-            HVC_PING => Ok(HypervisorAction::HvcResult { x0: HVC_PONG }),
             _ => Err(HypervisorError::InvalidHvc(x0)),
         }
     }
@@ -124,6 +132,11 @@ impl Hypervisor {
 
     fn hvc_vm_destroy(&mut self, x1: u64) -> Result<HypervisorAction, HypervisorError> {
         let vmid = VmId(x1 as u8);
+        // Defense-in-depth: never destroy the active VM (Stage-2 tables in use).
+        // Management HVCs are already host-only, but guard explicitly.
+        if self.active_vmid == Some(vmid) {
+            return Err(HypervisorError::VmAlreadyRunning(vmid));
+        }
         let vm = self
             .vms
             .remove(&vmid.0)
@@ -133,9 +146,6 @@ impl Hypervisor {
             (self.frame_dealloc)(frame);
         }
         self.vmid_alloc.free(vmid);
-        if self.active_vmid == Some(vmid) {
-            self.active_vmid = None;
-        }
         Ok(HypervisorAction::HvcResult { x0: 0 })
     }
 
@@ -839,7 +849,7 @@ mod tests {
             &mut alloc,
         )
         .unwrap();
-        // Try to start VM 2 while VM 1 is active
+        // Try to start VM 2 while VM 1 is active — management HVC rejected
         let result = hyp.handle(
             TrapEvent::HvcCall {
                 x0: HVC_VM_START,
@@ -849,9 +859,10 @@ mod tests {
             },
             &mut alloc,
         );
+        // Management HVCs are host-only; rejected with InvalidHvc when guest is active
         assert!(matches!(
             result,
-            Err(HypervisorError::VmAlreadyRunning(VmId(1)))
+            Err(HypervisorError::InvalidHvc(HVC_VM_START))
         ));
     }
 
@@ -893,5 +904,145 @@ mod tests {
             &mut alloc,
         );
         assert!(matches!(result, Err(HypervisorError::Stage2MapFailed(_))));
+    }
+
+    #[test]
+    fn guest_cannot_call_management_hvcs() {
+        let arena = vec![0u8; 65 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_START,
+                x1: 1,
+                x2: 0x4000_0000,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        // Guest tries to create a VM — rejected
+        let result = hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        );
+        assert!(matches!(result, Err(HypervisorError::InvalidHvc(_))));
+        // Guest tries to map memory — rejected
+        let result = hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_MAP,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        );
+        assert!(matches!(result, Err(HypervisorError::InvalidHvc(_))));
+        // Guest CAN call exit and ping
+        let action = hyp
+            .handle(
+                TrapEvent::HvcCall {
+                    x0: HVC_PING,
+                    x1: 0,
+                    x2: 0,
+                    x3: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        assert_eq!(
+            action,
+            HypervisorAction::HvcResult {
+                x0: crate::platform::HVC_PONG
+            }
+        );
+    }
+
+    #[test]
+    fn destroy_active_vm_rejected() {
+        let arena = vec![0u8; 65 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_START,
+                x1: 1,
+                x2: 0x4000_0000,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        // Guest exit to return to host
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_GUEST_EXIT,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        // Restart VM 1 to make it active again
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_START,
+                x1: 1,
+                x2: 0x4000_0000,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        // Guest exits
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_GUEST_EXIT,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        // Now from host: destroy VM 1 (should succeed since it's not active)
+        let action = hyp
+            .handle(
+                TrapEvent::HvcCall {
+                    x0: HVC_VM_DESTROY,
+                    x1: 1,
+                    x2: 0,
+                    x3: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        assert_eq!(action, HypervisorAction::HvcResult { x0: 0 });
     }
 }
