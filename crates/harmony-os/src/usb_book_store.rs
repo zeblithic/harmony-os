@@ -294,7 +294,10 @@ impl UsbBookStore {
     }
 
     pub fn is_full(&self) -> bool {
-        self.book_count as usize >= self.max_books()
+        // Check both: book_count (from superblock) and index.len() (actual
+        // parsed entries). They can diverge after a partial write / corruption.
+        let max = self.max_books();
+        self.book_count as usize >= max || self.index.len() >= max
     }
 
     // --- Serialization helpers -----------------------------------------------
@@ -335,7 +338,7 @@ impl UsbBookStore {
         let start_sector = u32::from_le_bytes(data[32..36].try_into().ok()?);
         let byte_length = u32::from_le_bytes(data[36..40].try_into().ok()?);
         // Reject entries pointing into superblock or index area.
-        if start_sector < DATA_START_SECTOR {
+        if start_sector < DATA_START_SECTOR || byte_length == 0 {
             return None;
         }
         Some(IndexEntry {
@@ -414,6 +417,9 @@ impl BookStore for UsbBookStore {
         data: &[u8],
         flags: ContentFlags,
     ) -> Result<ContentId, ContentError> {
+        if data.is_empty() {
+            return Err(ContentError::EmptyData);
+        }
         let cid = ContentId::for_book(data, flags)?;
         if !self.cache.contains_key(&cid) {
             if self.is_full() {
@@ -463,6 +469,10 @@ impl BookStore for UsbBookStore {
     }
 
     fn store(&mut self, cid: ContentId, data: Vec<u8>) {
+        if data.is_empty() {
+            eprintln!("[usb-book-store] zero-length book rejected");
+            return;
+        }
         if !self.cache.contains_key(&cid) {
             if self.is_full() {
                 eprintln!("[usb-book-store] index full, cannot store book");
