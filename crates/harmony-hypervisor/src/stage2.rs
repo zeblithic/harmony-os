@@ -70,7 +70,12 @@ fn desc_to_flags(desc: u64) -> Stage2Flags {
         MEMATTR_NORMAL_NC => Stage2MemAttr::NormalNonCacheable,
         _ => Stage2MemAttr::Device,
     };
-    Stage2Flags { readable, writable, executable, mem_attr }
+    Stage2Flags {
+        readable,
+        writable,
+        executable,
+        mem_attr,
+    }
 }
 
 // ── Stage2PageTable ─────────────────────────────────────────────────
@@ -83,7 +88,11 @@ pub struct Stage2PageTable {
 
 impl Stage2PageTable {
     pub fn new(root: PhysAddr, vmid: VmId, phys_to_virt: fn(PhysAddr) -> *mut u8) -> Self {
-        Self { root, vmid, phys_to_virt }
+        Self {
+            root,
+            vmid,
+            phys_to_virt,
+        }
     }
 
     pub fn root_paddr(&self) -> PhysAddr {
@@ -216,9 +225,11 @@ mod tests {
             // Allocate extra page for alignment
             let memory = vec![0u8; (num_pages + 1) * TEST_PAGE_SIZE as usize];
             let base = memory.as_ptr() as usize;
-            let aligned =
-                (base + TEST_PAGE_SIZE as usize - 1) & !(TEST_PAGE_SIZE as usize - 1);
-            Self { memory, next_free: aligned }
+            let aligned = (base + TEST_PAGE_SIZE as usize - 1) & !(TEST_PAGE_SIZE as usize - 1);
+            Self {
+                memory,
+                next_free: aligned,
+            }
         }
 
         fn alloc_frame(&mut self) -> Option<PhysAddr> {
@@ -268,7 +279,8 @@ mod tests {
         for i in 0..4u64 {
             let ipa = 0x4000_0000 + i * TEST_PAGE_SIZE;
             let pa = PhysAddr(0x8000_0000 + i * TEST_PAGE_SIZE);
-            pt.map(ipa, pa, Stage2Flags::GUEST_RAM, &mut || arena.alloc_frame()).unwrap();
+            pt.map(ipa, pa, Stage2Flags::GUEST_RAM, &mut || arena.alloc_frame())
+                .unwrap();
         }
         for i in 0..4u64 {
             let ipa = 0x4000_0000 + i * TEST_PAGE_SIZE;
@@ -283,7 +295,10 @@ mod tests {
         let root = arena.alloc_frame().unwrap();
         let mut pt = Stage2PageTable::new(root, VmId(1), TestArena::phys_to_virt);
         let pa = PhysAddr(0x8000_0000);
-        pt.map(0x4000_0000, pa, Stage2Flags::GUEST_RAM, &mut || arena.alloc_frame()).unwrap();
+        pt.map(0x4000_0000, pa, Stage2Flags::GUEST_RAM, &mut || {
+            arena.alloc_frame()
+        })
+        .unwrap();
         let unmapped = pt.unmap(0x4000_0000).unwrap();
         assert_eq!(unmapped, pa);
         assert_eq!(pt.walk(0x4000_0000), None);

@@ -34,11 +34,27 @@ pub fn unpack_vm_map_x1(x1: u64) -> (u8, u8, u16) {
 /// Events fed into the hypervisor by the platform shim after parsing ESR_EL2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrapEvent {
-    HvcCall { x0: u64, x1: u64, x2: u64, x3: u64 },
-    DataAbort { ipa: u64, access: AccessType, width: u8 },
-    InstructionAbort { ipa: u64 },
+    HvcCall {
+        x0: u64,
+        x1: u64,
+        x2: u64,
+        x3: u64,
+    },
+    DataAbort {
+        ipa: u64,
+        access: AccessType,
+        width: u8,
+    },
+    InstructionAbort {
+        ipa: u64,
+    },
     WfiWfe,
-    SmcForward { x0: u64, x1: u64, x2: u64, x3: u64 },
+    SmcForward {
+        x0: u64,
+        x1: u64,
+        x2: u64,
+        x3: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,7 +139,13 @@ mod tests {
 
     #[test]
     fn hvc_constants_are_unique() {
-        let ids = [HVC_VM_CREATE, HVC_VM_DESTROY, HVC_VM_START, HVC_VM_MAP, HVC_GUEST_EXIT];
+        let ids = [
+            HVC_VM_CREATE,
+            HVC_VM_DESTROY,
+            HVC_VM_START,
+            HVC_VM_MAP,
+            HVC_GUEST_EXIT,
+        ];
         for (i, a) in ids.iter().enumerate() {
             for b in &ids[i + 1..] {
                 assert_ne!(a, b);
@@ -133,7 +155,12 @@ mod tests {
 
     #[test]
     fn trap_event_variants_constructible() {
-        let _hvc = TrapEvent::HvcCall { x0: 0, x1: 0, x2: 0, x3: 0 };
+        let _hvc = TrapEvent::HvcCall {
+            x0: 0,
+            x1: 0,
+            x2: 0,
+            x3: 0,
+        };
         let _da = TrapEvent::DataAbort {
             ipa: 0x0900_0000,
             access: AccessType::Write { value: b'H' as u64 },
@@ -141,7 +168,12 @@ mod tests {
         };
         let _ia = TrapEvent::InstructionAbort { ipa: 0x4000_0000 };
         let _wfi = TrapEvent::WfiWfe;
-        let _smc = TrapEvent::SmcForward { x0: 0, x1: 0, x2: 0, x3: 0 };
+        let _smc = TrapEvent::SmcForward {
+            x0: 0,
+            x1: 0,
+            x2: 0,
+            x3: 0,
+        };
     }
 
     #[test]
