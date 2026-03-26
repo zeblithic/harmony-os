@@ -460,11 +460,16 @@ impl UsbBookStore {
     /// Shared validation + state mutation for inserting a new book.
     /// Called by both `insert_with_flags` and `store`.
     fn try_add_book(&mut self, cid: ContentId, data: &[u8]) -> Result<(), ContentError> {
-        // Check index too — a CID may be in the index but not the cache
-        // if load_book rejected it (hash mismatch). Don't create a duplicate.
-        if self.index.iter().any(|e| e.cid == cid) {
-            // Already indexed on disk; just populate the cache.
+        // Check index for existing CID — avoid creating a duplicate entry.
+        if let Some(entry) = self.index.iter().find(|e| e.cid == cid) {
+            let was_in_cache = self.cache.contains_key(&cid);
             self.cache.insert(cid, data.to_vec());
+            if !was_in_cache {
+                // CID is in the index but wasn't in the cache — load_book
+                // previously rejected it (hash mismatch). Queue a corrective
+                // write so the on-disk data is repaired for next cold start.
+                self.queue_book_write(entry.start_sector, data);
+            }
             return Ok(());
         }
         if self.is_full() {
