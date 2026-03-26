@@ -243,6 +243,9 @@ impl UsbBookStore {
                 }
             }
         }
+        // Reconcile book_count with actual parsed entries — the superblock
+        // value may be inflated if entries were corrupted and skipped.
+        self.book_count = self.index.len() as u32;
         actions
     }
 
@@ -445,6 +448,49 @@ impl UsbBookStore {
             data: self.serialize_superblock(),
         });
     }
+
+    /// Shared validation + state mutation for inserting a new book.
+    /// Called by both `insert_with_flags` and `store`.
+    fn try_add_book(&mut self, cid: ContentId, data: &[u8]) -> Result<(), ContentError> {
+        if self.is_full() {
+            return Err(ContentError::PayloadTooLarge {
+                size: self.book_count as usize,
+                max: self.max_books(),
+            });
+        }
+        let byte_length = u32::try_from(data.len()).map_err(|_| ContentError::PayloadTooLarge {
+            size: data.len(),
+            max: u32::MAX as usize,
+        })?;
+        let sectors_needed = byte_length.div_ceil(self.block_size);
+        if sectors_needed > u16::MAX as u32 {
+            return Err(ContentError::PayloadTooLarge {
+                size: data.len(),
+                max: u16::MAX as usize * self.block_size as usize,
+            });
+        }
+        let start_sector = self.next_free_sector;
+        let new_next = self.next_free_sector.checked_add(sectors_needed).ok_or(
+            ContentError::PayloadTooLarge {
+                size: data.len(),
+                max: u32::MAX as usize,
+            },
+        )?;
+
+        let on_disk_slot = self.next_on_disk_slot();
+        self.index.push(IndexEntry {
+            cid,
+            start_sector,
+            byte_length,
+            on_disk_slot,
+        });
+        self.book_count += 1;
+        self.next_free_sector = new_next;
+
+        self.cache.insert(cid, data.to_vec());
+        self.queue_book_write(start_sector, data);
+        Ok(())
+    }
 }
 
 // --- BookStore trait ---------------------------------------------------------
@@ -467,46 +513,7 @@ impl BookStore for UsbBookStore {
         }
         let cid = ContentId::for_book(data, flags)?;
         if !self.cache.contains_key(&cid) {
-            if self.is_full() {
-                return Err(ContentError::PayloadTooLarge {
-                    size: self.book_count as usize,
-                    max: self.max_books(),
-                });
-            }
-            let byte_length =
-                u32::try_from(data.len()).map_err(|_| ContentError::PayloadTooLarge {
-                    size: data.len(),
-                    max: u32::MAX as usize,
-                })?;
-            let sectors_needed = byte_length.div_ceil(self.block_size);
-            // Reject books that would be unloadable on cold restart
-            // (load_index ReadSectors.count is u16).
-            if sectors_needed > u16::MAX as u32 {
-                return Err(ContentError::PayloadTooLarge {
-                    size: data.len(),
-                    max: u16::MAX as usize * self.block_size as usize,
-                });
-            }
-            let start_sector = self.next_free_sector;
-            let new_next = self.next_free_sector.checked_add(sectors_needed).ok_or(
-                ContentError::PayloadTooLarge {
-                    size: data.len(),
-                    max: u32::MAX as usize,
-                },
-            )?;
-
-            let on_disk_slot = self.next_on_disk_slot();
-            self.index.push(IndexEntry {
-                cid,
-                start_sector,
-                byte_length,
-                on_disk_slot,
-            });
-            self.book_count += 1;
-            self.next_free_sector = new_next;
-
-            self.cache.insert(cid, data.to_vec());
-            self.queue_book_write(start_sector, data);
+            self.try_add_book(cid, data)?;
         }
         Ok(cid)
     }
@@ -525,38 +532,9 @@ impl BookStore for UsbBookStore {
             return;
         }
         if !self.cache.contains_key(&cid) {
-            if self.is_full() {
-                eprintln!("[usb-book-store] index full, cannot store book");
-                return;
+            if let Err(e) = self.try_add_book(cid, &data) {
+                eprintln!("[usb-book-store] store failed: {e:?}");
             }
-            let Ok(byte_length) = u32::try_from(data.len()) else {
-                eprintln!("[usb-book-store] book too large for u32 byte_length, skipping");
-                return;
-            };
-            let sectors_needed = byte_length.div_ceil(self.block_size);
-            if sectors_needed > u16::MAX as u32 {
-                eprintln!("[usb-book-store] book too large for u16 sector count, skipping");
-                return;
-            }
-            let start_sector = self.next_free_sector;
-            let Some(new_next) = self.next_free_sector.checked_add(sectors_needed) else {
-                eprintln!("[usb-book-store] next_free_sector overflow, skipping");
-                return;
-            };
-
-            let on_disk_slot = self.next_on_disk_slot();
-            self.index.push(IndexEntry {
-                cid,
-                start_sector,
-                byte_length,
-                on_disk_slot,
-            });
-            self.book_count += 1;
-            self.next_free_sector = new_next;
-
-            let data_ref = &*data;
-            self.queue_book_write(start_sector, data_ref);
-            self.cache.insert(cid, data);
         }
     }
 
