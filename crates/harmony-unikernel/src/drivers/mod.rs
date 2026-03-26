@@ -9,6 +9,7 @@ pub mod dma_pool;
 pub mod dwc_usb;
 pub mod genet;
 pub mod gpio;
+pub mod mass_storage;
 pub mod pl011;
 pub mod register_bank;
 pub mod sdhci;
