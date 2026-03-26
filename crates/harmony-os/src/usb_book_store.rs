@@ -404,14 +404,11 @@ impl UsbBookStore {
 
     /// Queue all USB write actions needed to persist a newly added book.
     ///
-    /// Assumes the book has already been added to `self.index` and
-    /// `self.book_count` / `self.next_free_sector` have been updated.
-    ///
     /// Queues three [`UsbStoreAction::WriteSectors`] actions:
     /// 1. The book's data (padded to a sector boundary).
-    /// 2. The index sector containing the new entry.
+    /// 2. The index sector containing the entry at `on_disk_slot`.
     /// 3. The updated superblock (sector 0).
-    fn queue_book_write(&mut self, start_sector: u32, data: &[u8]) {
+    fn queue_book_write(&mut self, start_sector: u32, on_disk_slot: u32, data: &[u8]) {
         let sectors_needed = (data.len() as u32).div_ceil(self.block_size);
 
         // 1. Book data padded to sector boundary.
@@ -423,12 +420,8 @@ impl UsbBookStore {
             data: padded,
         });
 
-        // 2. The index sector containing the new entry.
-        // Use on_disk_slot from the entry — this is the absolute position
-        // in the on-disk index, which may differ from the Vec position if
-        // corrupted entries were skipped during load_index.
-        let new_entry = &self.index[self.index.len() - 1];
-        let slot = new_entry.on_disk_slot as usize;
+        // 2. The index sector containing the entry at on_disk_slot.
+        let slot = on_disk_slot as usize;
         let entries_per_sector = self.block_size as usize / INDEX_ENTRY_SIZE;
         let sector_offset = slot / entries_per_sector;
         let index_sector = INDEX_START_SECTOR + sector_offset as u32;
@@ -468,7 +461,7 @@ impl UsbBookStore {
                 // CID is in the index but wasn't in the cache — load_book
                 // previously rejected it (hash mismatch). Queue a corrective
                 // write so the on-disk data is repaired for next cold start.
-                self.queue_book_write(entry.start_sector, data);
+                self.queue_book_write(entry.start_sector, entry.on_disk_slot, data);
             }
             return Ok(());
         }
@@ -517,7 +510,7 @@ impl UsbBookStore {
         self.next_free_sector = new_next;
 
         self.cache.insert(cid, data.to_vec());
-        self.queue_book_write(start_sector, data);
+        self.queue_book_write(start_sector, on_disk_slot, data);
         Ok(())
     }
 }
