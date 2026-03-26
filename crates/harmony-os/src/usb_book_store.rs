@@ -184,6 +184,7 @@ impl UsbBookStore {
     /// Returns `(cid, byte_length, ReadSectors)` so callers can trim
     /// sector-padded reads back to the actual book content.
     pub fn load_index(&mut self, data: &[u8]) -> Vec<(ContentId, u32, UsbStoreAction)> {
+        self.index.clear();
         let mut actions = Vec::new();
         let bs = self.block_size as usize;
         let entries_per_sector = bs / INDEX_ENTRY_SIZE;
@@ -359,8 +360,9 @@ impl UsbBookStore {
         let sectors_needed = (data.len() as u32).div_ceil(self.block_size);
 
         // 1. Book data padded to sector boundary.
+        // Multiply in usize to avoid u32 overflow for near-4GiB books.
         let mut padded = data.to_vec();
-        padded.resize((sectors_needed * self.block_size) as usize, 0);
+        padded.resize(sectors_needed as usize * self.block_size as usize, 0);
         self.pending_writes.push(UsbStoreAction::WriteSectors {
             start_lba: start_sector,
             data: padded,
@@ -426,7 +428,21 @@ impl BookStore for UsbBookStore {
                     max: u32::MAX as usize,
                 })?;
             let sectors_needed = byte_length.div_ceil(self.block_size);
+            // Reject books that would be unloadable on cold restart
+            // (load_index ReadSectors.count is u16).
+            if sectors_needed > u16::MAX as u32 {
+                return Err(ContentError::PayloadTooLarge {
+                    size: data.len(),
+                    max: u16::MAX as usize * self.block_size as usize,
+                });
+            }
             let start_sector = self.next_free_sector;
+            let new_next = self.next_free_sector.checked_add(sectors_needed).ok_or(
+                ContentError::PayloadTooLarge {
+                    size: data.len(),
+                    max: u32::MAX as usize,
+                },
+            )?;
 
             self.index.push(IndexEntry {
                 cid,
@@ -434,7 +450,7 @@ impl BookStore for UsbBookStore {
                 byte_length,
             });
             self.book_count += 1;
-            self.next_free_sector += sectors_needed;
+            self.next_free_sector = new_next;
 
             self.cache.insert(cid, data.to_vec());
             self.queue_book_write(start_sector, data);
@@ -457,7 +473,15 @@ impl BookStore for UsbBookStore {
                 return;
             };
             let sectors_needed = byte_length.div_ceil(self.block_size);
+            if sectors_needed > u16::MAX as u32 {
+                eprintln!("[usb-book-store] book too large for u16 sector count, skipping");
+                return;
+            }
             let start_sector = self.next_free_sector;
+            let Some(new_next) = self.next_free_sector.checked_add(sectors_needed) else {
+                eprintln!("[usb-book-store] next_free_sector overflow, skipping");
+                return;
+            };
 
             self.index.push(IndexEntry {
                 cid,
@@ -465,7 +489,7 @@ impl BookStore for UsbBookStore {
                 byte_length,
             });
             self.book_count += 1;
-            self.next_free_sector += sectors_needed;
+            self.next_free_sector = new_next;
 
             let data_ref = &*data;
             self.queue_book_write(start_sector, data_ref);
