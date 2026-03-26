@@ -388,6 +388,12 @@ impl FileServer for ConfigServer {
                 Ok(written)
             }
             NodeKind::State => {
+                // NOTE: State restore bypasses do_stage validation (signature
+                // verification, schema version check, CAS reference checks).
+                // This is intentional — /state is a trusted kernel-internal
+                // operation. The data was serialized from a ConfigServer that
+                // already validated everything. Re-validation would require
+                // CAS access which isn't available during state transfer.
                 let state: ConfigServerState =
                     ciborium::from_reader(data).map_err(|_| IpcError::InvalidArgument)?;
                 self.trusted_operators = state.trusted_operators;
