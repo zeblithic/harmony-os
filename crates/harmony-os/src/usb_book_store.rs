@@ -245,6 +245,7 @@ impl UsbBookStore {
     /// Verifies the content hash matches the expected CID. Returns `false`
     /// (and skips the insert) if the data doesn't match — indicating disk
     /// corruption or a caller pairing error.
+    #[must_use = "returns false when the CID hash does not match; ignoring this means the cache was not populated"]
     pub fn load_book(&mut self, cid: ContentId, data: Vec<u8>) -> bool {
         if !cid.verify_hash(&data) {
             eprintln!(
