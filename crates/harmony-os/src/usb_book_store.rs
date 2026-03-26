@@ -27,7 +27,9 @@ const INDEX_START_SECTOR: u32 = 1;
 const INDEX_SECTOR_COUNT: u16 = 256;
 const DATA_START_SECTOR: u32 = 257;
 const INDEX_ENTRY_SIZE: usize = 40;
-const MAX_BOOKS: usize = 3072;
+/// Max books for the default 512-byte block size (used in tests).
+#[cfg(test)]
+const MAX_BOOKS_512: usize = (512 / INDEX_ENTRY_SIZE) * INDEX_SECTOR_COUNT as usize;
 
 // --- Action type -------------------------------------------------------------
 
@@ -273,8 +275,13 @@ impl UsbBookStore {
     }
 
     /// Returns `true` if the index is at maximum capacity (3,072 entries).
+    /// Maximum number of books the index can hold for this block_size.
+    pub fn max_books(&self) -> usize {
+        (self.block_size as usize / INDEX_ENTRY_SIZE) * INDEX_SECTOR_COUNT as usize
+    }
+
     pub fn is_full(&self) -> bool {
-        self.book_count as usize >= MAX_BOOKS
+        self.book_count as usize >= self.max_books()
     }
 
     // --- Serialization helpers -----------------------------------------------
@@ -348,7 +355,9 @@ impl UsbBookStore {
         });
 
         // 2. The index sector containing the new entry.
-        let entry_index = self.book_count as usize - 1;
+        // Use index.len() rather than book_count — they can diverge if
+        // the superblock's book_count doesn't match actual parsed entries.
+        let entry_index = self.index.len() - 1;
         let entries_per_sector = self.block_size as usize / INDEX_ENTRY_SIZE;
         let sector_offset = entry_index / entries_per_sector;
         let index_sector = INDEX_START_SECTOR + sector_offset as u32;
@@ -389,7 +398,7 @@ impl BookStore for UsbBookStore {
             if self.is_full() {
                 return Err(ContentError::PayloadTooLarge {
                     size: self.book_count as usize,
-                    max: MAX_BOOKS,
+                    max: self.max_books(),
                 });
             }
             let byte_length =
@@ -749,10 +758,10 @@ mod tests {
         assert!(!store.is_full());
 
         // Manually inflate book_count to the limit
-        store.book_count = MAX_BOOKS as u32;
+        store.book_count = MAX_BOOKS_512 as u32;
         assert!(store.is_full());
 
-        store.book_count = MAX_BOOKS as u32 - 1;
+        store.book_count = MAX_BOOKS_512 as u32 - 1;
         assert!(!store.is_full());
     }
 
