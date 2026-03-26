@@ -8,6 +8,8 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use serde::{Deserialize, Serialize};
+
 use crate::content_server::{format_cid_hex, parse_hex_cid, slice_data, ContentServer};
 use crate::fid_tracker::FidTracker;
 use crate::node_config::NodeConfig;
@@ -24,6 +26,7 @@ const STAGE: QPath = 4;
 const COMMIT: QPath = 5;
 const ROLLBACK: QPath = 6;
 const NODE_CBOR: QPath = 7;
+const STATE: QPath = 8;
 
 // ── Node taxonomy ────────────────────────────────────────────────────
 
@@ -38,6 +41,22 @@ enum NodeKind {
     Commit,
     Rollback,
     NodeCbor,
+    State,
+}
+
+// ── State serialization ───────────────────────────────────────────────
+
+/// Serializable snapshot of transferable `ConfigServer` state.
+/// The `cas` Arc is excluded — it is infrastructure wiring, not server state.
+#[derive(Serialize, Deserialize)]
+struct ConfigServerState {
+    trusted_operators: Vec<[u8; 16]>,
+    active_cid: Option<[u8; 32]>,
+    active_config: Option<NodeConfig>,
+    pending_cid: Option<[u8; 32]>,
+    pending_config: Option<NodeConfig>,
+    previous_cid: Option<[u8; 32]>,
+    previous_config: Option<NodeConfig>,
 }
 
 // ── ConfigServer ─────────────────────────────────────────────────────
@@ -243,6 +262,7 @@ impl FileServer for ConfigServer {
                 "commit" => (COMMIT, NodeKind::Commit),
                 "rollback" => (ROLLBACK, NodeKind::Rollback),
                 "node.cbor" => (NODE_CBOR, NodeKind::NodeCbor),
+                "state" => (STATE, NodeKind::State),
                 _ => return Err(IpcError::NotFound),
             },
             // All non-root nodes are leaves — cannot walk into them.
@@ -252,7 +272,8 @@ impl FileServer for ConfigServer {
             | NodeKind::Stage
             | NodeKind::Commit
             | NodeKind::Rollback
-            | NodeKind::NodeCbor => return Err(IpcError::NotDirectory),
+            | NodeKind::NodeCbor
+            | NodeKind::State => return Err(IpcError::NotDirectory),
         };
 
         self.tracker.insert(new_fid, qpath, node)?;
@@ -280,6 +301,8 @@ impl FileServer for ConfigServer {
                     return Err(IpcError::PermissionDenied);
                 }
             }
+            // State allows Read, Write, and ReadWrite.
+            NodeKind::State => {}
         }
         entry.mark_open(mode);
         Ok(())
@@ -318,6 +341,20 @@ impl FileServer for ConfigServer {
             }
             // Write-only nodes — already handled above, but exhaustive match.
             NodeKind::Stage | NodeKind::Commit | NodeKind::Rollback => Err(IpcError::ReadOnly),
+            NodeKind::State => {
+                let state = ConfigServerState {
+                    trusted_operators: self.trusted_operators.clone(),
+                    active_cid: self.active_cid,
+                    active_config: self.active_config.clone(),
+                    pending_cid: self.pending_cid,
+                    pending_config: self.pending_config.clone(),
+                    previous_cid: self.previous_cid,
+                    previous_config: self.previous_config.clone(),
+                };
+                let mut buf = Vec::new();
+                ciborium::into_writer(&state, &mut buf).map_err(|_| IpcError::ResourceExhausted)?;
+                Ok(slice_data(&buf, offset, count))
+            }
         }
     }
 
@@ -348,6 +385,24 @@ impl FileServer for ConfigServer {
             }
             NodeKind::Rollback => {
                 self.do_rollback()?;
+                Ok(written)
+            }
+            NodeKind::State => {
+                // NOTE: State restore bypasses do_stage validation (signature
+                // verification, schema version check, CAS reference checks).
+                // This is intentional — /state is a trusted kernel-internal
+                // operation. The data was serialized from a ConfigServer that
+                // already validated everything. Re-validation would require
+                // CAS access which isn't available during state transfer.
+                let state: ConfigServerState =
+                    ciborium::from_reader(data).map_err(|_| IpcError::InvalidArgument)?;
+                self.trusted_operators = state.trusted_operators;
+                self.active_cid = state.active_cid;
+                self.active_config = state.active_config;
+                self.pending_cid = state.pending_cid;
+                self.pending_config = state.pending_config;
+                self.previous_cid = state.previous_cid;
+                self.previous_config = state.previous_config;
                 Ok(written)
             }
         }
@@ -414,6 +469,12 @@ impl FileServer for ConfigServer {
                     .as_ref()
                     .map(|c| c.to_cbor().len() as u64)
                     .unwrap_or(0),
+                file_type: FileType::Regular,
+            }),
+            NodeKind::State => Ok(FileStat {
+                qpath: STATE,
+                name: Arc::from("state"),
+                size: 0,
                 file_type: FileType::Regular,
             }),
         }
@@ -947,5 +1008,40 @@ mod tests {
             stage_config(&mut server, &signed_cid),
             Err(IpcError::InvalidArgument)
         );
+    }
+
+    #[test]
+    fn state_round_trip() {
+        let (cas, signed_cid, trusted) = setup();
+        let mut old = ConfigServer::new(cas.clone(), trusted.clone());
+
+        // Stage + commit a config
+        stage_config(&mut old, &signed_cid).unwrap();
+        commit(&mut old).unwrap();
+
+        // Read state
+        old.walk(0, 20, "state").unwrap();
+        old.open(20, OpenMode::Read).unwrap();
+        let state_bytes = old.read(20, 0, 4 * 1024 * 1024).unwrap();
+        old.clunk(20).unwrap();
+
+        // Write state to new server (same CAS Arc)
+        let mut new_srv = ConfigServer::new(cas, trusted);
+        new_srv.walk(0, 21, "state").unwrap();
+        new_srv.open(21, OpenMode::Write).unwrap();
+        new_srv.write(21, 0, &state_bytes).unwrap();
+        new_srv.clunk(21).unwrap();
+
+        // Verify: active CID matches
+        let active = read_active(&mut new_srv);
+        let expected = format_cid_hex(&signed_cid);
+        assert_eq!(core::str::from_utf8(&active).unwrap(), &expected);
+    }
+
+    #[test]
+    fn state_walk_exists() {
+        let (cas, _signed_cid, trusted) = setup();
+        let mut server = ConfigServer::new(cas, trusted);
+        server.walk(0, 1, "state").unwrap();
     }
 }

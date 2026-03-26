@@ -17,6 +17,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use harmony_athenaeum::{sha256_hash, Book, PageAddr, BOOK_MAX_SIZE};
+use serde::{Deserialize, Serialize};
 
 use crate::fid_tracker::FidTracker;
 use crate::{Fid, FileServer, FileStat, FileType, IpcError, OpenMode, QPath};
@@ -34,6 +35,7 @@ const ROOT: QPath = 0;
 const BOOKS_DIR: QPath = 1;
 const PAGES_DIR: QPath = 2;
 const INGEST: QPath = 3;
+const STATE: QPath = 4;
 /// Book QPaths: `BOOK_QPATH_BASE | u64_from_cid[0..8] & 0x7FFF_FFFF_FFFF_FFFF`.
 /// Bit 32 is always set (via OR), so minimum book QPath is `0x1_0000_0000`.
 /// Page QPaths: `0x1000_0000 + hash_bits` (hash_bits is 28 bits, max 0x0FFF_FFFF).
@@ -50,8 +52,16 @@ enum NodeKind {
     BooksDir,
     PagesDir,
     Ingest,
+    State,
     Book([u8; 32]),
     Page(PageAddr),
+}
+
+/// Serializable snapshot of ContentServer state for hot-swap.
+#[derive(Serialize, Deserialize)]
+struct ContentServerState {
+    pages: Vec<(PageAddr, Vec<u8>)>,
+    books: Vec<([u8; 32], Book)>,
 }
 
 // ── Ingest pipeline ─────────────────────────────────────────────────
@@ -395,6 +405,7 @@ impl FileServer for ContentServer {
                 "books" => (BOOKS_DIR, NodeKind::BooksDir),
                 "pages" => (PAGES_DIR, NodeKind::PagesDir),
                 "ingest" => (INGEST, NodeKind::Ingest),
+                "state" => (STATE, NodeKind::State),
                 _ => return Err(IpcError::NotFound),
             },
             NodeKind::BooksDir => {
@@ -418,7 +429,7 @@ impl FileServer for ContentServer {
                 (Self::page_qpath(&addr), NodeKind::Page(addr))
             }
             // Leaf nodes are not directories — cannot walk into them.
-            NodeKind::Book(_) | NodeKind::Page(_) | NodeKind::Ingest => {
+            NodeKind::Book(_) | NodeKind::Page(_) | NodeKind::Ingest | NodeKind::State => {
                 return Err(IpcError::NotDirectory);
             }
         };
@@ -460,6 +471,8 @@ impl FileServer for ContentServer {
                 entry.mark_open(mode);
                 return Ok(());
             }
+            // State allows any open mode — falls through to mark_open.
+            NodeKind::State => {}
         }
         entry.mark_open(mode);
         Ok(())
@@ -482,6 +495,24 @@ impl FileServer for ContentServer {
             }
             NodeKind::Book(cid) => self.read_book(cid, offset, count),
             NodeKind::Page(addr) => self.read_page_data(addr, offset, count),
+            NodeKind::State => {
+                // NOTE: State is re-serialized on every read call. The kernel's
+                // try_transfer_state does a single read(0, MAX_STATE_SIZE) — multi-read
+                // streaming is NOT supported (would produce inconsistent CBOR if state
+                // mutates between reads). For servers with state > MAX_STATE_SIZE,
+                // use persistent backing storage instead of in-memory state transfer.
+                let state = ContentServerState {
+                    pages: self
+                        .pages
+                        .iter()
+                        .map(|(_, (addr, data))| (*addr, data.clone()))
+                        .collect(),
+                    books: self.books.iter().map(|(&k, v)| (k, v.clone())).collect(),
+                };
+                let mut buf = Vec::new();
+                ciborium::into_writer(&state, &mut buf).map_err(|_| IpcError::ResourceExhausted)?;
+                Ok(slice_data(&buf, offset, count))
+            }
         }
     }
 
@@ -518,6 +549,18 @@ impl FileServer for ContentServer {
                     IngestState::Done(_) => Err(IpcError::InvalidArgument), // Already finalized
                 }
             }
+            NodeKind::State => {
+                let written = u32::try_from(data.len()).map_err(|_| IpcError::ResourceExhausted)?;
+                let state: ContentServerState =
+                    ciborium::from_reader(data).map_err(|_| IpcError::InvalidArgument)?;
+                self.pages = state
+                    .pages
+                    .into_iter()
+                    .map(|(addr, page_data)| (addr.hash_bits(), (addr, page_data)))
+                    .collect();
+                self.books = state.books.into_iter().collect();
+                Ok(written)
+            }
         }
     }
 
@@ -552,6 +595,12 @@ impl FileServer for ContentServer {
             NodeKind::Ingest => Ok(FileStat {
                 qpath: INGEST,
                 name: Arc::from("ingest"),
+                size: 0,
+                file_type: FileType::Regular,
+            }),
+            NodeKind::State => Ok(FileStat {
+                qpath: STATE,
+                name: Arc::from("state"),
                 size: 0,
                 file_type: FileType::Regular,
             }),
@@ -1203,5 +1252,62 @@ mod tests {
     fn has_book_false_for_missing() {
         let server = ContentServer::new();
         assert!(!server.has_book(&[0xBB; 32]));
+    }
+
+    // ── /state tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn state_walk_exists() {
+        let mut server = ContentServer::new();
+        let qpath = server.walk(0, 1, "state").unwrap();
+        assert!(qpath > 0);
+    }
+
+    #[test]
+    fn state_empty_server_round_trip() {
+        let mut old = ContentServer::new();
+        old.walk(0, 1, "state").unwrap();
+        old.open(1, OpenMode::Read).unwrap();
+        let state_bytes = old.read(1, 0, 65536).unwrap();
+        old.clunk(1).unwrap();
+
+        let mut new = ContentServer::new();
+        new.walk(0, 1, "state").unwrap();
+        new.open(1, OpenMode::Write).unwrap();
+        new.write(1, 0, &state_bytes).unwrap();
+        new.clunk(1).unwrap();
+
+        assert_eq!(new.book_count(), 0);
+        assert_eq!(new.page_count(), 0);
+    }
+
+    #[test]
+    fn state_round_trip() {
+        let mut old = ContentServer::new();
+        // Ingest a book
+        let blob = alloc::vec![0x42u8; 8000];
+        old.walk(0, 1, "ingest").unwrap();
+        old.open(1, OpenMode::ReadWrite).unwrap();
+        old.write(1, 0, &blob).unwrap();
+        let resp = old.read(1, 0, 256).unwrap();
+        let cid: [u8; 32] = resp[..32].try_into().unwrap();
+        old.clunk(1).unwrap();
+
+        // Read state
+        old.walk(0, 2, "state").unwrap();
+        old.open(2, OpenMode::Read).unwrap();
+        let state_bytes = old.read(2, 0, 4 * 1024 * 1024).unwrap();
+        old.clunk(2).unwrap();
+
+        // Write state to new server
+        let mut new = ContentServer::new();
+        new.walk(0, 1, "state").unwrap();
+        new.open(1, OpenMode::Write).unwrap();
+        new.write(1, 0, &state_bytes).unwrap();
+        new.clunk(1).unwrap();
+
+        // Verify: get_book_bytes works on new server
+        let restored = new.get_book_bytes(&cid).unwrap();
+        assert_eq!(restored, blob);
     }
 }

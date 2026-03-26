@@ -158,6 +158,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bs58"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -681,15 +690,16 @@ dependencies = [
 [[package]]
 name = "harmony-athenaeum"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#d1b131324ad017bce1df206c6c0e0ef73841e8db"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#bc65c85d1f67c6b6440c65b2c5a4599a7d8b8b75"
 dependencies = [
+ "serde",
  "sha2",
 ]
 
 [[package]]
 name = "harmony-compute"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#d1b131324ad017bce1df206c6c0e0ef73841e8db"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#bc65c85d1f67c6b6440c65b2c5a4599a7d8b8b75"
 dependencies = [
  "harmony-crypto",
  "thiserror",
@@ -699,7 +709,7 @@ dependencies = [
 [[package]]
 name = "harmony-content"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#d1b131324ad017bce1df206c6c0e0ef73841e8db"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#bc65c85d1f67c6b6440c65b2c5a4599a7d8b8b75"
 dependencies = [
  "harmony-crypto",
  "harmony-zenoh",
@@ -714,7 +724,7 @@ dependencies = [
 [[package]]
 name = "harmony-crypto"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#d1b131324ad017bce1df206c6c0e0ef73841e8db"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#bc65c85d1f67c6b6440c65b2c5a4599a7d8b8b75"
 dependencies = [
  "aes",
  "blake3",
@@ -738,14 +748,17 @@ dependencies = [
 [[package]]
 name = "harmony-identity"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#d1b131324ad017bce1df206c6c0e0ef73841e8db"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#bc65c85d1f67c6b6440c65b2c5a4599a7d8b8b75"
 dependencies = [
+ "base64",
+ "bs58",
  "ed25519-dalek",
  "harmony-crypto",
  "harmony-platform",
  "hashbrown 0.15.5",
  "rand_core 0.6.4",
  "serde",
+ "serde_json",
  "thiserror",
  "x25519-dalek",
  "zeroize",
@@ -802,7 +815,7 @@ dependencies = [
 [[package]]
 name = "harmony-platform"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#d1b131324ad017bce1df206c6c0e0ef73841e8db"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#bc65c85d1f67c6b6440c65b2c5a4599a7d8b8b75"
 dependencies = [
  "hashbrown 0.15.5",
  "rand_core 0.6.4",
@@ -812,7 +825,7 @@ dependencies = [
 [[package]]
 name = "harmony-reticulum"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#d1b131324ad017bce1df206c6c0e0ef73841e8db"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#bc65c85d1f67c6b6440c65b2c5a4599a7d8b8b75"
 dependencies = [
  "ed25519-dalek",
  "harmony-crypto",
@@ -840,7 +853,7 @@ dependencies = [
 [[package]]
 name = "harmony-workflow"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#d1b131324ad017bce1df206c6c0e0ef73841e8db"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#bc65c85d1f67c6b6440c65b2c5a4599a7d8b8b75"
 dependencies = [
  "harmony-compute",
  "harmony-crypto",
@@ -850,7 +863,7 @@ dependencies = [
 [[package]]
 name = "harmony-zenoh"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#d1b131324ad017bce1df206c6c0e0ef73841e8db"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#bc65c85d1f67c6b6440c65b2c5a4599a7d8b8b75"
 dependencies = [
  "harmony-crypto",
  "harmony-identity",
@@ -1800,6 +1813,21 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "tinyvec"
+version = "1.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e61e67053d25a4e82c844e8424039d9745781b3fc4f32b8d55ed50f5f667ef3"
+dependencies = [
+ "tinyvec_macros",
+]
+
+[[package]]
+name = "tinyvec_macros"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "token-cell"

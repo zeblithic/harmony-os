@@ -19,7 +19,7 @@ kernel = [
     "dep:harmony-crypto", "harmony-crypto/std",
     "dep:harmony-identity", "harmony-identity/std", "harmony-identity/test-utils",
     "dep:harmony-platform", "harmony-platform/std",
-    "dep:harmony-athenaeum", "harmony-athenaeum/std",
+    "dep:harmony-athenaeum", "harmony-athenaeum/std", "harmony-athenaeum/serde",
     "dep:rand_core",
     "dep:serde",
     "dep:ciborium",
