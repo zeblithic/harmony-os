@@ -495,6 +495,10 @@ impl BookStore for UsbBookStore {
             eprintln!("[usb-book-store] zero-length book rejected");
             return;
         }
+        if !cid.verify_hash(&data) {
+            eprintln!("[usb-book-store] CID-data mismatch in store(), rejecting");
+            return;
+        }
         if !self.cache.contains_key(&cid) {
             if self.is_full() {
                 eprintln!("[usb-book-store] index full, cannot store book");
