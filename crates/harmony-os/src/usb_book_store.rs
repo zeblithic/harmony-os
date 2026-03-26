@@ -51,6 +51,9 @@ pub enum UsbStoreError {
     InvalidMagic,
     /// Superblock version is not supported (expected `VERSION = 1`).
     UnsupportedVersion,
+    /// Superblock fields contain invalid values (zero block_size,
+    /// next_free_sector in reserved area, etc.).
+    CorruptedSuperblock,
     /// Data buffer is too short for the expected structure.
     DataTooShort,
 }
@@ -145,8 +148,16 @@ impl UsbBookStore {
             return Err(UsbStoreError::UnsupportedVersion);
         }
         self.book_count = u32::from_le_bytes(data[10..14].try_into().unwrap());
-        self.block_size = u32::from_le_bytes(data[14..18].try_into().unwrap());
-        self.next_free_sector = u32::from_le_bytes(data[18..22].try_into().unwrap());
+        let block_size = u32::from_le_bytes(data[14..18].try_into().unwrap());
+        if block_size < INDEX_ENTRY_SIZE as u32 {
+            return Err(UsbStoreError::CorruptedSuperblock);
+        }
+        self.block_size = block_size;
+        let next_free = u32::from_le_bytes(data[18..22].try_into().unwrap());
+        if next_free < DATA_START_SECTOR {
+            return Err(UsbStoreError::CorruptedSuperblock);
+        }
+        self.next_free_sector = next_free;
         Ok(())
     }
 
@@ -160,7 +171,9 @@ impl UsbBookStore {
     /// bytes).
     /// Parse the index and return `(ContentId, ReadSectors)` pairs so the
     /// caller can match each read action to the CID it should `load_book` with.
-    pub fn load_index(&mut self, data: &[u8]) -> Vec<(ContentId, UsbStoreAction)> {
+    /// Returns `(cid, byte_length, ReadSectors)` so callers can trim
+    /// sector-padded reads back to the actual book content.
+    pub fn load_index(&mut self, data: &[u8]) -> Vec<(ContentId, u32, UsbStoreAction)> {
         let mut actions = Vec::new();
         let bs = self.block_size as usize;
         let entries_per_sector = bs / INDEX_ENTRY_SIZE;
@@ -189,8 +202,10 @@ impl UsbBookStore {
                         continue;
                     };
                     let cid = entry.cid;
+                    let byte_length = entry.byte_length;
                     actions.push((
                         cid,
+                        byte_length,
                         UsbStoreAction::ReadSectors {
                             start_lba: entry.start_sector,
                             count,
@@ -611,16 +626,15 @@ mod tests {
                     store2.load_superblock(&data).unwrap();
                 } else {
                     let book_reads = store2.load_index(&data);
-                    // Execute book reads
-                    for (book_cid, book_action) in &book_reads {
+                    // Execute book reads — use byte_length to trim padding
+                    for (book_cid, byte_len, book_action) in &book_reads {
                         if let UsbStoreAction::ReadSectors {
                             start_lba: blba,
                             count: bcnt,
                         } = book_action
                         {
                             let book_bytes = read_sectors(&disk, BLOCK_SIZE, *blba, *bcnt);
-                            // Trim to actual byte_length from index
-                            let trimmed = book_bytes[..book_data.len()].to_vec();
+                            let trimmed = book_bytes[..*byte_len as usize].to_vec();
                             store2.load_book(*book_cid, trimmed);
                         }
                     }
@@ -799,14 +813,12 @@ mod tests {
         let idx_data = read_sectors(&disk, block_size, INDEX_START_SECTOR, INDEX_SECTOR_COUNT);
         let book_reads = store2.load_index(&idx_data);
 
-        // Each action is paired with its CID — no need to re-parse index.
+        // Each action is paired with its CID + byte_length for trimming.
         let _ = init_actions;
-        for (book_cid, book_action) in &book_reads {
+        for (book_cid, byte_len, book_action) in &book_reads {
             if let UsbStoreAction::ReadSectors { start_lba, count } = book_action {
                 let raw = read_sectors(&disk, block_size, *start_lba, *count);
-                // Find original data length for this CID
-                let original = cids.iter().find(|(c, _)| c == book_cid).unwrap().1;
-                let trimmed = raw[..original.len()].to_vec();
+                let trimmed = raw[..*byte_len as usize].to_vec();
                 store2.load_book(*book_cid, trimmed);
             }
         }
