@@ -426,6 +426,20 @@ impl FileServer for NixStoreServer {
             NixFidPayload::State => {
                 let state: NixStoreServerState =
                     ciborium::from_reader(data).map_err(|_| IpcError::InvalidArgument)?;
+                // Validate deserialized names with the same rules as import_nar.
+                for (name, _) in &state.store_paths {
+                    if name.is_empty()
+                        || name.contains('/')
+                        || name.contains('\0')
+                        || name.contains('\n')
+                        || name.contains('\r')
+                        || name == "."
+                        || name == ".."
+                        || name == "state"
+                    {
+                        return Err(IpcError::InvalidArgument);
+                    }
+                }
                 self.store_paths = state
                     .store_paths
                     .into_iter()

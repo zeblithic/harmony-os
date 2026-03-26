@@ -555,7 +555,10 @@ impl FileServer for ContentServer {
                 self.pages = state
                     .pages
                     .into_iter()
-                    .map(|(k, addr, page_data)| (k, (addr, page_data)))
+                    // Re-derive key from addr.hash_bits() rather than trusting
+                    // the serialized key — prevents inconsistent map keys with
+                    // malformed CBOR.
+                    .map(|(_k, addr, page_data)| (addr.hash_bits(), (addr, page_data)))
                     .collect();
                 self.books = state.books.into_iter().collect();
                 Ok(u32::try_from(data.len()).unwrap_or(u32::MAX))
