@@ -17,7 +17,7 @@
 //!
 //! ```rust,ignore
 //! let mut dev = MassStorageDevice::new(slot_id, bulk_in_ep, bulk_out_ep);
-//! let (cbw, _dir, _len) = dev.build_read_cbw(lba, 1);
+//! let (cbw, _dir, _len) = dev.build_read_cbw(lba, 1, 512);
 //! // Caller: bulk_out(cbw), bulk_in(512 bytes), bulk_in(13 bytes → csw)
 //! let csw = parse_csw(&csw_buf)?;
 //! ```
@@ -225,15 +225,18 @@ impl MassStorageDevice {
     /// Build a SCSI READ(10) CBW.
     ///
     /// `lba` is the starting logical block address (big-endian in CDB).
-    /// `sector_count` is the number of 512-byte sectors to read.
+    /// `sector_count` is the number of logical blocks to read.
+    /// `block_size` is the device's logical block size in bytes (from
+    /// `parse_read_capacity`).
     ///
-    /// Returns `(cbw, DataDirection::In, sector_count * 512)`.
+    /// Returns `(cbw, DataDirection::In, sector_count * block_size)`.
     pub fn build_read_cbw(
         &mut self,
         lba: u32,
         sector_count: u16,
+        block_size: u32,
     ) -> ([u8; 31], DataDirection, u32) {
-        let data_len = u32::from(sector_count) * 512;
+        let data_len = u32::from(sector_count) * block_size;
         let lba_bytes = lba.to_be_bytes();
         let count_bytes = sector_count.to_be_bytes();
         // READ(10) CDB layout:
@@ -262,15 +265,18 @@ impl MassStorageDevice {
     /// Build a SCSI WRITE(10) CBW.
     ///
     /// `lba` is the starting logical block address (big-endian in CDB).
-    /// `sector_count` is the number of 512-byte sectors to write.
+    /// `sector_count` is the number of logical blocks to write.
+    /// `block_size` is the device's logical block size in bytes (from
+    /// `parse_read_capacity`).
     ///
-    /// Returns `(cbw, DataDirection::Out, sector_count * 512)`.
+    /// Returns `(cbw, DataDirection::Out, sector_count * block_size)`.
     pub fn build_write_cbw(
         &mut self,
         lba: u32,
         sector_count: u16,
+        block_size: u32,
     ) -> ([u8; 31], DataDirection, u32) {
-        let data_len = u32::from(sector_count) * 512;
+        let data_len = u32::from(sector_count) * block_size;
         let lba_bytes = lba.to_be_bytes();
         let count_bytes = sector_count.to_be_bytes();
         // WRITE(10) CDB layout identical to READ(10) except opcode
@@ -572,14 +578,14 @@ mod tests {
     #[test]
     fn read_cbw_valid_signature() {
         let mut dev = make_device();
-        let (cbw, _, _) = dev.build_read_cbw(0, 1);
+        let (cbw, _, _) = dev.build_read_cbw(0, 1, 512);
         assert!(cbw_has_valid_signature(&cbw));
     }
 
     #[test]
     fn read_cbw_correct_opcode() {
         let mut dev = make_device();
-        let (cbw, _, _) = dev.build_read_cbw(0, 1);
+        let (cbw, _, _) = dev.build_read_cbw(0, 1, 512);
         assert_eq!(cbw_scsi_opcode(&cbw), SCSI_READ_10);
     }
 
@@ -587,7 +593,7 @@ mod tests {
     fn read_cbw_lba_big_endian_encoding() {
         let mut dev = make_device();
         let lba: u32 = 0x0102_0304;
-        let (cbw, _, _) = dev.build_read_cbw(lba, 1);
+        let (cbw, _, _) = dev.build_read_cbw(lba, 1, 512);
         // LBA is at CDB[2..6] → CBW bytes [17..21]
         assert_eq!(cbw[17], 0x01);
         assert_eq!(cbw[18], 0x02);
@@ -598,24 +604,32 @@ mod tests {
     #[test]
     fn read_cbw_sector_count_big_endian_encoding() {
         let mut dev = make_device();
-        let (cbw, _, _) = dev.build_read_cbw(0, 0x0102);
+        let (cbw, _, _) = dev.build_read_cbw(0, 0x0102, 512);
         // count is at CDB[7..9] → CBW bytes [22..24]
         assert_eq!(cbw[22], 0x01);
         assert_eq!(cbw[23], 0x02);
     }
 
     #[test]
-    fn read_cbw_data_length_is_sectors_times_512() {
+    fn read_cbw_data_length_uses_block_size() {
         let mut dev = make_device();
-        let (cbw, _, len) = dev.build_read_cbw(0, 4);
+        let (cbw, _, len) = dev.build_read_cbw(0, 4, 512);
         assert_eq!(len, 4 * 512);
         assert_eq!(cbw_data_len(&cbw), 4 * 512);
     }
 
     #[test]
+    fn read_cbw_data_length_4k_blocks() {
+        let mut dev = make_device();
+        let (cbw, _, len) = dev.build_read_cbw(0, 2, 4096);
+        assert_eq!(len, 2 * 4096);
+        assert_eq!(cbw_data_len(&cbw), 2 * 4096);
+    }
+
+    #[test]
     fn read_cbw_direction_in() {
         let mut dev = make_device();
-        let (cbw, dir, _) = dev.build_read_cbw(0, 1);
+        let (cbw, dir, _) = dev.build_read_cbw(0, 1, 512);
         assert_eq!(dir, DataDirection::In);
         assert_eq!(cbw_flags(&cbw), CBW_FLAG_IN);
     }
@@ -625,38 +639,46 @@ mod tests {
     #[test]
     fn write_cbw_valid_signature() {
         let mut dev = make_device();
-        let (cbw, _, _) = dev.build_write_cbw(0, 1);
+        let (cbw, _, _) = dev.build_write_cbw(0, 1, 512);
         assert!(cbw_has_valid_signature(&cbw));
     }
 
     #[test]
     fn write_cbw_correct_opcode() {
         let mut dev = make_device();
-        let (cbw, _, _) = dev.build_write_cbw(0, 1);
+        let (cbw, _, _) = dev.build_write_cbw(0, 1, 512);
         assert_eq!(cbw_scsi_opcode(&cbw), SCSI_WRITE_10);
     }
 
     #[test]
     fn write_cbw_direction_out_flag() {
         let mut dev = make_device();
-        let (cbw, dir, _) = dev.build_write_cbw(0, 1);
+        let (cbw, dir, _) = dev.build_write_cbw(0, 1, 512);
         assert_eq!(dir, DataDirection::Out);
         assert_eq!(cbw_flags(&cbw), CBW_FLAG_OUT);
     }
 
     #[test]
-    fn write_cbw_data_length_is_sectors_times_512() {
+    fn write_cbw_data_length_uses_block_size() {
         let mut dev = make_device();
-        let (cbw, _, len) = dev.build_write_cbw(0, 3);
+        let (cbw, _, len) = dev.build_write_cbw(0, 3, 512);
         assert_eq!(len, 3 * 512);
         assert_eq!(cbw_data_len(&cbw), 3 * 512);
+    }
+
+    #[test]
+    fn write_cbw_data_length_4k_blocks() {
+        let mut dev = make_device();
+        let (cbw, _, len) = dev.build_write_cbw(0, 1, 4096);
+        assert_eq!(len, 4096);
+        assert_eq!(cbw_data_len(&cbw), 4096);
     }
 
     #[test]
     fn write_cbw_lba_big_endian_encoding() {
         let mut dev = make_device();
         let lba: u32 = 0xDEAD_BEEF;
-        let (cbw, _, _) = dev.build_write_cbw(lba, 1);
+        let (cbw, _, _) = dev.build_write_cbw(lba, 1, 512);
         assert_eq!(cbw[17], 0xDE);
         assert_eq!(cbw[18], 0xAD);
         assert_eq!(cbw[19], 0xBE);
@@ -757,8 +779,8 @@ mod tests {
     #[test]
     fn tag_increments_across_different_command_types() {
         let mut dev = make_device();
-        let (cbw1, _, _) = dev.build_read_cbw(0, 1);
-        let (cbw2, _, _) = dev.build_write_cbw(0, 1);
+        let (cbw1, _, _) = dev.build_read_cbw(0, 1, 512);
+        let (cbw2, _, _) = dev.build_write_cbw(0, 1, 512);
         let (cbw3, _, _) = dev.build_read_capacity_cbw();
         assert_eq!(cbw_tag(&cbw1), 1);
         assert_eq!(cbw_tag(&cbw2), 2);
@@ -1024,7 +1046,7 @@ mod tests {
     #[test]
     fn cbw_cb_length_set_correctly_for_10byte_cdb() {
         let mut dev = make_device();
-        let (cbw, _, _) = dev.build_read_cbw(0, 1);
+        let (cbw, _, _) = dev.build_read_cbw(0, 1, 512);
         assert_eq!(cbw[14], 10, "bCBWCBLength for 10-byte CDB");
     }
 }
