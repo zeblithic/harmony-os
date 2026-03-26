@@ -262,7 +262,10 @@ impl UsbBookStore {
         let max_occupied = self
             .index
             .iter()
-            .map(|e| e.start_sector + e.byte_length.div_ceil(self.block_size))
+            .map(|e| {
+                e.start_sector
+                    .saturating_add(e.byte_length.div_ceil(self.block_size))
+            })
             .max()
             .unwrap_or(DATA_START_SECTOR);
         if max_occupied > self.next_free_sector {
