@@ -157,6 +157,7 @@ impl NixStoreServer {
             || name.contains('\r')
             || name == "."
             || name == ".."
+            || name == "state"
         {
             return Err(NarError::InvalidString);
         }
@@ -243,6 +244,11 @@ impl NixStoreServer {
                 let end = start
                     .saturating_add(count as usize)
                     .min(contents_offset.saturating_add(*contents_len));
+                // Bounds check: after /state restore, offsets may be inconsistent
+                // with the nar_blob if the transfer was truncated or malformed.
+                if end > sp.nar_blob.len() || start > sp.nar_blob.len() {
+                    return Vec::new();
+                }
                 sp.nar_blob[start..end].to_vec()
             }
             NarEntry::Symlink { target } => {
@@ -358,6 +364,9 @@ impl FileServer for NixStoreServer {
         if !entry.is_open() {
             return Err(IpcError::NotOpen);
         }
+        if matches!(entry.mode(), Some(OpenMode::Write)) {
+            return Err(IpcError::PermissionDenied);
+        }
         let payload = entry.payload.clone();
 
         match &payload {
@@ -387,6 +396,9 @@ impl FileServer for NixStoreServer {
                 Ok(self.read_entry_data(sp, nar_entry, offset, count))
             }
             NixFidPayload::State => {
+                // NOTE: re-serialized on every read. Single-read assumed
+                // (kernel's try_transfer_state does one read(0, MAX_STATE_SIZE)).
+                // Multi-read streaming NOT supported — would produce inconsistent CBOR.
                 let state = NixStoreServerState {
                     store_paths: self
                         .store_paths
@@ -405,6 +417,9 @@ impl FileServer for NixStoreServer {
         let entry = self.tracker.get(fid)?;
         if !entry.is_open() {
             return Err(IpcError::NotOpen);
+        }
+        if matches!(entry.mode(), Some(OpenMode::Read)) {
+            return Err(IpcError::PermissionDenied);
         }
         let payload = entry.payload.clone();
         match &payload {
@@ -650,7 +665,10 @@ mod tests {
         srv.walk(0, 1, "abc123-hello").unwrap();
         srv.walk(1, 2, "README").unwrap();
         srv.open(2, OpenMode::Read).unwrap();
-        assert_eq!(srv.write(2, 0, &[0xDE, 0xAD]), Err(IpcError::ReadOnly));
+        assert_eq!(
+            srv.write(2, 0, &[0xDE, 0xAD]),
+            Err(IpcError::PermissionDenied)
+        );
     }
 
     #[test]

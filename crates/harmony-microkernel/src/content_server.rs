@@ -496,6 +496,11 @@ impl FileServer for ContentServer {
             NodeKind::Book(cid) => self.read_book(cid, offset, count),
             NodeKind::Page(addr) => self.read_page_data(addr, offset, count),
             NodeKind::State => {
+                // NOTE: State is re-serialized on every read call. The kernel's
+                // try_transfer_state does a single read(0, MAX_STATE_SIZE) — multi-read
+                // streaming is NOT supported (would produce inconsistent CBOR if state
+                // mutates between reads). For servers with state > MAX_STATE_SIZE,
+                // use persistent backing storage instead of in-memory state transfer.
                 let state = ContentServerState {
                     pages: self
                         .pages
