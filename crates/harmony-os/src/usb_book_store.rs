@@ -67,6 +67,9 @@ struct IndexEntry {
     cid: ContentId,
     start_sector: u32,
     byte_length: u32,
+    /// Absolute slot position in the on-disk index (0-based).
+    /// Used by queue_book_write to compute the correct index sector.
+    on_disk_slot: u32,
 }
 
 // --- Main type ---------------------------------------------------------------
@@ -201,6 +204,7 @@ impl UsbBookStore {
 
         // Walk sector by sector, then entry by entry within each sector.
         // Each sector has `entries_per_sector` entries followed by padding.
+        let mut absolute_slot: u32 = 0;
         for sector in 0..INDEX_SECTOR_COUNT as usize {
             let sector_base = sector * bs;
             if sector_base >= data.len() {
@@ -211,9 +215,12 @@ impl UsbBookStore {
                 if offset + INDEX_ENTRY_SIZE > data.len() {
                     break;
                 }
-                if let Some(entry) =
+                let current_slot = absolute_slot;
+                absolute_slot += 1;
+                if let Some(mut entry) =
                     Self::parse_index_entry(&data[offset..offset + INDEX_ENTRY_SIZE])
                 {
+                    entry.on_disk_slot = current_slot;
                     let sectors_needed = entry.byte_length.div_ceil(self.block_size);
                     let Ok(count) = u16::try_from(sectors_needed) else {
                         eprintln!(
@@ -292,6 +299,16 @@ impl UsbBookStore {
         (store, actions)
     }
 
+    /// Compute the next available on-disk slot for a new index entry.
+    fn next_on_disk_slot(&self) -> u32 {
+        self.index
+            .iter()
+            .map(|e| e.on_disk_slot)
+            .max()
+            .map(|s| s + 1)
+            .unwrap_or(0)
+    }
+
     // --- Write management ----------------------------------------------------
 
     /// Retrieve and clear all queued write actions.
@@ -368,6 +385,7 @@ impl UsbBookStore {
             cid,
             start_sector,
             byte_length,
+            on_disk_slot: 0, // caller (load_index) sets the real value
         })
     }
 
@@ -395,20 +413,24 @@ impl UsbBookStore {
         });
 
         // 2. The index sector containing the new entry.
-        // Use index.len() rather than book_count — they can diverge if
-        // the superblock's book_count doesn't match actual parsed entries.
-        let entry_index = self.index.len() - 1;
+        // Use on_disk_slot from the entry — this is the absolute position
+        // in the on-disk index, which may differ from the Vec position if
+        // corrupted entries were skipped during load_index.
+        let new_entry = &self.index[self.index.len() - 1];
+        let slot = new_entry.on_disk_slot as usize;
         let entries_per_sector = self.block_size as usize / INDEX_ENTRY_SIZE;
-        let sector_offset = entry_index / entries_per_sector;
+        let sector_offset = slot / entries_per_sector;
         let index_sector = INDEX_START_SECTOR + sector_offset as u32;
-        let sector_start_entry = sector_offset * entries_per_sector;
 
+        // Write the full sector — need to find all entries that share this sector.
+        let sector_slot_start = sector_offset * entries_per_sector;
+        let sector_slot_end = sector_slot_start + entries_per_sector;
         let mut sector_data = vec![0u8; self.block_size as usize];
-        for i in 0..entries_per_sector {
-            let idx = sector_start_entry + i;
-            if idx < self.index.len() {
-                let entry_bytes = Self::serialize_index_entry(&self.index[idx]);
-                let offset = i * INDEX_ENTRY_SIZE;
+        for entry in &self.index {
+            let es = entry.on_disk_slot as usize;
+            if es >= sector_slot_start && es < sector_slot_end {
+                let entry_bytes = Self::serialize_index_entry(entry);
+                let offset = (es - sector_slot_start) * INDEX_ENTRY_SIZE;
                 sector_data[offset..offset + INDEX_ENTRY_SIZE].copy_from_slice(&entry_bytes);
             }
         }
@@ -473,10 +495,12 @@ impl BookStore for UsbBookStore {
                 },
             )?;
 
+            let on_disk_slot = self.next_on_disk_slot();
             self.index.push(IndexEntry {
                 cid,
                 start_sector,
                 byte_length,
+                on_disk_slot,
             });
             self.book_count += 1;
             self.next_free_sector = new_next;
@@ -520,10 +544,12 @@ impl BookStore for UsbBookStore {
                 return;
             };
 
+            let on_disk_slot = self.next_on_disk_slot();
             self.index.push(IndexEntry {
                 cid,
                 start_sector,
                 byte_length,
+                on_disk_slot,
             });
             self.book_count += 1;
             self.next_free_sector = new_next;
@@ -619,6 +645,7 @@ mod tests {
             cid,
             start_sector: 300,
             byte_length: data.len() as u32,
+            on_disk_slot: 0,
         };
         let bytes = UsbBookStore::serialize_index_entry(&entry);
         let parsed = UsbBookStore::parse_index_entry(&bytes).unwrap();
