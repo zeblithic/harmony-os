@@ -197,6 +197,14 @@ impl UsbBookStore {
     /// Returns `(cid, byte_length, ReadSectors)` so callers can trim
     /// sector-padded reads back to the actual book content.
     pub fn load_index(&mut self, data: &[u8]) -> Vec<(ContentId, u32, UsbStoreAction)> {
+        let expected = self.block_size as usize * INDEX_SECTOR_COUNT as usize;
+        if data.len() < expected {
+            eprintln!(
+                "[usb-book-store] load_index: expected {} bytes, got {}; index may be incomplete",
+                expected,
+                data.len()
+            );
+        }
         self.index.clear();
         let mut actions = Vec::new();
         let bs = self.block_size as usize;
@@ -452,6 +460,13 @@ impl UsbBookStore {
     /// Shared validation + state mutation for inserting a new book.
     /// Called by both `insert_with_flags` and `store`.
     fn try_add_book(&mut self, cid: ContentId, data: &[u8]) -> Result<(), ContentError> {
+        // Check index too — a CID may be in the index but not the cache
+        // if load_book rejected it (hash mismatch). Don't create a duplicate.
+        if self.index.iter().any(|e| e.cid == cid) {
+            // Already indexed on disk; just populate the cache.
+            self.cache.insert(cid, data.to_vec());
+            return Ok(());
+        }
         if self.is_full() {
             return Err(ContentError::PayloadTooLarge {
                 size: self.book_count as usize,
