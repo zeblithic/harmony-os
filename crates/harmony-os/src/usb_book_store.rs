@@ -159,6 +159,10 @@ impl UsbBookStore {
             return Err(UsbStoreError::CorruptedSuperblock);
         }
         self.block_size = block_size;
+        let max = (block_size as usize / INDEX_ENTRY_SIZE) * INDEX_SECTOR_COUNT as usize;
+        if self.book_count as usize > max {
+            return Err(UsbStoreError::CorruptedSuperblock);
+        }
         let next_free = u32::from_le_bytes(data[18..22].try_into().unwrap());
         if next_free < DATA_START_SECTOR {
             return Err(UsbStoreError::CorruptedSuperblock);
@@ -396,6 +400,13 @@ impl UsbBookStore {
 // --- BookStore trait ---------------------------------------------------------
 
 impl BookStore for UsbBookStore {
+    /// Insert a book into the USB store.
+    ///
+    /// Returns `ContentError::PayloadTooLarge` in two cases:
+    /// - **Index full**: `size` = book_count, `max` = max_books() (small, e.g. 3072).
+    ///   The store has no room for more entries.
+    /// - **Book too large**: `size` = data.len(), `max` = u32::MAX.
+    ///   Individual book exceeds the 4 GiB sector-addressing limit.
     fn insert_with_flags(
         &mut self,
         data: &[u8],
