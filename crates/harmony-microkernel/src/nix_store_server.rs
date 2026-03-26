@@ -433,6 +433,7 @@ impl FileServer for NixStoreServer {
         let payload = entry.payload.clone();
         match &payload {
             NixFidPayload::State => {
+                let written = u32::try_from(data.len()).map_err(|_| IpcError::ResourceExhausted)?;
                 let state: NixStoreServerState =
                     ciborium::from_reader(data).map_err(|_| IpcError::InvalidArgument)?;
                 // Validate deserialized names with the same rules as import_nar.
@@ -454,7 +455,7 @@ impl FileServer for NixStoreServer {
                     .into_iter()
                     .map(|(k, v)| (Arc::from(k.as_str()), v))
                     .collect();
-                u32::try_from(data.len()).map_err(|_| IpcError::ResourceExhausted)
+                Ok(written)
             }
             _ => Err(IpcError::ReadOnly),
         }

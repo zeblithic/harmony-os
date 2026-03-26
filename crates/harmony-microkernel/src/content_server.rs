@@ -550,18 +550,16 @@ impl FileServer for ContentServer {
                 }
             }
             NodeKind::State => {
+                let written = u32::try_from(data.len()).map_err(|_| IpcError::ResourceExhausted)?;
                 let state: ContentServerState =
                     ciborium::from_reader(data).map_err(|_| IpcError::InvalidArgument)?;
                 self.pages = state
                     .pages
                     .into_iter()
-                    // Re-derive key from addr.hash_bits() rather than trusting
-                    // the serialized key — prevents inconsistent map keys with
-                    // malformed CBOR.
                     .map(|(addr, page_data)| (addr.hash_bits(), (addr, page_data)))
                     .collect();
                 self.books = state.books.into_iter().collect();
-                u32::try_from(data.len()).map_err(|_| IpcError::ResourceExhausted)
+                Ok(written)
             }
         }
     }
