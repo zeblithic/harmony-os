@@ -254,6 +254,21 @@ impl UsbBookStore {
         // Reconcile book_count with actual parsed entries — the superblock
         // value may be inflated if entries were corrupted and skipped.
         self.book_count = self.index.len() as u32;
+
+        // Reconcile next_free_sector — after a crash between the index
+        // write and superblock write, the superblock's value may be stale.
+        // Compute the highest occupied sector across all entries to avoid
+        // overwriting existing data.
+        let max_occupied = self
+            .index
+            .iter()
+            .map(|e| e.start_sector + e.byte_length.div_ceil(self.block_size))
+            .max()
+            .unwrap_or(DATA_START_SECTOR);
+        if max_occupied > self.next_free_sector {
+            self.next_free_sector = max_occupied;
+        }
+
         actions
     }
 
