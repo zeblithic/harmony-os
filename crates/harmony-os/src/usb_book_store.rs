@@ -478,6 +478,15 @@ impl UsbBookStore {
         )?;
 
         let on_disk_slot = self.next_on_disk_slot();
+        // Guard against slot overflow into data area — can happen when
+        // gaps from skipped/corrupted entries push the next slot past
+        // max_books even though index.len() is below capacity.
+        if on_disk_slot as usize >= self.max_books() {
+            return Err(ContentError::PayloadTooLarge {
+                size: on_disk_slot as usize,
+                max: self.max_books(),
+            });
+        }
         self.index.push(IndexEntry {
             cid,
             start_sector,
