@@ -153,20 +153,24 @@ impl UsbBookStore {
         if version != VERSION {
             return Err(UsbStoreError::UnsupportedVersion);
         }
-        self.book_count = u32::from_le_bytes(data[10..14].try_into().unwrap());
+        // Parse and validate all fields into locals before committing,
+        // so self is untouched if any check fails.
+        let book_count = u32::from_le_bytes(data[10..14].try_into().unwrap());
         let block_size = u32::from_le_bytes(data[14..18].try_into().unwrap());
         if block_size < INDEX_ENTRY_SIZE as u32 {
             return Err(UsbStoreError::CorruptedSuperblock);
         }
-        self.block_size = block_size;
         let max = (block_size as usize / INDEX_ENTRY_SIZE) * INDEX_SECTOR_COUNT as usize;
-        if self.book_count as usize > max {
+        if book_count as usize > max {
             return Err(UsbStoreError::CorruptedSuperblock);
         }
         let next_free = u32::from_le_bytes(data[18..22].try_into().unwrap());
         if next_free < DATA_START_SECTOR {
             return Err(UsbStoreError::CorruptedSuperblock);
         }
+        // All validated — commit atomically.
+        self.book_count = book_count;
+        self.block_size = block_size;
         self.next_free_sector = next_free;
         Ok(())
     }
@@ -231,8 +235,20 @@ impl UsbBookStore {
 
     /// Insert a book into the in-memory cache after its data has been read
     /// from USB (as requested by [`Self::load_index`]).
-    pub fn load_book(&mut self, cid: ContentId, data: Vec<u8>) {
+    ///
+    /// Verifies the content hash matches the expected CID. Returns `false`
+    /// (and skips the insert) if the data doesn't match — indicating disk
+    /// corruption or a caller pairing error.
+    pub fn load_book(&mut self, cid: ContentId, data: Vec<u8>) -> bool {
+        if !cid.verify_hash(&data) {
+            eprintln!(
+                "[usb-book-store] CID hash mismatch on load, skipping {:?}",
+                hex::encode(cid.to_bytes())
+            );
+            return false;
+        }
         self.cache.insert(cid, data);
+        true
     }
 
     /// Initialize a fresh USB drive: creates a zeroed superblock and index.
@@ -697,7 +713,7 @@ mod tests {
                         {
                             let book_bytes = read_sectors(&disk, BLOCK_SIZE, *blba, *bcnt);
                             let trimmed = book_bytes[..*byte_len as usize].to_vec();
-                            store2.load_book(*book_cid, trimmed);
+                            assert!(store2.load_book(*book_cid, trimmed), "CID hash mismatch");
                         }
                     }
                 }
@@ -881,7 +897,7 @@ mod tests {
             if let UsbStoreAction::ReadSectors { start_lba, count } = book_action {
                 let raw = read_sectors(&disk, block_size, *start_lba, *count);
                 let trimmed = raw[..*byte_len as usize].to_vec();
-                store2.load_book(*book_cid, trimmed);
+                assert!(store2.load_book(*book_cid, trimmed), "CID hash mismatch");
             }
         }
 
