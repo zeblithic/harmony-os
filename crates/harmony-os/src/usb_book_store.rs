@@ -160,6 +160,12 @@ impl UsbBookStore {
         if block_size < INDEX_ENTRY_SIZE as u32 {
             return Err(UsbStoreError::CorruptedSuperblock);
         }
+        // On-disk block_size must match the device's actual sector size
+        // (passed to new()). A mismatch means this drive was formatted on
+        // a device with a different sector size and is incompatible.
+        if block_size != self.block_size {
+            return Err(UsbStoreError::CorruptedSuperblock);
+        }
         let max = (block_size as usize / INDEX_ENTRY_SIZE) * INDEX_SECTOR_COUNT as usize;
         if book_count as usize > max {
             return Err(UsbStoreError::CorruptedSuperblock);
@@ -169,8 +175,8 @@ impl UsbBookStore {
             return Err(UsbStoreError::CorruptedSuperblock);
         }
         // All validated — commit atomically.
+        // block_size already matches self.block_size (validated above).
         self.book_count = book_count;
-        self.block_size = block_size;
         self.next_free_sector = next_free;
         Ok(())
     }
