@@ -73,11 +73,27 @@ pub enum AccessType {
 /// + ISB) after any `HvcResult` returned from `HVC_VM_MAP`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HypervisorAction {
-    DestroyVm { vmid: VmId },
-    EmitChar { ch: u8 },
-    ForwardSmc { x0: u64, x1: u64, x2: u64, x3: u64 },
-    EnterGuest { vmid: VmId },
-    HvcResult { x0: u64 },
+    /// Resume the currently active guest without modification.
+    /// Used for trapped MMIO reads where no host-side effect is needed.
+    ResumeGuest,
+    DestroyVm {
+        vmid: VmId,
+    },
+    EmitChar {
+        ch: u8,
+    },
+    ForwardSmc {
+        x0: u64,
+        x1: u64,
+        x2: u64,
+        x3: u64,
+    },
+    EnterGuest {
+        vmid: VmId,
+    },
+    HvcResult {
+        x0: u64,
+    },
 }
 
 // ── Stage-2 flags ────────────────────────────────────────────────────
@@ -119,6 +135,8 @@ pub enum HypervisorError {
     Stage2MapFailed(VmError),
     VmAlreadyRunning(VmId),
     OutOfMemory,
+    /// A trap arrived but no guest VM is active (active_vmid is None).
+    NoActiveVm,
 }
 
 #[cfg(test)]

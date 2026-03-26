@@ -50,7 +50,7 @@ impl Hypervisor {
             TrapEvent::HvcCall { x0, x1, x2, x3 } => self.handle_hvc(x0, x1, x2, x3, frame_alloc),
             TrapEvent::DataAbort { ipa, access, .. } => self.handle_data_abort(ipa, access),
             TrapEvent::InstructionAbort { ipa: _ } => {
-                let vmid = self.active_vmid.unwrap_or(VmId(0));
+                let vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
                 if let Some(vm) = self.vms.get_mut(&vmid.0) {
                     vm.state = VmState::Halted;
                 }
@@ -132,15 +132,16 @@ impl Hypervisor {
     }
 
     fn hvc_vm_start(&mut self, x1: u64, x2: u64) -> Result<HypervisorAction, HypervisorError> {
+        // Reject if any VM is already active — host must wait for guest exit.
+        if let Some(active) = self.active_vmid {
+            return Err(HypervisorError::VmAlreadyRunning(active));
+        }
         let vmid = VmId(x1 as u8);
         let entry_ipa = x2;
         let vm = self
             .vms
             .get_mut(&vmid.0)
             .ok_or(HypervisorError::InvalidVmId(vmid))?;
-        if vm.state == VmState::Running {
-            return Err(HypervisorError::VmAlreadyRunning(vmid));
-        }
         // Cold-restart: reset register file so halted VMs don't start with stale state.
         if vm.state == VmState::Halted {
             vm.vcpu = VCpuContext::default();
@@ -205,15 +206,15 @@ impl Hypervisor {
         access: AccessType,
     ) -> Result<HypervisorAction, HypervisorError> {
         if ipa == VIRTUAL_UART_IPA {
-            let ch = match access {
-                AccessType::Write { value } => value as u8,
-                AccessType::Read => 0,
+            return match access {
+                AccessType::Write { value } => Ok(HypervisorAction::EmitChar { ch: value as u8 }),
+                // TX-only virtual UART: swallow reads silently.
+                AccessType::Read => Ok(HypervisorAction::ResumeGuest),
             };
-            return Ok(HypervisorAction::EmitChar { ch });
         }
         // Unknown IPA — kill the guest. Clear active_vmid atomically with the
         // DestroyVm decision, matching the WFI and guest_exit paths.
-        let vmid = self.active_vmid.unwrap_or(VmId(0));
+        let vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
         if let Some(vm) = self.vms.get_mut(&vmid.0) {
             vm.state = VmState::Halted;
         }
@@ -686,5 +687,162 @@ mod tests {
             )
             .unwrap();
         assert_eq!(action, HypervisorAction::HvcResult { x0: 0 });
+    }
+
+    #[test]
+    fn data_abort_without_active_vm_returns_error() {
+        let mut hyp = make_hypervisor();
+        let mut alloc = BumpAlloc::new(0x10_0000, 0x10_0000);
+        let result = hyp.handle(
+            TrapEvent::DataAbort {
+                ipa: 0xDEAD_0000,
+                access: AccessType::Read,
+                width: 4,
+            },
+            &mut || alloc.alloc(),
+        );
+        assert!(matches!(result, Err(HypervisorError::NoActiveVm)));
+    }
+
+    #[test]
+    fn instruction_abort_without_active_vm_returns_error() {
+        let mut hyp = make_hypervisor();
+        let mut alloc = BumpAlloc::new(0x10_0000, 0x10_0000);
+        let result = hyp.handle(
+            TrapEvent::InstructionAbort { ipa: 0x4000_0000 },
+            &mut || alloc.alloc(),
+        );
+        assert!(matches!(result, Err(HypervisorError::NoActiveVm)));
+    }
+
+    #[test]
+    fn uart_read_returns_resume_guest() {
+        let arena = vec![0u8; 64 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8);
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_START,
+                x1: 1,
+                x2: 0x4000_0000,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        let action = hyp
+            .handle(
+                TrapEvent::DataAbort {
+                    ipa: VIRTUAL_UART_IPA,
+                    access: AccessType::Read,
+                    width: 4,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        assert_eq!(action, HypervisorAction::ResumeGuest);
+    }
+
+    #[test]
+    fn vm_start_rejects_when_another_vm_active() {
+        let arena = vec![0u8; 128 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8);
+        // Create two VMs
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        // Start VM 1
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_START,
+                x1: 1,
+                x2: 0x4000_0000,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        // Try to start VM 2 while VM 1 is active
+        let result = hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_START,
+                x1: 2,
+                x2: 0x5000_0000,
+                x3: 0,
+            },
+            &mut alloc,
+        );
+        assert!(matches!(
+            result,
+            Err(HypervisorError::VmAlreadyRunning(VmId(1)))
+        ));
+    }
+
+    #[test]
+    fn double_map_same_ipa_rejected() {
+        let arena = vec![0u8; 64 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8);
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        // Map page once
+        let x1 = pack_vm_map_x1(1, 0b00_000_111, 1);
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_MAP,
+                x1,
+                x2: 0x4000_0000,
+                x3: 0x8000_0000,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        // Map same IPA again — should fail
+        let result = hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_MAP,
+                x1,
+                x2: 0x4000_0000,
+                x3: 0x9000_0000,
+            },
+            &mut alloc,
+        );
+        assert!(matches!(result, Err(HypervisorError::Stage2MapFailed(_))));
     }
 }

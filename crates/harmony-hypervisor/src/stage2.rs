@@ -137,6 +137,11 @@ impl Stage2PageTable {
 
         let table = self.table_mut(table_paddr);
         let idx = Self::index(ipa, 0);
+        if table[idx] & 0b11 != DESC_INVALID {
+            return Err(VmError::RegionConflict(harmony_microkernel::vm::VirtAddr(
+                ipa,
+            )));
+        }
         table[idx] = (pa.as_u64() & ADDR_MASK) | flags_to_desc(flags);
         Ok(())
     }
