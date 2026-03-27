@@ -83,6 +83,19 @@ impl QueuePair {
 
 The existing `NvmeDriver::identify_controller()` and
 `NvmeDriver::check_completion()` delegate to the admin `QueuePair`.
+The driver-level methods are kept as thin wrappers that preserve the
+existing public signatures:
+
+```rust
+// Wrapper preserves Result<Option<...>> return type from Phase 1.
+pub fn check_completion(
+    &mut self,
+    cqe_bytes: &[u8; 16],
+) -> Result<Option<CompletionResult>, NvmeError> {
+    Ok(self.admin.check_completion(cqe_bytes, self.doorbell_stride))
+}
+```
+
 Public API unchanged — all 13 Phase 1 tests pass without modification.
 
 ## NvmeDriver Struct Changes
@@ -112,6 +125,11 @@ State transitions:
 Uninitialized → init() → Disabled → setup_admin_queue() → Enabled
     → create_io_queues() + activate_io_queues() → Ready
 ```
+
+All admin commands (`identify_controller`, `identify_namespace`,
+`create_io_cq`, `create_io_sq`) accept both `Enabled` and `Ready`
+states. Phase 1's `identify_controller()` state guard must be updated
+from `state != Enabled` to `state != Enabled && state != Ready`.
 
 ## New Admin Commands
 
@@ -211,10 +229,11 @@ pub fn activate_io_queues(
 ) -> Result<(), NvmeError>
 ```
 
-This stores the `QueuePair` in `self.io` and transitions to `Ready`.
-The split between `create_io_queues()` (build commands) and
-`activate_io_queues()` (record success) preserves the sans-I/O contract:
-the driver never assumes commands succeeded until told.
+This constructs `QueuePair::new(1, sq_phys, cq_phys, size)`, stores
+it in `self.io`, and transitions to `Ready`. The split between
+`create_io_queues()` (build commands) and `activate_io_queues()`
+(record success) preserves the sans-I/O contract: the driver never
+assumes commands succeeded until told.
 
 ## Identify Namespace Response Parser
 
@@ -225,7 +244,7 @@ pub struct IdentifyNamespace {
     pub nsze: u64,           // bytes 0-7: namespace size in logical blocks
     pub ncap: u64,           // bytes 8-15: namespace capacity
     pub nuse: u64,           // bytes 16-23: namespace utilization
-    pub flbas: u8,           // byte 26: formatted LBA size index (bits 3:0)
+    pub flbas: u8,           // byte 26, raw value (use bits 3:0 as LBA format index)
     pub lba_size_bytes: u32, // derived: 2^(LBAF[flbas].LBADS)
 }
 ```
@@ -282,6 +301,7 @@ All tests use MockRegisterBank — no hardware needed.
 ### Identify Namespace tests
 - Correct SQE: opcode=0x06, CNS=0, NSID field set
 - Different NSIDs produce different SQEs
+- Rejects Disabled state
 
 ### parse_identify_namespace tests
 - Extracts NSZE, NCAP, NUSE, FLBAS from known buffer
