@@ -20,6 +20,7 @@ pub mod echo;
 pub mod fid_tracker;
 pub mod genet_server;
 pub mod gpio_server;
+pub mod net_device;
 #[cfg(feature = "kernel")]
 pub mod kernel;
 #[cfg(feature = "kernel")]
