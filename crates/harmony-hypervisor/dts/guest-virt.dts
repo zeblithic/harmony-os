@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
 // Device tree for the Harmony EL2 micro-VM virtual machine.
-// Describes minimal hardware for earlycon boot: one CPU, 128 MiB RAM,
-// PL011 UART at 0x0900_0000. No GIC — interrupts are not yet supported.
+// One CPU, 128 MiB RAM, GICv3, PL011 UART with interrupt.
 
 /dts-v1/;
 
@@ -26,12 +25,19 @@
 		reg = <0x0 0x40000000 0x0 0x08000000>;
 	};
 
-	// NOTE: interrupts and interrupt-parent are intentionally omitted.
-	// GIC emulation is a separate milestone (harmony-os-04p). Without
-	// them the full PL011 driver falls back to polling; earlycon works.
+	intc: interrupt-controller@8000000 {
+		compatible = "arm,gic-v3";
+		#interrupt-cells = <3>;
+		interrupt-controller;
+		reg = <0x0 0x08000000 0x0 0x10000>,
+		      <0x0 0x080a0000 0x0 0x20000>;
+	};
+
 	pl011@9000000 {
 		compatible = "arm,pl011", "arm,primecell";
 		reg = <0x0 0x09000000 0x0 0x1000>;
+		interrupts = <0 1 4>;
+		interrupt-parent = <&intc>;
 		clock-names = "uartclk", "apb_pclk";
 		clocks = <&apb_pclk>, <&apb_pclk>;
 	};
