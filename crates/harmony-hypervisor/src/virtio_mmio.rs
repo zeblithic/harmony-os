@@ -129,6 +129,11 @@ impl VirtioMmio {
         }
     }
 
+    /// Returns the link status from config space (VIRTIO_NET_S_LINK_UP).
+    pub fn link_status(&self) -> u16 {
+        u16::from_le_bytes([self.config[6], self.config[7]])
+    }
+
     /// Handle one MMIO access.
     ///
     /// `offset` is the byte offset from the device base address.

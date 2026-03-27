@@ -27,6 +27,7 @@ pub mod kernel;
 pub mod library_server;
 pub mod namespace;
 pub mod nar;
+pub mod net_device;
 #[cfg(feature = "kernel")]
 pub mod nix_store_server;
 #[cfg(feature = "kernel")]
@@ -34,6 +35,7 @@ pub mod node_config;
 pub mod sd_server;
 pub mod serial_server;
 pub mod uart_server;
+pub mod virtio_net_server;
 pub mod vm;
 
 #[cfg(feature = "kernel")]
