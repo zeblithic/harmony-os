@@ -9,6 +9,7 @@ use alloc::collections::BTreeMap;
 use crate::platform::{HVC_PING, HVC_PONG, VIRTUAL_UART_IPA, VIRTUAL_UART_SIZE};
 use crate::stage2::Stage2PageTable;
 use crate::trap::*;
+use crate::uart::VirtualUart;
 use crate::vcpu::{VCpuContext, Vm, VmState};
 use crate::vmid::{VmId, VmIdAllocator};
 use harmony_microkernel::vm::PhysAddr;
@@ -132,6 +133,7 @@ impl Hypervisor {
             vcpu: VCpuContext::default(),
             stage2,
             state: VmState::Created,
+            uart: VirtualUart::new(),
         };
         self.vms.insert(vmid.0, vm);
         Ok(HypervisorAction::HvcResult { x0: vmid.0 as u64 })
@@ -273,18 +275,14 @@ impl Hypervisor {
         let vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
 
         if (VIRTUAL_UART_IPA..VIRTUAL_UART_IPA + VIRTUAL_UART_SIZE).contains(&ipa) {
-            let offset = ipa - VIRTUAL_UART_IPA;
+            let offset = (ipa - VIRTUAL_UART_IPA) as u16;
+            let vm = self.vms.get_mut(&vmid.0).ok_or(HypervisorError::InvalidVmId(vmid.0 as u64))?;
+
             let (emit, read_value) = match access {
-                // UARTDR write (offset +0x00) → emit character to host console.
-                AccessType::Write { value } if offset == 0 => (Some(value as u8), 0),
-                // All other writes (UARTCR, UARTLCR_H, etc.) → swallow silently.
-                AccessType::Write { .. } => (None, 0),
-                // UARTFR (offset +0x18) read → TXFE (bit 7) + RXFE (bit 4).
-                // Without RXFE, guest RX path sees "data available" and spinloops.
-                AccessType::Read if offset == 0x18 => (None, (1 << 7) | (1 << 4)),
-                // All other reads → return 0.
-                AccessType::Read => (None, 0),
+                AccessType::Write { value } => (vm.uart.write(offset, value), 0),
+                AccessType::Read => (None, vm.uart.read(offset)),
             };
+
             return Ok(HypervisorAction::MmioResult {
                 emit,
                 read_value,
@@ -1216,5 +1214,82 @@ mod tests {
             )
             .unwrap();
         assert_eq!(action, HypervisorAction::HvcResult { x0: 0 });
+    }
+
+    #[test]
+    fn uart_probe_via_hypervisor() {
+        let arena = vec![0u8; 65 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
+
+        // Create VM
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+
+        // Start VM
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_START,
+                x1: 1,
+                x2: 0x4000_0000,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+
+        // Read PeriphID0 (IPA = VIRTUAL_UART_IPA + 0xFE0) → expect 0x11
+        let action = hyp
+            .handle(
+                TrapEvent::DataAbort {
+                    ipa: VIRTUAL_UART_IPA + 0xFE0,
+                    access: AccessType::Read,
+                    width: 4,
+                    srt: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        assert_eq!(
+            action,
+            HypervisorAction::MmioResult {
+                emit: None,
+                read_value: 0x11,
+                width: 4,
+                srt: 0,
+                pc_advance: 4,
+            }
+        );
+
+        // Write 'H' (0x48) to UARTDR (IPA = VIRTUAL_UART_IPA + 0x000) → expect emit Some(0x48)
+        let action = hyp
+            .handle(
+                TrapEvent::DataAbort {
+                    ipa: VIRTUAL_UART_IPA,
+                    access: AccessType::Write { value: 0x48 },
+                    width: 1,
+                    srt: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        assert_eq!(
+            action,
+            HypervisorAction::MmioResult {
+                emit: Some(0x48),
+                read_value: 0,
+                width: 1,
+                srt: 0,
+                pc_advance: 4,
+            }
+        );
     }
 }
