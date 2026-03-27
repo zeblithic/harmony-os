@@ -68,6 +68,61 @@ pub struct CompletionResult {
     pub cq_doorbell_value: u32,
 }
 
+// ── Queue pair ───────────────────────────────────────────────────────────
+
+/// A submission/completion queue pair.
+///
+/// Tracks the software-maintained tail, head, and phase pointers for one
+/// SQ+CQ pair.  Both admin (qid=0) and I/O (qid≥1) queues use this struct.
+pub struct QueuePair {
+    qid: u16,
+    sq_tail: u16,
+    // Fields used in Task 2 (check_completion) and beyond.
+    #[allow(dead_code)]
+    cq_head: u16,
+    #[allow(dead_code)]
+    cq_phase: bool,
+    #[allow(dead_code)]
+    sq_phys: u64,
+    #[allow(dead_code)]
+    cq_phys: u64,
+    size: u16,
+}
+
+impl QueuePair {
+    /// Create a new queue pair with all pointers at zero and phase=true.
+    pub fn new(qid: u16, sq_phys: u64, cq_phys: u64, size: u16) -> Self {
+        Self {
+            qid,
+            sq_tail: 0,
+            cq_head: 0,
+            cq_phase: true,
+            sq_phys,
+            cq_phys,
+            size,
+        }
+    }
+
+    /// Compute the byte offset into the SQ buffer for the current tail,
+    /// advance the tail (wrapping), and return an [`AdminCommand`] with
+    /// the SQE and doorbell information.
+    pub fn submit(&mut self, sqe: [u8; 64], doorbell_stride: u8) -> AdminCommand {
+        let sq_offset = (self.sq_tail as u64) * 64;
+        self.sq_tail = (self.sq_tail + 1) % self.size;
+
+        let stride = 4usize << doorbell_stride;
+        let doorbell_offset = 0x1000 + (2 * self.qid as usize) * stride;
+        let doorbell_value = self.sq_tail as u32;
+
+        AdminCommand {
+            sqe,
+            sq_offset,
+            doorbell_offset,
+            doorbell_value,
+        }
+    }
+}
+
 /// Parsed fields from the 4 KiB Identify Controller data structure.
 #[derive(Debug, Clone)]
 pub struct IdentifyController {
@@ -813,5 +868,45 @@ mod tests {
         assert_eq!(&ic.firmware_rev, fw);
         assert_eq!(ic.max_data_transfer, 5);
         assert_eq!(ic.num_namespaces, 1024);
+    }
+
+    // ── QueuePair unit tests ───────────────────────────────────────────────
+
+    #[test]
+    fn queue_pair_submit_computes_offset_and_advances_tail() {
+        let mut qp = QueuePair::new(0, 0x1_0000, 0x2_0000, 32);
+        let sqe = [0xABu8; 64];
+        let cmd = qp.submit(sqe, 0); // doorbell_stride=0
+
+        // sq_offset = tail(0) * 64 = 0
+        assert_eq!(cmd.sq_offset, 0);
+        // doorbell for SQ of qid=0, stride=0: 0x1000 + (2*0+0)*(4<<0) = 0x1000
+        assert_eq!(cmd.doorbell_offset, 0x1000);
+        // doorbell value = new tail = 1
+        assert_eq!(cmd.doorbell_value, 1);
+        // SQE bytes preserved
+        assert_eq!(cmd.sqe, [0xABu8; 64]);
+
+        // Second submit: offset = 1*64 = 64, tail advances to 2
+        let cmd2 = qp.submit([0xCDu8; 64], 0);
+        assert_eq!(cmd2.sq_offset, 64);
+        assert_eq!(cmd2.doorbell_value, 2);
+    }
+
+    #[test]
+    fn queue_pair_submit_wraps_tail() {
+        let mut qp = QueuePair::new(0, 0x1_0000, 0x2_0000, 2);
+        let _ = qp.submit([0u8; 64], 0); // tail: 0 → 1
+        let cmd = qp.submit([0u8; 64], 0); // tail: 1 → 0 (wrap)
+        assert_eq!(cmd.doorbell_value, 0);
+        assert_eq!(cmd.sq_offset, 64); // offset was computed before wrap
+    }
+
+    #[test]
+    fn queue_pair_submit_uses_io_queue_doorbell() {
+        // qid=1, doorbell_stride=0: SQ doorbell = 0x1000 + (2*1+0)*(4<<0) = 0x1008
+        let mut qp = QueuePair::new(1, 0x3_0000, 0x4_0000, 16);
+        let cmd = qp.submit([0u8; 64], 0);
+        assert_eq!(cmd.doorbell_offset, 0x1008);
     }
 }
