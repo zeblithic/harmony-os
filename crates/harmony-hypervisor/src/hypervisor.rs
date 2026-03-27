@@ -6,7 +6,7 @@
 
 use alloc::collections::BTreeMap;
 
-use crate::platform::{HVC_PING, HVC_PONG, VIRTUAL_UART_IPA};
+use crate::platform::{HVC_PING, HVC_PONG, VIRTUAL_UART_IPA, VIRTUAL_UART_SIZE};
 use crate::stage2::Stage2PageTable;
 use crate::trap::*;
 use crate::vcpu::{VCpuContext, Vm, VmState};
@@ -246,11 +246,15 @@ impl Hypervisor {
         // All data aborts require an active guest — reject early if host-only.
         let vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
 
-        if ipa == VIRTUAL_UART_IPA {
+        if (VIRTUAL_UART_IPA..VIRTUAL_UART_IPA + VIRTUAL_UART_SIZE).contains(&ipa) {
             return match access {
-                AccessType::Write { value } => Ok(HypervisorAction::EmitChar { ch: value as u8 }),
-                // TX-only virtual UART: swallow reads silently.
-                AccessType::Read => Ok(HypervisorAction::ResumeGuest),
+                // Only UARTDR (offset +0x00) produces output; all other writes are swallowed.
+                AccessType::Write { value } if ipa == VIRTUAL_UART_IPA => {
+                    Ok(HypervisorAction::EmitChar { ch: value as u8 })
+                }
+                // Writes to non-DR registers (UARTCR, UARTLCR_H, etc.) and all reads
+                // are silently consumed — TX-only virtual UART, no RX or config.
+                _ => Ok(HypervisorAction::ResumeGuest),
             };
         }
         // Unknown IPA — kill the guest. Clear active_vmid atomically with the
