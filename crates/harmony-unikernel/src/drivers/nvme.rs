@@ -517,6 +517,50 @@ impl<R: RegisterBank> NvmeDriver<R> {
 
         Ok(self.admin.submit(sqe, self.doorbell_stride))
     }
+
+    /// Build admin commands to create one I/O CQ+SQ pair (qid=1).
+    ///
+    /// Returns `[create_cq_cmd, create_sq_cmd]`.  The caller must execute
+    /// them in order, confirm both completions succeed, then call
+    /// [`activate_io_queues`] to record the result.
+    pub fn create_io_queues(
+        &mut self,
+        sq_phys: u64,
+        cq_phys: u64,
+        size: u16,
+    ) -> Result<[AdminCommand; 2], NvmeError> {
+        // Only allow in Enabled state — not Ready (queues already exist)
+        // or Disabled (admin queue not active).
+        if self.state != NvmeState::Enabled {
+            return Err(NvmeError::InvalidState);
+        }
+        let size = size.min(self.max_queue_entries);
+        let cq_cmd = self.create_io_cq(cq_phys, size)?;
+        let sq_cmd = self.create_io_sq(sq_phys, size)?;
+        Ok([cq_cmd, sq_cmd])
+    }
+
+    /// Record that the I/O queues were successfully created on the
+    /// controller.
+    ///
+    /// Call this after executing both commands from [`create_io_queues`]
+    /// and confirming successful completions.  Transitions the driver to
+    /// [`NvmeState::Ready`].
+    pub fn activate_io_queues(
+        &mut self,
+        sq_phys: u64,
+        cq_phys: u64,
+        size: u16,
+    ) -> Result<(), NvmeError> {
+        if self.state != NvmeState::Enabled {
+            return Err(NvmeError::InvalidState);
+        }
+
+        let size = size.min(self.max_queue_entries);
+        self.io = Some(QueuePair::new(1, sq_phys, cq_phys, size));
+        self.state = NvmeState::Ready;
+        Ok(())
+    }
 }
 
 // ── Completion checking ───────────────────────────────────────────────────────
@@ -1051,5 +1095,102 @@ mod tests {
         let cmd2 = driver.create_io_cq(0xBBBB_0000, 16).unwrap();
         // Doorbell values should be sequential (admin SQ tail advancing)
         assert_eq!(cmd1.doorbell_value, cmd2.doorbell_value - 1);
+    }
+
+    // ── create_io_queues + activate tests ─────────────────────────────────────
+
+    #[test]
+    fn create_io_queues_returns_cq_first_sq_second() {
+        let mut driver = enabled_driver();
+        let cmds = driver
+            .create_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
+            .unwrap();
+
+        // First command is Create I/O CQ (opcode 0x05)
+        let cdw0_cq = u32::from_le_bytes(cmds[0].sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0_cq & 0xFF, 0x05);
+
+        // Second command is Create I/O SQ (opcode 0x01)
+        let cdw0_sq = u32::from_le_bytes(cmds[1].sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0_sq & 0xFF, 0x01);
+    }
+
+    #[test]
+    fn create_io_queues_clamps_size() {
+        let mut driver = enabled_driver(); // MQES+1 = 64
+        let cmds = driver
+            .create_io_queues(0xBBBB_0000, 0xAAAA_0000, 256)
+            .unwrap();
+
+        // CDW10 of CQ: size-1 in upper 16 bits should be 63 (clamped to 64)
+        let cdw10 = u32::from_le_bytes(cmds[0].sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10 >> 16, 63);
+    }
+
+    #[test]
+    fn create_io_queues_rejects_disabled_state() {
+        let bank = mock_nvme_bank();
+        let mut driver = NvmeDriver::init(bank).unwrap();
+        assert_eq!(
+            driver.create_io_queues(0x1000, 0x2000, 16).unwrap_err(),
+            NvmeError::InvalidState
+        );
+    }
+
+    #[test]
+    fn create_io_queues_rejects_ready_state() {
+        let mut driver = enabled_driver();
+        driver
+            .activate_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
+            .unwrap();
+        assert_eq!(driver.state(), NvmeState::Ready);
+        // Already has I/O queues — should reject
+        assert_eq!(
+            driver
+                .create_io_queues(0xCCCC_0000, 0xDDDD_0000, 16)
+                .unwrap_err(),
+            NvmeError::InvalidState
+        );
+    }
+
+    #[test]
+    fn activate_io_queues_transitions_to_ready() {
+        let mut driver = enabled_driver();
+        assert_eq!(driver.state(), NvmeState::Enabled);
+
+        driver
+            .activate_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
+            .unwrap();
+
+        assert_eq!(driver.state(), NvmeState::Ready);
+        assert!(driver.io.is_some());
+        let io = driver.io.as_ref().unwrap();
+        assert_eq!(io.qid, 1);
+        assert_eq!(io.size, 32);
+    }
+
+    #[test]
+    fn activate_io_queues_rejects_double_activation() {
+        let mut driver = enabled_driver();
+        driver
+            .activate_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
+            .unwrap();
+        // Now Ready — second call should fail
+        assert_eq!(
+            driver
+                .activate_io_queues(0xCCCC_0000, 0xDDDD_0000, 16)
+                .unwrap_err(),
+            NvmeError::InvalidState
+        );
+    }
+
+    #[test]
+    fn activate_io_queues_rejects_disabled_state() {
+        let bank = mock_nvme_bank();
+        let mut driver = NvmeDriver::init(bank).unwrap();
+        assert_eq!(
+            driver.activate_io_queues(0x1000, 0x2000, 16).unwrap_err(),
+            NvmeError::InvalidState
+        );
     }
 }
