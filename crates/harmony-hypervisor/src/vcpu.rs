@@ -2,6 +2,7 @@
 //! vCPU context and VM state.
 
 use crate::stage2::Stage2PageTable;
+use crate::uart::VirtualUart;
 use crate::virtio_net::VirtioNetDevice;
 use crate::vmid::VmId;
 
@@ -38,6 +39,7 @@ pub struct Vm {
     pub vcpu: VCpuContext,
     pub stage2: Stage2PageTable,
     pub state: VmState,
+    pub uart: VirtualUart,
     pub virtio_net: VirtioNetDevice,
 }
 
