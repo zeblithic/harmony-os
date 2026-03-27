@@ -189,7 +189,7 @@ impl Hypervisor {
         frame_alloc: &mut dyn FnMut() -> Option<PhysAddr>,
     ) -> Result<HypervisorAction, HypervisorError> {
         let (vmid_raw, flags_raw, page_count) = unpack_vm_map_x1(x1);
-        let vmid = VmId(vmid_raw);
+        let vmid = Self::parse_vmid(vmid_raw as u64)?;
         let ipa_base = x2;
         let pa_base = x3;
 
@@ -240,12 +240,11 @@ impl Hypervisor {
     }
 
     fn hvc_guest_exit(&mut self, x1: u64) -> Result<HypervisorAction, HypervisorError> {
-        if let Some(vmid) = self.active_vmid {
-            if let Some(vm) = self.vms.get_mut(&vmid.0) {
-                vm.state = VmState::Halted;
-            }
-            self.active_vmid = None;
+        let vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
+        if let Some(vm) = self.vms.get_mut(&vmid.0) {
+            vm.state = VmState::Halted;
         }
+        self.active_vmid = None;
         Ok(HypervisorAction::HvcResult { x0: x1 })
     }
 
@@ -264,9 +263,9 @@ impl Hypervisor {
                 AccessType::Write { value } if offset == 0 => (Some(value as u8), 0),
                 // All other writes (UARTCR, UARTLCR_H, etc.) → swallow silently.
                 AccessType::Write { .. } => (None, 0),
-                // UARTFR (offset +0x18) read → report TX FIFO not full (bit 5 = 0)
-                // and TX FIFO empty (bit 7 = TXFE = 1) so guest doesn't spin.
-                AccessType::Read if offset == 0x18 => (None, 1 << 7),
+                // UARTFR (offset +0x18) read → TXFE (bit 7) + RXFE (bit 4).
+                // Without RXFE, guest RX path sees "data available" and spinloops.
+                AccessType::Read if offset == 0x18 => (None, (1 << 7) | (1 << 4)),
                 // All other reads → return 0.
                 AccessType::Read => (None, 0),
             };
@@ -938,7 +937,7 @@ mod tests {
             action,
             HypervisorAction::MmioResult {
                 emit: None,
-                read_value: 1 << 7, // TXFE = TX FIFO empty
+                read_value: (1 << 7) | (1 << 4), // TXFE + RXFE
                 pc_advance: 4,
             }
         );

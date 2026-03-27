@@ -98,6 +98,11 @@ pub struct Stage2PageTable {
 }
 
 impl Stage2PageTable {
+    /// Creates a new Stage-2 page table rooted at `root`.
+    ///
+    /// **Precondition**: the page at `root` must already be zero-initialized.
+    /// `hvc_vm_create` satisfies this via `write_bytes`; callers in other
+    /// contexts must do the same.
     pub fn new(root: PhysAddr, vmid: VmId, phys_to_virt: fn(PhysAddr) -> *mut u8) -> Self {
         Self {
             root,
