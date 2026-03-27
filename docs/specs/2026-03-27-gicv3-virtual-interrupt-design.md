@@ -77,7 +77,7 @@ MMIO region: `0x0800_0000` – `0x0800_FFFF` (64 KiB).
 | 0x0400 | GICD_IPRIORITYR[0..15] | Priority bytes | Store bytes |
 | 0x0800 | GICD_ITARGETSR[0..15] | 0x01 (CPU 0) | Ignored (single vCPU) |
 | 0x0C00 | GICD_ICFGR[0..3] | Stored | Store |
-| 0xFFD0 | GICD_PIDR2 | 0x3B (GICv3 arch revision) | — |
+| 0xFFE8 | GICD_PIDR2 | 0x3B (GICv3 arch revision) | — |
 | Other PIDR/CIDR | ID registers | GICv3 identification | — |
 
 Registers beyond the 64-IRQ range (offset ≥ array bounds) read as 0,
