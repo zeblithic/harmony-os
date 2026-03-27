@@ -7,7 +7,6 @@
 //! `MmioResponse` — no I/O is performed here.
 
 use crate::trap::AccessType;
-use core::cmp::min;
 
 // ── Register offsets ─────────────────────────────────────────────────────────
 
@@ -64,7 +63,7 @@ pub enum MmioResponse {
 }
 
 /// Per-queue configuration state programmed by the driver.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QueueConfig {
     pub num: u16,
     pub ready: bool,
@@ -174,53 +173,73 @@ impl VirtioMmio {
                 self.queue_sel = value as u32;
                 MmioResponse::WriteAck
             }
-            (REG_QUEUE_NUM_MAX, AccessType::Read) => MmioResponse::ReadValue(QUEUE_NUM_MAX as u64),
+            (REG_QUEUE_NUM_MAX, AccessType::Read) => {
+                // VirtIO 1.2 §4.2.2.1: return 0 for unavailable queues.
+                if self.queue_sel as usize >= NUM_QUEUES {
+                    MmioResponse::ReadValue(0)
+                } else {
+                    MmioResponse::ReadValue(QUEUE_NUM_MAX as u64)
+                }
+            }
             (REG_QUEUE_NUM, AccessType::Write { value }) => {
                 let n = value as u16;
-                if n > 0 && n.is_power_of_two() && n as u32 <= QUEUE_NUM_MAX {
-                    self.selected_queue().num = n;
+                if let Some(q) = self.selected_queue_checked() {
+                    if n > 0 && n.is_power_of_two() && n as u32 <= QUEUE_NUM_MAX {
+                        q.num = n;
+                    }
                 }
                 MmioResponse::WriteAck
             }
             (REG_QUEUE_READY, AccessType::Read) => {
-                let ready = self.selected_queue().ready as u64;
+                let ready = self.selected_queue_checked().map_or(0, |q| q.ready as u64);
                 MmioResponse::ReadValue(ready)
             }
             (REG_QUEUE_READY, AccessType::Write { value }) => {
-                self.selected_queue().ready = value != 0;
+                if let Some(q) = self.selected_queue_checked() {
+                    q.ready = value != 0;
+                }
                 MmioResponse::WriteAck
             }
 
             // ── Queue descriptor/available/used ring addresses ────────────────
+            // All silently ignored if queue_sel is out of range.
             (REG_QUEUE_DESC_LOW, AccessType::Write { value }) => {
-                let q = self.selected_queue();
-                q.desc_addr = (q.desc_addr & 0xFFFF_FFFF_0000_0000) | (value & 0xFFFF_FFFF);
+                if let Some(q) = self.selected_queue_checked() {
+                    q.desc_addr = (q.desc_addr & 0xFFFF_FFFF_0000_0000) | (value & 0xFFFF_FFFF);
+                }
                 MmioResponse::WriteAck
             }
             (REG_QUEUE_DESC_HIGH, AccessType::Write { value }) => {
-                let q = self.selected_queue();
-                q.desc_addr = (q.desc_addr & 0x0000_0000_FFFF_FFFF) | ((value & 0xFFFF_FFFF) << 32);
+                if let Some(q) = self.selected_queue_checked() {
+                    q.desc_addr =
+                        (q.desc_addr & 0x0000_0000_FFFF_FFFF) | ((value & 0xFFFF_FFFF) << 32);
+                }
                 MmioResponse::WriteAck
             }
             (REG_QUEUE_AVAIL_LOW, AccessType::Write { value }) => {
-                let q = self.selected_queue();
-                q.avail_addr = (q.avail_addr & 0xFFFF_FFFF_0000_0000) | (value & 0xFFFF_FFFF);
+                if let Some(q) = self.selected_queue_checked() {
+                    q.avail_addr = (q.avail_addr & 0xFFFF_FFFF_0000_0000) | (value & 0xFFFF_FFFF);
+                }
                 MmioResponse::WriteAck
             }
             (REG_QUEUE_AVAIL_HIGH, AccessType::Write { value }) => {
-                let q = self.selected_queue();
-                q.avail_addr =
-                    (q.avail_addr & 0x0000_0000_FFFF_FFFF) | ((value & 0xFFFF_FFFF) << 32);
+                if let Some(q) = self.selected_queue_checked() {
+                    q.avail_addr =
+                        (q.avail_addr & 0x0000_0000_FFFF_FFFF) | ((value & 0xFFFF_FFFF) << 32);
+                }
                 MmioResponse::WriteAck
             }
             (REG_QUEUE_USED_LOW, AccessType::Write { value }) => {
-                let q = self.selected_queue();
-                q.used_addr = (q.used_addr & 0xFFFF_FFFF_0000_0000) | (value & 0xFFFF_FFFF);
+                if let Some(q) = self.selected_queue_checked() {
+                    q.used_addr = (q.used_addr & 0xFFFF_FFFF_0000_0000) | (value & 0xFFFF_FFFF);
+                }
                 MmioResponse::WriteAck
             }
             (REG_QUEUE_USED_HIGH, AccessType::Write { value }) => {
-                let q = self.selected_queue();
-                q.used_addr = (q.used_addr & 0x0000_0000_FFFF_FFFF) | ((value & 0xFFFF_FFFF) << 32);
+                if let Some(q) = self.selected_queue_checked() {
+                    q.used_addr =
+                        (q.used_addr & 0x0000_0000_FFFF_FFFF) | ((value & 0xFFFF_FFFF) << 32);
+                }
                 MmioResponse::WriteAck
             }
 
@@ -242,6 +261,17 @@ impl VirtioMmio {
             (REG_STATUS, AccessType::Read) => MmioResponse::ReadValue(self.status as u64),
             (REG_STATUS, AccessType::Write { value }) => {
                 self.status = value as u32;
+                // VirtIO 1.2 §2.1: writing 0 triggers a device reset.
+                if self.status == 0 {
+                    self.driver_features = 0;
+                    self.queue_sel = 0;
+                    self.device_features_sel = 0;
+                    self.driver_features_sel = 0;
+                    self.interrupt_status = 0;
+                    for q in &mut self.queues {
+                        *q = QueueConfig::default();
+                    }
+                }
                 MmioResponse::StatusChanged {
                     status: self.status,
                 }
@@ -267,8 +297,9 @@ impl VirtioMmio {
     /// Return a mutable reference to the currently-selected queue.
     ///
     /// Clamps `queue_sel` to the valid range `[0, NUM_QUEUES - 1]`.
-    fn selected_queue(&mut self) -> &mut QueueConfig {
-        &mut self.queues[min(self.queue_sel, (NUM_QUEUES - 1) as u32) as usize]
+    /// Returns the currently selected queue, or None if queue_sel is out of range.
+    fn selected_queue_checked(&mut self) -> Option<&mut QueueConfig> {
+        self.queues.get_mut(self.queue_sel as usize)
     }
 }
 

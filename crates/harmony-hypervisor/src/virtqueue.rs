@@ -98,6 +98,11 @@ impl DescriptorChain {
             return Err(VirtQueueError::ChainTooLong);
         }
 
+        // Validate guest-supplied index before computing offset.
+        if next_idx >= self.queue_size {
+            return Err(VirtQueueError::ChainTooLong);
+        }
+
         let base = self.desc_offset + (next_idx as usize) * DESC_SIZE;
         let addr = read_u64(mem, base);
         let len = read_u32(mem, base + 8);
@@ -249,6 +254,9 @@ impl VirtQueue {
     /// Returns `true` if the driver should be notified after `push_used`.
     ///
     /// Checks the `VRING_AVAIL_F_NO_INTERRUPT` flag in the available ring.
+    /// Currently unused — will be called when GIC interrupt injection is
+    /// implemented (harmony-os-04p).
+    #[allow(dead_code)]
     pub fn needs_notification(&self, mem: &[u8]) -> bool {
         let avail_flags = read_u16(mem, self.avail_offset);
         avail_flags & VRING_AVAIL_F_NO_INTERRUPT == 0
