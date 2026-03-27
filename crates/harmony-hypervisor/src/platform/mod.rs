@@ -18,6 +18,11 @@ pub const HVC_PING: u64 = 0x4856_FFFF;
 /// Expected HVC ping response.
 pub const HVC_PONG: u64 = 0x4856_FFFE;
 
+/// CNTHCTL_EL2 value for guest entry: EL1PCTEN (bit 0) + EL1PCEN (bit 1).
+pub const GUEST_CNTHCTL_EL2: u64 = 0b11;
+/// CNTVOFF_EL2 value: zero offset (virtual == physical counter).
+pub const GUEST_CNTVOFF_EL2: u64 = 0;
+
 #[cfg(test)]
 mod tests {
     use super::*;

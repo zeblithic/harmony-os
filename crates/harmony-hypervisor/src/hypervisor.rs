@@ -6,7 +6,10 @@
 
 use alloc::collections::BTreeMap;
 
-use crate::platform::{HVC_PING, HVC_PONG, VIRTUAL_UART_IPA, VIRTUAL_UART_SIZE};
+use crate::platform::{
+    GUEST_CNTHCTL_EL2, GUEST_CNTVOFF_EL2, HVC_PING, HVC_PONG, VIRTUAL_UART_IPA,
+    VIRTUAL_UART_SIZE,
+};
 use crate::stage2::Stage2PageTable;
 use crate::trap::*;
 use crate::uart::VirtualUart;
@@ -208,6 +211,8 @@ impl Hypervisor {
             stage2_root,
             elr_el2: vm.vcpu.elr_el2,
             spsr_el2: vm.vcpu.spsr_el2,
+            cnthctl_el2: GUEST_CNTHCTL_EL2,
+            cntvoff_el2: GUEST_CNTVOFF_EL2,
         })
     }
 
@@ -513,6 +518,57 @@ mod tests {
             action,
             HypervisorAction::EnterGuest { vmid: VmId(1), .. }
         ));
+    }
+
+    #[test]
+    fn enter_guest_includes_timer_config() {
+        use crate::platform::{GUEST_CNTHCTL_EL2, GUEST_CNTVOFF_EL2};
+
+        let mut hyp = make_hypervisor();
+        let arena = vec![0u8; 65 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+
+        // Create VM
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+
+        // Start VM
+        let action = hyp
+            .handle(
+                TrapEvent::HvcCall {
+                    x0: HVC_VM_START,
+                    x1: 1,
+                    x2: 0x4000_0000,
+                    x3: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+
+        // EnterGuest must carry timer configuration for the platform shim.
+        match action {
+            HypervisorAction::EnterGuest {
+                cnthctl_el2,
+                cntvoff_el2,
+                ..
+            } => {
+                // EL1PCTEN (bit 0) and EL1PCEN (bit 1) must be set.
+                assert_eq!(cnthctl_el2, GUEST_CNTHCTL_EL2);
+                assert_ne!(cnthctl_el2 & 0b11, 0, "EL1PCTEN and EL1PCEN must be set");
+                // Virtual counter offset must be zero (virtual == physical).
+                assert_eq!(cntvoff_el2, GUEST_CNTVOFF_EL2);
+                assert_eq!(cntvoff_el2, 0);
+            }
+            other => panic!("expected EnterGuest, got {other:?}"),
+        }
     }
 
     #[test]
