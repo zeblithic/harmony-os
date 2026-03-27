@@ -8,5 +8,6 @@ pub mod stage2;
 pub mod trap;
 pub mod vcpu;
 pub mod virtio_mmio;
+pub mod virtio_net;
 pub mod virtqueue;
 pub mod vmid;

@@ -28,7 +28,12 @@ fn write_u16(mem: &mut [u8], offset: usize, val: u16) {
 }
 
 fn read_u32(mem: &[u8], offset: usize) -> u32 {
-    let bytes = [mem[offset], mem[offset + 1], mem[offset + 2], mem[offset + 3]];
+    let bytes = [
+        mem[offset],
+        mem[offset + 1],
+        mem[offset + 2],
+        mem[offset + 3],
+    ];
     u32::from_le_bytes(bytes)
 }
 
@@ -103,7 +108,12 @@ impl DescriptorChain {
             return Err(VirtQueueError::IndirectNotSupported);
         }
 
-        let desc = Descriptor { addr, len, flags, next: next_field };
+        let desc = Descriptor {
+            addr,
+            len,
+            flags,
+            next: next_field,
+        };
 
         if flags & VRING_DESC_F_NEXT != 0 {
             self.next = Some(next_field);
