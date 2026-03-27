@@ -252,13 +252,7 @@ impl NixStoreServer {
                 sp.nar_blob[start..end].to_vec()
             }
             NarEntry::Symlink { target } => {
-                let bytes = target.as_bytes();
-                let off = usize::try_from(offset).unwrap_or(usize::MAX);
-                if off >= bytes.len() {
-                    return Vec::new();
-                }
-                let end = off.saturating_add(count as usize).min(bytes.len());
-                bytes[off..end].to_vec()
+                crate::slice_at_offset(target.as_bytes(), offset, count as usize)
             }
             NarEntry::Directory { entries } => {
                 let mut listing = String::new();
@@ -266,13 +260,7 @@ impl NixStoreServer {
                     listing.push_str(name);
                     listing.push('\n');
                 }
-                let bytes = listing.as_bytes();
-                let off = usize::try_from(offset).unwrap_or(usize::MAX);
-                if off >= bytes.len() {
-                    return Vec::new();
-                }
-                let end = off.saturating_add(count as usize).min(bytes.len());
-                bytes[off..end].to_vec()
+                crate::slice_at_offset(listing.as_bytes(), offset, count as usize)
             }
         }
     }
@@ -386,13 +374,11 @@ impl FileServer for NixStoreServer {
                 if !state_written {
                     listing.push_str("state\n");
                 }
-                let bytes = listing.as_bytes();
-                let off = usize::try_from(offset).unwrap_or(usize::MAX);
-                if off >= bytes.len() {
-                    return Ok(Vec::new());
-                }
-                let end = off.saturating_add(count as usize).min(bytes.len());
-                Ok(bytes[off..end].to_vec())
+                Ok(crate::slice_at_offset(
+                    listing.as_bytes(),
+                    offset,
+                    count as usize,
+                ))
             }
             NixFidPayload::StorePathRoot { name } => {
                 let sp = self.store_paths.get(name).ok_or(IpcError::NotFound)?;

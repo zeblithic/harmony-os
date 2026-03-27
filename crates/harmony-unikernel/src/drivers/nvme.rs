@@ -39,6 +39,45 @@ const CSTS_RDY: u32 = 1;
 /// Maximum polling iterations before returning [`NvmeError::Timeout`].
 const MAX_POLL_ITERATIONS: u32 = 100_000;
 
+// ── Command / completion types ────────────────────────────────────────────────
+
+/// An admin command ready for the caller to execute.
+pub struct AdminCommand {
+    /// 64-byte SQE to write at `admin_sq_phys + sq_offset`.
+    pub sqe: [u8; 64],
+    /// Byte offset into the admin submission queue.
+    pub sq_offset: u64,
+    /// Register offset for the SQ tail doorbell.
+    pub doorbell_offset: usize,
+    /// Value to write to the SQ tail doorbell.
+    pub doorbell_value: u32,
+}
+
+/// A parsed completion queue entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    pub cid: u16,
+    pub status: u16,
+    pub result: u32,
+}
+
+/// Completion with doorbell info for the caller to ring.
+pub struct CompletionResult {
+    pub completion: Completion,
+    pub cq_doorbell_offset: usize,
+    pub cq_doorbell_value: u32,
+}
+
+/// Parsed fields from the 4 KiB Identify Controller data structure.
+#[derive(Debug, Clone)]
+pub struct IdentifyController {
+    pub serial_number: [u8; 20],
+    pub model_number: [u8; 40],
+    pub firmware_rev: [u8; 8],
+    pub max_data_transfer: u8,
+    pub num_namespaces: u32,
+}
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// Errors returned by NVMe driver operations.
@@ -99,7 +138,6 @@ pub struct NvmeDriver<R: RegisterBank> {
     /// Number of entries in each admin queue.
     admin_queue_size: u16,
     /// Monotonically increasing command identifier.
-    #[allow(dead_code)]
     next_cid: u16,
     /// Current lifecycle state of the driver.
     state: NvmeState,
@@ -133,7 +171,6 @@ impl<R: RegisterBank> NvmeDriver<R> {
     /// Per NVMe spec §3.1.12: doorbell base = 0x1000, stride = 4 << DSTRD.
     /// SQ tail doorbell for queue `qid` is at index `2*qid`;
     /// CQ head doorbell is at `2*qid + 1`.
-    #[allow(dead_code)]
     fn doorbell_offset(&self, qid: u16, is_cq: bool) -> usize {
         let stride = 4usize << self.doorbell_stride;
         0x1000 + (2 * qid as usize + is_cq as usize) * stride
@@ -313,6 +350,161 @@ impl<R: RegisterBank> NvmeDriver<R> {
     }
 }
 
+// ── Identify Controller command ───────────────────────────────────────────────
+
+impl<R: RegisterBank> NvmeDriver<R> {
+    /// Build an Identify Controller admin command (opcode 0x06, CNS=1).
+    ///
+    /// The caller must DMA-map a 4 KiB buffer and pass its physical address as
+    /// `data_phys`.  On success an [`AdminCommand`] is returned; the caller
+    /// writes the SQE to host memory, updates the doorbell, and later harvests
+    /// the completion with [`check_completion`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NvmeError::InvalidState`] if the driver is not in
+    /// [`NvmeState::Enabled`].
+    pub fn identify_controller(&mut self, data_phys: u64) -> Result<AdminCommand, NvmeError> {
+        if self.state != NvmeState::Enabled {
+            return Err(NvmeError::InvalidState);
+        }
+
+        let cid = self.next_cid;
+
+        // Build 64-byte SQE (all bytes zero by default).
+        let mut sqe = [0u8; 64];
+
+        // CDW0 bytes 0-3: opcode=0x06 | (cid << 16), little-endian.
+        let cdw0: u32 = 0x06 | ((cid as u32) << 16);
+        sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
+
+        // PRP1 bytes 24-31: data_phys, little-endian u64.
+        sqe[24..32].copy_from_slice(&data_phys.to_le_bytes());
+
+        // CDW10 bytes 40-43: CNS=0x01 (Identify Controller), little-endian.
+        sqe[40..44].copy_from_slice(&1u32.to_le_bytes());
+
+        // sq_offset = admin_sq_tail * 64 (byte offset into the queue buffer).
+        let sq_offset = (self.admin_sq_tail as u64) * 64;
+
+        // Advance the tail pointer (wrapping within queue bounds).
+        self.admin_sq_tail = (self.admin_sq_tail + 1) % self.admin_queue_size;
+
+        // Increment command identifier for the next command.
+        self.next_cid = self.next_cid.wrapping_add(1);
+
+        let doorbell_offset = self.doorbell_offset(0, false);
+        let doorbell_value = self.admin_sq_tail as u32;
+
+        Ok(AdminCommand {
+            sqe,
+            sq_offset,
+            doorbell_offset,
+            doorbell_value,
+        })
+    }
+}
+
+// ── Completion checking ───────────────────────────────────────────────────────
+
+impl<R: RegisterBank> NvmeDriver<R> {
+    /// Parse a raw 16-byte completion queue entry and, if the phase bit
+    /// matches the expected phase, return a [`CompletionResult`].
+    ///
+    /// The caller reads 16 bytes from `admin_cq_phys + (admin_cq_head * 16)`
+    /// and passes them here.  If the phase bit in the CQE matches the driver's
+    /// current `admin_cq_phase`, the completion is valid and the head/phase
+    /// are advanced.
+    ///
+    /// Returns `Ok(None)` when the phase does not match (no new completion).
+    ///
+    /// # CQE layout (NVMe spec §4.6)
+    ///
+    /// | Bytes | Field         |
+    /// |-------|---------------|
+    /// | 0-3   | DW0 (result)  |
+    /// | 4-7   | DW1 (reserved)|
+    /// | 8-9   | SQ head ptr   |
+    /// | 10-11 | SQ identifier |
+    /// | 12-13 | CID           |
+    /// | 14-15 | Status (P=b0) |
+    pub fn check_completion(
+        &mut self,
+        cqe_bytes: &[u8; 16],
+    ) -> Result<Option<CompletionResult>, NvmeError> {
+        // Parse status word (bytes 14-15, LE).
+        let status_word = u16::from_le_bytes([cqe_bytes[14], cqe_bytes[15]]);
+        let phase = (status_word & 0x0001) != 0;
+        // Status code lives in bits 15:1.
+        let status = status_word >> 1;
+
+        // Phase mismatch → no completion available yet.
+        if phase != self.admin_cq_phase {
+            return Ok(None);
+        }
+
+        // Parse result (DW0, bytes 0-3) and CID (bytes 12-13).
+        let result = u32::from_le_bytes([cqe_bytes[0], cqe_bytes[1], cqe_bytes[2], cqe_bytes[3]]);
+        let cid = u16::from_le_bytes([cqe_bytes[12], cqe_bytes[13]]);
+
+        // Advance the CQ head; invert phase on wrap.
+        let next_head = self.admin_cq_head + 1;
+        if next_head >= self.admin_queue_size {
+            self.admin_cq_head = 0;
+            self.admin_cq_phase = !self.admin_cq_phase;
+        } else {
+            self.admin_cq_head = next_head;
+        }
+
+        let cq_doorbell_offset = self.doorbell_offset(0, true);
+        let cq_doorbell_value = self.admin_cq_head as u32;
+
+        Ok(Some(CompletionResult {
+            completion: Completion {
+                cid,
+                status,
+                result,
+            },
+            cq_doorbell_offset,
+            cq_doorbell_value,
+        }))
+    }
+}
+
+// ── Identify Controller response parser ──────────────────────────────────────
+
+/// Parse the 4 KiB Identify Controller data structure (NVMe spec §5.15.2.1).
+///
+/// | Bytes   | Field              |
+/// |---------|--------------------|
+/// | 4-23    | Serial Number (SN) |
+/// | 24-63   | Model Number (MN)  |
+/// | 64-71   | Firmware Revision  |
+/// | 77      | MDTS               |
+/// | 516-519 | NN (num namespaces)|
+pub fn parse_identify_controller(data: &[u8; 4096]) -> IdentifyController {
+    let mut serial_number = [0u8; 20];
+    serial_number.copy_from_slice(&data[4..24]);
+
+    let mut model_number = [0u8; 40];
+    model_number.copy_from_slice(&data[24..64]);
+
+    let mut firmware_rev = [0u8; 8];
+    firmware_rev.copy_from_slice(&data[64..72]);
+
+    let max_data_transfer = data[77];
+
+    let num_namespaces = u32::from_le_bytes([data[516], data[517], data[518], data[519]]);
+
+    IdentifyController {
+        serial_number,
+        model_number,
+        firmware_rev,
+        max_data_transfer,
+        num_namespaces,
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -455,5 +647,161 @@ mod tests {
         // Now Enabled — second call should fail
         let result = driver.setup_admin_queue(0x3_0000, 0x4_0000, 32);
         assert_eq!(result.unwrap_err(), NvmeError::InvalidState);
+    }
+
+    // ── Task 3 & 4 tests ──────────────────────────────────────────────────────
+
+    /// Helper: produce an Enabled driver ready for command tests.
+    fn enabled_driver() -> NvmeDriver<MockRegisterBank> {
+        let bank = mock_nvme_bank();
+        let mut driver = NvmeDriver::init(bank).unwrap();
+        driver.bank.on_read(REG_CSTS, vec![CSTS_RDY]);
+        driver.setup_admin_queue(0x1_0000, 0x2_0000, 32).unwrap();
+        driver
+    }
+
+    #[test]
+    fn identify_controller_builds_correct_sqe() {
+        let mut driver = enabled_driver();
+        let data_phys: u64 = 0xDEAD_BEEF_0000u64;
+        let cmd = driver.identify_controller(data_phys).unwrap();
+
+        // CDW0: opcode=0x06, CID=0 → bits 7:0 = 0x06, bits 31:16 = 0
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x06, "opcode must be 0x06");
+        assert_eq!((cdw0 >> 16) as u16, 0, "CID must be 0 for first command");
+
+        // PRP1 at bytes 24-31
+        let prp1 = u64::from_le_bytes(cmd.sqe[24..32].try_into().unwrap());
+        assert_eq!(prp1, data_phys, "PRP1 must equal data_phys");
+
+        // CDW10 at bytes 40-43: CNS=1
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10, 1, "CDW10 must be 1 (CNS=Identify Controller)");
+
+        // Doorbell offset for admin SQ (qid=0, is_cq=false, DSTRD=0): 0x1000
+        assert_eq!(cmd.doorbell_offset, 0x1000, "SQ tail doorbell offset");
+        // Doorbell value: new tail = 1
+        assert_eq!(cmd.doorbell_value, 1, "SQ tail doorbell value must be 1");
+    }
+
+    #[test]
+    fn identify_controller_increments_cid() {
+        let mut driver = enabled_driver();
+
+        let cmd0 = driver.identify_controller(0x1000).unwrap();
+        let cdw0_0 = u32::from_le_bytes(cmd0.sqe[0..4].try_into().unwrap());
+        assert_eq!((cdw0_0 >> 16) as u16, 0, "first CID must be 0");
+
+        let cmd1 = driver.identify_controller(0x2000).unwrap();
+        let cdw0_1 = u32::from_le_bytes(cmd1.sqe[0..4].try_into().unwrap());
+        assert_eq!((cdw0_1 >> 16) as u16, 1, "second CID must be 1");
+    }
+
+    #[test]
+    fn check_completion_detects_phase_match() {
+        let mut driver = enabled_driver();
+        // Initial phase is `true` (1), so set phase bit = 1.
+        let mut cqe = [0u8; 16];
+        cqe[0..4].copy_from_slice(&0x42u32.to_le_bytes()); // DW0 result
+        cqe[12..14].copy_from_slice(&0u16.to_le_bytes()); // CID=0
+        cqe[14..16].copy_from_slice(&0x0001u16.to_le_bytes()); // status: phase=1, code=0
+
+        let result = driver.check_completion(&cqe).unwrap();
+        let cr = result.expect("phase matches, should return Some");
+
+        assert_eq!(cr.completion.cid, 0);
+        assert_eq!(cr.completion.status, 0, "status code must be 0 (success)");
+        assert_eq!(cr.completion.result, 0x42);
+    }
+
+    #[test]
+    fn check_completion_rejects_phase_mismatch() {
+        let mut driver = enabled_driver();
+        // Initial phase is `true` (1); set phase bit = 0 → mismatch.
+        let mut cqe = [0u8; 16];
+        cqe[14..16].copy_from_slice(&0x0000u16.to_le_bytes()); // phase=0
+
+        let result = driver.check_completion(&cqe).unwrap();
+        assert!(result.is_none(), "phase mismatch must return None");
+    }
+
+    #[test]
+    fn check_completion_advances_head_and_inverts_phase_on_wrap() {
+        // Use a queue of size 2 so the wrap happens quickly.
+        let bank = mock_nvme_bank();
+        let mut driver = NvmeDriver::init(bank).unwrap();
+        driver.bank.on_read(REG_CSTS, vec![CSTS_RDY]);
+        driver.setup_admin_queue(0x1_0000, 0x2_0000, 2).unwrap();
+
+        // Build a CQE with the given result and phase bit.
+        let make_cqe = |result: u32, phase: bool| -> [u8; 16] {
+            let mut cqe = [0u8; 16];
+            cqe[0..4].copy_from_slice(&result.to_le_bytes());
+            let status_word: u16 = if phase { 0x0001 } else { 0x0000 };
+            cqe[14..16].copy_from_slice(&status_word.to_le_bytes());
+            cqe
+        };
+
+        // Completion 1: head=0, phase=true → valid; head advances to 1.
+        let cqe1 = make_cqe(1, true);
+        let r1 = driver
+            .check_completion(&cqe1)
+            .unwrap()
+            .expect("cqe1 should match");
+        assert_eq!(r1.completion.result, 1);
+        assert_eq!(driver.admin_cq_head, 1);
+        assert!(driver.admin_cq_phase, "phase stays true after head=0→1");
+
+        // Completion 2: head=1, phase=true → valid; wraps to head=0, phase inverts.
+        let cqe2 = make_cqe(2, true);
+        let r2 = driver
+            .check_completion(&cqe2)
+            .unwrap()
+            .expect("cqe2 should match");
+        assert_eq!(r2.completion.result, 2);
+        assert_eq!(driver.admin_cq_head, 0, "head wraps to 0");
+        assert!(!driver.admin_cq_phase, "phase inverts on wrap");
+
+        // Completion 3: head=0, phase=false → valid after inversion.
+        let cqe3 = make_cqe(3, false);
+        let r3 = driver
+            .check_completion(&cqe3)
+            .unwrap()
+            .expect("cqe3 should match");
+        assert_eq!(r3.completion.result, 3);
+        assert_eq!(driver.admin_cq_head, 1);
+        assert!(!driver.admin_cq_phase, "phase stays false after head=0→1");
+    }
+
+    #[test]
+    fn parse_identify_controller_extracts_fields() {
+        let mut data = [0u8; 4096];
+
+        // Serial number: bytes 4-23 (20 bytes)
+        let sn = b"SN1234567890123456  ";
+        data[4..24].copy_from_slice(sn);
+
+        // Model number: bytes 24-63 (40 bytes)
+        let mn = b"ModelXYZ                                ";
+        data[24..64].copy_from_slice(mn);
+
+        // Firmware revision: bytes 64-71 (8 bytes)
+        let fw = b"FW1.2345";
+        data[64..72].copy_from_slice(fw);
+
+        // MDTS: byte 77
+        data[77] = 5;
+
+        // NN: bytes 516-519 (LE u32)
+        data[516..520].copy_from_slice(&1024u32.to_le_bytes());
+
+        let ic = parse_identify_controller(&data);
+
+        assert_eq!(&ic.serial_number, sn);
+        assert_eq!(&ic.model_number, mn);
+        assert_eq!(&ic.firmware_rev, fw);
+        assert_eq!(ic.max_data_transfer, 5);
+        assert_eq!(ic.num_namespaces, 1024);
     }
 }
