@@ -125,14 +125,15 @@ impl VirtualGic {
                 self.pending[idx] as u64
             }
 
-            // IPRIORITYR[0..15]: 4 priority bytes packed per 32-bit read
-            o if (reg::IPRIORITYR..reg::IPRIORITYR + 64).contains(&o) => {
-                let base = ((o - reg::IPRIORITYR) / 4 * 4) as usize;
-                let p = &self.priority;
-                (p[base] as u64)
-                    | ((p[base + 1] as u64) << 8)
-                    | ((p[base + 2] as u64) << 16)
-                    | ((p[base + 3] as u64) << 24)
+            // IPRIORITYR: byte-addressable priority registers
+            o if (reg::IPRIORITYR..reg::IPRIORITYR + IRQ_COUNT as u32).contains(&o) => {
+                let base = (o - reg::IPRIORITYR) as usize;
+                let end = (base + 4).min(IRQ_COUNT);
+                let mut val = 0u64;
+                for i in base..end {
+                    val |= (self.priority[i] as u64) << ((i - base) * 8);
+                }
+                val
             }
 
             // ITARGETSR[0..15]: all IRQs target CPU 0
@@ -188,13 +189,13 @@ impl VirtualGic {
                 self.pending[idx] &= !v32;
             }
 
-            // IPRIORITYR: unpack 4 priority bytes per word
-            o if (reg::IPRIORITYR..reg::IPRIORITYR + 64).contains(&o) => {
-                let base = ((o - reg::IPRIORITYR) / 4 * 4) as usize;
-                self.priority[base] = (v32 & 0xFF) as u8;
-                self.priority[base + 1] = ((v32 >> 8) & 0xFF) as u8;
-                self.priority[base + 2] = ((v32 >> 16) & 0xFF) as u8;
-                self.priority[base + 3] = ((v32 >> 24) & 0xFF) as u8;
+            // IPRIORITYR: byte-addressable priority writes
+            o if (reg::IPRIORITYR..reg::IPRIORITYR + IRQ_COUNT as u32).contains(&o) => {
+                let base = (o - reg::IPRIORITYR) as usize;
+                let end = (base + 4).min(IRQ_COUNT);
+                for i in base..end {
+                    self.priority[i] = ((value >> ((i - base) * 8)) & 0xFF) as u8;
+                }
             }
 
             // ICFGR: direct store
@@ -241,14 +242,15 @@ impl VirtualGic {
         match offset {
             gicr::SGI_ISENABLER0 | gicr::SGI_ICENABLER0 => self.enable[0] as u64,
             gicr::SGI_ISPENDR0 | gicr::SGI_ICPENDR0 => self.pending[0] as u64,
-            // SGI_IPRIORITYR[0..7]: 4 priority bytes per 32-bit word for IRQs 0-31
+            // SGI_IPRIORITYR: byte-addressable priority for IRQs 0-31
             o if (gicr::SGI_IPRIORITYR..gicr::SGI_IPRIORITYR + 32).contains(&o) => {
-                let base = ((o - gicr::SGI_IPRIORITYR) / 4 * 4) as usize;
-                let p = &self.priority;
-                (p[base] as u64)
-                    | ((p[base + 1] as u64) << 8)
-                    | ((p[base + 2] as u64) << 16)
-                    | ((p[base + 3] as u64) << 24)
+                let base = (o - gicr::SGI_IPRIORITYR) as usize;
+                let end = (base + 4).min(32);
+                let mut val = 0u64;
+                for i in base..end {
+                    val |= (self.priority[i] as u64) << ((i - base) * 8);
+                }
+                val
             }
             _ => 0,
         }
@@ -269,11 +271,11 @@ impl VirtualGic {
             gicr::SGI_ISPENDR0 => self.pending[0] |= v32,
             gicr::SGI_ICPENDR0 => self.pending[0] &= !v32,
             o if (gicr::SGI_IPRIORITYR..gicr::SGI_IPRIORITYR + 32).contains(&o) => {
-                let base = ((o - gicr::SGI_IPRIORITYR) / 4 * 4) as usize;
-                self.priority[base] = (v32 & 0xFF) as u8;
-                self.priority[base + 1] = ((v32 >> 8) & 0xFF) as u8;
-                self.priority[base + 2] = ((v32 >> 16) & 0xFF) as u8;
-                self.priority[base + 3] = ((v32 >> 24) & 0xFF) as u8;
+                let base = (o - gicr::SGI_IPRIORITYR) as usize;
+                let end = (base + 4).min(32);
+                for i in base..end {
+                    self.priority[i] = ((value >> ((i - base) * 8)) & 0xFF) as u8;
+                }
             }
             _ => {}
         }
@@ -316,12 +318,38 @@ impl VirtualGic {
     }
 
     /// Scan pending+enabled IRQs and populate List Registers.
+    ///
+    /// Preserves LRs that are in Active state (hardware set this when
+    /// the guest acknowledged the interrupt via IAR). Only fills empty
+    /// or inactive LR slots with new pending interrupts.
     pub fn sync_lrs(&self, ich_lr: &mut [u64; 4], ich_hcr: &mut u64) {
         use crate::platform::LR_COUNT;
 
-        *ich_lr = [0u64; 4];
+        const LR_STATE_MASK: u64 = 0b11 << 62;
+        const LR_STATE_ACTIVE: u64 = 0b10 << 62;
+        const LR_STATE_PENDING_ACTIVE: u64 = 0b11 << 62;
 
-        // Collect pending+enabled IRQs with priorities
+        // Step 1: Preserve active LRs, clear inactive/pending-only ones.
+        // Active LRs represent interrupts the guest acknowledged but hasn't
+        // EOI'd yet — destroying them would lose the in-flight interrupt.
+        let mut free_slots = 0usize;
+        for lr in ich_lr.iter_mut() {
+            let state = *lr & LR_STATE_MASK;
+            if state == LR_STATE_ACTIVE || state == LR_STATE_PENDING_ACTIVE {
+                // Keep — guest owns this interrupt
+            } else {
+                *lr = 0;
+                free_slots += 1;
+            }
+        }
+
+        if free_slots == 0 {
+            // All LRs occupied by active interrupts — nothing to inject
+            *ich_hcr |= 1;
+            return;
+        }
+
+        // Step 2: Collect pending+enabled IRQs with priorities
         let mut candidates = [(0u32, 0xFFu8); IRQ_COUNT];
         let mut count = 0usize;
 
@@ -329,12 +357,20 @@ impl VirtualGic {
             let idx = (irq / 32) as usize;
             let bit = 1 << (irq % 32);
             if self.pending[idx] & bit != 0 && self.enable[idx] & bit != 0 {
-                candidates[count] = (irq, self.priority[irq as usize]);
-                count += 1;
+                // Skip if this IRQ is already in an active LR
+                let already_active = ich_lr.iter().any(|lr| {
+                    let state = *lr & LR_STATE_MASK;
+                    let vintid = (*lr & 0xFFFF_FFFF) as u32;
+                    (state == LR_STATE_ACTIVE || state == LR_STATE_PENDING_ACTIVE) && vintid == irq
+                });
+                if !already_active {
+                    candidates[count] = (irq, self.priority[irq as usize]);
+                    count += 1;
+                }
             }
         }
 
-        // Sort by priority (lower = higher priority) — insertion sort
+        // Step 3: Sort by priority (lower = higher priority)
         for i in 1..count {
             let key = candidates[i];
             let mut j = i;
@@ -345,20 +381,29 @@ impl VirtualGic {
             candidates[j] = key;
         }
 
-        // Pack top LR_COUNT into LR format
-        let lr_count = count.min(LR_COUNT);
-        for i in 0..lr_count {
-            let (irq, prio) = candidates[i];
-            ich_lr[i] = (0b01u64 << 62)    // State = pending
-                | (1u64 << 60)              // Group = 1
-                | ((prio as u64) << 48)     // Priority
-                | (irq as u64); // vINTID
+        // Step 4: Fill empty LR slots with new pending interrupts
+        let to_inject = count.min(free_slots).min(LR_COUNT);
+        let mut injected = 0;
+        for lr in ich_lr.iter_mut() {
+            if injected >= to_inject {
+                break;
+            }
+            if *lr == 0 {
+                let (irq, prio) = candidates[injected];
+                *lr = (0b01u64 << 62) // State = pending
+                    | (1u64 << 60)     // Group = 1
+                    | ((prio as u64) << 48)
+                    | (irq as u64);
+                injected += 1;
+            }
         }
 
-        if lr_count > 0 {
-            *ich_hcr |= 1; // ICH_HCR_EL2.En = 1
+        // Enable/disable virtual interrupt delivery
+        let any_active = ich_lr.iter().any(|lr| *lr != 0);
+        if any_active {
+            *ich_hcr |= 1;
         } else {
-            *ich_hcr &= !1; // Clear En when no virtual interrupts pending
+            *ich_hcr &= !1;
         }
     }
 }
