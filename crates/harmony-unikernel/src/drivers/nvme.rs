@@ -42,6 +42,7 @@ const MAX_POLL_ITERATIONS: u32 = 100_000;
 // ── Command / completion types ────────────────────────────────────────────────
 
 /// An admin command ready for the caller to execute.
+#[derive(Debug)]
 pub struct AdminCommand {
     /// 64-byte SQE to write at `sq_phys + sq_offset`.
     pub sqe: [u8; 64],
@@ -463,6 +464,56 @@ impl<R: RegisterBank> NvmeDriver<R> {
 
         // CDW10 bytes 40-43: CNS=0x01 (Identify Controller), little-endian.
         sqe[40..44].copy_from_slice(&1u32.to_le_bytes());
+
+        Ok(self.admin.submit(sqe, self.doorbell_stride))
+    }
+}
+
+// ── I/O queue creation ───────────────────────────────────────────────────────
+
+impl<R: RegisterBank> NvmeDriver<R> {
+    /// Build a Create I/O Completion Queue admin command (opcode 0x05).
+    pub fn create_io_cq(&mut self, cq_phys: u64, size: u16) -> Result<AdminCommand, NvmeError> {
+        if self.state != NvmeState::Enabled && self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+
+        let cid = self.next_cid;
+        self.next_cid = self.next_cid.wrapping_add(1);
+
+        let size = size.min(self.max_queue_entries);
+
+        let mut sqe = [0u8; 64];
+        let cdw0: u32 = 0x05 | ((cid as u32) << 16);
+        sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
+        sqe[24..32].copy_from_slice(&cq_phys.to_le_bytes());
+        let cdw10: u32 = 1 | (((size - 1) as u32) << 16);
+        sqe[40..44].copy_from_slice(&cdw10.to_le_bytes());
+        let cdw11: u32 = 0x0000_0003;
+        sqe[44..48].copy_from_slice(&cdw11.to_le_bytes());
+
+        Ok(self.admin.submit(sqe, self.doorbell_stride))
+    }
+
+    /// Build a Create I/O Submission Queue admin command (opcode 0x01).
+    pub fn create_io_sq(&mut self, sq_phys: u64, size: u16) -> Result<AdminCommand, NvmeError> {
+        if self.state != NvmeState::Enabled && self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+
+        let cid = self.next_cid;
+        self.next_cid = self.next_cid.wrapping_add(1);
+
+        let size = size.min(self.max_queue_entries);
+
+        let mut sqe = [0u8; 64];
+        let cdw0: u32 = 0x01 | ((cid as u32) << 16);
+        sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
+        sqe[24..32].copy_from_slice(&sq_phys.to_le_bytes());
+        let cdw10: u32 = 1 | (((size - 1) as u32) << 16);
+        sqe[40..44].copy_from_slice(&cdw10.to_le_bytes());
+        let cdw11: u32 = 0x0001_0001;
+        sqe[44..48].copy_from_slice(&cdw11.to_le_bytes());
 
         Ok(self.admin.submit(sqe, self.doorbell_stride))
     }
@@ -934,5 +985,71 @@ mod tests {
 
         let cr = qp.check_completion(&cqe, 0).unwrap();
         assert_eq!(cr.cq_doorbell_offset, 0x100C);
+    }
+
+    // ── Create I/O queue tests ────────────────────────────────────────────
+
+    #[test]
+    fn create_io_cq_builds_correct_sqe() {
+        let mut driver = enabled_driver();
+        let cq_phys: u64 = 0xAAAA_0000;
+        let cmd = driver.create_io_cq(cq_phys, 32).unwrap();
+
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x05, "opcode must be 0x05 (Create I/O CQ)");
+
+        let prp1 = u64::from_le_bytes(cmd.sqe[24..32].try_into().unwrap());
+        assert_eq!(prp1, cq_phys);
+
+        // CDW10: QID=1 | (31 << 16) = 0x001F_0001
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10 & 0xFFFF, 1, "QID must be 1");
+        assert_eq!(cdw10 >> 16, 31, "QSIZE must be size-1 = 31");
+
+        // CDW11: PC=1, IEN=1, IV=0 → 0x0000_0003
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11, 0x0000_0003);
+    }
+
+    #[test]
+    fn create_io_sq_builds_correct_sqe() {
+        let mut driver = enabled_driver();
+        let sq_phys: u64 = 0xBBBB_0000;
+        let cmd = driver.create_io_sq(sq_phys, 32).unwrap();
+
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x01, "opcode must be 0x01 (Create I/O SQ)");
+
+        let prp1 = u64::from_le_bytes(cmd.sqe[24..32].try_into().unwrap());
+        assert_eq!(prp1, sq_phys);
+
+        // CDW10: QID=1 | (31 << 16)
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10 & 0xFFFF, 1);
+        assert_eq!(cdw10 >> 16, 31);
+
+        // CDW11: PC=1, CQID=1<<16 → 0x0001_0001
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11, 0x0001_0001);
+    }
+
+    #[test]
+    fn create_io_cq_rejects_disabled_state() {
+        let bank = mock_nvme_bank();
+        let mut driver = NvmeDriver::init(bank).unwrap();
+        // State is Disabled — should reject
+        assert_eq!(
+            driver.create_io_cq(0x1000, 16).unwrap_err(),
+            NvmeError::InvalidState
+        );
+    }
+
+    #[test]
+    fn create_io_cq_advances_admin_doorbell() {
+        let mut driver = enabled_driver();
+        let cmd1 = driver.create_io_cq(0xAAAA_0000, 16).unwrap();
+        let cmd2 = driver.create_io_cq(0xBBBB_0000, 16).unwrap();
+        // Doorbell values should be sequential (admin SQ tail advancing)
+        assert_eq!(cmd1.doorbell_value, cmd2.doorbell_value - 1);
     }
 }
