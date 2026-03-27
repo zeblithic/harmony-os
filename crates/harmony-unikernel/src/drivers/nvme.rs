@@ -99,6 +99,7 @@ pub struct NvmeDriver<R: RegisterBank> {
     /// Number of entries in each admin queue.
     admin_queue_size: u16,
     /// Monotonically increasing command identifier.
+    #[allow(dead_code)]
     next_cid: u16,
     /// Current lifecycle state of the driver.
     state: NvmeState,
@@ -111,6 +112,7 @@ impl<R: RegisterBank> NvmeDriver<R> {
     ///
     /// `offset_lo` is the lower-word offset; the upper word is at
     /// `offset_lo + 4`.
+    #[allow(dead_code)]
     fn read64(&self, offset_lo: usize) -> u64 {
         let lo = self.bank.read(offset_lo) as u64;
         let hi = self.bank.read(offset_lo + 4) as u64;
@@ -131,6 +133,7 @@ impl<R: RegisterBank> NvmeDriver<R> {
     /// Per NVMe spec §3.1.12: doorbell base = 0x1000, stride = 4 << DSTRD.
     /// SQ tail doorbell for queue `qid` is at index `2*qid`;
     /// CQ head doorbell is at `2*qid + 1`.
+    #[allow(dead_code)]
     fn doorbell_offset(&self, qid: u16, is_cq: bool) -> usize {
         let stride = 4usize << self.doorbell_stride;
         0x1000 + (2 * qid as usize + is_cq as usize) * stride
