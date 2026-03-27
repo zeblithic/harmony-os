@@ -38,10 +38,22 @@ impl<B: RegisterBank> ConsoleRenderer<B> {
     /// `cols` and `rows` are computed from `fb.info()`. The cursor starts at
     /// `(0, 0)`. The screen is **not** cleared on construction; call
     /// [`clear`](Self::clear) explicitly if needed.
+    /// # Panics
+    ///
+    /// Panics if the framebuffer is too small for even one character cell
+    /// (width < 8 or height < 16).
     pub fn new(fb: FramebufferDriver<B>, fg: Color, bg: Color) -> Self {
         let info = *fb.info();
         let cols = info.width / 8;
         let rows = info.height / 16;
+        assert!(
+            cols > 0,
+            "framebuffer width must be at least 8 pixels for a console"
+        );
+        assert!(
+            rows > 0,
+            "framebuffer height must be at least 16 pixels for a console"
+        );
         Self {
             fb,
             cursor_x: 0,
@@ -153,6 +165,10 @@ impl<B: RegisterBank> ConsoleRenderer<B> {
     /// Copies pixel rows 16..height to rows 0..height-16, then clears the
     /// bottom character row to the background colour. After scrolling the
     /// cursor row is decremented by the caller.
+    // TODO: replace pixel-by-pixel copy with bulk memmove once RegisterBank
+    // exposes a raw slice. Current approach issues 2 × (rows-1) × 16 × width
+    // MMIO ops per scroll (~2M on 1080p). Acceptable for early-boot debug
+    // console but will stall on high-res displays.
     fn scroll(&mut self) {
         let info = *self.fb.info();
         for y in 16..(self.rows * 16) {
@@ -167,6 +183,10 @@ impl<B: RegisterBank> ConsoleRenderer<B> {
     }
 }
 
+/// NOTE: `write_str` iterates over raw bytes (`s.as_bytes()`), rendering each
+/// byte as its CP437 glyph. Non-ASCII UTF-8 characters will be split into
+/// their component bytes and rendered as unrelated CP437 glyphs. Restrict
+/// output to ASCII for correct visual results.
 impl<B: RegisterBank> fmt::Write for ConsoleRenderer<B> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for &b in s.as_bytes() {
