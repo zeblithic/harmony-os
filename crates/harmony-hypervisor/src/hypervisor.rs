@@ -104,10 +104,15 @@ impl Hypervisor {
         match x0 {
             HVC_VM_CREATE => self.hvc_vm_create(frame_alloc),
             HVC_VM_DESTROY => self.hvc_vm_destroy(x1),
-            HVC_VM_START => self.hvc_vm_start(x1, x2),
+            HVC_VM_START => self.hvc_vm_start(x1, x2, x3),
             HVC_VM_MAP => self.hvc_vm_map(x1, x2, x3, frame_alloc),
             _ => Err(HypervisorError::InvalidHvc(x0)),
         }
+    }
+
+    /// Read-only access to a VM by VMID (for testing and inspection).
+    pub fn vm(&self, vmid: u8) -> Option<&Vm> {
+        self.vms.get(&vmid)
     }
 
     fn hvc_vm_create(
@@ -166,13 +171,19 @@ impl Hypervisor {
         Ok(HypervisorAction::HvcResult { x0: 0 })
     }
 
-    fn hvc_vm_start(&mut self, x1: u64, x2: u64) -> Result<HypervisorAction, HypervisorError> {
+    fn hvc_vm_start(
+        &mut self,
+        x1: u64,
+        x2: u64,
+        x3: u64,
+    ) -> Result<HypervisorAction, HypervisorError> {
         // Reject if any VM is already active — host must wait for guest exit.
         if let Some(active) = self.active_vmid {
             return Err(HypervisorError::VmAlreadyRunning(active));
         }
         let vmid = Self::parse_vmid(x1)?;
         let entry_ipa = x2;
+        let dtb_ipa = x3;
         let vm = self
             .vms
             .get_mut(&vmid.0)
@@ -183,6 +194,12 @@ impl Hypervisor {
         }
         vm.vcpu.elr_el2 = entry_ipa;
         vm.vcpu.spsr_el2 = 0x3C5; // EL1h + DAIF masked
+                                  // ARM64 boot protocol: x0 = DTB physical address
+        vm.vcpu.x[0] = dtb_ipa;
+        // x1, x2, x3 must be 0
+        vm.vcpu.x[1] = 0;
+        vm.vcpu.x[2] = 0;
+        vm.vcpu.x[3] = 0;
         vm.state = VmState::Running;
         self.active_vmid = Some(vmid);
         let stage2_root = vm.stage2.root_paddr();
@@ -276,7 +293,10 @@ impl Hypervisor {
 
         if (VIRTUAL_UART_IPA..VIRTUAL_UART_IPA + VIRTUAL_UART_SIZE).contains(&ipa) {
             let offset = (ipa - VIRTUAL_UART_IPA) as u16;
-            let vm = self.vms.get_mut(&vmid.0).ok_or(HypervisorError::InvalidVmId(vmid.0 as u64))?;
+            let vm = self
+                .vms
+                .get_mut(&vmid.0)
+                .ok_or(HypervisorError::InvalidVmId(vmid.0 as u64))?;
 
             let (emit, read_value) = match access {
                 AccessType::Write { value } => (vm.uart.write(offset, value), 0),
@@ -493,6 +513,65 @@ mod tests {
             action,
             HypervisorAction::EnterGuest { vmid: VmId(1), .. }
         ));
+    }
+
+    #[test]
+    fn vm_start_sets_x0_to_dtb_ipa() {
+        use crate::platform::GUEST_RAM_BASE_IPA;
+
+        let entry_ipa = GUEST_RAM_BASE_IPA;
+        let dtb_ipa = GUEST_RAM_BASE_IPA + 0x780_0000;
+
+        let mut hyp = make_hypervisor();
+        let arena = vec![0u8; 65 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+
+        // Create VM
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+
+        // Start VM with dtb_ipa in x3
+        let action = hyp
+            .handle(
+                TrapEvent::HvcCall {
+                    x0: HVC_VM_START,
+                    x1: 1,
+                    x2: entry_ipa,
+                    x3: dtb_ipa,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+
+        // Verify EnterGuest action has correct elr_el2
+        match action {
+            HypervisorAction::EnterGuest {
+                vmid: VmId(1),
+                elr_el2,
+                ..
+            } => {
+                assert_eq!(elr_el2, entry_ipa);
+            }
+            other => panic!("expected EnterGuest, got {:?}", other),
+        }
+
+        // Verify vcpu register state via vm() accessor
+        let vm = hyp.vm(1).expect("VM 1 should exist");
+        assert_eq!(
+            vm.vcpu.x[0], dtb_ipa,
+            "x0 must be dtb_ipa per ARM64 boot protocol"
+        );
+        assert_eq!(vm.vcpu.x[1], 0, "x1 must be 0 per ARM64 boot protocol");
+        assert_eq!(vm.vcpu.x[2], 0, "x2 must be 0 per ARM64 boot protocol");
+        assert_eq!(vm.vcpu.x[3], 0, "x3 must be 0 per ARM64 boot protocol");
     }
 
     #[test]
