@@ -10,6 +10,11 @@ pub const VIRTUAL_UART_IPA: u64 = 0x0900_0000;
 /// Size of the virtual UART MMIO region (one 4KiB page covers all PL011 registers).
 pub const VIRTUAL_UART_SIZE: u64 = 0x1000;
 
+/// VirtIO-net MMIO base IPA.
+pub const VIRTIO_NET_MMIO_IPA: u64 = 0x0A00_0000;
+/// Size of the VirtIO-net MMIO region (one 4KiB page).
+pub const VIRTIO_NET_MMIO_SIZE: u64 = 0x1000;
+
 /// Default guest RAM base IPA.
 pub const GUEST_RAM_BASE_IPA: u64 = 0x4000_0000;
 

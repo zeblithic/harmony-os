@@ -6,10 +6,15 @@
 
 use alloc::collections::BTreeMap;
 
-use crate::platform::{HVC_PING, HVC_PONG, VIRTUAL_UART_IPA, VIRTUAL_UART_SIZE};
+use crate::platform::{
+    HVC_PING, HVC_PONG, VIRTIO_NET_MMIO_IPA, VIRTIO_NET_MMIO_SIZE, VIRTUAL_UART_IPA,
+    VIRTUAL_UART_SIZE,
+};
 use crate::stage2::Stage2PageTable;
 use crate::trap::*;
 use crate::vcpu::{VCpuContext, Vm, VmState};
+use crate::virtio_mmio::MmioResponse;
+use crate::virtio_net::VirtioNetDevice;
 use crate::vmid::{VmId, VmIdAllocator};
 use harmony_microkernel::vm::PhysAddr;
 
@@ -127,11 +132,14 @@ impl Hypervisor {
         let ptr = (self.phys_to_virt)(root);
         unsafe { core::ptr::write_bytes(ptr, 0, 4096) };
         let stage2 = Stage2PageTable::new(root, vmid, self.phys_to_virt);
+        let mac = [0x02, 0x00, 0x00, 0x00, 0x00, vmid.0];
+        let virtio_net = VirtioNetDevice::new(mac);
         let vm = Vm {
             id: vmid,
             vcpu: VCpuContext::default(),
             stage2,
             state: VmState::Created,
+            virtio_net,
         };
         self.vms.insert(vmid.0, vm);
         Ok(HypervisorAction::HvcResult { x0: vmid.0 as u64 })
@@ -271,6 +279,38 @@ impl Hypervisor {
     ) -> Result<HypervisorAction, HypervisorError> {
         // All data aborts require an active guest — reject early if host-only.
         let vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
+
+        if (VIRTIO_NET_MMIO_IPA..VIRTIO_NET_MMIO_IPA + VIRTIO_NET_MMIO_SIZE).contains(&ipa) {
+            let offset = (ipa - VIRTIO_NET_MMIO_IPA) as u32;
+            let vm = self
+                .vms
+                .get_mut(&vmid.0)
+                .ok_or(HypervisorError::InvalidVmId(vmid.0 as u64))?;
+            let response = vm.virtio_net.handle_mmio(offset, access);
+            return match response {
+                MmioResponse::ReadValue(val) => Ok(HypervisorAction::MmioResult {
+                    emit: None,
+                    read_value: val,
+                    width,
+                    srt,
+                    pc_advance: 4,
+                }),
+                MmioResponse::WriteAck | MmioResponse::StatusChanged { .. } => {
+                    Ok(HypervisorAction::MmioResult {
+                        emit: None,
+                        read_value: 0,
+                        width,
+                        srt,
+                        pc_advance: 4,
+                    })
+                }
+                MmioResponse::QueueNotify { queue } => Ok(HypervisorAction::VirtioQueueNotify {
+                    vmid,
+                    queue,
+                    pc_advance: 4,
+                }),
+            };
+        }
 
         if (VIRTUAL_UART_IPA..VIRTUAL_UART_IPA + VIRTUAL_UART_SIZE).contains(&ipa) {
             let offset = ipa - VIRTUAL_UART_IPA;
@@ -1216,5 +1256,219 @@ mod tests {
             )
             .unwrap();
         assert_eq!(action, HypervisorAction::HvcResult { x0: 0 });
+    }
+
+    // ── VirtIO MMIO routing tests ─────────────────────────────────────────────
+
+    #[test]
+    fn virtio_mmio_magic_via_hypervisor() {
+        let arena = vec![0u8; 65 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_START,
+                x1: 1,
+                x2: 0x4000_0000,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        // Read REG_MAGIC at offset +0x000 — expect 0x74726976 ("virt" LE)
+        let action = hyp
+            .handle(
+                TrapEvent::DataAbort {
+                    ipa: crate::platform::VIRTIO_NET_MMIO_IPA,
+                    access: AccessType::Read,
+                    width: 4,
+                    srt: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        assert_eq!(
+            action,
+            HypervisorAction::MmioResult {
+                emit: None,
+                read_value: 0x7472_6976,
+                width: 4,
+                srt: 0,
+                pc_advance: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn virtio_mmio_write_via_hypervisor() {
+        let arena = vec![0u8; 65 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_START,
+                x1: 1,
+                x2: 0x4000_0000,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        // Write Status=1 to REG_STATUS at offset +0x070
+        let action = hyp
+            .handle(
+                TrapEvent::DataAbort {
+                    ipa: crate::platform::VIRTIO_NET_MMIO_IPA + 0x070,
+                    access: AccessType::Write { value: 1 },
+                    width: 4,
+                    srt: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        // Write path: MmioResult with read_value=0
+        assert_eq!(
+            action,
+            HypervisorAction::MmioResult {
+                emit: None,
+                read_value: 0,
+                width: 4,
+                srt: 0,
+                pc_advance: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn virtio_queue_notify_via_hypervisor() {
+        let arena = vec![0u8; 65 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_START,
+                x1: 1,
+                x2: 0x4000_0000,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        // Write queue index 1 to REG_QUEUE_NOTIFY at offset +0x050
+        let action = hyp
+            .handle(
+                TrapEvent::DataAbort {
+                    ipa: crate::platform::VIRTIO_NET_MMIO_IPA + 0x050,
+                    access: AccessType::Write { value: 1 },
+                    width: 4,
+                    srt: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        assert_eq!(
+            action,
+            HypervisorAction::VirtioQueueNotify {
+                vmid: VmId(1),
+                queue: 1,
+                pc_advance: 4
+            }
+        );
+    }
+
+    #[test]
+    fn virtio_mmio_without_active_vm_errors() {
+        let mut hyp = make_hypervisor();
+        let mut alloc = BumpAlloc::new(0x10_0000, 0x10_0000);
+        // No VM created or started — DataAbort at VirtIO IPA should return NoActiveVm
+        let result = hyp.handle(
+            TrapEvent::DataAbort {
+                ipa: crate::platform::VIRTIO_NET_MMIO_IPA,
+                access: AccessType::Read,
+                width: 4,
+                srt: 0,
+            },
+            &mut || alloc.alloc(),
+        );
+        assert!(matches!(result, Err(HypervisorError::NoActiveVm)));
+    }
+
+    #[test]
+    fn virtio_config_space_mac() {
+        let arena = vec![0u8; 65 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_START,
+                x1: 1,
+                x2: 0x4000_0000,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        // Read REG_CONFIG_BASE at offset +0x100 — first MAC byte should be 0x02
+        let action = hyp
+            .handle(
+                TrapEvent::DataAbort {
+                    ipa: crate::platform::VIRTIO_NET_MMIO_IPA + 0x100,
+                    access: AccessType::Read,
+                    width: 1,
+                    srt: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        assert_eq!(
+            action,
+            HypervisorAction::MmioResult {
+                emit: None,
+                read_value: 0x02,
+                width: 1,
+                srt: 0,
+                pc_advance: 4,
+            }
+        );
     }
 }
