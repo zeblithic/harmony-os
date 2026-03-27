@@ -38,9 +38,21 @@ mod tests {
     #[test]
     fn vm_command_eq() {
         assert_eq!(
-            VmCommand::Start { entry_ipa: 0x4000_0000, dtb_ipa: 0x4400_0000 },
-            VmCommand::Start { entry_ipa: 0x4000_0000, dtb_ipa: 0x4400_0000 },
+            VmCommand::Start {
+                entry_ipa: 0x4000_0000,
+                dtb_ipa: 0x4400_0000
+            },
+            VmCommand::Start {
+                entry_ipa: 0x4000_0000,
+                dtb_ipa: 0x4400_0000
+            },
         );
-        assert_ne!(VmCommand::Destroy, VmCommand::Start { entry_ipa: 0, dtb_ipa: 0 });
+        assert_ne!(
+            VmCommand::Destroy,
+            VmCommand::Start {
+                entry_ipa: 0,
+                dtb_ipa: 0
+            }
+        );
     }
 }
