@@ -102,6 +102,7 @@ fn parse_hex(s: &str) -> Option<u64> {
     u64::from_str_radix(s, 16).ok()
 }
 
+// Commands are case-sensitive (all lower-case per Plan 9 convention).
 fn parse_ctl_command(data: &[u8]) -> Result<VmCommand, IpcError> {
     let s = core::str::from_utf8(data).map_err(|_| IpcError::InvalidArgument)?;
     let s = s.trim();
@@ -189,7 +190,11 @@ impl FileServer for HvServer {
         }
     }
 
-    fn write(&mut self, fid: Fid, _offset: u64, data: &[u8]) -> Result<u32, IpcError> {
+    fn write(&mut self, fid: Fid, offset: u64, data: &[u8]) -> Result<u32, IpcError> {
+        // Ctl commands are atomic, not seekable — reject non-zero offsets.
+        if offset != 0 {
+            return Err(IpcError::InvalidArgument);
+        }
         let entry = self.tracker.get(fid)?;
         if !entry.is_open() {
             return Err(IpcError::NotOpen);
@@ -204,6 +209,9 @@ impl FileServer for HvServer {
         let qpath = entry.qpath; // Copy before match to avoid borrow conflict
         match qpath {
             QPATH_CTL => {
+                if self.pending.is_some() {
+                    return Err(IpcError::NotReady);
+                }
                 let cmd = parse_ctl_command(data)?;
                 self.pending = Some(cmd);
                 Ok(data.len() as u32)

@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! VM lifecycle types for the 9P VmServer.
 
+/// Commands produced by [`HvServer`](super::hv_server::HvServer) when the kernel writes to `ctl`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmCommand {
+    /// Start the VM. `entry_ipa` is the guest kernel entry point;
+    /// `dtb_ipa` is the device tree blob address (written to x0 per ARM64 boot protocol).
     Start { entry_ipa: u64, dtb_ipa: u64 },
+    /// Destroy the VM and free its resources.
     Destroy,
 }
 
