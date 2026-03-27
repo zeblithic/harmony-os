@@ -123,10 +123,16 @@ pub enum HypervisorAction {
         x3: u64,
     },
     /// Switch to guest context and eret. The platform shim must:
-    /// 1. Load `VTTBR_EL2 = (vmid << 48) | stage2_root`.
-    /// 2. Set `ELR_EL2 = elr_el2`, `SPSR_EL2 = spsr_el2`.
-    /// 3. Restore guest GPRs from VCpuContext.
-    /// 4. Issue `eret`.
+    /// 1. If this VMID was previously used by a destroyed VM, issue
+    ///    `TLBI VMALLS12E1IS; DSB ISH; ISB` to purge stale Stage-1/Stage-2
+    ///    TLB entries tagged with this VMID (ARM DDI 0487 §D8.10).
+    ///    The per-mapping `TLBI IPAS2E1IS` from `HVC_VM_MAP` only covers
+    ///    Stage-2 entries by IPA — it does not invalidate Stage-1 entries
+    ///    cached under the old VMID.
+    /// 2. Load `VTTBR_EL2 = (vmid << 48) | stage2_root`.
+    /// 3. Set `ELR_EL2 = elr_el2`, `SPSR_EL2 = spsr_el2`.
+    /// 4. Restore guest GPRs from VCpuContext.
+    /// 5. Issue `eret`.
     EnterGuest {
         vmid: VmId,
         stage2_root: PhysAddr,
