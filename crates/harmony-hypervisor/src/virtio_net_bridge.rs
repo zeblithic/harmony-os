@@ -70,6 +70,8 @@ mod tests {
     use super::*;
     use crate::virtio_net::{VirtioNetDevice, VIRTIO_NET_HDR_SIZE};
     use crate::virtqueue::VRING_DESC_F_WRITE;
+    use harmony_microkernel::virtio_net_server::VirtioNetServer;
+    use harmony_microkernel::{FileServer, OpenMode};
 
     // ── memory layout (mirrors virtio_net.rs tests) ───────────────────────────
     //
@@ -235,5 +237,87 @@ mod tests {
             VirtioNetBridge::new(&mut dev, &mut mem, 0, |a| a as *const u8, |a| a as *mut u8);
 
         assert!(bridge.link_up());
+    }
+
+    // ── integration test 5: server → bridge → TX ─────────────────────────────
+
+    #[test]
+    fn server_bridge_end_to_end_tx() {
+        let (mut dev, mut mem) = make_device(false, true);
+
+        // Write a TX packet: 12-byte virtio_net_hdr (zeroed) + 60-byte Ethernet frame (all 0xBB).
+        let pkt_len = VIRTIO_NET_HDR_SIZE + 60;
+        let pkt_ptr = mem[PKT_BUF_OFF..].as_ptr() as u64;
+        // Header bytes are already zero from vec initialisation.
+        mem[PKT_BUF_OFF + VIRTIO_NET_HDR_SIZE..PKT_BUF_OFF + pkt_len].fill(0xBB);
+
+        write_descriptor(&mut mem, TX_DESC_OFF, 0, pkt_ptr, pkt_len as u32, 0, 0);
+        push_avail(&mut mem, TX_AVAIL_OFF, QUEUE_SIZE, 0);
+
+        let bridge =
+            VirtioNetBridge::new(&mut dev, &mut mem, 0, |a| a as *const u8, |a| a as *mut u8);
+
+        let mut srv = VirtioNetServer::new(bridge, "virtio0");
+
+        // Walk root(0) → "virtio0"(1) → "data"(2).
+        srv.walk(0, 1, "virtio0").unwrap();
+        srv.walk(1, 2, "data").unwrap();
+        srv.open(2, OpenMode::Read).unwrap();
+
+        // Read with enough headroom to hold a full Ethernet MTU.
+        let data = srv.read(2, 0, 1514).unwrap();
+
+        // The virtio_net_hdr must be stripped; only the 60-byte frame is returned.
+        assert_eq!(data.len(), 60);
+        assert_eq!(data, vec![0xBB_u8; 60]);
+    }
+
+    // ── integration test 6: server → bridge → RX ─────────────────────────────
+
+    #[test]
+    fn server_bridge_end_to_end_rx() {
+        let (mut dev, mut mem) = make_device(true, false);
+
+        // Post an available RX buffer (descriptor 0 points at PKT_BUF_OFF, size 256, writable).
+        let pkt_ptr = mem[PKT_BUF_OFF..].as_mut_ptr() as u64;
+        write_descriptor(
+            &mut mem,
+            RX_DESC_OFF,
+            0,
+            pkt_ptr,
+            256,
+            VRING_DESC_F_WRITE,
+            0,
+        );
+        push_avail(&mut mem, RX_AVAIL_OFF, QUEUE_SIZE, 0);
+
+        let bridge =
+            VirtioNetBridge::new(&mut dev, &mut mem, 0, |a| a as *const u8, |a| a as *mut u8);
+
+        let mut srv = VirtioNetServer::new(bridge, "virtio0");
+
+        // Walk root(0) → "virtio0"(1) → "data"(2).
+        srv.walk(0, 1, "virtio0").unwrap();
+        srv.walk(1, 2, "data").unwrap();
+        srv.open(2, OpenMode::Write).unwrap();
+
+        let frame = [0xCC_u8; 60];
+        let n = srv.write(2, 0, &frame).unwrap();
+        assert_eq!(n, 60);
+
+        // Verify the RX used ring was advanced: used_idx should be 1.
+        let used_idx = read_u16_le(&mem, RX_USED_OFF + 2);
+        assert_eq!(used_idx, 1);
+
+        // Verify bytes_written = virtio_net_hdr (12) + frame (60) = 72.
+        // used_elem layout: id (u32 LE) at +4, len (u32 LE) at +8.
+        let len_off = RX_USED_OFF + 4 + 4; // skip flags(2) + idx(2) + elem[0].id(4)
+        let bytes_written = u32::from_le_bytes([
+            mem[len_off],
+            mem[len_off + 1],
+            mem[len_off + 2],
+            mem[len_off + 3],
+        ]);
+        assert_eq!(bytes_written as usize, VIRTIO_NET_HDR_SIZE + frame.len());
     }
 }
