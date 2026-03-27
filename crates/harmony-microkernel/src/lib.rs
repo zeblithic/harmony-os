@@ -155,7 +155,7 @@ pub trait FileServer {
 /// Returns an empty vec if offset is past the end — signaling EOF to 9P clients.
 ///
 /// Used by FileServer implementations for offset-based reads on control files.
-pub fn slice_at_offset(bytes: &[u8], offset: u64, max: usize) -> Vec<u8> {
+pub(crate) fn slice_at_offset(bytes: &[u8], offset: u64, max: usize) -> Vec<u8> {
     let start = (offset.min(usize::MAX as u64) as usize).min(bytes.len());
     let end = start.saturating_add(max).min(bytes.len());
     bytes[start..end].to_vec()
