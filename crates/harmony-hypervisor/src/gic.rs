@@ -322,12 +322,27 @@ impl VirtualGic {
     /// Preserves LRs that are in Active state (hardware set this when
     /// the guest acknowledged the interrupt via IAR). Only fills empty
     /// or inactive LR slots with new pending interrupts.
-    pub fn sync_lrs(&self, ich_lr: &mut [u64; 4], ich_hcr: &mut u64) {
+    ///
+    /// Also clears software pending bits for interrupts that the hardware
+    /// transitioned to Active (guest read IAR), modeling the real GIC
+    /// behavior where acknowledgment clears the pending state.
+    pub fn sync_lrs(&mut self, ich_lr: &mut [u64; 4], ich_hcr: &mut u64) {
         use crate::platform::LR_COUNT;
 
         const LR_STATE_MASK: u64 = 0b11 << 62;
         const LR_STATE_ACTIVE: u64 = 0b10 << 62;
         const LR_STATE_PENDING_ACTIVE: u64 = 0b11 << 62;
+
+        // Step 0: Clear software pending bits for interrupts the hardware
+        // transitioned to Active (guest called IAR). This mirrors the real
+        // GIC hardware where IAR read clears the pending bit.
+        for lr in ich_lr.iter() {
+            let state = *lr & LR_STATE_MASK;
+            if state == LR_STATE_ACTIVE {
+                let vintid = (*lr & 0xFFFF_FFFF) as u32;
+                self.unpend(vintid);
+            }
+        }
 
         // Step 1: Preserve active LRs, clear inactive/pending-only ones.
         // Active LRs represent interrupts the guest acknowledged but hasn't

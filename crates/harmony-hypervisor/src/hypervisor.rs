@@ -99,7 +99,8 @@ impl Hypervisor {
                 vm.gic.pend(27); // PPI 27 = virtual timer
                 vm.gic
                     .sync_lrs(&mut vm.vcpu.ich_lr, &mut vm.vcpu.ich_hcr_el2);
-                vm.gic.unpend(27); // Clear after LR write — HW owns delivery
+                // No unpend — sync_lrs will auto-clear when the guest acknowledges
+                // the interrupt (LR transitions to Active on IAR read).
                 Ok(HypervisorAction::ResumeGuest)
             }
         }
