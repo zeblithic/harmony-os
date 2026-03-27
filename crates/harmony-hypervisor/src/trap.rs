@@ -145,6 +145,14 @@ pub enum HypervisorAction {
     HvcResult {
         x0: u64,
     },
+    /// Guest kicked a VirtIO queue — host should process pending descriptors.
+    /// The platform shim must advance ELR_EL2 by `pc_advance` bytes
+    /// (QueueNotify is a store instruction that faulted) and resume the guest.
+    VirtioQueueNotify {
+        vmid: VmId,
+        queue: u16,
+        pc_advance: u8,
+    },
 }
 
 // ── Stage-2 flags ────────────────────────────────────────────────────
