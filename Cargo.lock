@@ -746,6 +746,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-hypervisor"
+version = "0.1.0"
+dependencies = [
+ "harmony-microkernel",
+]
+
+[[package]]
 name = "harmony-identity"
 version = "0.1.0"
 source = "git+https://github.com/zeblithic/harmony.git?branch=main#bc65c85d1f67c6b6440c65b2c5a4599a7d8b8b75"

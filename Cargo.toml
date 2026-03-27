@@ -5,6 +5,7 @@ members = [
     "crates/harmony-microkernel",
     "crates/harmony-os",
     "crates/harmony-netstack",
+    "crates/harmony-hypervisor",
 ]
 # harmony-boot is excluded from the workspace because it targets bare metal
 # (x86_64-unknown-none) and Cargo's workspace feature unification would force
@@ -37,6 +38,7 @@ harmony-athenaeum = { git = "https://github.com/zeblithic/harmony.git", branch =
 # Internal workspace crates
 harmony-unikernel = { path = "crates/harmony-unikernel", default-features = false }
 harmony-microkernel = { path = "crates/harmony-microkernel", default-features = false }
+harmony-hypervisor = { path = "crates/harmony-hypervisor", default-features = false }
 harmony-os = { path = "crates/harmony-os" }
 
 # Benchmark framework

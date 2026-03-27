@@ -1,0 +1,17 @@
+[package]
+name = "harmony-hypervisor"
+description = "EL2 micro-VM hypervisor — sans-I/O state machine for aarch64 virtualization"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+harmony-microkernel = { workspace = true, default-features = false }
+
+[dev-dependencies]
+harmony-microkernel = { workspace = true, features = ["kernel"] }
