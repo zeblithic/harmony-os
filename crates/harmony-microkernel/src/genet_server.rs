@@ -30,6 +30,7 @@ const QPATH_MAC: QPath = 3;
 const QPATH_MTU: QPath = 4;
 const QPATH_STATS: QPath = 5;
 const QPATH_LINK: QPath = 6;
+const QPATH_STATE: QPath = 7;
 
 /// A 9P file server wrapping a [`GenetDriver`] and [`RegisterBank`].
 ///
@@ -79,6 +80,7 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> GenetServer<B, RX, TX> {
             (QPATH_DIR, "mtu") => Ok(QPATH_MTU),
             (QPATH_DIR, "stats") => Ok(QPATH_STATS),
             (QPATH_DIR, "link") => Ok(QPATH_LINK),
+            (QPATH_DIR, "state") => Ok(QPATH_STATE),
             _ => Err(IpcError::NotFound),
         }
     }
@@ -92,6 +94,7 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> GenetServer<B, RX, TX> {
             QPATH_MTU => "mtu",
             QPATH_STATS => "stats",
             QPATH_LINK => "link",
+            QPATH_STATE => "state",
             _ => "?",
         }
     }
@@ -205,6 +208,11 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
                 let bytes: &[u8] = if up { b"up\n" } else { b"down\n" };
                 Ok(crate::slice_at_offset(bytes, offset, max))
             }
+            QPATH_STATE => {
+                // Serialize soft state for hot-swap transfer.
+                let bytes = self.mdio_polls.to_le_bytes();
+                Ok(crate::slice_at_offset(&bytes, offset, max))
+            }
             _ => Err(IpcError::NotFound),
         }
     }
@@ -237,6 +245,14 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
                     })?;
                 Ok(data.len() as u32)
             }
+            QPATH_STATE => {
+                // Restore soft state from hot-swap transfer.
+                if data.len() < 4 {
+                    return Err(IpcError::InvalidArgument);
+                }
+                self.mdio_polls = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                Ok(data.len() as u32)
+            }
             _ => Err(IpcError::ReadOnly),
         }
     }
@@ -257,9 +273,10 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
             qpath,
             name: Arc::from(name),
             size: match qpath {
-                QPATH_MAC => 18, // "aa:bb:cc:dd:ee:ff\n"
-                QPATH_MTU => 5,  // "1500\n"
-                _ => 0,          // stream or dynamic content
+                QPATH_MAC => 18,  // "aa:bb:cc:dd:ee:ff\n"
+                QPATH_MTU => 5,   // "1500\n"
+                QPATH_STATE => 4, // u32 le bytes
+                _ => 0,           // stream or dynamic content
             },
             file_type,
         })
@@ -736,5 +753,42 @@ mod tests {
         srv.open(2, OpenMode::Read).unwrap();
         let data = srv.read(2, 0, 2048).unwrap();
         assert!(data.is_empty());
+    }
+
+    #[test]
+    fn state_read_returns_mdio_polls() {
+        let mut srv = test_server();
+        srv.walk(0, 1, "genet0").unwrap();
+        srv.walk(1, 2, "state").unwrap();
+        srv.open(2, OpenMode::Read).unwrap();
+        let data = srv.read(2, 0, 64).unwrap();
+        assert_eq!(data.len(), 4);
+        let polls = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        assert_eq!(polls, 100); // default mdio_polls from make_server
+    }
+
+    #[test]
+    fn state_write_restores_mdio_polls() {
+        let mut srv = test_server();
+        srv.walk(0, 1, "genet0").unwrap();
+        srv.walk(1, 2, "state").unwrap();
+        srv.open(2, OpenMode::ReadWrite).unwrap();
+        // Write a new value
+        let new_polls: u32 = 42;
+        srv.write(2, 0, &new_polls.to_le_bytes()).unwrap();
+        // Read it back
+        let data = srv.read(2, 0, 64).unwrap();
+        let restored = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        assert_eq!(restored, 42);
+    }
+
+    #[test]
+    fn state_write_too_short_fails() {
+        let mut srv = test_server();
+        srv.walk(0, 1, "genet0").unwrap();
+        srv.walk(1, 2, "state").unwrap();
+        srv.open(2, OpenMode::Write).unwrap();
+        let result = srv.write(2, 0, &[0x01, 0x02]); // only 2 bytes, need 4
+        assert_eq!(result, Err(IpcError::InvalidArgument));
     }
 }
