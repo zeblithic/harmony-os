@@ -47,17 +47,6 @@ pub mod gicr {
     pub const SGI_IPRIORITYR: u32 = 0x0400;
 }
 
-/// Identifies which GIC MMIO region an access targets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GicRegion {
-    /// GIC Distributor (GICD).
-    Distributor,
-    /// GIC Redistributor RD_base frame (GICR RD).
-    RedistributorRd,
-    /// GIC Redistributor SGI_base frame (GICR SGI).
-    RedistributorSgi,
-}
-
 /// Virtual GICv3 interrupt controller state.
 ///
 /// Tracks distributor configuration for up to [`IRQ_COUNT`] IRQs. The
@@ -368,6 +357,8 @@ impl VirtualGic {
 
         if lr_count > 0 {
             *ich_hcr |= 1; // ICH_HCR_EL2.En = 1
+        } else {
+            *ich_hcr &= !1; // Clear En when no virtual interrupts pending
         }
     }
 }

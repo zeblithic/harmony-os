@@ -33,6 +33,15 @@
 		      <0x0 0x080a0000 0x0 0x20000>;
 	};
 
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupt-parent = <&intc>;
+		interrupts = <1 13 4>,  /* secure physical    PPI 29 */
+		             <1 14 4>,  /* non-secure physical PPI 30 */
+		             <1 11 4>,  /* virtual             PPI 27 */
+		             <1 10 4>;  /* hypervisor          PPI 26 */
+	};
+
 	pl011@9000000 {
 		compatible = "arm,pl011", "arm,primecell";
 		reg = <0x0 0x09000000 0x0 0x1000>;

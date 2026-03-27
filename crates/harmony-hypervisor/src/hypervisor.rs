@@ -99,6 +99,7 @@ impl Hypervisor {
                 vm.gic.pend(27); // PPI 27 = virtual timer
                 vm.gic
                     .sync_lrs(&mut vm.vcpu.ich_lr, &mut vm.vcpu.ich_hcr_el2);
+                vm.gic.unpend(27); // Clear after LR write — HW owns delivery
                 Ok(HypervisorAction::ResumeGuest)
             }
         }
@@ -115,7 +116,15 @@ impl Hypervisor {
         // Guest-allowed HVCs: exit and ping. Always permitted.
         match x0 {
             HVC_GUEST_EXIT => return self.hvc_guest_exit(x1),
-            HVC_PING => return Ok(HypervisorAction::HvcResult { x0: HVC_PONG }),
+            HVC_PING => {
+                if let Some(vmid) = self.active_vmid {
+                    if let Some(vm) = self.vms.get_mut(&vmid.0) {
+                        vm.gic
+                            .sync_lrs(&mut vm.vcpu.ich_lr, &mut vm.vcpu.ich_hcr_el2);
+                    }
+                }
+                return Ok(HypervisorAction::HvcResult { x0: HVC_PONG });
+            }
             _ => {}
         }
         // Management HVCs: host-only. Reject if a guest is active.
