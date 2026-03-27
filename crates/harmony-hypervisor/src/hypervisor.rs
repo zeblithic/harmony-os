@@ -213,7 +213,12 @@ impl Hypervisor {
             let ipa = ipa_base + i * 4096;
             let pa = PhysAddr(pa_base + i * 4096);
             if let Err(e) = vm.stage2.map(ipa, pa, flags, frame_alloc) {
-                // Rollback: unmap all successfully mapped pages.
+                // Rollback: unmap all successfully mapped leaf entries.
+                // Note: intermediate table frames allocated during the successful
+                // map() calls remain in owned_frames and are reclaimed on VM
+                // destroy. Reclaiming empty intermediate tables here would require
+                // walking and pruning the tree — not worth the complexity for
+                // Phase A+B1 where mappings are set up once at VM creation.
                 for j in 0..i {
                     let rollback_ipa = ipa_base + j * 4096;
                     let _ = vm.stage2.unmap(rollback_ipa);

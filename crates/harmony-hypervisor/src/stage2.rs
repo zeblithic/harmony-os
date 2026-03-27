@@ -134,7 +134,8 @@ impl Stage2PageTable {
             let idx = Self::index(ipa, level);
             let entry = table[idx];
 
-            if entry & 0b11 != DESC_INVALID {
+            if entry & 0b11 == DESC_VALID {
+                // Valid table descriptor — follow to next level.
                 table_paddr = PhysAddr(entry & ADDR_MASK);
             } else {
                 let new_frame = frame_alloc().ok_or(VmError::OutOfMemory)?;
@@ -169,7 +170,7 @@ impl Stage2PageTable {
             let table = self.table_mut(table_paddr);
             let idx = Self::index(ipa, level);
             let entry = table[idx];
-            if entry & 0b11 == DESC_INVALID {
+            if entry & 0b11 != DESC_VALID {
                 return Err(VmError::NotMapped(harmony_microkernel::vm::VirtAddr(ipa)));
             }
             table_paddr = PhysAddr(entry & ADDR_MASK);
@@ -178,7 +179,7 @@ impl Stage2PageTable {
         let table = self.table_mut(table_paddr);
         let idx = Self::index(ipa, 0);
         let entry = table[idx];
-        if entry & 0b11 == DESC_INVALID {
+        if entry & 0b11 != DESC_VALID {
             return Err(VmError::NotMapped(harmony_microkernel::vm::VirtAddr(ipa)));
         }
         let pa = PhysAddr(entry & ADDR_MASK);
@@ -192,7 +193,7 @@ impl Stage2PageTable {
             let table = self.table_ref(table_paddr);
             let idx = Self::index(ipa, level);
             let entry = table[idx];
-            if entry & 0b11 == DESC_INVALID {
+            if entry & 0b11 != DESC_VALID {
                 return None;
             }
             table_paddr = PhysAddr(entry & ADDR_MASK);
@@ -200,7 +201,7 @@ impl Stage2PageTable {
         let table = self.table_ref(table_paddr);
         let idx = Self::index(ipa, 0);
         let entry = table[idx];
-        if entry & 0b11 == DESC_INVALID {
+        if entry & 0b11 != DESC_VALID {
             return None;
         }
         Some((PhysAddr(entry & ADDR_MASK), desc_to_flags(entry)))
