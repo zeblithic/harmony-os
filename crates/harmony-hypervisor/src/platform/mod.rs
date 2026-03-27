@@ -29,6 +29,17 @@ pub const GUEST_CNTHCTL_EL2: u64 = 0b11;
 /// CNTVOFF_EL2 value: zero offset (virtual == physical counter).
 pub const GUEST_CNTVOFF_EL2: u64 = 0;
 
+/// GIC Distributor virtual IPA (QEMU virt layout).
+pub const GICD_IPA: u64 = 0x0800_0000;
+/// GIC Distributor MMIO region size (64 KiB).
+pub const GICD_SIZE: u64 = 0x1_0000;
+/// GIC Redistributor virtual IPA (QEMU virt layout).
+pub const GICR_IPA: u64 = 0x080A_0000;
+/// GIC Redistributor MMIO region size (128 KiB: RD_base + SGI_base frames).
+pub const GICR_SIZE: u64 = 0x2_0000;
+/// Number of List Registers modeled (matches QEMU virt default).
+pub const LR_COUNT: usize = 4;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -85,6 +85,12 @@ impl Hypervisor {
                 let _vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
                 Ok(HypervisorAction::ForwardSmc { x0, x1, x2, x3 })
             }
+            TrapEvent::TimerIrq => {
+                // Virtual timer interrupt — LRs will be loaded by the GIC emulator
+                // (not yet implemented). For now, acknowledge and resume the guest.
+                let _vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
+                Ok(HypervisorAction::ResumeGuest)
+            }
         }
     }
 
