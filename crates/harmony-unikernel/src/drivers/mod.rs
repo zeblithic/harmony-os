@@ -13,6 +13,7 @@ pub mod framebuffer;
 pub mod genet;
 pub mod gpio;
 pub mod mass_storage;
+pub mod nvme;
 pub mod pl011;
 pub mod register_bank;
 pub mod sdhci;
