@@ -69,6 +69,9 @@ impl Hypervisor {
                 Ok(HypervisorAction::HaltGuest { vmid })
             }
             TrapEvent::SmcForward { x0, x1, x2, x3 } => {
+                // SMC traps only arrive from a guest (EL1). A host-side SMC goes
+                // directly to EL3 and never reaches this handler.
+                let _vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
                 Ok(HypervisorAction::ForwardSmc { x0, x1, x2, x3 })
             }
         }
@@ -129,8 +132,16 @@ impl Hypervisor {
         Ok(HypervisorAction::HvcResult { x0: vmid.0 as u64 })
     }
 
+    /// Validate and extract a VMID from a u64 HVC argument. Rejects values > 255.
+    fn parse_vmid(x: u64) -> Result<VmId, HypervisorError> {
+        if x > u8::MAX as u64 {
+            return Err(HypervisorError::InvalidVmId(VmId(x as u8)));
+        }
+        Ok(VmId(x as u8))
+    }
+
     fn hvc_vm_destroy(&mut self, x1: u64) -> Result<HypervisorAction, HypervisorError> {
-        let vmid = VmId(x1 as u8);
+        let vmid = Self::parse_vmid(x1)?;
         // Defense-in-depth: never destroy the active VM (Stage-2 tables in use).
         // Management HVCs are already host-only, but guard explicitly.
         if self.active_vmid == Some(vmid) {
@@ -153,7 +164,7 @@ impl Hypervisor {
         if let Some(active) = self.active_vmid {
             return Err(HypervisorError::VmAlreadyRunning(active));
         }
-        let vmid = VmId(x1 as u8);
+        let vmid = Self::parse_vmid(x1)?;
         let entry_ipa = x2;
         let vm = self
             .vms
@@ -586,8 +597,29 @@ mod tests {
 
     #[test]
     fn smc_forward() {
-        let mut hyp = make_hypervisor();
-        let mut alloc = BumpAlloc::new(0x10_0000, 0x10_0000);
+        let arena = vec![0u8; 65 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_START,
+                x1: 1,
+                x2: 0x4000_0000,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
         let action = hyp
             .handle(
                 TrapEvent::SmcForward {
@@ -596,7 +628,7 @@ mod tests {
                     x2: 0,
                     x3: 0,
                 },
-                &mut || alloc.alloc(),
+                &mut alloc,
             )
             .unwrap();
         assert!(matches!(
@@ -606,6 +638,49 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn smc_forward_without_active_vm_errors() {
+        let mut hyp = make_hypervisor();
+        let mut alloc = BumpAlloc::new(0x10_0000, 0x10_0000);
+        let result = hyp.handle(
+            TrapEvent::SmcForward {
+                x0: 0xC400_0003,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut || alloc.alloc(),
+        );
+        assert!(matches!(result, Err(HypervisorError::NoActiveVm)));
+    }
+
+    #[test]
+    fn vmid_truncation_rejected() {
+        let mut hyp = make_hypervisor();
+        let mut alloc = BumpAlloc::new(0x10_0000, 0x10_0000);
+        // 0x101 would truncate to VmId(1) — should be rejected
+        let result = hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_DESTROY,
+                x1: 0x101,
+                x2: 0,
+                x3: 0,
+            },
+            &mut || alloc.alloc(),
+        );
+        assert!(matches!(result, Err(HypervisorError::InvalidVmId(_))));
+        let result = hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_START,
+                x1: 0x101,
+                x2: 0x4000_0000,
+                x3: 0,
+            },
+            &mut || alloc.alloc(),
+        );
+        assert!(matches!(result, Err(HypervisorError::InvalidVmId(_))));
     }
 
     #[test]
