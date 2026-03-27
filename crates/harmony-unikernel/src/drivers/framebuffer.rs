@@ -76,6 +76,15 @@ impl<B: RegisterBank> FramebufferDriver<B> {
         &self.info
     }
 
+    /// Return a shared reference to the underlying register bank.
+    ///
+    /// Available within the crate for testing purposes (e.g. inspecting write
+    /// logs in [`MockRegisterBank`](super::register_bank::mock::MockRegisterBank)).
+    #[cfg(test)]
+    pub(crate) fn bank(&self) -> &B {
+        &self.bank
+    }
+
     /// Write a single pixel at `(x, y)`. Out-of-bounds coordinates are silently
     /// ignored.
     pub fn write_pixel(&mut self, x: u32, y: u32, color: Color) {
