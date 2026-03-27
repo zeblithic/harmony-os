@@ -247,15 +247,23 @@ impl Hypervisor {
         let vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
 
         if (VIRTUAL_UART_IPA..VIRTUAL_UART_IPA + VIRTUAL_UART_SIZE).contains(&ipa) {
-            return match access {
-                // Only UARTDR (offset +0x00) produces output; all other writes are swallowed.
-                AccessType::Write { value } if ipa == VIRTUAL_UART_IPA => {
-                    Ok(HypervisorAction::EmitChar { ch: value as u8 })
-                }
-                // Writes to non-DR registers (UARTCR, UARTLCR_H, etc.) and all reads
-                // are silently consumed — TX-only virtual UART, no RX or config.
-                _ => Ok(HypervisorAction::ResumeGuest),
+            let offset = ipa - VIRTUAL_UART_IPA;
+            let (emit, read_value) = match access {
+                // UARTDR write (offset +0x00) → emit character to host console.
+                AccessType::Write { value } if offset == 0 => (Some(value as u8), 0),
+                // All other writes (UARTCR, UARTLCR_H, etc.) → swallow silently.
+                AccessType::Write { .. } => (None, 0),
+                // UARTFR (offset +0x18) read → report TX FIFO not full (bit 5 = 0)
+                // and TX FIFO empty (bit 7 = TXFE = 1) so guest doesn't spin.
+                AccessType::Read if offset == 0x18 => (None, 1 << 7),
+                // All other reads → return 0.
+                AccessType::Read => (None, 0),
             };
+            return Ok(HypervisorAction::MmioResult {
+                emit,
+                read_value,
+                pc_advance: 4,
+            });
         }
         // Unknown IPA — kill the guest. Clear active_vmid atomically with the
         // DestroyVm decision, matching the WFI and guest_exit paths.
@@ -499,7 +507,14 @@ mod tests {
                 &mut alloc,
             )
             .unwrap();
-        assert_eq!(action, HypervisorAction::EmitChar { ch: b'H' });
+        assert_eq!(
+            action,
+            HypervisorAction::MmioResult {
+                emit: Some(b'H'),
+                read_value: 0,
+                pc_advance: 4,
+            }
+        );
     }
 
     #[test]
@@ -724,7 +739,14 @@ mod tests {
                     &mut alloc,
                 )
                 .unwrap();
-            assert_eq!(action, HypervisorAction::EmitChar { ch });
+            assert_eq!(
+                action,
+                HypervisorAction::MmioResult {
+                    emit: Some(ch),
+                    read_value: 0,
+                    pc_advance: 4,
+                }
+            );
         }
 
         // 5. Guest exits via HVC
@@ -807,6 +829,7 @@ mod tests {
             &mut alloc,
         )
         .unwrap();
+        // Read at UARTDR (offset +0x00) → read_value 0
         let action = hyp
             .handle(
                 TrapEvent::DataAbort {
@@ -817,7 +840,33 @@ mod tests {
                 &mut alloc,
             )
             .unwrap();
-        assert_eq!(action, HypervisorAction::ResumeGuest);
+        assert_eq!(
+            action,
+            HypervisorAction::MmioResult {
+                emit: None,
+                read_value: 0,
+                pc_advance: 4,
+            }
+        );
+        // Read at UARTFR (offset +0x18) → bit 7 (TXFE) set
+        let action = hyp
+            .handle(
+                TrapEvent::DataAbort {
+                    ipa: VIRTUAL_UART_IPA + 0x18,
+                    access: AccessType::Read,
+                    width: 4,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        assert_eq!(
+            action,
+            HypervisorAction::MmioResult {
+                emit: None,
+                read_value: 1 << 7, // TXFE = TX FIFO empty
+                pc_advance: 4,
+            }
+        );
     }
 
     #[test]

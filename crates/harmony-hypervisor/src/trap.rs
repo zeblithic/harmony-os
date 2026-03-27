@@ -73,24 +73,39 @@ pub enum AccessType {
 /// + ISB) after any `HvcResult` returned from `HVC_VM_MAP`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HypervisorAction {
-    /// Resume the currently active guest without modification.
-    /// Used for trapped MMIO reads where no host-side effect is needed.
-    ResumeGuest,
     DestroyVm {
         vmid: VmId,
     },
-    EmitChar {
-        ch: u8,
+    /// Result of a trapped MMIO access (Stage-2 data abort).
+    /// The platform shim must:
+    /// 1. If `emit` is Some(ch), write `ch` to the host console (virtual UART TX).
+    /// 2. If the original access was a read, inject `read_value` into the guest
+    ///    register indicated by ESR_EL2.ISS.SRT.
+    /// 3. Advance ELR_EL2 by `pc_advance` bytes (typically 4) to skip the
+    ///    faulting instruction.
+    /// 4. Resume the guest.
+    MmioResult {
+        /// Character to emit to host console, if any (virtual UART TX at offset +0x00).
+        emit: Option<u8>,
+        /// Value to inject into the guest's target register on a read trap.
+        /// For writes and TX-only UART, this is 0.
+        read_value: u64,
+        /// Bytes to advance ELR_EL2 (4 for A64, 2 for T32).
+        pc_advance: u8,
     },
+    /// Forward an SMC to EL3 (PSCI). The platform shim must advance
+    /// ELR_EL2 by 4 after the SMC completes, then resume the guest.
     ForwardSmc {
         x0: u64,
         x1: u64,
         x2: u64,
         x3: u64,
     },
+    /// Switch VTTBR_EL2 to this VM's Stage-2 root and eret into the guest.
     EnterGuest {
         vmid: VmId,
     },
+    /// Return x0 to the HVC caller and resume at EL1.
     HvcResult {
         x0: u64,
     },
