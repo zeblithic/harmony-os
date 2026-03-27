@@ -26,6 +26,9 @@
 		reg = <0x0 0x40000000 0x0 0x08000000>;
 	};
 
+	// NOTE: interrupts and interrupt-parent are intentionally omitted.
+	// GIC emulation is a separate milestone (harmony-os-04p). Without
+	// them the full PL011 driver falls back to polling; earlycon works.
 	pl011@9000000 {
 		compatible = "arm,pl011", "arm,primecell";
 		reg = <0x0 0x09000000 0x0 0x1000>;

@@ -38,15 +38,21 @@ pub struct VirtualUart {
     cr: u16,
 }
 
-impl VirtualUart {
-    /// Create a new `VirtualUart` with `cr` defaulting to `0x0300` (TXE | RXE enabled).
-    pub fn new() -> Self {
+impl Default for VirtualUart {
+    fn default() -> Self {
         Self {
             ibrd: 0,
             fbrd: 0,
             lcr_h: 0,
-            cr: 0x0300,
+            cr: 0x0300, // PL011 reset default: TXE | RXE enabled
         }
+    }
+}
+
+impl VirtualUart {
+    /// Create a new `VirtualUart` with PL011 power-on defaults.
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Read a register by MMIO offset.
@@ -121,7 +127,11 @@ mod tests {
     fn uartfr_returns_txfe_rxfe() {
         let uart = VirtualUart::new();
         assert_eq!(uart.read(reg::UARTFR), UARTFR_TXFE_RXFE);
-        assert_eq!(uart.read(reg::UARTFR), 0x90);
+        // Confirm the constant itself encodes the expected PL011 bit pattern.
+        assert_eq!(
+            UARTFR_TXFE_RXFE, 0x90,
+            "bit 7 (TXFE) and bit 4 (RXFE) must be set"
+        );
     }
 
     #[test]

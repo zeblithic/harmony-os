@@ -111,15 +111,15 @@ impl BootPlan {
             map_chunks.push((ipa, remainder as u16));
         }
 
-        debug_assert!(
+        assert!(
             kernel_size as u64 <= layout::INITRAMFS_OFFSET,
             "kernel too large"
         );
-        debug_assert!(
+        assert!(
             layout::INITRAMFS_OFFSET + initramfs_size as u64 <= layout::DTB_OFFSET,
             "initramfs too large"
         );
-        debug_assert!(
+        assert!(
             layout::DTB_OFFSET + dtb_size as u64 <= layout::RAM_SIZE,
             "DTB doesn't fit"
         );
