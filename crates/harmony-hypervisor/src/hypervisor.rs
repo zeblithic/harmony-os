@@ -196,9 +196,10 @@ impl Hypervisor {
             .vms
             .get_mut(&vmid.0)
             .ok_or(HypervisorError::InvalidVmId(vmid.0 as u64))?;
-        // Cold-restart: reset register file so halted VMs don't start with stale state.
+        // Cold-restart: reset all per-VM state so halted VMs don't start with stale values.
         if vm.state == VmState::Halted {
             vm.vcpu = VCpuContext::default();
+            vm.uart = VirtualUart::new();
         }
         vm.vcpu.elr_el2 = entry_ipa;
         vm.vcpu.spsr_el2 = 0x3C5; // EL1h + DAIF masked

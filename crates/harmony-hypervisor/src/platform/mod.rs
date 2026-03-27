@@ -15,8 +15,9 @@ pub const VIRTIO_NET_MMIO_IPA: u64 = 0x0A00_0000;
 /// Size of the VirtIO-net MMIO region (one 4KiB page).
 pub const VIRTIO_NET_MMIO_SIZE: u64 = 0x1000;
 
-/// Default guest RAM base IPA.
-pub const GUEST_RAM_BASE_IPA: u64 = 0x4000_0000;
+/// Default guest RAM base IPA. Re-exported from the guest loader layout
+/// to ensure a single source of truth across crate boundaries.
+pub const GUEST_RAM_BASE_IPA: u64 = harmony_microkernel::guest_loader::layout::RAM_BASE;
 
 /// HVC ping function ID for EL2→EL1 drop validation.
 pub const HVC_PING: u64 = 0x4856_FFFF;
