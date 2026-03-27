@@ -74,6 +74,68 @@ pub fn guest_dtb() -> &'static [u8] {
     GUEST_DTB
 }
 
+/// A planned sequence of HVC operations to boot a guest VM.
+/// Computed from blob sizes; the caller executes the actual HVC calls.
+pub struct BootPlan {
+    /// Total pages to allocate (RAM_SIZE / 4096).
+    pub total_pages: u32,
+    /// (ipa, page_count) pairs for VM_MAP calls (2 MiB chunks).
+    pub map_chunks: alloc::vec::Vec<(u64, u16)>,
+    /// Entry IPA (where kernel starts).
+    pub entry_ipa: u64,
+    /// DTB IPA (passed as x0 to guest).
+    pub dtb_ipa: u64,
+    /// Byte offsets within allocated RAM for blob copies.
+    pub kernel_offset: u64,
+    pub initramfs_offset: u64,
+    pub dtb_offset: u64,
+}
+
+impl BootPlan {
+    /// Compute a boot plan for the given blob sizes.
+    pub fn new(kernel_size: usize, initramfs_size: usize, dtb_size: usize) -> Self {
+        let total_pages = (layout::RAM_SIZE / 4096) as u32;
+
+        // Build 2 MiB chunk list for VM_MAP
+        let pages_per_chunk: u16 = 512; // 2 MiB / 4096
+        let full_chunks = total_pages / pages_per_chunk as u32;
+        let remainder = total_pages % pages_per_chunk as u32;
+
+        let mut map_chunks = alloc::vec::Vec::new();
+        for i in 0..full_chunks {
+            let ipa = layout::RAM_BASE + (i as u64) * (pages_per_chunk as u64 * 4096);
+            map_chunks.push((ipa, pages_per_chunk));
+        }
+        if remainder > 0 {
+            let ipa = layout::RAM_BASE + (full_chunks as u64) * (pages_per_chunk as u64 * 4096);
+            map_chunks.push((ipa, remainder as u16));
+        }
+
+        debug_assert!(
+            kernel_size as u64 <= layout::INITRAMFS_OFFSET,
+            "kernel too large"
+        );
+        debug_assert!(
+            layout::INITRAMFS_OFFSET + initramfs_size as u64 <= layout::DTB_OFFSET,
+            "initramfs too large"
+        );
+        debug_assert!(
+            layout::DTB_OFFSET + dtb_size as u64 <= layout::RAM_SIZE,
+            "DTB doesn't fit"
+        );
+
+        Self {
+            total_pages,
+            map_chunks,
+            entry_ipa: layout::KERNEL_IPA,
+            dtb_ipa: layout::DTB_IPA,
+            kernel_offset: layout::KERNEL_OFFSET,
+            initramfs_offset: layout::INITRAMFS_OFFSET,
+            dtb_offset: layout::DTB_OFFSET,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,7 +181,10 @@ mod tests {
         let initrd_end: u64 = 0x0000_0000_4500_1234;
 
         let patched = patch_dtb_initrd_end(&mut buf, initrd_end);
-        assert!(patched, "placeholder should have been found in the real DTB");
+        assert!(
+            patched,
+            "placeholder should have been found in the real DTB"
+        );
 
         // The original 8-byte placeholder must no longer be present.
         let needle = {
@@ -151,5 +216,22 @@ mod tests {
         let mut buf = [0xAA_u8; 64];
         let result = patch_dtb_initrd_end(&mut buf, 0x1234_5678);
         assert!(!result, "should return false when placeholder is absent");
+    }
+
+    #[test]
+    fn boot_plan_computes_correct_chunks() {
+        let plan = BootPlan::new(10 * 1024 * 1024, 3 * 1024 * 1024, 4096);
+        // 128 MiB / 2 MiB = 64 chunks
+        assert_eq!(plan.map_chunks.len(), 64);
+        assert_eq!(plan.total_pages, 32768);
+        assert_eq!(plan.entry_ipa, 0x4000_0000);
+        assert_eq!(plan.dtb_ipa, 0x4780_0000);
+        // First chunk starts at RAM base
+        assert_eq!(plan.map_chunks[0], (0x4000_0000, 512));
+        // Last chunk
+        assert_eq!(
+            plan.map_chunks[63],
+            (0x4000_0000 + 63u64 * 2 * 1024 * 1024, 512)
+        );
     }
 }
