@@ -59,7 +59,7 @@ impl NetworkDevice for VirtioNetBridge<'_> {
     }
 
     fn link_up(&self) -> bool {
-        true
+        self.device.mmio.link_status() & 1 != 0
     }
 }
 

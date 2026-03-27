@@ -157,7 +157,9 @@ impl<N: NetworkDevice> FileServer for VirtioNetServer<N> {
                 if max == 0 {
                     return Ok(Vec::new());
                 }
-                let mut buf = [0u8; 1514];
+                // 2048 matches VirtioNetDevice's internal staging buffer size,
+                // preventing silent truncation for VLAN-tagged or jumbo frames.
+                let mut buf = [0u8; 2048];
                 match self.device.poll_tx(&mut buf) {
                     Some(n) => {
                         if n > max {
