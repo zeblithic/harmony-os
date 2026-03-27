@@ -66,7 +66,7 @@ impl Hypervisor {
                     vm.state = VmState::Halted;
                 }
                 self.active_vmid = None;
-                Ok(HypervisorAction::HvcResult { x0: 0 })
+                Ok(HypervisorAction::HaltGuest { vmid })
             }
             TrapEvent::SmcForward { x0, x1, x2, x3 } => {
                 Ok(HypervisorAction::ForwardSmc { x0, x1, x2, x3 })
@@ -581,7 +581,7 @@ mod tests {
         )
         .unwrap();
         let action = hyp.handle(TrapEvent::WfiWfe, &mut alloc).unwrap();
-        assert!(matches!(action, HypervisorAction::HvcResult { .. }));
+        assert_eq!(action, HypervisorAction::HaltGuest { vmid: VmId(1) });
     }
 
     #[test]

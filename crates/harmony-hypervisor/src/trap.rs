@@ -93,6 +93,12 @@ pub enum HypervisorAction {
         /// Bytes to advance ELR_EL2 (4 for A64, 2 for T32).
         pc_advance: u8,
     },
+    /// Guest executed WFI/WFE and has been descheduled. The platform shim
+    /// should switch to host context (restore host vCPU, clear VTTBR_EL2).
+    /// This is NOT an HVC — do not attempt to return a value to the guest.
+    HaltGuest {
+        vmid: VmId,
+    },
     /// Forward an SMC to EL3 (PSCI). The platform shim must advance
     /// ELR_EL2 by 4 after the SMC completes, then resume the guest.
     ForwardSmc {

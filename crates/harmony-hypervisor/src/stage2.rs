@@ -37,8 +37,17 @@ const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
 // ── Descriptor helpers ──────────────────────────────────────────────
 
+/// Outer Shareable — required for Device memory (ARM DDI 0487 §D8.5.5).
+const SH_OUTER: u64 = 0b10 << 8;
+
 pub(crate) fn flags_to_desc(flags: Stage2Flags) -> u64 {
-    let mut desc: u64 = DESC_VALID | AF | SH_INNER;
+    // Device memory requires Outer Shareable; Normal uses Inner Shareable.
+    let sh = if flags.mem_attr == Stage2MemAttr::Device {
+        SH_OUTER
+    } else {
+        SH_INNER
+    };
+    let mut desc: u64 = DESC_VALID | AF | sh;
 
     desc |= match (flags.readable, flags.writable) {
         (true, true) => S2AP_RW,
