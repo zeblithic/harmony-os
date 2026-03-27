@@ -8,6 +8,7 @@
 pub mod dma_pool;
 pub mod dwc_usb;
 pub mod font_8x16;
+pub mod framebuffer;
 pub mod genet;
 pub mod gpio;
 pub mod mass_storage;
