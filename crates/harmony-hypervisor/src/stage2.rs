@@ -125,38 +125,41 @@ impl Stage2PageTable {
             return Err(VmError::Unaligned(pa.as_u64()));
         }
 
-        // Extract phys_to_virt to avoid borrow conflict with owned_frames.
-        let ptov = self.phys_to_virt;
-
         let mut table_paddr = self.root;
         for level in (1..=3).rev() {
-            let table = Self::table_mut_raw(ptov, table_paddr);
             let idx = Self::index(ipa, level);
-            let entry = table[idx];
+            let entry = self.read_entry(table_paddr, idx);
 
             if entry & 0b11 == DESC_VALID {
-                // Valid table descriptor — follow to next level.
                 table_paddr = PhysAddr(entry & ADDR_MASK);
             } else {
                 let new_frame = frame_alloc().ok_or(VmError::OutOfMemory)?;
-                let new_ptr = ptov(new_frame);
+                let new_ptr = (self.phys_to_virt)(new_frame);
                 unsafe {
                     core::ptr::write_bytes(new_ptr, 0, PAGE_SIZE as usize);
                 }
                 self.owned_frames.push(new_frame);
-                table[idx] = (new_frame.as_u64() & ADDR_MASK) | DESC_VALID;
+                self.write_entry(
+                    table_paddr,
+                    idx,
+                    (new_frame.as_u64() & ADDR_MASK) | DESC_VALID,
+                );
                 table_paddr = new_frame;
             }
         }
 
-        let table = Self::table_mut_raw(ptov, table_paddr);
         let idx = Self::index(ipa, 0);
-        if table[idx] & 0b11 != DESC_INVALID {
+        let leaf = self.read_entry(table_paddr, idx);
+        if leaf & 0b11 != DESC_INVALID {
             return Err(VmError::RegionConflict(harmony_microkernel::vm::VirtAddr(
                 ipa,
             )));
         }
-        table[idx] = (pa.as_u64() & ADDR_MASK) | flags_to_desc(flags);
+        self.write_entry(
+            table_paddr,
+            idx,
+            (pa.as_u64() & ADDR_MASK) | flags_to_desc(flags),
+        );
         Ok(())
     }
 
@@ -167,65 +170,53 @@ impl Stage2PageTable {
 
         let mut table_paddr = self.root;
         for level in (1..=3).rev() {
-            let table = self.table_mut(table_paddr);
             let idx = Self::index(ipa, level);
-            let entry = table[idx];
+            let entry = self.read_entry(table_paddr, idx);
             if entry & 0b11 != DESC_VALID {
                 return Err(VmError::NotMapped(harmony_microkernel::vm::VirtAddr(ipa)));
             }
             table_paddr = PhysAddr(entry & ADDR_MASK);
         }
 
-        let table = self.table_mut(table_paddr);
         let idx = Self::index(ipa, 0);
-        let entry = table[idx];
+        let entry = self.read_entry(table_paddr, idx);
         if entry & 0b11 != DESC_VALID {
             return Err(VmError::NotMapped(harmony_microkernel::vm::VirtAddr(ipa)));
         }
         let pa = PhysAddr(entry & ADDR_MASK);
-        table[idx] = DESC_INVALID;
+        self.write_entry(table_paddr, idx, DESC_INVALID);
         Ok(pa)
     }
 
     pub fn walk(&self, ipa: u64) -> Option<(PhysAddr, Stage2Flags)> {
         let mut table_paddr = self.root;
         for level in (1..=3).rev() {
-            let table = self.table_ref(table_paddr);
             let idx = Self::index(ipa, level);
-            let entry = table[idx];
+            let entry = self.read_entry(table_paddr, idx);
             if entry & 0b11 != DESC_VALID {
                 return None;
             }
             table_paddr = PhysAddr(entry & ADDR_MASK);
         }
-        let table = self.table_ref(table_paddr);
         let idx = Self::index(ipa, 0);
-        let entry = table[idx];
+        let entry = self.read_entry(table_paddr, idx);
         if entry & 0b11 != DESC_VALID {
             return None;
         }
         Some((PhysAddr(entry & ADDR_MASK), desc_to_flags(entry)))
     }
 
-    #[allow(clippy::mut_from_ref)]
-    fn table_mut(&self, table_paddr: PhysAddr) -> &mut [u64; 512] {
-        Self::table_mut_raw(self.phys_to_virt, table_paddr)
+    /// Read a single 8-byte entry from a page table frame via raw pointer.
+    /// Avoids fabricating `&mut [u64; 512]` references that violate aliasing rules.
+    fn read_entry(&self, table_paddr: PhysAddr, idx: usize) -> u64 {
+        let ptr = (self.phys_to_virt)(table_paddr) as *const u64;
+        unsafe { ptr.add(idx).read() }
     }
 
-    /// Static variant that takes phys_to_virt directly, avoiding borrow
-    /// conflicts when map() needs to mutate both table entries and owned_frames.
-    #[allow(clippy::mut_from_ref)]
-    fn table_mut_raw(
-        phys_to_virt: fn(PhysAddr) -> *mut u8,
-        table_paddr: PhysAddr,
-    ) -> &'static mut [u64; 512] {
-        let ptr = phys_to_virt(table_paddr);
-        unsafe { &mut *(ptr as *mut [u64; 512]) }
-    }
-
-    fn table_ref(&self, table_paddr: PhysAddr) -> &[u64; 512] {
-        let ptr = (self.phys_to_virt)(table_paddr);
-        unsafe { &*(ptr as *const [u64; 512]) }
+    /// Write a single 8-byte entry to a page table frame via raw pointer.
+    fn write_entry(&self, table_paddr: PhysAddr, idx: usize, value: u64) {
+        let ptr = (self.phys_to_virt)(table_paddr) as *mut u64;
+        unsafe { ptr.add(idx).write(value) };
     }
 
     fn index(ipa: u64, level: usize) -> usize {

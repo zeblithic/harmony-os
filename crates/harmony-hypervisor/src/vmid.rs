@@ -28,6 +28,7 @@ impl VmIdAllocator {
     }
 
     pub fn alloc(&mut self) -> Option<VmId> {
+        debug_assert!(self.bitmap[0] & 1 == 1, "host VMID slot 0 was freed");
         for (chunk_idx, chunk) in self.bitmap.iter_mut().enumerate() {
             if *chunk != u64::MAX {
                 let bit = (!*chunk).trailing_zeros() as u8;

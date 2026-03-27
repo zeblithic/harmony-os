@@ -61,12 +61,11 @@ impl Hypervisor {
                 Ok(HypervisorAction::DestroyVm { vmid })
             }
             TrapEvent::WfiWfe => {
-                if let Some(vmid) = self.active_vmid {
-                    if let Some(vm) = self.vms.get_mut(&vmid.0) {
-                        vm.state = VmState::Halted;
-                    }
-                    self.active_vmid = None;
+                let vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
+                if let Some(vm) = self.vms.get_mut(&vmid.0) {
+                    vm.state = VmState::Halted;
                 }
+                self.active_vmid = None;
                 Ok(HypervisorAction::HvcResult { x0: 0 })
             }
             TrapEvent::SmcForward { x0, x1, x2, x3 } => {
