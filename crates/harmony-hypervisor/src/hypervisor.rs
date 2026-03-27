@@ -7,11 +7,12 @@
 use alloc::collections::BTreeMap;
 
 use crate::platform::{
-    HVC_PING, HVC_PONG, VIRTIO_NET_MMIO_IPA, VIRTIO_NET_MMIO_SIZE, VIRTUAL_UART_IPA,
-    VIRTUAL_UART_SIZE,
+    GUEST_CNTHCTL_EL2, GUEST_CNTVOFF_EL2, HVC_PING, HVC_PONG, VIRTIO_NET_MMIO_IPA,
+    VIRTIO_NET_MMIO_SIZE, VIRTUAL_UART_IPA, VIRTUAL_UART_SIZE,
 };
 use crate::stage2::Stage2PageTable;
 use crate::trap::*;
+use crate::uart::VirtualUart;
 use crate::vcpu::{VCpuContext, Vm, VmState};
 use crate::virtio_mmio::MmioResponse;
 use crate::virtio_net::VirtioNetDevice;
@@ -108,10 +109,15 @@ impl Hypervisor {
         match x0 {
             HVC_VM_CREATE => self.hvc_vm_create(frame_alloc),
             HVC_VM_DESTROY => self.hvc_vm_destroy(x1),
-            HVC_VM_START => self.hvc_vm_start(x1, x2),
+            HVC_VM_START => self.hvc_vm_start(x1, x2, x3),
             HVC_VM_MAP => self.hvc_vm_map(x1, x2, x3, frame_alloc),
             _ => Err(HypervisorError::InvalidHvc(x0)),
         }
+    }
+
+    /// Read-only access to a VM by VMID (for testing and inspection).
+    pub fn vm(&self, vmid: u8) -> Option<&Vm> {
+        self.vms.get(&vmid)
     }
 
     fn hvc_vm_create(
@@ -139,6 +145,7 @@ impl Hypervisor {
             vcpu: VCpuContext::default(),
             stage2,
             state: VmState::Created,
+            uart: VirtualUart::new(),
             virtio_net,
         };
         self.vms.insert(vmid.0, vm);
@@ -172,23 +179,36 @@ impl Hypervisor {
         Ok(HypervisorAction::HvcResult { x0: 0 })
     }
 
-    fn hvc_vm_start(&mut self, x1: u64, x2: u64) -> Result<HypervisorAction, HypervisorError> {
+    fn hvc_vm_start(
+        &mut self,
+        x1: u64,
+        x2: u64,
+        x3: u64,
+    ) -> Result<HypervisorAction, HypervisorError> {
         // Reject if any VM is already active — host must wait for guest exit.
         if let Some(active) = self.active_vmid {
             return Err(HypervisorError::VmAlreadyRunning(active));
         }
         let vmid = Self::parse_vmid(x1)?;
         let entry_ipa = x2;
+        let dtb_ipa = x3;
         let vm = self
             .vms
             .get_mut(&vmid.0)
             .ok_or(HypervisorError::InvalidVmId(vmid.0 as u64))?;
-        // Cold-restart: reset register file so halted VMs don't start with stale state.
+        // Cold-restart: reset all per-VM state so halted VMs don't start with stale values.
         if vm.state == VmState::Halted {
             vm.vcpu = VCpuContext::default();
+            vm.uart = VirtualUart::new();
         }
         vm.vcpu.elr_el2 = entry_ipa;
         vm.vcpu.spsr_el2 = 0x3C5; // EL1h + DAIF masked
+                                  // ARM64 boot protocol: x0 = DTB physical address
+        vm.vcpu.x[0] = dtb_ipa;
+        // x1, x2, x3 must be 0
+        vm.vcpu.x[1] = 0;
+        vm.vcpu.x[2] = 0;
+        vm.vcpu.x[3] = 0;
         vm.state = VmState::Running;
         self.active_vmid = Some(vmid);
         let stage2_root = vm.stage2.root_paddr();
@@ -197,6 +217,8 @@ impl Hypervisor {
             stage2_root,
             elr_el2: vm.vcpu.elr_el2,
             spsr_el2: vm.vcpu.spsr_el2,
+            cnthctl_el2: GUEST_CNTHCTL_EL2,
+            cntvoff_el2: GUEST_CNTVOFF_EL2,
         })
     }
 
@@ -313,18 +335,17 @@ impl Hypervisor {
         }
 
         if (VIRTUAL_UART_IPA..VIRTUAL_UART_IPA + VIRTUAL_UART_SIZE).contains(&ipa) {
-            let offset = ipa - VIRTUAL_UART_IPA;
+            let offset = (ipa - VIRTUAL_UART_IPA) as u16;
+            let vm = self
+                .vms
+                .get_mut(&vmid.0)
+                .ok_or(HypervisorError::InvalidVmId(vmid.0 as u64))?;
+
             let (emit, read_value) = match access {
-                // UARTDR write (offset +0x00) → emit character to host console.
-                AccessType::Write { value } if offset == 0 => (Some(value as u8), 0),
-                // All other writes (UARTCR, UARTLCR_H, etc.) → swallow silently.
-                AccessType::Write { .. } => (None, 0),
-                // UARTFR (offset +0x18) read → TXFE (bit 7) + RXFE (bit 4).
-                // Without RXFE, guest RX path sees "data available" and spinloops.
-                AccessType::Read if offset == 0x18 => (None, (1 << 7) | (1 << 4)),
-                // All other reads → return 0.
-                AccessType::Read => (None, 0),
+                AccessType::Write { value } => (vm.uart.write(offset, value), 0),
+                AccessType::Read => (None, vm.uart.read(offset)),
             };
+
             return Ok(HypervisorAction::MmioResult {
                 emit,
                 read_value,
@@ -535,6 +556,116 @@ mod tests {
             action,
             HypervisorAction::EnterGuest { vmid: VmId(1), .. }
         ));
+    }
+
+    #[test]
+    fn enter_guest_includes_timer_config() {
+        use crate::platform::{GUEST_CNTHCTL_EL2, GUEST_CNTVOFF_EL2};
+
+        let mut hyp = make_hypervisor();
+        let arena = vec![0u8; 65 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+
+        // Create VM
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+
+        // Start VM
+        let action = hyp
+            .handle(
+                TrapEvent::HvcCall {
+                    x0: HVC_VM_START,
+                    x1: 1,
+                    x2: 0x4000_0000,
+                    x3: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+
+        // EnterGuest must carry timer configuration for the platform shim.
+        match action {
+            HypervisorAction::EnterGuest {
+                cnthctl_el2,
+                cntvoff_el2,
+                ..
+            } => {
+                // EL1PCTEN (bit 0) and EL1PCEN (bit 1) must be set.
+                assert_eq!(cnthctl_el2, GUEST_CNTHCTL_EL2);
+                assert_ne!(cnthctl_el2 & 0b11, 0, "EL1PCTEN and EL1PCEN must be set");
+                // Virtual counter offset must be zero (virtual == physical).
+                assert_eq!(cntvoff_el2, GUEST_CNTVOFF_EL2);
+                assert_eq!(cntvoff_el2, 0);
+            }
+            other => panic!("expected EnterGuest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_start_sets_x0_to_dtb_ipa() {
+        use crate::platform::GUEST_RAM_BASE_IPA;
+
+        let entry_ipa = GUEST_RAM_BASE_IPA;
+        let dtb_ipa = GUEST_RAM_BASE_IPA + 0x780_0000;
+
+        let mut hyp = make_hypervisor();
+        let arena = vec![0u8; 65 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+
+        // Create VM
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+
+        // Start VM with dtb_ipa in x3
+        let action = hyp
+            .handle(
+                TrapEvent::HvcCall {
+                    x0: HVC_VM_START,
+                    x1: 1,
+                    x2: entry_ipa,
+                    x3: dtb_ipa,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+
+        // Verify EnterGuest action has correct elr_el2
+        match action {
+            HypervisorAction::EnterGuest {
+                vmid: VmId(1),
+                elr_el2,
+                ..
+            } => {
+                assert_eq!(elr_el2, entry_ipa);
+            }
+            other => panic!("expected EnterGuest, got {:?}", other),
+        }
+
+        // Verify vcpu register state via vm() accessor
+        let vm = hyp.vm(1).expect("VM 1 should exist");
+        assert_eq!(
+            vm.vcpu.x[0], dtb_ipa,
+            "x0 must be dtb_ipa per ARM64 boot protocol"
+        );
+        assert_eq!(vm.vcpu.x[1], 0, "x1 must be 0 per ARM64 boot protocol");
+        assert_eq!(vm.vcpu.x[2], 0, "x2 must be 0 per ARM64 boot protocol");
+        assert_eq!(vm.vcpu.x[3], 0, "x3 must be 0 per ARM64 boot protocol");
     }
 
     #[test]
@@ -1256,6 +1387,83 @@ mod tests {
             )
             .unwrap();
         assert_eq!(action, HypervisorAction::HvcResult { x0: 0 });
+    }
+
+    #[test]
+    fn uart_probe_via_hypervisor() {
+        let arena = vec![0u8; 65 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
+
+        // Create VM
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+
+        // Start VM
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_START,
+                x1: 1,
+                x2: 0x4000_0000,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+
+        // Read PeriphID0 (IPA = VIRTUAL_UART_IPA + 0xFE0) → expect 0x11
+        let action = hyp
+            .handle(
+                TrapEvent::DataAbort {
+                    ipa: VIRTUAL_UART_IPA + 0xFE0,
+                    access: AccessType::Read,
+                    width: 4,
+                    srt: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        assert_eq!(
+            action,
+            HypervisorAction::MmioResult {
+                emit: None,
+                read_value: 0x11,
+                width: 4,
+                srt: 0,
+                pc_advance: 4,
+            }
+        );
+
+        // Write 'H' (0x48) to UARTDR (IPA = VIRTUAL_UART_IPA + 0x000) → expect emit Some(0x48)
+        let action = hyp
+            .handle(
+                TrapEvent::DataAbort {
+                    ipa: VIRTUAL_UART_IPA,
+                    access: AccessType::Write { value: 0x48 },
+                    width: 1,
+                    srt: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        assert_eq!(
+            action,
+            HypervisorAction::MmioResult {
+                emit: Some(0x48),
+                read_value: 0,
+                width: 1,
+                srt: 0,
+                pc_advance: 4,
+            }
+        );
     }
 
     // ── VirtIO MMIO routing tests ─────────────────────────────────────────────

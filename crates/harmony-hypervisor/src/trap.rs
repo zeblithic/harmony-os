@@ -138,6 +138,8 @@ pub enum HypervisorAction {
         stage2_root: PhysAddr,
         elr_el2: u64,
         spsr_el2: u64,
+        cnthctl_el2: u64,
+        cntvoff_el2: u64,
     },
     /// Return x0 to the HVC caller and resume at EL1.
     HvcResult {
