@@ -25,6 +25,28 @@ pub mod reg {
     pub const PIDR2: u32 = 0xFFE8;
 }
 
+/// GIC Redistributor register offsets.
+///
+/// The GICR has two 64 KiB frames:
+/// - RD_base (frame 0): per-CPU control registers.
+/// - SGI_base (frame 1, starting at offset 0x10000): enable/pending/priority
+///   for SGIs and PPIs (IRQs 0-31). These share backing storage with the
+///   corresponding GICD registers.
+pub mod gicr {
+    // RD_base frame
+    pub const CTLR: u32 = 0x0000;
+    pub const IIDR: u32 = 0x0004;
+    pub const TYPER_LO: u32 = 0x0008;
+    pub const TYPER_HI: u32 = 0x000C;
+    pub const WAKER: u32 = 0x0014;
+    // SGI_base frame (offsets relative to SGI_base start, i.e. 0x10000 subtracted by caller)
+    pub const SGI_ISENABLER0: u32 = 0x0100;
+    pub const SGI_ICENABLER0: u32 = 0x0180;
+    pub const SGI_ISPENDR0: u32 = 0x0200;
+    pub const SGI_ICPENDR0: u32 = 0x0280;
+    pub const SGI_IPRIORITYR: u32 = 0x0400;
+}
+
 /// Identifies which GIC MMIO region an access targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GicRegion {
@@ -53,8 +75,7 @@ pub struct VirtualGic {
     priority: [u8; IRQ_COUNT],
     /// GICD_ICFGR[0..4] — interrupt configuration (edge/level).
     config: [u32; 4],
-    /// GICR_WAKER — redistributor waker register (modeled in future redistributor work).
-    #[allow(dead_code)]
+    /// GICR_WAKER — redistributor waker register.
     waker: u32,
 }
 
@@ -196,6 +217,78 @@ impl VirtualGic {
             _ => {}
         }
     }
+
+    /// Read a GIC Redistributor RD_base frame register by MMIO offset.
+    ///
+    /// Returns `0` for unknown or unimplemented offsets.
+    pub fn read_gicr_rd(&self, offset: u32) -> u64 {
+        match offset {
+            gicr::CTLR => 0,
+            gicr::IIDR => 0x0100_0000, // Harmony implementer ID
+            gicr::TYPER_LO => 0x10,    // Last=1 (bit 4), ProcessorNumber=0
+            gicr::TYPER_HI => 0,
+            gicr::WAKER => self.waker as u64,
+            _ => 0,
+        }
+    }
+
+    /// Write a GIC Redistributor RD_base frame register by MMIO offset.
+    ///
+    /// Unknown offsets are silently ignored.
+    pub fn write_gicr_rd(&mut self, offset: u32, value: u64) {
+        if offset == gicr::WAKER {
+            self.waker = value as u32;
+        }
+    }
+
+    /// Read a GIC Redistributor SGI_base frame register by MMIO offset.
+    ///
+    /// `offset` is relative to the SGI_base start (0x10000 already subtracted
+    /// by the caller). SGI/PPI registers share backing storage with the
+    /// distributor (`enable[0]`, `pending[0]`, `priority[0..31]`).
+    ///
+    /// Returns `0` for unknown or unimplemented offsets.
+    pub fn read_gicr_sgi(&self, offset: u32) -> u64 {
+        match offset {
+            gicr::SGI_ISENABLER0 | gicr::SGI_ICENABLER0 => self.enable[0] as u64,
+            gicr::SGI_ISPENDR0 | gicr::SGI_ICPENDR0 => self.pending[0] as u64,
+            // SGI_IPRIORITYR[0..7]: 4 priority bytes per 32-bit word for IRQs 0-31
+            o if (gicr::SGI_IPRIORITYR..gicr::SGI_IPRIORITYR + 32).contains(&o) => {
+                let base = ((o - gicr::SGI_IPRIORITYR) / 4 * 4) as usize;
+                let p = &self.priority;
+                (p[base] as u64)
+                    | ((p[base + 1] as u64) << 8)
+                    | ((p[base + 2] as u64) << 16)
+                    | ((p[base + 3] as u64) << 24)
+            }
+            _ => 0,
+        }
+    }
+
+    /// Write a GIC Redistributor SGI_base frame register by MMIO offset.
+    ///
+    /// `offset` is relative to the SGI_base start (0x10000 already subtracted
+    /// by the caller). Writes to SGI/PPI registers are reflected in the shared
+    /// distributor backing arrays.
+    ///
+    /// Unknown offsets are silently ignored.
+    pub fn write_gicr_sgi(&mut self, offset: u32, value: u64) {
+        let v32 = value as u32;
+        match offset {
+            gicr::SGI_ISENABLER0 => self.enable[0] |= v32,
+            gicr::SGI_ICENABLER0 => self.enable[0] &= !v32,
+            gicr::SGI_ISPENDR0 => self.pending[0] |= v32,
+            gicr::SGI_ICPENDR0 => self.pending[0] &= !v32,
+            o if (gicr::SGI_IPRIORITYR..gicr::SGI_IPRIORITYR + 32).contains(&o) => {
+                let base = ((o - gicr::SGI_IPRIORITYR) / 4 * 4) as usize;
+                self.priority[base] = (v32 & 0xFF) as u8;
+                self.priority[base + 1] = ((v32 >> 8) & 0xFF) as u8;
+                self.priority[base + 2] = ((v32 >> 16) & 0xFF) as u8;
+                self.priority[base + 3] = ((v32 >> 24) & 0xFF) as u8;
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -319,5 +412,77 @@ mod tests {
         assert_eq!(gic.read_gicd(0x0010), 0, "offset 0x0010 must return 0");
         assert_eq!(gic.read_gicd(0x0050), 0, "offset 0x0050 must return 0");
         assert_eq!(gic.read_gicd(0x1000), 0, "offset 0x1000 must return 0");
+    }
+
+    // ---- GICR tests ----
+
+    #[test]
+    fn gicr_typer_reports_last_cpu() {
+        let gic = VirtualGic::new();
+        // TYPER_LO bit 4 = Last; ProcessorNumber = 0 in upper bits.
+        let typer_lo = gic.read_gicr_rd(gicr::TYPER_LO);
+        assert_eq!(
+            typer_lo & (1 << 4),
+            1 << 4,
+            "TYPER_LO bit 4 (Last) must be set for single redistributor"
+        );
+        assert_eq!(
+            typer_lo & !0x10u64,
+            0,
+            "TYPER_LO ProcessorNumber and other fields must be 0"
+        );
+        assert_eq!(gic.read_gicr_rd(gicr::TYPER_HI), 0, "TYPER_HI must be 0");
+    }
+
+    #[test]
+    fn gicr_waker_round_trip() {
+        let mut gic = VirtualGic::new();
+        // Initially zero.
+        assert_eq!(gic.read_gicr_rd(gicr::WAKER), 0);
+        // Write a sentinel value and read it back.
+        gic.write_gicr_rd(gicr::WAKER, 0xDEAD_BEEF);
+        assert_eq!(
+            gic.read_gicr_rd(gicr::WAKER),
+            0xDEAD_BEEF,
+            "GICR_WAKER must round-trip through read/write"
+        );
+    }
+
+    #[test]
+    fn gicr_sgi_enable_shared_with_gicd() {
+        let mut gic = VirtualGic::new();
+        // Enable PPI 27 via GICR SGI_ISENABLER0 (bit 27).
+        gic.write_gicr_sgi(gicr::SGI_ISENABLER0, 1 << 27);
+        // The same bit must be visible when reading GICD_ISENABLER[0].
+        assert_eq!(
+            gic.read_gicd(reg::ISENABLER),
+            1 << 27,
+            "enable[0] set via GICR must be visible in GICD_ISENABLER[0]"
+        );
+        // Reading via GICR SGI_ISENABLER0 must also reflect the state.
+        assert_eq!(
+            gic.read_gicr_sgi(gicr::SGI_ISENABLER0),
+            1 << 27,
+            "GICR_SGI_ISENABLER0 read must return the shared enable state"
+        );
+    }
+
+    #[test]
+    fn gicr_sgi_pending_shared_with_gicd() {
+        let mut gic = VirtualGic::new();
+        // Pend PPI 27 via GICR SGI_ISPENDR0 (bit 27).
+        gic.write_gicr_sgi(gicr::SGI_ISPENDR0, 1 << 27);
+        // The same bit must be visible when reading GICD_ISPENDR[0].
+        assert_eq!(
+            gic.read_gicd(reg::ISPENDR),
+            1 << 27,
+            "pending[0] set via GICR must be visible in GICD_ISPENDR[0]"
+        );
+        // Reading via GICR SGI_ISPENDR0 must also reflect the state.
+        assert_eq!(
+            gic.read_gicr_sgi(gicr::SGI_ISPENDR0),
+            1 << 27,
+            "GICR_SGI_ISPENDR0 read must return the shared pending state"
+        );
     }
 }
