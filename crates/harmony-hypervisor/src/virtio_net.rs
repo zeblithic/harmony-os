@@ -223,8 +223,15 @@ impl VirtioNetDevice {
     }
 
     /// Forward an MMIO access to the underlying `VirtioMmio` transport.
+    /// Clears cached VirtQueue instances on device reset (STATUS=0) so
+    /// a re-probe by the guest driver picks up the new queue addresses.
     pub fn handle_mmio(&mut self, offset: u32, access: AccessType) -> MmioResponse {
-        self.mmio.handle_mmio(offset, access)
+        let resp = self.mmio.handle_mmio(offset, access);
+        if matches!(resp, MmioResponse::StatusChanged { status: 0 }) {
+            self.rx_queue = None;
+            self.tx_queue = None;
+        }
+        resp
     }
 }
 
