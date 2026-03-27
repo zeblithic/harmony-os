@@ -6,6 +6,7 @@
 
 use alloc::collections::BTreeMap;
 
+use crate::gic::VirtualGic;
 use crate::platform::{
     GUEST_CNTHCTL_EL2, GUEST_CNTVOFF_EL2, HVC_PING, HVC_PONG, VIRTIO_NET_MMIO_IPA,
     VIRTIO_NET_MMIO_SIZE, VIRTUAL_UART_IPA, VIRTUAL_UART_SIZE,
@@ -153,6 +154,7 @@ impl Hypervisor {
             state: VmState::Created,
             uart: VirtualUart::new(),
             virtio_net,
+            gic: VirtualGic::new(),
         };
         self.vms.insert(vmid.0, vm);
         Ok(HypervisorAction::HvcResult { x0: vmid.0 as u64 })
@@ -206,6 +208,7 @@ impl Hypervisor {
         if vm.state == VmState::Halted {
             vm.vcpu = VCpuContext::default();
             vm.uart = VirtualUart::new();
+            vm.gic = VirtualGic::new();
         }
         vm.vcpu.elr_el2 = entry_ipa;
         vm.vcpu.spsr_el2 = 0x3C5; // EL1h + DAIF masked

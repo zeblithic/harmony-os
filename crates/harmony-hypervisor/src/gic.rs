@@ -289,6 +289,87 @@ impl VirtualGic {
             _ => {}
         }
     }
+
+    /// Mark an IRQ as pending.
+    pub fn pend(&mut self, irq: u32) {
+        if (irq as usize) < IRQ_COUNT {
+            let idx = (irq / 32) as usize;
+            self.pending[idx] |= 1 << (irq % 32);
+        }
+    }
+
+    /// Clear the pending state of an IRQ.
+    pub fn unpend(&mut self, irq: u32) {
+        if (irq as usize) < IRQ_COUNT {
+            let idx = (irq / 32) as usize;
+            self.pending[idx] &= !(1 << (irq % 32));
+        }
+    }
+
+    /// Return `true` if the given IRQ is currently pending.
+    pub fn is_pending(&self, irq: u32) -> bool {
+        if (irq as usize) < IRQ_COUNT {
+            let idx = (irq / 32) as usize;
+            self.pending[idx] & (1 << (irq % 32)) != 0
+        } else {
+            false
+        }
+    }
+
+    /// Return `true` if the given IRQ is currently enabled.
+    pub fn is_enabled(&self, irq: u32) -> bool {
+        if (irq as usize) < IRQ_COUNT {
+            let idx = (irq / 32) as usize;
+            self.enable[idx] & (1 << (irq % 32)) != 0
+        } else {
+            false
+        }
+    }
+
+    /// Scan pending+enabled IRQs and populate List Registers.
+    pub fn sync_lrs(&self, ich_lr: &mut [u64; 4], ich_hcr: &mut u64) {
+        use crate::platform::LR_COUNT;
+
+        *ich_lr = [0u64; 4];
+
+        // Collect pending+enabled IRQs with priorities
+        let mut candidates = [(0u32, 0xFFu8); IRQ_COUNT];
+        let mut count = 0usize;
+
+        for irq in 0..IRQ_COUNT as u32 {
+            let idx = (irq / 32) as usize;
+            let bit = 1 << (irq % 32);
+            if self.pending[idx] & bit != 0 && self.enable[idx] & bit != 0 {
+                candidates[count] = (irq, self.priority[irq as usize]);
+                count += 1;
+            }
+        }
+
+        // Sort by priority (lower = higher priority) — insertion sort
+        for i in 1..count {
+            let key = candidates[i];
+            let mut j = i;
+            while j > 0 && candidates[j - 1].1 > key.1 {
+                candidates[j] = candidates[j - 1];
+                j -= 1;
+            }
+            candidates[j] = key;
+        }
+
+        // Pack top LR_COUNT into LR format
+        let lr_count = count.min(LR_COUNT);
+        for i in 0..lr_count {
+            let (irq, prio) = candidates[i];
+            ich_lr[i] = (0b01u64 << 62)    // State = pending
+                | (1u64 << 60)              // Group = 1
+                | ((prio as u64) << 48)     // Priority
+                | (irq as u64); // vINTID
+        }
+
+        if lr_count > 0 {
+            *ich_hcr |= 1; // ICH_HCR_EL2.En = 1
+        }
+    }
 }
 
 #[cfg(test)]
@@ -484,5 +565,77 @@ mod tests {
             1 << 27,
             "GICR_SGI_ISPENDR0 read must return the shared pending state"
         );
+    }
+
+    #[test]
+    fn pend_unpend_round_trip() {
+        let mut gic = VirtualGic::new();
+        gic.pend(27);
+        assert!(gic.is_pending(27));
+        gic.unpend(27);
+        assert!(!gic.is_pending(27));
+    }
+
+    #[test]
+    fn sync_lrs_populates_lr_for_pending_enabled_irq() {
+        let mut gic = VirtualGic::new();
+        gic.pend(27);
+        gic.write_gicr_sgi(gicr::SGI_ISENABLER0, 1 << 27);
+        gic.priority[27] = 0xA0;
+
+        let mut lr = [0u64; 4];
+        let mut hcr = 0u64;
+        gic.sync_lrs(&mut lr, &mut hcr);
+
+        assert_ne!(lr[0], 0);
+        assert_eq!(lr[0] & 0xFFFF_FFFF, 27);
+        assert_eq!((lr[0] >> 62) & 0x3, 0b01); // pending
+        assert_eq!((lr[0] >> 48) & 0xFF, 0xA0);
+        assert_eq!(hcr & 1, 1); // En
+    }
+
+    #[test]
+    fn sync_lrs_skips_disabled_irqs() {
+        let mut gic = VirtualGic::new();
+        gic.pend(27);
+        let mut lr = [0u64; 4];
+        let mut hcr = 0u64;
+        gic.sync_lrs(&mut lr, &mut hcr);
+        assert_eq!(lr[0], 0);
+    }
+
+    #[test]
+    fn sync_lrs_respects_priority_ordering() {
+        let mut gic = VirtualGic::new();
+        gic.pend(33);
+        gic.write_gicd(0x0104, 1 << 1); // Enable SPI 33 (ISENABLER[1] bit 1)
+        gic.priority[33] = 0xC0;
+        gic.pend(27);
+        gic.write_gicr_sgi(gicr::SGI_ISENABLER0, 1 << 27);
+        gic.priority[27] = 0x40;
+
+        let mut lr = [0u64; 4];
+        let mut hcr = 0u64;
+        gic.sync_lrs(&mut lr, &mut hcr);
+
+        assert_eq!(lr[0] & 0xFFFF_FFFF, 27); // Higher priority first
+        assert_eq!(lr[1] & 0xFFFF_FFFF, 33);
+    }
+
+    #[test]
+    fn sync_lrs_caps_at_lr_count() {
+        let mut gic = VirtualGic::new();
+        for irq in 0..6u32 {
+            gic.pend(irq);
+            gic.enable[0] |= 1 << irq;
+            gic.priority[irq as usize] = (irq as u8) * 0x10;
+        }
+        let mut lr = [0u64; 4];
+        let mut hcr = 0u64;
+        gic.sync_lrs(&mut lr, &mut hcr);
+
+        assert_ne!(lr[3], 0); // 4th LR used
+        assert_eq!(lr[0] & 0xFFFF_FFFF, 0); // Highest priority
+        assert_eq!(lr[3] & 0xFFFF_FFFF, 3);
     }
 }

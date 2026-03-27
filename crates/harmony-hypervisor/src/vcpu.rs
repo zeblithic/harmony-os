@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! vCPU context and VM state.
 
+use crate::gic::VirtualGic;
 use crate::stage2::Stage2PageTable;
 use crate::uart::VirtualUart;
 use crate::virtio_net::VirtioNetDevice;
@@ -25,6 +26,10 @@ pub struct VCpuContext {
     pub contextidr_el1: u64,
     pub cntv_ctl_el0: u64,
     pub cntv_cval_el0: u64,
+    pub ich_lr: [u64; 4], // GICv3 List Registers
+    pub ich_hcr_el2: u64, // GICv3 Hypervisor Control Register
+    pub icc_pmr_el1: u64, // Interrupt Priority Mask Register
+    pub icc_sre_el1: u64, // System Register Enable
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +46,7 @@ pub struct Vm {
     pub state: VmState,
     pub uart: VirtualUart,
     pub virtio_net: VirtioNetDevice,
+    pub gic: VirtualGic,
 }
 
 #[cfg(test)]
