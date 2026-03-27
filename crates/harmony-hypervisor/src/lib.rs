@@ -2,6 +2,7 @@
 #![cfg_attr(not(test), no_std)]
 extern crate alloc;
 
+pub mod gic;
 pub mod hypervisor;
 pub mod platform;
 pub mod stage2;

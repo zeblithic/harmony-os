@@ -58,6 +58,9 @@ pub enum TrapEvent {
         x2: u64,
         x3: u64,
     },
+    /// Virtual timer fired (CNTV_CTL_EL0.ISTATUS set and IMASK clear).
+    /// Reported by the platform shim after every guest trap.
+    TimerIrq,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +156,9 @@ pub enum HypervisorAction {
         queue: u16,
         pc_advance: u8,
     },
+    /// Resume guest execution. LRs are already synced in VCpuContext.
+    /// The platform shim restores VCpuContext as-is and erets.
+    ResumeGuest,
 }
 
 // ── Stage-2 flags ────────────────────────────────────────────────────
