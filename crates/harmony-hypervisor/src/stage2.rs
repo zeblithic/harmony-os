@@ -145,7 +145,14 @@ impl Stage2PageTable {
             let entry = self.read_entry(table_paddr, idx);
 
             if entry & 0b11 == DESC_VALID {
+                // Valid table descriptor — follow to next level.
                 table_paddr = PhysAddr(entry & ADDR_MASK);
+            } else if entry & 0b11 != DESC_INVALID {
+                // Non-zero non-table entry (e.g., block descriptor 0b01).
+                // Reject rather than silently overwrite.
+                return Err(VmError::RegionConflict(harmony_microkernel::vm::VirtAddr(
+                    ipa,
+                )));
             } else {
                 let new_frame = frame_alloc().ok_or(VmError::OutOfMemory)?;
                 let new_ptr = (self.phys_to_virt)(new_frame);

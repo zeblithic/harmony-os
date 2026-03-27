@@ -51,7 +51,9 @@ impl Hypervisor {
     ) -> Result<HypervisorAction, HypervisorError> {
         match event {
             TrapEvent::HvcCall { x0, x1, x2, x3 } => self.handle_hvc(x0, x1, x2, x3, frame_alloc),
-            TrapEvent::DataAbort { ipa, access, .. } => self.handle_data_abort(ipa, access),
+            TrapEvent::DataAbort { ipa, access, width } => {
+                self.handle_data_abort(ipa, access, width)
+            }
             TrapEvent::InstructionAbort { ipa: _ } => {
                 let vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
                 if let Some(vm) = self.vms.get_mut(&vmid.0) {
@@ -135,7 +137,7 @@ impl Hypervisor {
     /// Validate and extract a VMID from a u64 HVC argument. Rejects values > 255.
     fn parse_vmid(x: u64) -> Result<VmId, HypervisorError> {
         if x > u8::MAX as u64 {
-            return Err(HypervisorError::InvalidVmId(VmId(x as u8)));
+            return Err(HypervisorError::InvalidVmId(x));
         }
         Ok(VmId(x as u8))
     }
@@ -150,7 +152,7 @@ impl Hypervisor {
         let vm = self
             .vms
             .remove(&vmid.0)
-            .ok_or(HypervisorError::InvalidVmId(vmid))?;
+            .ok_or(HypervisorError::InvalidVmId(vmid.0 as u64))?;
         // Free all Stage-2 table frames (root + intermediates).
         for frame in vm.stage2.into_owned_frames() {
             (self.frame_dealloc)(frame);
@@ -169,7 +171,7 @@ impl Hypervisor {
         let vm = self
             .vms
             .get_mut(&vmid.0)
-            .ok_or(HypervisorError::InvalidVmId(vmid))?;
+            .ok_or(HypervisorError::InvalidVmId(vmid.0 as u64))?;
         // Cold-restart: reset register file so halted VMs don't start with stale state.
         if vm.state == VmState::Halted {
             vm.vcpu = VCpuContext::default();
@@ -178,7 +180,13 @@ impl Hypervisor {
         vm.vcpu.spsr_el2 = 0x3C5; // EL1h + DAIF masked
         vm.state = VmState::Running;
         self.active_vmid = Some(vmid);
-        Ok(HypervisorAction::EnterGuest { vmid })
+        let stage2_root = vm.stage2.root_paddr();
+        Ok(HypervisorAction::EnterGuest {
+            vmid,
+            stage2_root,
+            elr_el2: vm.vcpu.elr_el2,
+            spsr_el2: vm.vcpu.spsr_el2,
+        })
     }
 
     fn hvc_vm_map(
@@ -218,7 +226,7 @@ impl Hypervisor {
         let vm = self
             .vms
             .get_mut(&vmid.0)
-            .ok_or(HypervisorError::InvalidVmId(vmid))?;
+            .ok_or(HypervisorError::InvalidVmId(vmid.0 as u64))?;
         for i in 0..page_count as u64 {
             let ipa = ipa_base + i * 4096;
             let pa = PhysAddr(pa_base + i * 4096);
@@ -252,6 +260,7 @@ impl Hypervisor {
         &mut self,
         ipa: u64,
         access: AccessType,
+        width: u8,
     ) -> Result<HypervisorAction, HypervisorError> {
         // All data aborts require an active guest — reject early if host-only.
         let vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
@@ -272,6 +281,7 @@ impl Hypervisor {
             return Ok(HypervisorAction::MmioResult {
                 emit,
                 read_value,
+                width,
                 pc_advance: 4,
             });
         }
@@ -398,10 +408,7 @@ mod tests {
             },
             &mut || alloc.alloc(),
         );
-        assert!(matches!(
-            result,
-            Err(HypervisorError::InvalidVmId(VmId(99)))
-        ));
+        assert!(matches!(result, Err(HypervisorError::InvalidVmId(99))));
     }
 
     #[test]
@@ -478,7 +485,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             action,
-            HypervisorAction::EnterGuest { vmid: VmId(1) }
+            HypervisorAction::EnterGuest { vmid: VmId(1), .. }
         ));
     }
 
@@ -522,6 +529,7 @@ mod tests {
             HypervisorAction::MmioResult {
                 emit: Some(b'H'),
                 read_value: 0,
+                width: 1,
                 pc_advance: 4,
             }
         );
@@ -798,7 +806,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             action,
-            HypervisorAction::EnterGuest { vmid: VmId(1) }
+            HypervisorAction::EnterGuest { vmid: VmId(1), .. }
         ));
 
         // 4. Guest writes "Hi" to virtual UART
@@ -818,6 +826,7 @@ mod tests {
                 HypervisorAction::MmioResult {
                     emit: Some(ch),
                     read_value: 0,
+                    width: 1,
                     pc_advance: 4,
                 }
             );
@@ -919,10 +928,11 @@ mod tests {
             HypervisorAction::MmioResult {
                 emit: None,
                 read_value: 0,
+                width: 4,
                 pc_advance: 4,
             }
         );
-        // Read at UARTFR (offset +0x18) → bit 7 (TXFE) set
+        // Read at UARTFR (offset +0x18) → TXFE + RXFE
         let action = hyp
             .handle(
                 TrapEvent::DataAbort {
@@ -938,6 +948,7 @@ mod tests {
             HypervisorAction::MmioResult {
                 emit: None,
                 read_value: (1 << 7) | (1 << 4), // TXFE + RXFE
+                width: 4,
                 pc_advance: 4,
             }
         );

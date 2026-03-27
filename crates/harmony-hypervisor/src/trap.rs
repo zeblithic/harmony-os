@@ -2,7 +2,7 @@
 //! Trap event/action types, HVC constants, and error enum.
 
 use crate::vmid::VmId;
-use harmony_microkernel::vm::VmError;
+use harmony_microkernel::vm::{PhysAddr, VmError};
 
 // ── HVC Function IDs ─────────────────────────────────────────────────
 
@@ -90,6 +90,10 @@ pub enum HypervisorAction {
         /// Value to inject into the guest's target register on a read trap.
         /// For writes and TX-only UART, this is 0.
         read_value: u64,
+        /// Access width in bytes (1/2/4/8) from ESR_EL2.ISS.SAS.
+        /// The shim uses this to zero/sign-extend `read_value` when
+        /// injecting into the guest's target register.
+        width: u8,
         /// Bytes to advance ELR_EL2 (4 for A64, 2 for T32).
         pc_advance: u8,
     },
@@ -107,9 +111,16 @@ pub enum HypervisorAction {
         x2: u64,
         x3: u64,
     },
-    /// Switch VTTBR_EL2 to this VM's Stage-2 root and eret into the guest.
+    /// Switch to guest context and eret. The platform shim must:
+    /// 1. Load `VTTBR_EL2 = (vmid << 48) | stage2_root`.
+    /// 2. Set `ELR_EL2 = elr_el2`, `SPSR_EL2 = spsr_el2`.
+    /// 3. Restore guest GPRs from VCpuContext.
+    /// 4. Issue `eret`.
     EnterGuest {
         vmid: VmId,
+        stage2_root: PhysAddr,
+        elr_el2: u64,
+        spsr_el2: u64,
     },
     /// Return x0 to the HVC caller and resume at EL1.
     HvcResult {
@@ -151,7 +162,9 @@ impl Stage2Flags {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HypervisorError {
     VmLimitReached,
-    InvalidVmId(VmId),
+    /// The VMID argument is out of range or does not refer to a known VM.
+    /// Carries the raw u64 so diagnostics can report the actual bad input.
+    InvalidVmId(u64),
     InvalidHvc(u64),
     Stage2MapFailed(VmError),
     VmAlreadyRunning(VmId),
@@ -218,7 +231,7 @@ mod tests {
     #[test]
     fn hypervisor_error_variants_constructible() {
         let _a = HypervisorError::VmLimitReached;
-        let _b = HypervisorError::InvalidVmId(VmId(42));
+        let _b = HypervisorError::InvalidVmId(42);
         let _c = HypervisorError::InvalidHvc(0xDEAD);
         let _d = HypervisorError::VmAlreadyRunning(VmId(1));
         let _e = HypervisorError::OutOfMemory;
