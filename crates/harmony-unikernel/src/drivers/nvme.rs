@@ -180,6 +180,10 @@ impl<R: RegisterBank> NvmeDriver<R> {
     ///
     /// Returns `Ok(())` when the bit matches or [`NvmeError::Timeout`] if
     /// [`MAX_POLL_ITERATIONS`] is exhausted without the bit settling.
+    ///
+    /// Note: this uses a fixed iteration count, not `timeout_ms`. Callers
+    /// on real hardware should use `timeout_ms()` for wall-clock timeout;
+    /// `MAX_POLL_ITERATIONS` is sized for unit-test environments.
     fn poll_ready(&self, expected: bool) -> Result<(), NvmeError> {
         for _ in 0..MAX_POLL_ITERATIONS {
             let csts = self.bank.read(REG_CSTS);
@@ -233,8 +237,9 @@ impl<R: RegisterBank> NvmeDriver<R> {
         let cap = (cap_lo as u64) | ((cap_hi as u64) << 32);
 
         // MQES (bits 15:0) — maximum queue entries supported (0-based, add 1).
+        // Saturate at u16::MAX to avoid wrapping when MQES=0xFFFF (65536 entries).
         let mqes = (cap & 0xFFFF) as u16;
-        let max_queue_entries = mqes.wrapping_add(1);
+        let max_queue_entries = mqes.saturating_add(1);
 
         // TO (bits 31:24 of CAP, i.e., bits 31:24 of cap_lo) — timeout in
         // 500 ms units.
@@ -319,6 +324,11 @@ impl<R: RegisterBank> NvmeDriver<R> {
 
         // Step 2 — clamp queue size to what the controller supports.
         let size = queue_size.min(self.max_queue_entries);
+
+        // Guard: AQA fields are 0-based (size-1), so zero is illegal.
+        if size == 0 {
+            return Err(NvmeError::InvalidState);
+        }
 
         // Step 3 — write AQA: both ACQS and ASQS are 0-based, so subtract 1.
         let size_minus_1 = (size - 1) as u32;
