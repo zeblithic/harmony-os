@@ -6,10 +6,15 @@
 
 use alloc::collections::BTreeMap;
 
-use crate::platform::{HVC_PING, HVC_PONG, VIRTUAL_UART_IPA, VIRTUAL_UART_SIZE};
+use crate::platform::{
+    HVC_PING, HVC_PONG, VIRTIO_NET_MMIO_IPA, VIRTIO_NET_MMIO_SIZE, VIRTUAL_UART_IPA,
+    VIRTUAL_UART_SIZE,
+};
 use crate::stage2::Stage2PageTable;
 use crate::trap::*;
 use crate::vcpu::{VCpuContext, Vm, VmState};
+use crate::virtio_mmio::MmioResponse;
+use crate::virtio_net::VirtioNetDevice;
 use crate::vmid::{VmId, VmIdAllocator};
 use harmony_microkernel::vm::PhysAddr;
 
@@ -20,7 +25,7 @@ use harmony_microkernel::vm::PhysAddr;
 /// operation. The hot-path trap handling (`handle()`) does not allocate.
 pub struct Hypervisor {
     vmid_alloc: VmIdAllocator,
-    vms: BTreeMap<u8, Vm>,
+    pub(crate) vms: BTreeMap<u8, Vm>,
     /// Currently executing VM (None = host).
     pub(crate) active_vmid: Option<VmId>,
     /// Host vCPU context (VM 0).
@@ -127,11 +132,14 @@ impl Hypervisor {
         let ptr = (self.phys_to_virt)(root);
         unsafe { core::ptr::write_bytes(ptr, 0, 4096) };
         let stage2 = Stage2PageTable::new(root, vmid, self.phys_to_virt);
+        let mac = [0x02, 0x00, 0x00, 0x00, 0x00, vmid.0];
+        let virtio_net = VirtioNetDevice::new(mac);
         let vm = Vm {
             id: vmid,
             vcpu: VCpuContext::default(),
             stage2,
             state: VmState::Created,
+            virtio_net,
         };
         self.vms.insert(vmid.0, vm);
         Ok(HypervisorAction::HvcResult { x0: vmid.0 as u64 })
@@ -271,6 +279,38 @@ impl Hypervisor {
     ) -> Result<HypervisorAction, HypervisorError> {
         // All data aborts require an active guest — reject early if host-only.
         let vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
+
+        if (VIRTIO_NET_MMIO_IPA..VIRTIO_NET_MMIO_IPA + VIRTIO_NET_MMIO_SIZE).contains(&ipa) {
+            let offset = (ipa - VIRTIO_NET_MMIO_IPA) as u32;
+            let vm = self
+                .vms
+                .get_mut(&vmid.0)
+                .ok_or(HypervisorError::InvalidVmId(vmid.0 as u64))?;
+            let response = vm.virtio_net.handle_mmio(offset, access);
+            return match response {
+                MmioResponse::ReadValue(val) => Ok(HypervisorAction::MmioResult {
+                    emit: None,
+                    read_value: val,
+                    width,
+                    srt,
+                    pc_advance: 4,
+                }),
+                MmioResponse::WriteAck | MmioResponse::StatusChanged { .. } => {
+                    Ok(HypervisorAction::MmioResult {
+                        emit: None,
+                        read_value: 0,
+                        width,
+                        srt,
+                        pc_advance: 4,
+                    })
+                }
+                MmioResponse::QueueNotify { queue } => Ok(HypervisorAction::VirtioQueueNotify {
+                    vmid,
+                    queue,
+                    pc_advance: 4,
+                }),
+            };
+        }
 
         if (VIRTUAL_UART_IPA..VIRTUAL_UART_IPA + VIRTUAL_UART_SIZE).contains(&ipa) {
             let offset = ipa - VIRTUAL_UART_IPA;
@@ -1216,5 +1256,616 @@ mod tests {
             )
             .unwrap();
         assert_eq!(action, HypervisorAction::HvcResult { x0: 0 });
+    }
+
+    // ── VirtIO MMIO routing tests ─────────────────────────────────────────────
+
+    #[test]
+    fn virtio_mmio_magic_via_hypervisor() {
+        let arena = vec![0u8; 65 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_START,
+                x1: 1,
+                x2: 0x4000_0000,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        // Read REG_MAGIC at offset +0x000 — expect 0x74726976 ("virt" LE)
+        let action = hyp
+            .handle(
+                TrapEvent::DataAbort {
+                    ipa: crate::platform::VIRTIO_NET_MMIO_IPA,
+                    access: AccessType::Read,
+                    width: 4,
+                    srt: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        assert_eq!(
+            action,
+            HypervisorAction::MmioResult {
+                emit: None,
+                read_value: 0x7472_6976,
+                width: 4,
+                srt: 0,
+                pc_advance: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn virtio_mmio_write_via_hypervisor() {
+        let arena = vec![0u8; 65 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_START,
+                x1: 1,
+                x2: 0x4000_0000,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        // Write Status=1 to REG_STATUS at offset +0x070
+        let action = hyp
+            .handle(
+                TrapEvent::DataAbort {
+                    ipa: crate::platform::VIRTIO_NET_MMIO_IPA + 0x070,
+                    access: AccessType::Write { value: 1 },
+                    width: 4,
+                    srt: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        // Write path: MmioResult with read_value=0
+        assert_eq!(
+            action,
+            HypervisorAction::MmioResult {
+                emit: None,
+                read_value: 0,
+                width: 4,
+                srt: 0,
+                pc_advance: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn virtio_queue_notify_via_hypervisor() {
+        let arena = vec![0u8; 65 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_START,
+                x1: 1,
+                x2: 0x4000_0000,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        // Write queue index 1 to REG_QUEUE_NOTIFY at offset +0x050
+        let action = hyp
+            .handle(
+                TrapEvent::DataAbort {
+                    ipa: crate::platform::VIRTIO_NET_MMIO_IPA + 0x050,
+                    access: AccessType::Write { value: 1 },
+                    width: 4,
+                    srt: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        assert_eq!(
+            action,
+            HypervisorAction::VirtioQueueNotify {
+                vmid: VmId(1),
+                queue: 1,
+                pc_advance: 4
+            }
+        );
+    }
+
+    #[test]
+    fn virtio_mmio_without_active_vm_errors() {
+        let mut hyp = make_hypervisor();
+        let mut alloc = BumpAlloc::new(0x10_0000, 0x10_0000);
+        // No VM created or started — DataAbort at VirtIO IPA should return NoActiveVm
+        let result = hyp.handle(
+            TrapEvent::DataAbort {
+                ipa: crate::platform::VIRTIO_NET_MMIO_IPA,
+                access: AccessType::Read,
+                width: 4,
+                srt: 0,
+            },
+            &mut || alloc.alloc(),
+        );
+        assert!(matches!(result, Err(HypervisorError::NoActiveVm)));
+    }
+
+    // ── End-to-end: Linux virtio-mmio probe + TX packet ──────────────────────
+
+    /// Send a DataAbort at `VIRTIO_NET_MMIO_IPA + offset` through the hypervisor
+    /// and return the resulting action.
+    fn send_mmio(
+        hyp: &mut Hypervisor,
+        alloc: &mut impl FnMut() -> Option<PhysAddr>,
+        offset: u32,
+        access: AccessType,
+    ) -> HypervisorAction {
+        hyp.handle(
+            TrapEvent::DataAbort {
+                ipa: crate::platform::VIRTIO_NET_MMIO_IPA + offset as u64,
+                access,
+                width: 4,
+                srt: 0,
+            },
+            alloc,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn linux_virtio_mmio_probe_and_tx() {
+        // ── Setup: VM lifecycle ───────────────────────────────────────────────
+
+        // Large arena for Stage-2 page table frames (64 pages).
+        let stage2_arena = vec![0u8; 65 * 4096];
+        let mut alloc = make_arena_alloc(&stage2_arena);
+
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
+
+        // HVC_VM_CREATE → VMID 1
+        let action = hyp
+            .handle(
+                TrapEvent::HvcCall {
+                    x0: HVC_VM_CREATE,
+                    x1: 0,
+                    x2: 0,
+                    x3: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        assert_eq!(action, HypervisorAction::HvcResult { x0: 1 });
+
+        // HVC_VM_START → guest enters
+        let action = hyp
+            .handle(
+                TrapEvent::HvcCall {
+                    x0: HVC_VM_START,
+                    x1: 1,
+                    x2: 0x4000_0000,
+                    x3: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        assert!(matches!(
+            action,
+            HypervisorAction::EnterGuest { vmid: VmId(1), .. }
+        ));
+
+        // ── Shared memory arena for virtqueues and packet buffer ──────────────
+        //
+        // Layout (byte offsets into `mem`):
+        //   0x0000  RX desc table  (16 entries × 16 bytes = 256 bytes)
+        //   0x0100  RX avail ring  (6 + 2×16 = 38 bytes)
+        //   0x1000  RX used ring   (page-aligned; 6 + 8×16 = 134 bytes)
+        //   0x2000  TX desc table  (256 bytes)
+        //   0x2100  TX avail ring  (38 bytes)
+        //   0x3000  TX used ring   (134 bytes)
+        //   0x4000  Packet buffer  (12-byte virtio_net_hdr + 60-byte frame = 72 bytes)
+        //
+        // The queue address registers are programmed with these byte offsets directly.
+        // `try_make_queue` uses them as offsets into the `mem` slice, so they must be
+        // small numbers within `mem.len()`, not absolute IPAs.
+        //
+        // The descriptor `addr` field stores the actual host pointer to the packet
+        // buffer, so `ipa_to_ptr = |addr| addr as *const u8` is the identity.
+
+        const RX_DESC_OFF: u64 = 0x0000;
+        const RX_AVAIL_OFF: u64 = 0x0100;
+        const RX_USED_OFF: u64 = 0x1000;
+        const TX_DESC_OFF: u64 = 0x2000;
+        const TX_AVAIL_OFF: u64 = 0x2100;
+        const TX_USED_OFF: u64 = 0x3000;
+        const PKT_BUF_OFF: u64 = 0x4000;
+        const MEM_SIZE: usize = 0x5000; // 5 pages, covers all offsets
+
+        let mut mem = vec![0u8; MEM_SIZE];
+
+        // ── Phase 1: Device Discovery (3 reads) ───────────────────────────────
+
+        // REG_MAGIC (+0x000) → 0x74726976 ("virt" LE)
+        let a = send_mmio(&mut hyp, &mut alloc, 0x000, AccessType::Read);
+        assert_eq!(
+            a,
+            HypervisorAction::MmioResult {
+                emit: None,
+                read_value: 0x7472_6976,
+                width: 4,
+                srt: 0,
+                pc_advance: 4
+            }
+        );
+
+        // REG_VERSION (+0x004) → 2
+        let a = send_mmio(&mut hyp, &mut alloc, 0x004, AccessType::Read);
+        assert_eq!(
+            a,
+            HypervisorAction::MmioResult {
+                emit: None,
+                read_value: 2,
+                width: 4,
+                srt: 0,
+                pc_advance: 4
+            }
+        );
+
+        // REG_DEVICE_ID (+0x008) → 1 (net)
+        let a = send_mmio(&mut hyp, &mut alloc, 0x008, AccessType::Read);
+        assert_eq!(
+            a,
+            HypervisorAction::MmioResult {
+                emit: None,
+                read_value: 1,
+                width: 4,
+                srt: 0,
+                pc_advance: 4
+            }
+        );
+
+        // ── Phase 2: Status Lifecycle ─────────────────────────────────────────
+
+        // Reset (write 0)
+        send_mmio(&mut hyp, &mut alloc, 0x070, AccessType::Write { value: 0 });
+        // ACKNOWLEDGE (bit 0)
+        send_mmio(&mut hyp, &mut alloc, 0x070, AccessType::Write { value: 1 });
+        // ACKNOWLEDGE | DRIVER (bits 0+1)
+        send_mmio(&mut hyp, &mut alloc, 0x070, AccessType::Write { value: 3 });
+
+        // ── Phase 3: Feature Negotiation ─────────────────────────────────────
+
+        // Select feature word 0
+        send_mmio(&mut hyp, &mut alloc, 0x014, AccessType::Write { value: 0 });
+        // Read device features word 0 — must have bit 5 (F_MAC) and bit 16 (F_STATUS)
+        let a = send_mmio(&mut hyp, &mut alloc, 0x010, AccessType::Read);
+        let feat0 = match a {
+            HypervisorAction::MmioResult { read_value, .. } => read_value,
+            other => panic!("expected MmioResult, got {:?}", other),
+        };
+        assert_ne!(feat0 & (1 << 5), 0, "F_MAC must be set in feature word 0");
+        assert_ne!(
+            feat0 & (1 << 16),
+            0,
+            "F_STATUS must be set in feature word 0"
+        );
+
+        // Select feature word 1
+        send_mmio(&mut hyp, &mut alloc, 0x014, AccessType::Write { value: 1 });
+        // Read device features word 1 — must have bit 0 (F_VERSION_1, global bit 32)
+        let a = send_mmio(&mut hyp, &mut alloc, 0x010, AccessType::Read);
+        let feat1 = match a {
+            HypervisorAction::MmioResult { read_value, .. } => read_value,
+            other => panic!("expected MmioResult, got {:?}", other),
+        };
+        assert_ne!(feat1 & 1, 0, "F_VERSION_1 must be set in feature word 1");
+
+        // Write driver features: word 0 = F_MAC | F_STATUS
+        send_mmio(&mut hyp, &mut alloc, 0x024, AccessType::Write { value: 0 });
+        send_mmio(
+            &mut hyp,
+            &mut alloc,
+            0x020,
+            AccessType::Write {
+                value: (1 << 5) | (1 << 16),
+            },
+        );
+        // Write driver features: word 1 = F_VERSION_1
+        send_mmio(&mut hyp, &mut alloc, 0x024, AccessType::Write { value: 1 });
+        send_mmio(&mut hyp, &mut alloc, 0x020, AccessType::Write { value: 1 });
+
+        // FEATURES_OK (bits 0+1+3 = 0xB)
+        send_mmio(
+            &mut hyp,
+            &mut alloc,
+            0x070,
+            AccessType::Write { value: 0xB },
+        );
+        // Read back status — must still be 0xB
+        let a = send_mmio(&mut hyp, &mut alloc, 0x070, AccessType::Read);
+        assert_eq!(
+            a,
+            HypervisorAction::MmioResult {
+                emit: None,
+                read_value: 0xB,
+                width: 4,
+                srt: 0,
+                pc_advance: 4
+            }
+        );
+
+        // ── Phase 4: Queue Configuration ─────────────────────────────────────
+        //
+        // Queue register addresses are byte offsets into `mem`.  VirtQueue::new
+        // receives them directly as `desc_offset`, `avail_offset`, `used_offset`.
+
+        // — Select RX queue (index 0) —
+        send_mmio(&mut hyp, &mut alloc, 0x030, AccessType::Write { value: 0 });
+        send_mmio(&mut hyp, &mut alloc, 0x038, AccessType::Write { value: 16 });
+        // QueueDescLow/High
+        send_mmio(
+            &mut hyp,
+            &mut alloc,
+            0x080,
+            AccessType::Write {
+                value: RX_DESC_OFF & 0xFFFF_FFFF,
+            },
+        );
+        send_mmio(
+            &mut hyp,
+            &mut alloc,
+            0x084,
+            AccessType::Write {
+                value: (RX_DESC_OFF >> 32) & 0xFFFF_FFFF,
+            },
+        );
+        // QueueAvailLow/High
+        send_mmio(
+            &mut hyp,
+            &mut alloc,
+            0x090,
+            AccessType::Write {
+                value: RX_AVAIL_OFF & 0xFFFF_FFFF,
+            },
+        );
+        send_mmio(
+            &mut hyp,
+            &mut alloc,
+            0x094,
+            AccessType::Write {
+                value: (RX_AVAIL_OFF >> 32) & 0xFFFF_FFFF,
+            },
+        );
+        // QueueUsedLow/High
+        send_mmio(
+            &mut hyp,
+            &mut alloc,
+            0x0A0,
+            AccessType::Write {
+                value: RX_USED_OFF & 0xFFFF_FFFF,
+            },
+        );
+        send_mmio(
+            &mut hyp,
+            &mut alloc,
+            0x0A4,
+            AccessType::Write {
+                value: (RX_USED_OFF >> 32) & 0xFFFF_FFFF,
+            },
+        );
+        // QueueReady = 1
+        send_mmio(&mut hyp, &mut alloc, 0x044, AccessType::Write { value: 1 });
+
+        // — Select TX queue (index 1) —
+        send_mmio(&mut hyp, &mut alloc, 0x030, AccessType::Write { value: 1 });
+        send_mmio(&mut hyp, &mut alloc, 0x038, AccessType::Write { value: 16 });
+        // QueueDescLow/High
+        send_mmio(
+            &mut hyp,
+            &mut alloc,
+            0x080,
+            AccessType::Write {
+                value: TX_DESC_OFF & 0xFFFF_FFFF,
+            },
+        );
+        send_mmio(
+            &mut hyp,
+            &mut alloc,
+            0x084,
+            AccessType::Write {
+                value: (TX_DESC_OFF >> 32) & 0xFFFF_FFFF,
+            },
+        );
+        // QueueAvailLow/High
+        send_mmio(
+            &mut hyp,
+            &mut alloc,
+            0x090,
+            AccessType::Write {
+                value: TX_AVAIL_OFF & 0xFFFF_FFFF,
+            },
+        );
+        send_mmio(
+            &mut hyp,
+            &mut alloc,
+            0x094,
+            AccessType::Write {
+                value: (TX_AVAIL_OFF >> 32) & 0xFFFF_FFFF,
+            },
+        );
+        // QueueUsedLow/High
+        send_mmio(
+            &mut hyp,
+            &mut alloc,
+            0x0A0,
+            AccessType::Write {
+                value: TX_USED_OFF & 0xFFFF_FFFF,
+            },
+        );
+        send_mmio(
+            &mut hyp,
+            &mut alloc,
+            0x0A4,
+            AccessType::Write {
+                value: (TX_USED_OFF >> 32) & 0xFFFF_FFFF,
+            },
+        );
+        // QueueReady = 1
+        send_mmio(&mut hyp, &mut alloc, 0x044, AccessType::Write { value: 1 });
+
+        // ── Phase 5: Driver Ready ─────────────────────────────────────────────
+
+        // DRIVER_OK (bits 0+1+2+3 = 0xF)
+        send_mmio(
+            &mut hyp,
+            &mut alloc,
+            0x070,
+            AccessType::Write { value: 0xF },
+        );
+
+        // ── Phase 6: TX Packet ────────────────────────────────────────────────
+
+        // Build a 60-byte test Ethernet frame (all 0xAA).
+        const FRAME_LEN: usize = 60;
+        const HDR_LEN: usize = 12; // virtio_net_hdr
+        const PKT_LEN: usize = HDR_LEN + FRAME_LEN; // 72
+
+        // Write packet into shared memory:
+        //   [0..12]  virtio_net_hdr  (all zeros)
+        //   [12..72] Ethernet frame  (all 0xAA)
+        let pkt_off = PKT_BUF_OFF as usize;
+        // Header is already zeroed (vec! initializes to 0).
+        mem[pkt_off + HDR_LEN..pkt_off + PKT_LEN].fill(0xAA);
+
+        // The descriptor `addr` is the actual host pointer to the packet buffer.
+        // `ipa_to_ptr = |addr| addr as *const u8` is the identity function.
+        let pkt_ptr = mem[pkt_off..].as_ptr() as u64;
+
+        // Write TX descriptor 0 at TX_DESC_OFF:
+        //   addr  = pkt_ptr (host pointer, used by ipa_to_ptr)
+        //   len   = 72
+        //   flags = 0 (no NEXT, no WRITE)
+        //   next  = 0
+        let tx_desc_base = TX_DESC_OFF as usize;
+        mem[tx_desc_base..tx_desc_base + 8].copy_from_slice(&pkt_ptr.to_le_bytes());
+        mem[tx_desc_base + 8..tx_desc_base + 12].copy_from_slice(&(PKT_LEN as u32).to_le_bytes());
+        mem[tx_desc_base + 12..tx_desc_base + 14].copy_from_slice(&0u16.to_le_bytes());
+        mem[tx_desc_base + 14..tx_desc_base + 16].copy_from_slice(&0u16.to_le_bytes());
+
+        // Write TX available ring: flags=0, idx=1, ring[0]=0
+        let tx_avail_base = TX_AVAIL_OFF as usize;
+        mem[tx_avail_base..tx_avail_base + 2].copy_from_slice(&0u16.to_le_bytes()); // flags
+        mem[tx_avail_base + 2..tx_avail_base + 4].copy_from_slice(&1u16.to_le_bytes()); // idx=1
+        mem[tx_avail_base + 4..tx_avail_base + 6].copy_from_slice(&0u16.to_le_bytes()); // ring[0]=0
+
+        // Guest notifies TX queue (index 1).
+        let a = send_mmio(&mut hyp, &mut alloc, 0x050, AccessType::Write { value: 1 });
+        assert_eq!(
+            a,
+            HypervisorAction::VirtioQueueNotify {
+                vmid: VmId(1),
+                queue: 1,
+                pc_advance: 4
+            }
+        );
+
+        // ── Phase 7: Host reads the TX packet ─────────────────────────────────
+
+        let vm = hyp.vms.get_mut(&1).expect("VM 1 must exist");
+        let mut out_buf = [0u8; 1500];
+        let n = vm
+            .virtio_net
+            .poll_tx(&mut mem, 0, |addr| addr as *const u8, &mut out_buf)
+            .expect("poll_tx must return Some");
+
+        // Expect exactly 60 bytes (virtio_net_hdr stripped).
+        assert_eq!(n, FRAME_LEN);
+        // All frame bytes must be 0xAA.
+        assert!(
+            out_buf[..FRAME_LEN].iter().all(|&b| b == 0xAA),
+            "frame bytes must all be 0xAA, got: {:?}",
+            &out_buf[..FRAME_LEN]
+        );
+    }
+
+    #[test]
+    fn virtio_config_space_mac() {
+        let arena = vec![0u8; 65 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_START,
+                x1: 1,
+                x2: 0x4000_0000,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        // Read REG_CONFIG_BASE at offset +0x100 — first MAC byte should be 0x02
+        let action = hyp
+            .handle(
+                TrapEvent::DataAbort {
+                    ipa: crate::platform::VIRTIO_NET_MMIO_IPA + 0x100,
+                    access: AccessType::Read,
+                    width: 1,
+                    srt: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        assert_eq!(
+            action,
+            HypervisorAction::MmioResult {
+                emit: None,
+                read_value: 0x02,
+                width: 1,
+                srt: 0,
+                pc_advance: 4,
+            }
+        );
     }
 }
