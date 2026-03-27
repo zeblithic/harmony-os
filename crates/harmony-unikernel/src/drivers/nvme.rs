@@ -77,10 +77,7 @@ pub struct CompletionResult {
 pub struct QueuePair {
     qid: u16,
     sq_tail: u16,
-    // Fields used in Task 2 (check_completion) and beyond.
-    #[allow(dead_code)]
     cq_head: u16,
-    #[allow(dead_code)]
     cq_phase: bool,
     #[allow(dead_code)]
     sq_phys: u64,
@@ -101,6 +98,47 @@ impl QueuePair {
             cq_phys,
             size,
         }
+    }
+
+    /// Parse a 16-byte CQE and, if the phase bit matches, return the
+    /// completion with CQ doorbell info.  Returns `None` on phase mismatch.
+    pub fn check_completion(
+        &mut self,
+        cqe: &[u8; 16],
+        doorbell_stride: u8,
+    ) -> Option<CompletionResult> {
+        let status_word = u16::from_le_bytes([cqe[14], cqe[15]]);
+        let phase = (status_word & 0x0001) != 0;
+        let status = status_word >> 1;
+
+        if phase != self.cq_phase {
+            return None;
+        }
+
+        let result = u32::from_le_bytes([cqe[0], cqe[1], cqe[2], cqe[3]]);
+        let cid = u16::from_le_bytes([cqe[12], cqe[13]]);
+
+        let next_head = self.cq_head + 1;
+        if next_head >= self.size {
+            self.cq_head = 0;
+            self.cq_phase = !self.cq_phase;
+        } else {
+            self.cq_head = next_head;
+        }
+
+        let stride = 4usize << doorbell_stride;
+        let cq_doorbell_offset = 0x1000 + (2 * self.qid as usize + 1) * stride;
+        let cq_doorbell_value = self.cq_head as u32;
+
+        Some(CompletionResult {
+            completion: Completion {
+                cid,
+                status,
+                result,
+            },
+            cq_doorbell_offset,
+            cq_doorbell_value,
+        })
     }
 
     /// Compute the byte offset into the SQ buffer for the current tail,
@@ -908,5 +946,68 @@ mod tests {
         let mut qp = QueuePair::new(1, 0x3_0000, 0x4_0000, 16);
         let cmd = qp.submit([0u8; 64], 0);
         assert_eq!(cmd.doorbell_offset, 0x1008);
+    }
+
+    #[test]
+    fn queue_pair_check_completion_phase_match() {
+        let mut qp = QueuePair::new(0, 0x1_0000, 0x2_0000, 32);
+        // CQE with phase=1 (matches initial cq_phase=true), CID=5, result=0x42
+        let mut cqe = [0u8; 16];
+        cqe[0..4].copy_from_slice(&0x42u32.to_le_bytes());
+        cqe[12..14].copy_from_slice(&5u16.to_le_bytes());
+        cqe[14..16].copy_from_slice(&0x0001u16.to_le_bytes()); // phase=1, status=0
+
+        let cr = qp.check_completion(&cqe, 0).expect("phase matches");
+        assert_eq!(cr.completion.cid, 5);
+        assert_eq!(cr.completion.status, 0);
+        assert_eq!(cr.completion.result, 0x42);
+        // CQ doorbell for qid=0: 0x1000 + (2*0+1)*(4<<0) = 0x1004
+        assert_eq!(cr.cq_doorbell_offset, 0x1004);
+        assert_eq!(cr.cq_doorbell_value, 1); // head advanced to 1
+    }
+
+    #[test]
+    fn queue_pair_check_completion_phase_mismatch() {
+        let mut qp = QueuePair::new(0, 0x1_0000, 0x2_0000, 32);
+        // CQE with phase=0, but cq_phase=true → mismatch
+        let mut cqe = [0u8; 16];
+        cqe[14..16].copy_from_slice(&0x0000u16.to_le_bytes());
+
+        assert!(qp.check_completion(&cqe, 0).is_none());
+    }
+
+    #[test]
+    fn queue_pair_check_completion_wraps_and_inverts_phase() {
+        let mut qp = QueuePair::new(0, 0x1_0000, 0x2_0000, 2); // size=2
+
+        let make_cqe = |phase: bool| -> [u8; 16] {
+            let mut cqe = [0u8; 16];
+            let status_word: u16 = if phase { 0x0001 } else { 0x0000 };
+            cqe[14..16].copy_from_slice(&status_word.to_le_bytes());
+            cqe
+        };
+
+        // head=0, phase=true → match, head→1
+        let r1 = qp.check_completion(&make_cqe(true), 0).unwrap();
+        assert_eq!(r1.cq_doorbell_value, 1);
+
+        // head=1, phase=true → match, head wraps→0, phase inverts→false
+        let r2 = qp.check_completion(&make_cqe(true), 0).unwrap();
+        assert_eq!(r2.cq_doorbell_value, 0);
+
+        // head=0, phase=false → match (inverted phase)
+        let r3 = qp.check_completion(&make_cqe(false), 0).unwrap();
+        assert_eq!(r3.cq_doorbell_value, 1);
+    }
+
+    #[test]
+    fn queue_pair_check_completion_io_queue_doorbell() {
+        // qid=1, stride=0: CQ doorbell = 0x1000 + (2*1+1)*(4<<0) = 0x100C
+        let mut qp = QueuePair::new(1, 0x3_0000, 0x4_0000, 16);
+        let mut cqe = [0u8; 16];
+        cqe[14..16].copy_from_slice(&0x0001u16.to_le_bytes());
+
+        let cr = qp.check_completion(&cqe, 0).unwrap();
+        assert_eq!(cr.cq_doorbell_offset, 0x100C);
     }
 }
