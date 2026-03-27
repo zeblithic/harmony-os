@@ -43,7 +43,7 @@ const MAX_POLL_ITERATIONS: u32 = 100_000;
 
 /// An admin command ready for the caller to execute.
 pub struct AdminCommand {
-    /// 64-byte SQE to write at `admin_sq_phys + sq_offset`.
+    /// 64-byte SQE to write at `sq_phys + sq_offset`.
     pub sqe: [u8; 64],
     /// Byte offset into the admin submission queue.
     pub sq_offset: u64,
@@ -75,15 +75,15 @@ pub struct CompletionResult {
 /// Tracks the software-maintained tail, head, and phase pointers for one
 /// SQ+CQ pair.  Both admin (qid=0) and I/O (qid≥1) queues use this struct.
 pub struct QueuePair {
-    qid: u16,
-    sq_tail: u16,
-    cq_head: u16,
-    cq_phase: bool,
+    pub(crate) qid: u16,
+    pub(crate) sq_tail: u16,
+    pub(crate) cq_head: u16,
+    pub(crate) cq_phase: bool,
     #[allow(dead_code)]
-    sq_phys: u64,
+    pub(crate) sq_phys: u64,
     #[allow(dead_code)]
-    cq_phys: u64,
-    size: u16,
+    pub(crate) cq_phys: u64,
+    pub(crate) size: u16,
 }
 
 impl QueuePair {
@@ -202,6 +202,8 @@ pub enum NvmeState {
     Disabled,
     /// Controller is running (CC.EN=1, CSTS.RDY=1).
     Enabled,
+    /// I/O queues created and active.
+    Ready,
 }
 
 // ── Driver struct ─────────────────────────────────────────────────────────────
@@ -218,18 +220,11 @@ pub struct NvmeDriver<R: RegisterBank> {
     doorbell_stride: u8,
     /// Per-controller timeout in milliseconds (TO * 500 ms units).
     timeout_ms: u32,
-    /// Admin submission queue tail pointer (software-maintained).
-    admin_sq_tail: u16,
-    /// Admin completion queue head pointer (software-maintained).
-    admin_cq_head: u16,
-    /// Admin completion queue phase bit.
-    admin_cq_phase: bool,
-    /// Physical base address of the admin submission queue.
-    admin_sq_phys: u64,
-    /// Physical base address of the admin completion queue.
-    admin_cq_phys: u64,
-    /// Number of entries in each admin queue.
-    admin_queue_size: u16,
+    /// Admin submission/completion queue pair.
+    admin: QueuePair,
+    /// I/O submission/completion queue pair (None until created).
+    #[allow(dead_code)]
+    io: Option<QueuePair>,
     /// Monotonically increasing command identifier.
     next_cid: u16,
     /// Current lifecycle state of the driver.
@@ -257,16 +252,6 @@ impl<R: RegisterBank> NvmeDriver<R> {
     fn write64(&mut self, offset_lo: usize, value: u64) {
         self.bank.write(offset_lo, value as u32);
         self.bank.write(offset_lo + 4, (value >> 32) as u32);
-    }
-
-    /// Compute the MMIO offset of a submission or completion queue doorbell.
-    ///
-    /// Per NVMe spec §3.1.12: doorbell base = 0x1000, stride = 4 << DSTRD.
-    /// SQ tail doorbell for queue `qid` is at index `2*qid`;
-    /// CQ head doorbell is at `2*qid + 1`.
-    fn doorbell_offset(&self, qid: u16, is_cq: bool) -> usize {
-        let stride = 4usize << self.doorbell_stride;
-        0x1000 + (2 * qid as usize + is_cq as usize) * stride
     }
 
     /// Poll CSTS.RDY until it equals `expected`.
@@ -365,12 +350,8 @@ impl<R: RegisterBank> NvmeDriver<R> {
             max_queue_entries,
             doorbell_stride,
             timeout_ms,
-            admin_sq_tail: 0,
-            admin_cq_head: 0,
-            admin_cq_phase: true,
-            admin_sq_phys: 0,
-            admin_cq_phys: 0,
-            admin_queue_size: 0,
+            admin: QueuePair::new(0, 0, 0, 0),
+            io: None,
             next_cid: 0,
             state: NvmeState::Disabled,
         };
@@ -441,12 +422,7 @@ impl<R: RegisterBank> NvmeDriver<R> {
         self.poll_ready(true)?;
 
         // Step 8 — update driver state.
-        self.admin_sq_phys = sq_phys;
-        self.admin_cq_phys = cq_phys;
-        self.admin_queue_size = size;
-        self.admin_sq_tail = 0;
-        self.admin_cq_head = 0;
-        self.admin_cq_phase = true;
+        self.admin = QueuePair::new(0, sq_phys, cq_phys, size);
         self.state = NvmeState::Enabled;
 
         Ok(())
@@ -468,11 +444,12 @@ impl<R: RegisterBank> NvmeDriver<R> {
     /// Returns [`NvmeError::InvalidState`] if the driver is not in
     /// [`NvmeState::Enabled`].
     pub fn identify_controller(&mut self, data_phys: u64) -> Result<AdminCommand, NvmeError> {
-        if self.state != NvmeState::Enabled {
+        if self.state != NvmeState::Enabled && self.state != NvmeState::Ready {
             return Err(NvmeError::InvalidState);
         }
 
         let cid = self.next_cid;
+        self.next_cid = self.next_cid.wrapping_add(1);
 
         // Build 64-byte SQE (all bytes zero by default).
         let mut sqe = [0u8; 64];
@@ -487,24 +464,7 @@ impl<R: RegisterBank> NvmeDriver<R> {
         // CDW10 bytes 40-43: CNS=0x01 (Identify Controller), little-endian.
         sqe[40..44].copy_from_slice(&1u32.to_le_bytes());
 
-        // sq_offset = admin_sq_tail * 64 (byte offset into the queue buffer).
-        let sq_offset = (self.admin_sq_tail as u64) * 64;
-
-        // Advance the tail pointer (wrapping within queue bounds).
-        self.admin_sq_tail = (self.admin_sq_tail + 1) % self.admin_queue_size;
-
-        // Increment command identifier for the next command.
-        self.next_cid = self.next_cid.wrapping_add(1);
-
-        let doorbell_offset = self.doorbell_offset(0, false);
-        let doorbell_value = self.admin_sq_tail as u32;
-
-        Ok(AdminCommand {
-            sqe,
-            sq_offset,
-            doorbell_offset,
-            doorbell_value,
-        })
+        Ok(self.admin.submit(sqe, self.doorbell_stride))
     }
 }
 
@@ -535,42 +495,7 @@ impl<R: RegisterBank> NvmeDriver<R> {
         &mut self,
         cqe_bytes: &[u8; 16],
     ) -> Result<Option<CompletionResult>, NvmeError> {
-        // Parse status word (bytes 14-15, LE).
-        let status_word = u16::from_le_bytes([cqe_bytes[14], cqe_bytes[15]]);
-        let phase = (status_word & 0x0001) != 0;
-        // Status code lives in bits 15:1.
-        let status = status_word >> 1;
-
-        // Phase mismatch → no completion available yet.
-        if phase != self.admin_cq_phase {
-            return Ok(None);
-        }
-
-        // Parse result (DW0, bytes 0-3) and CID (bytes 12-13).
-        let result = u32::from_le_bytes([cqe_bytes[0], cqe_bytes[1], cqe_bytes[2], cqe_bytes[3]]);
-        let cid = u16::from_le_bytes([cqe_bytes[12], cqe_bytes[13]]);
-
-        // Advance the CQ head; invert phase on wrap.
-        let next_head = self.admin_cq_head + 1;
-        if next_head >= self.admin_queue_size {
-            self.admin_cq_head = 0;
-            self.admin_cq_phase = !self.admin_cq_phase;
-        } else {
-            self.admin_cq_head = next_head;
-        }
-
-        let cq_doorbell_offset = self.doorbell_offset(0, true);
-        let cq_doorbell_value = self.admin_cq_head as u32;
-
-        Ok(Some(CompletionResult {
-            completion: Completion {
-                cid,
-                status,
-                result,
-            },
-            cq_doorbell_offset,
-            cq_doorbell_value,
-        }))
+        Ok(self.admin.check_completion(cqe_bytes, self.doorbell_stride))
     }
 }
 
@@ -720,7 +645,7 @@ mod tests {
         driver.setup_admin_queue(0x1_0000, 0x2_0000, 32).unwrap();
 
         assert_eq!(driver.state, NvmeState::Enabled);
-        assert_eq!(driver.admin_queue_size, 32);
+        assert_eq!(driver.admin.size, 32);
         assert!(driver.bank.writes.contains(&(REG_AQA, 0x001F_001F)));
         assert!(driver.bank.writes.contains(&(REG_ASQ_LO, 0x0001_0000)));
         assert!(driver.bank.writes.contains(&(REG_ASQ_HI, 0x0000_0000)));
@@ -737,7 +662,7 @@ mod tests {
         driver.bank.writes.clear();
 
         driver.setup_admin_queue(0x1_0000, 0x2_0000, 256).unwrap();
-        assert_eq!(driver.admin_queue_size, 64); // MQES+1=64
+        assert_eq!(driver.admin.size, 64); // MQES+1=64
         assert!(driver.bank.writes.contains(&(REG_AQA, 0x003F_003F)));
     }
 
@@ -853,8 +778,8 @@ mod tests {
             .unwrap()
             .expect("cqe1 should match");
         assert_eq!(r1.completion.result, 1);
-        assert_eq!(driver.admin_cq_head, 1);
-        assert!(driver.admin_cq_phase, "phase stays true after head=0→1");
+        assert_eq!(driver.admin.cq_head, 1);
+        assert!(driver.admin.cq_phase, "phase stays true after head=0→1");
 
         // Completion 2: head=1, phase=true → valid; wraps to head=0, phase inverts.
         let cqe2 = make_cqe(2, true);
@@ -863,8 +788,8 @@ mod tests {
             .unwrap()
             .expect("cqe2 should match");
         assert_eq!(r2.completion.result, 2);
-        assert_eq!(driver.admin_cq_head, 0, "head wraps to 0");
-        assert!(!driver.admin_cq_phase, "phase inverts on wrap");
+        assert_eq!(driver.admin.cq_head, 0, "head wraps to 0");
+        assert!(!driver.admin.cq_phase, "phase inverts on wrap");
 
         // Completion 3: head=0, phase=false → valid after inversion.
         let cqe3 = make_cqe(3, false);
@@ -873,8 +798,8 @@ mod tests {
             .unwrap()
             .expect("cqe3 should match");
         assert_eq!(r3.completion.result, 3);
-        assert_eq!(driver.admin_cq_head, 1);
-        assert!(!driver.admin_cq_phase, "phase stays false after head=0→1");
+        assert_eq!(driver.admin.cq_head, 1);
+        assert!(!driver.admin.cq_phase, "phase stays false after head=0→1");
     }
 
     #[test]
