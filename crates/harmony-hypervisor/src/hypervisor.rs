@@ -8,8 +8,8 @@ use alloc::collections::BTreeMap;
 
 use crate::gic::VirtualGic;
 use crate::platform::{
-    GUEST_CNTHCTL_EL2, GUEST_CNTVOFF_EL2, HVC_PING, HVC_PONG, VIRTIO_NET_MMIO_IPA,
-    VIRTIO_NET_MMIO_SIZE, VIRTUAL_UART_IPA, VIRTUAL_UART_SIZE,
+    GICD_IPA, GICD_SIZE, GICR_IPA, GICR_SIZE, GUEST_CNTHCTL_EL2, GUEST_CNTVOFF_EL2, HVC_PING,
+    HVC_PONG, VIRTIO_NET_MMIO_IPA, VIRTIO_NET_MMIO_SIZE, VIRTUAL_UART_IPA, VIRTUAL_UART_SIZE,
 };
 use crate::stage2::Stage2PageTable;
 use crate::trap::*;
@@ -83,13 +83,22 @@ impl Hypervisor {
             TrapEvent::SmcForward { x0, x1, x2, x3 } => {
                 // SMC traps only arrive from a guest (EL1). A host-side SMC goes
                 // directly to EL3 and never reaches this handler.
-                let _vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
+                let vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
+                if let Some(vm) = self.vms.get_mut(&vmid.0) {
+                    vm.gic
+                        .sync_lrs(&mut vm.vcpu.ich_lr, &mut vm.vcpu.ich_hcr_el2);
+                }
                 Ok(HypervisorAction::ForwardSmc { x0, x1, x2, x3 })
             }
             TrapEvent::TimerIrq => {
-                // Virtual timer interrupt — LRs will be loaded by the GIC emulator
-                // (not yet implemented). For now, acknowledge and resume the guest.
-                let _vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
+                let vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
+                let vm = self
+                    .vms
+                    .get_mut(&vmid.0)
+                    .ok_or(HypervisorError::InvalidVmId(vmid.0 as u64))?;
+                vm.gic.pend(27); // PPI 27 = virtual timer
+                vm.gic
+                    .sync_lrs(&mut vm.vcpu.ich_lr, &mut vm.vcpu.ich_hcr_el2);
                 Ok(HypervisorAction::ResumeGuest)
             }
         }
@@ -219,6 +228,9 @@ impl Hypervisor {
         vm.vcpu.x[2] = 0;
         vm.vcpu.x[3] = 0;
         vm.state = VmState::Running;
+        vm.vcpu.icc_sre_el1 = 0x7; // SRE + DFB + DIB — enable system register access
+        vm.gic
+            .sync_lrs(&mut vm.vcpu.ich_lr, &mut vm.vcpu.ich_hcr_el2);
         self.active_vmid = Some(vmid);
         let stage2_root = vm.stage2.root_paddr();
         Ok(HypervisorAction::EnterGuest {
@@ -318,6 +330,8 @@ impl Hypervisor {
                 .get_mut(&vmid.0)
                 .ok_or(HypervisorError::InvalidVmId(vmid.0 as u64))?;
             let response = vm.virtio_net.handle_mmio(offset, access);
+            vm.gic
+                .sync_lrs(&mut vm.vcpu.ich_lr, &mut vm.vcpu.ich_hcr_el2);
             return match response {
                 MmioResponse::ReadValue(val) => Ok(HypervisorAction::MmioResult {
                     emit: None,
@@ -354,6 +368,8 @@ impl Hypervisor {
                 AccessType::Write { value } => (vm.uart.write(offset, value), 0),
                 AccessType::Read => (None, vm.uart.read(offset)),
             };
+            vm.gic
+                .sync_lrs(&mut vm.vcpu.ich_lr, &mut vm.vcpu.ich_hcr_el2);
 
             return Ok(HypervisorAction::MmioResult {
                 emit,
@@ -363,6 +379,67 @@ impl Hypervisor {
                 pc_advance: 4,
             });
         }
+        // GIC Distributor
+        if (GICD_IPA..GICD_IPA + GICD_SIZE).contains(&ipa) {
+            let offset = (ipa - GICD_IPA) as u32;
+            let vm = self
+                .vms
+                .get_mut(&vmid.0)
+                .ok_or(HypervisorError::InvalidVmId(vmid.0 as u64))?;
+            let read_value = match access {
+                AccessType::Write { value } => {
+                    vm.gic.write_gicd(offset, value);
+                    0
+                }
+                AccessType::Read => vm.gic.read_gicd(offset),
+            };
+            vm.gic
+                .sync_lrs(&mut vm.vcpu.ich_lr, &mut vm.vcpu.ich_hcr_el2);
+            return Ok(HypervisorAction::MmioResult {
+                emit: None,
+                read_value,
+                width,
+                srt,
+                pc_advance: 4,
+            });
+        }
+
+        // GIC Redistributor
+        if (GICR_IPA..GICR_IPA + GICR_SIZE).contains(&ipa) {
+            let offset = (ipa - GICR_IPA) as u32;
+            let vm = self
+                .vms
+                .get_mut(&vmid.0)
+                .ok_or(HypervisorError::InvalidVmId(vmid.0 as u64))?;
+            let read_value = if offset < 0x10000 {
+                match access {
+                    AccessType::Write { value } => {
+                        vm.gic.write_gicr_rd(offset, value);
+                        0
+                    }
+                    AccessType::Read => vm.gic.read_gicr_rd(offset),
+                }
+            } else {
+                let sgi_offset = offset - 0x10000;
+                match access {
+                    AccessType::Write { value } => {
+                        vm.gic.write_gicr_sgi(sgi_offset, value);
+                        0
+                    }
+                    AccessType::Read => vm.gic.read_gicr_sgi(sgi_offset),
+                }
+            };
+            vm.gic
+                .sync_lrs(&mut vm.vcpu.ich_lr, &mut vm.vcpu.ich_hcr_el2);
+            return Ok(HypervisorAction::MmioResult {
+                emit: None,
+                read_value,
+                width,
+                srt,
+                pc_advance: 4,
+            });
+        }
+
         // Unknown IPA — kill the guest. Clear active_vmid atomically with the
         // DestroyVm decision, matching the WFI and guest_exit paths.
         if let Some(vm) = self.vms.get_mut(&vmid.0) {
@@ -2080,6 +2157,125 @@ mod tests {
                 emit: None,
                 read_value: 0x02,
                 width: 1,
+                srt: 0,
+                pc_advance: 4,
+            }
+        );
+    }
+
+    // ── GIC integration tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn timer_irq_pends_ppi_27() {
+        use crate::platform::{GICR_IPA, LR_COUNT};
+
+        let arena = vec![0u8; 65 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
+
+        // Create and start VM
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_START,
+                x1: 1,
+                x2: 0x4000_0000,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+
+        // Enable PPI 27 via GICR SGI_base ISENABLER0 (IPA = GICR_IPA + 0x10000 + 0x0100)
+        // Bit 27 in ISENABLER0 enables IRQ 27.
+        hyp.handle(
+            TrapEvent::DataAbort {
+                ipa: GICR_IPA + 0x10000 + 0x0100,
+                access: AccessType::Write { value: 1 << 27 },
+                width: 4,
+                srt: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+
+        // Fire TimerIrq — should pend PPI 27 and return ResumeGuest
+        let action = hyp.handle(TrapEvent::TimerIrq, &mut alloc).unwrap();
+        assert_eq!(action, HypervisorAction::ResumeGuest);
+
+        // Verify: vm.vcpu.ich_lr[0] has vINTID = 27
+        let vm = hyp.vm(1).expect("VM 1 should exist");
+        let lr0 = vm.vcpu.ich_lr[0];
+        let vintid = lr0 & 0xFFFF_FFFF; // vINTID is bits [31:0]
+        assert_eq!(vintid, 27, "LR[0] vINTID must be 27 (virtual timer PPI)");
+        // Verify the LR has the pending state set (bits [63:62] = 0b01)
+        let state = (lr0 >> 62) & 0b11;
+        assert_eq!(state, 0b01, "LR[0] state must be pending (0b01)");
+        // Verify at most LR_COUNT LRs are used
+        let used = vm.vcpu.ich_lr[..LR_COUNT]
+            .iter()
+            .filter(|&&lr| (lr >> 62) & 0b11 != 0)
+            .count();
+        assert!(used >= 1, "at least one LR must be populated");
+    }
+
+    #[test]
+    fn gicd_mmio_reads_typer_through_hypervisor() {
+        use crate::platform::GICD_IPA;
+
+        let arena = vec![0u8; 65 * 4096];
+        let mut alloc = make_arena_alloc(&arena);
+        let mut hyp = Hypervisor::new(|pa| pa.0 as *mut u8, |_| {});
+
+        // Create and start VM
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_CREATE,
+                x1: 0,
+                x2: 0,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+        hyp.handle(
+            TrapEvent::HvcCall {
+                x0: HVC_VM_START,
+                x1: 1,
+                x2: 0x4000_0000,
+                x3: 0,
+            },
+            &mut alloc,
+        )
+        .unwrap();
+
+        // DataAbort read at GICD_IPA + 0x0004 (TYPER) — expect ITLinesNumber=1
+        let action = hyp
+            .handle(
+                TrapEvent::DataAbort {
+                    ipa: GICD_IPA + 0x0004,
+                    access: AccessType::Read,
+                    width: 4,
+                    srt: 0,
+                },
+                &mut alloc,
+            )
+            .unwrap();
+        assert_eq!(
+            action,
+            HypervisorAction::MmioResult {
+                emit: None,
+                read_value: 1,
+                width: 4,
                 srt: 0,
                 pc_advance: 4,
             }
