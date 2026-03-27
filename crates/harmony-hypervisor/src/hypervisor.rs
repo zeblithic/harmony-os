@@ -51,9 +51,12 @@ impl Hypervisor {
     ) -> Result<HypervisorAction, HypervisorError> {
         match event {
             TrapEvent::HvcCall { x0, x1, x2, x3 } => self.handle_hvc(x0, x1, x2, x3, frame_alloc),
-            TrapEvent::DataAbort { ipa, access, width } => {
-                self.handle_data_abort(ipa, access, width)
-            }
+            TrapEvent::DataAbort {
+                ipa,
+                access,
+                width,
+                srt,
+            } => self.handle_data_abort(ipa, access, width, srt),
             TrapEvent::InstructionAbort { ipa: _ } => {
                 let vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
                 if let Some(vm) = self.vms.get_mut(&vmid.0) {
@@ -136,7 +139,7 @@ impl Hypervisor {
 
     /// Validate and extract a VMID from a u64 HVC argument. Rejects values > 255.
     fn parse_vmid(x: u64) -> Result<VmId, HypervisorError> {
-        if x > u8::MAX as u64 {
+        if x == 0 || x > u8::MAX as u64 {
             return Err(HypervisorError::InvalidVmId(x));
         }
         Ok(VmId(x as u8))
@@ -253,7 +256,10 @@ impl Hypervisor {
             vm.state = VmState::Halted;
         }
         self.active_vmid = None;
-        Ok(HypervisorAction::HvcResult { x0: x1 })
+        Ok(HypervisorAction::GuestExited {
+            vmid,
+            exit_code: x1,
+        })
     }
 
     fn handle_data_abort(
@@ -261,6 +267,7 @@ impl Hypervisor {
         ipa: u64,
         access: AccessType,
         width: u8,
+        srt: u8,
     ) -> Result<HypervisorAction, HypervisorError> {
         // All data aborts require an active guest — reject early if host-only.
         let vmid = self.active_vmid.ok_or(HypervisorError::NoActiveVm)?;
@@ -282,6 +289,7 @@ impl Hypervisor {
                 emit,
                 read_value,
                 width,
+                srt,
                 pc_advance: 4,
             });
         }
@@ -520,6 +528,7 @@ mod tests {
                     ipa: VIRTUAL_UART_IPA,
                     access: AccessType::Write { value: b'H' as u64 },
                     width: 1,
+                    srt: 0,
                 },
                 &mut alloc,
             )
@@ -530,6 +539,7 @@ mod tests {
                 emit: Some(b'H'),
                 read_value: 0,
                 width: 1,
+                srt: 0,
                 pc_advance: 4,
             }
         );
@@ -566,6 +576,7 @@ mod tests {
                     ipa: 0xDEAD_0000,
                     access: AccessType::Read,
                     width: 4,
+                    srt: 0,
                 },
                 &mut alloc,
             )
@@ -726,7 +737,13 @@ mod tests {
                 &mut alloc,
             )
             .unwrap();
-        assert!(matches!(action, HypervisorAction::HvcResult { x0: 0 }));
+        assert!(matches!(
+            action,
+            HypervisorAction::GuestExited {
+                vmid: VmId(1),
+                exit_code: 0
+            }
+        ));
     }
 
     #[test]
@@ -817,6 +834,7 @@ mod tests {
                         ipa: VIRTUAL_UART_IPA,
                         access: AccessType::Write { value: ch as u64 },
                         width: 1,
+                        srt: 0,
                     },
                     &mut alloc,
                 )
@@ -827,6 +845,7 @@ mod tests {
                     emit: Some(ch),
                     read_value: 0,
                     width: 1,
+                    srt: 0,
                     pc_advance: 4,
                 }
             );
@@ -844,7 +863,13 @@ mod tests {
                 &mut alloc,
             )
             .unwrap();
-        assert_eq!(action, HypervisorAction::HvcResult { x0: 0 });
+        assert_eq!(
+            action,
+            HypervisorAction::GuestExited {
+                vmid: VmId(1),
+                exit_code: 0
+            }
+        );
 
         // 6. Destroy VM
         let action = hyp
@@ -870,6 +895,7 @@ mod tests {
                 ipa: 0xDEAD_0000,
                 access: AccessType::Read,
                 width: 4,
+                srt: 0,
             },
             &mut || alloc.alloc(),
         );
@@ -919,6 +945,7 @@ mod tests {
                     ipa: VIRTUAL_UART_IPA,
                     access: AccessType::Read,
                     width: 4,
+                    srt: 0,
                 },
                 &mut alloc,
             )
@@ -929,6 +956,7 @@ mod tests {
                 emit: None,
                 read_value: 0,
                 width: 4,
+                srt: 0,
                 pc_advance: 4,
             }
         );
@@ -939,6 +967,7 @@ mod tests {
                     ipa: VIRTUAL_UART_IPA + 0x18,
                     access: AccessType::Read,
                     width: 4,
+                    srt: 0,
                 },
                 &mut alloc,
             )
@@ -949,6 +978,7 @@ mod tests {
                 emit: None,
                 read_value: (1 << 7) | (1 << 4), // TXFE + RXFE
                 width: 4,
+                srt: 0,
                 pc_advance: 4,
             }
         );

@@ -43,7 +43,10 @@ pub enum TrapEvent {
     DataAbort {
         ipa: u64,
         access: AccessType,
+        /// Access width in bytes (1/2/4/8) from ESR_EL2.ISS.SAS.
         width: u8,
+        /// Destination register index (ESR_EL2.ISS.SRT, bits [20:16]).
+        srt: u8,
     },
     InstructionAbort {
         ipa: u64,
@@ -91,9 +94,10 @@ pub enum HypervisorAction {
         /// For writes and TX-only UART, this is 0.
         read_value: u64,
         /// Access width in bytes (1/2/4/8) from ESR_EL2.ISS.SAS.
-        /// The shim uses this to zero/sign-extend `read_value` when
-        /// injecting into the guest's target register.
         width: u8,
+        /// Destination register index (ESR_EL2.ISS.SRT, bits [20:16]).
+        /// The shim injects `read_value` into guest X[srt] on a read trap.
+        srt: u8,
         /// Bytes to advance ELR_EL2 (4 for A64, 2 for T32).
         pc_advance: u8,
     },
@@ -102,6 +106,13 @@ pub enum HypervisorAction {
     /// This is NOT an HVC — do not attempt to return a value to the guest.
     HaltGuest {
         vmid: VmId,
+    },
+    /// Guest called HVC_GUEST_EXIT. The platform shim must switch to host
+    /// context (restore host GPRs, clear VTTBR_EL2) and NOT re-enter the
+    /// guest. `exit_code` is the value the guest passed in x1.
+    GuestExited {
+        vmid: VmId,
+        exit_code: u64,
     },
     /// Forward an SMC to EL3 (PSCI). The platform shim must advance
     /// ELR_EL2 by 4 after the SMC completes, then resume the guest.
@@ -217,6 +228,7 @@ mod tests {
             ipa: 0x0900_0000,
             access: AccessType::Write { value: b'H' as u64 },
             width: 1,
+            srt: 0,
         };
         let _ia = TrapEvent::InstructionAbort { ipa: 0x4000_0000 };
         let _wfi = TrapEvent::WfiWfe;
