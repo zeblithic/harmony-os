@@ -151,13 +151,8 @@ mod tests {
         );
         assert_eq!(layout::DTB_IPA, layout::RAM_BASE + layout::DTB_OFFSET);
 
-        // DTB must fit within the RAM window.
-        assert!(
-            layout::DTB_OFFSET < layout::RAM_SIZE,
-            "DTB_OFFSET {:#x} must be < RAM_SIZE {:#x}",
-            layout::DTB_OFFSET,
-            layout::RAM_SIZE,
-        );
+        // DTB must fit within the RAM window (compile-time check).
+        const _: () = assert!(layout::DTB_OFFSET < layout::RAM_SIZE);
     }
 
     #[test]
