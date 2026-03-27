@@ -76,14 +76,6 @@ impl<N: NetworkDevice> VirtioNetServer<N> {
         }
     }
 
-    /// Slice `bytes` starting at `offset`, returning at most `max` bytes.
-    /// Returns an empty vec if offset is past the end — signaling EOF to 9P clients.
-    fn slice_at_offset(bytes: &[u8], offset: u64, max: usize) -> Vec<u8> {
-        let start = (offset.min(usize::MAX as u64) as usize).min(bytes.len());
-        let end = start.saturating_add(max).min(bytes.len());
-        bytes[start..end].to_vec()
-    }
-
     fn qpath_name(&self, qpath: QPath) -> &str {
         match qpath {
             QPATH_ROOT => "/",
@@ -183,11 +175,11 @@ impl<N: NetworkDevice> FileServer for VirtioNetServer<N> {
                     m[0], m[1], m[2], m[3], m[4], m[5]
                 );
                 let bytes = s.into_bytes();
-                Ok(Self::slice_at_offset(&bytes, offset, max))
+                Ok(crate::slice_at_offset(&bytes, offset, max))
             }
             QPATH_MTU => {
                 let bytes = b"1500\n";
-                Ok(Self::slice_at_offset(bytes, offset, max))
+                Ok(crate::slice_at_offset(bytes, offset, max))
             }
             QPATH_STATS => {
                 let s = format!(
@@ -195,7 +187,7 @@ impl<N: NetworkDevice> FileServer for VirtioNetServer<N> {
                     self.rx_packets, self.tx_packets, self.rx_bytes, self.tx_bytes,
                 );
                 let bytes = s.into_bytes();
-                Ok(Self::slice_at_offset(&bytes, offset, max))
+                Ok(crate::slice_at_offset(&bytes, offset, max))
             }
             QPATH_LINK => {
                 let bytes: &[u8] = if self.device.link_up() {
@@ -203,7 +195,7 @@ impl<N: NetworkDevice> FileServer for VirtioNetServer<N> {
                 } else {
                     b"down\n"
                 };
-                Ok(Self::slice_at_offset(bytes, offset, max))
+                Ok(crate::slice_at_offset(bytes, offset, max))
             }
             _ => Err(IpcError::NotFound),
         }

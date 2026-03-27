@@ -83,14 +83,6 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> GenetServer<B, RX, TX> {
         }
     }
 
-    /// Slice `bytes` starting at `offset`, returning at most `max` bytes.
-    /// Returns an empty vec if offset is past the end — signaling EOF to 9P clients.
-    fn slice_at_offset(bytes: &[u8], offset: u64, max: usize) -> Vec<u8> {
-        let start = (offset.min(usize::MAX as u64) as usize).min(bytes.len());
-        let end = start.saturating_add(max).min(bytes.len());
-        bytes[start..end].to_vec()
-    }
-
     fn qpath_name(qpath: QPath) -> &'static str {
         match qpath {
             QPATH_ROOT => "/",
@@ -185,11 +177,11 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
                     m[0], m[1], m[2], m[3], m[4], m[5]
                 );
                 let bytes = s.into_bytes();
-                Ok(Self::slice_at_offset(&bytes, offset, max))
+                Ok(crate::slice_at_offset(&bytes, offset, max))
             }
             QPATH_MTU => {
                 let bytes = b"1500\n";
-                Ok(Self::slice_at_offset(bytes, offset, max))
+                Ok(crate::slice_at_offset(bytes, offset, max))
             }
             QPATH_STATS => {
                 let stats = self.driver.stats();
@@ -198,7 +190,7 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
                     stats.rx_packets, stats.tx_packets, stats.rx_errors, stats.tx_errors
                 );
                 let bytes = s.into_bytes();
-                Ok(Self::slice_at_offset(&bytes, offset, max))
+                Ok(crate::slice_at_offset(&bytes, offset, max))
             }
             QPATH_LINK => {
                 let up = self
@@ -211,7 +203,7 @@ impl<B: RegisterBank, const RX: usize, const TX: usize> FileServer for GenetServ
                         IpcError::ResourceExhausted
                     })?;
                 let bytes: &[u8] = if up { b"up\n" } else { b"down\n" };
-                Ok(Self::slice_at_offset(bytes, offset, max))
+                Ok(crate::slice_at_offset(bytes, offset, max))
             }
             _ => Err(IpcError::NotFound),
         }
