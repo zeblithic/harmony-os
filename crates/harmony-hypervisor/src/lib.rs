@@ -6,6 +6,6 @@ pub mod hypervisor;
 pub mod platform;
 pub mod stage2;
 pub mod trap;
+pub mod uart;
 pub mod vcpu;
 pub mod vmid;
-pub mod uart;

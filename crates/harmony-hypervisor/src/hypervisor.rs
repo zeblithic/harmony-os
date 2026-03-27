@@ -7,8 +7,7 @@
 use alloc::collections::BTreeMap;
 
 use crate::platform::{
-    GUEST_CNTHCTL_EL2, GUEST_CNTVOFF_EL2, HVC_PING, HVC_PONG, VIRTUAL_UART_IPA,
-    VIRTUAL_UART_SIZE,
+    GUEST_CNTHCTL_EL2, GUEST_CNTVOFF_EL2, HVC_PING, HVC_PONG, VIRTUAL_UART_IPA, VIRTUAL_UART_SIZE,
 };
 use crate::stage2::Stage2PageTable;
 use crate::trap::*;
