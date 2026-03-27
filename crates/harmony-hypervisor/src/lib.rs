@@ -7,4 +7,5 @@ pub mod platform;
 pub mod stage2;
 pub mod trap;
 pub mod vcpu;
+pub mod virtqueue;
 pub mod vmid;
