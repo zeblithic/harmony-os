@@ -67,12 +67,12 @@ impl VirtioNetDevice {
     /// Called at the start of every `poll_tx` / `push_rx` so the queues are
     /// created as soon as the driver finishes setup, without requiring a
     /// separate "driver-ok" callback.
-    pub fn ensure_queues(&mut self, region_len: usize) {
+    pub fn ensure_queues(&mut self, region_base_ipa: u64, region_len: usize) {
         if self.rx_queue.is_none() {
-            self.rx_queue = try_make_queue(&self.mmio.queues[0], region_len);
+            self.rx_queue = try_make_queue(&self.mmio.queues[0], region_base_ipa, region_len);
         }
         if self.tx_queue.is_none() {
-            self.tx_queue = try_make_queue(&self.mmio.queues[1], region_len);
+            self.tx_queue = try_make_queue(&self.mmio.queues[1], region_base_ipa, region_len);
         }
     }
 
@@ -98,10 +98,11 @@ impl VirtioNetDevice {
     pub fn poll_tx(
         &mut self,
         mem: &mut [u8],
+        region_base_ipa: u64,
         ipa_to_ptr: fn(u64) -> *const u8,
         out_buf: &mut [u8],
     ) -> Option<usize> {
-        self.ensure_queues(mem.len());
+        self.ensure_queues(region_base_ipa, mem.len());
 
         let tx = self.tx_queue.as_mut()?;
 
@@ -167,9 +168,10 @@ impl VirtioNetDevice {
         &mut self,
         frame: &[u8],
         mem: &mut [u8],
+        region_base_ipa: u64,
         ipa_to_ptr: fn(u64) -> *mut u8,
     ) -> bool {
-        self.ensure_queues(mem.len());
+        self.ensure_queues(region_base_ipa, mem.len());
 
         let rx = match self.rx_queue.as_mut() {
             Some(q) => q,
@@ -232,18 +234,16 @@ impl VirtioNetDevice {
 ///
 /// Returns `None` if the queue is not yet marked ready or if `VirtQueue::new`
 /// returns an error (e.g. the region is too small for the requested layout).
-fn try_make_queue(cfg: &QueueConfig, region_len: usize) -> Option<VirtQueue> {
+fn try_make_queue(cfg: &QueueConfig, region_base_ipa: u64, region_len: usize) -> Option<VirtQueue> {
     if !cfg.ready || cfg.num == 0 {
         return None;
     }
-    VirtQueue::new(
-        cfg.num,
-        cfg.desc_addr as usize,
-        cfg.avail_addr as usize,
-        cfg.used_addr as usize,
-        region_len,
-    )
-    .ok()
+    // Guest writes raw IPAs to queue address registers. Subtract the shared
+    // memory base IPA to get byte offsets into the region slice.
+    let desc_off = cfg.desc_addr.checked_sub(region_base_ipa)? as usize;
+    let avail_off = cfg.avail_addr.checked_sub(region_base_ipa)? as usize;
+    let used_off = cfg.used_addr.checked_sub(region_base_ipa)? as usize;
+    VirtQueue::new(cfg.num, desc_off, avail_off, used_off, region_len).ok()
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -391,7 +391,7 @@ mod tests {
         let mut dev = VirtioNetDevice::new(TEST_MAC);
         let mut mem = vec![0u8; MEM_LEN];
         let mut out_buf = [0u8; 1500];
-        let result = dev.poll_tx(&mut mem, |addr| addr as *const u8, &mut out_buf);
+        let result = dev.poll_tx(&mut mem, 0, |addr| addr as *const u8, &mut out_buf);
         assert!(result.is_none());
     }
 
@@ -423,7 +423,7 @@ mod tests {
 
         let mut out_buf = [0u8; 1500];
         let n = dev
-            .poll_tx(&mut mem, |addr| addr as *const u8, &mut out_buf)
+            .poll_tx(&mut mem, 0, |addr| addr as *const u8, &mut out_buf)
             .expect("should return Some");
 
         assert_eq!(n, test_frame.len());
@@ -452,7 +452,7 @@ mod tests {
         push_avail(&mut mem, RX_AVAIL_OFF, QUEUE_SIZE, 0);
 
         let frame = [0x11, 0x22, 0x33, 0x44_u8];
-        let ok = dev.push_rx(&frame, &mut mem, |addr| addr as *mut u8);
+        let ok = dev.push_rx(&frame, &mut mem, 0, |addr| addr as *mut u8);
         assert!(ok);
 
         // Verify that the used ring was advanced.
@@ -482,7 +482,7 @@ mod tests {
         // RX queue is ready but available ring has no entries → false.
         let (mut dev, mut mem) = make_device_with_queues(true, false);
         let frame = [0x01, 0x02_u8];
-        let ok = dev.push_rx(&frame, &mut mem, |addr| addr as *mut u8);
+        let ok = dev.push_rx(&frame, &mut mem, 0, |addr| addr as *mut u8);
         assert!(!ok);
     }
 
@@ -515,7 +515,7 @@ mod tests {
         push_avail(&mut mem, RX_AVAIL_OFF, QUEUE_SIZE, 0);
 
         let frame = [0xAA, 0xBB, 0xCC, 0xDD_u8];
-        let ok = dev.push_rx(&frame, &mut mem, |addr| addr as *mut u8);
+        let ok = dev.push_rx(&frame, &mut mem, 0, |addr| addr as *mut u8);
         assert!(!ok);
     }
 }

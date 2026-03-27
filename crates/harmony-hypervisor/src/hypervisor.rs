@@ -1807,7 +1807,7 @@ mod tests {
         let mut out_buf = [0u8; 1500];
         let n = vm
             .virtio_net
-            .poll_tx(&mut mem, |addr| addr as *const u8, &mut out_buf)
+            .poll_tx(&mut mem, 0, |addr| addr as *const u8, &mut out_buf)
             .expect("poll_tx must return Some");
 
         // Expect exactly 60 bytes (virtio_net_hdr stripped).

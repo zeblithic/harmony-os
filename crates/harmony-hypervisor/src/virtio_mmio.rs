@@ -148,17 +148,24 @@ impl VirtioMmio {
                 MmioResponse::ReadValue(word as u64)
             }
             (REG_DEVICE_FEATURES_SEL, AccessType::Write { value }) => {
-                self.device_features_sel = value as u32;
+                // VirtIO 1.2 §4.2.2: only words 0 and 1 are defined. Clamp to
+                // prevent shift-by-64 panic (sel * 32 >= 64 is UB for u64 shift).
+                self.device_features_sel = (value as u32).min(1);
                 MmioResponse::WriteAck
             }
 
             // ── Driver features ──────────────────────────────────────────────
             (REG_DRIVER_FEATURES, AccessType::Write { value }) => {
-                self.driver_features |= value << (self.driver_features_sel * 32);
+                // Replace the addressed 32-bit word (not OR-accumulate) so the
+                // driver can revise features before writing FEATURES_OK (§3.1.1).
+                let shift = self.driver_features_sel * 32;
+                let mask: u64 = 0xFFFF_FFFF_u64 << shift;
+                self.driver_features =
+                    (self.driver_features & !mask) | ((value & 0xFFFF_FFFF) << shift);
                 MmioResponse::WriteAck
             }
             (REG_DRIVER_FEATURES_SEL, AccessType::Write { value }) => {
-                self.driver_features_sel = value as u32;
+                self.driver_features_sel = (value as u32).min(1);
                 MmioResponse::WriteAck
             }
 

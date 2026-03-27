@@ -94,7 +94,7 @@ impl DescriptorChain {
             Some(idx) => idx,
         };
 
-        if self.hops > self.queue_size {
+        if self.hops >= self.queue_size {
             return Err(VirtQueueError::ChainTooLong);
         }
 
