@@ -11,7 +11,7 @@ use crate::platform::{
     GICD_IPA, GICD_SIZE, GICR_IPA, GICR_SIZE, GUEST_CNTHCTL_EL2, GUEST_CNTVOFF_EL2, HVC_PING,
     HVC_PONG, VIRTIO_NET_MMIO_IPA, VIRTIO_NET_MMIO_SIZE, VIRTUAL_UART_IPA, VIRTUAL_UART_SIZE,
 };
-use crate::stage2::Stage2PageTable;
+use crate::stage2::{Stage2Granule, Stage2PageTable};
 use crate::trap::*;
 use crate::uart::VirtualUart;
 use crate::vcpu::{VCpuContext, Vm, VmState};
@@ -163,7 +163,7 @@ impl Hypervisor {
         };
         let ptr = (self.phys_to_virt)(root);
         unsafe { core::ptr::write_bytes(ptr, 0, 4096) };
-        let stage2 = Stage2PageTable::new(root, vmid, self.phys_to_virt);
+        let stage2 = Stage2PageTable::new(root, vmid, Stage2Granule::Four, self.phys_to_virt);
         let mac = [0x02, 0x00, 0x00, 0x00, 0x00, vmid.0];
         let virtio_net = VirtioNetDevice::new(mac);
         let vm = Vm {
