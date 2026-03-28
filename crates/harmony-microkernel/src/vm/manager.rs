@@ -20,8 +20,20 @@ use super::{FrameClassification, PageFlags, PhysAddr, VirtAddr, VmError, PAGE_SI
 /// Start of the user-space virtual address range (skip null-page guard).
 const USER_SPACE_START: u64 = 0x1000;
 
-/// End of the user-space virtual address range (guard before kernel half).
-const USER_SPACE_END: u64 = 0x0000_7FFF_FFFF_F000;
+/// End of user-space VA range. Derived from page table geometry.
+/// aarch64 4K: 48-bit VA → (1 << 48) - 4096
+/// aarch64 16K: 47-bit VA → (1 << 47) - 16384
+/// x86_64: always 48-bit VA → (1 << 48) - 4096
+#[cfg(all(target_arch = "aarch64", not(feature = "page-16k")))]
+const USER_SPACE_END: u64 = (1u64 << 48) - 4096;
+#[cfg(all(target_arch = "aarch64", feature = "page-16k"))]
+const USER_SPACE_END: u64 = (1u64 << 47) - 16384;
+#[cfg(target_arch = "x86_64")]
+const USER_SPACE_END: u64 = (1u64 << 48) - 4096;
+// Test host on macOS x86_64 matches the x86_64 path above.
+// This fallback covers other architectures (e.g. wasm32 for testing).
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+const USER_SPACE_END: u64 = (1u64 << 47) - 4096;
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -1988,5 +2000,13 @@ mod tests {
             regions.get(&VirtAddr(0x6000)).unwrap().flags,
             rw_user_flags()
         );
+    }
+
+    #[test]
+    fn user_space_end_consistent_with_geometry() {
+        use super::super::PAGE_SIZE;
+        assert!(USER_SPACE_END < (1u64 << 48));
+        assert!(USER_SPACE_END > 0);
+        assert_eq!(USER_SPACE_END & (PAGE_SIZE - 1), 0);
     }
 }
