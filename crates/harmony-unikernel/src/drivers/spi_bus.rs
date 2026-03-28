@@ -195,14 +195,15 @@ pub mod mock {
         }
 
         fn deassert_cs(&mut self) {
-            // Advance register response cursor (not FIFO)
+            // Advance register response cursor only for read transactions.
+            // Write transactions should not consume queued responses.
             if let Some(addr) = self.current_addr.take() {
-                if self.fifo_responses.contains_key(&addr) {
-                    // FIFO: offset persists, don't advance cursor
-                } else if let Some(cursor) = self.response_cursors.get_mut(&addr) {
-                    let max = self.responses.get(&addr).map(|r| r.len()).unwrap_or(0);
-                    if *cursor < max.saturating_sub(1) {
-                        *cursor += 1;
+                if self.current_is_read && !self.fifo_responses.contains_key(&addr) {
+                    if let Some(cursor) = self.response_cursors.get_mut(&addr) {
+                        let max = self.responses.get(&addr).map(|r| r.len()).unwrap_or(0);
+                        if *cursor < max.saturating_sub(1) {
+                            *cursor += 1;
+                        }
                     }
                 }
             }

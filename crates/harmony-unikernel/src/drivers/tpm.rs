@@ -7,11 +7,6 @@
 //! 2. **Command engine** — FIFO-based command execution
 //! 3. **Key derivation** — HMAC workflow for hardware-bound keys
 //!
-//! Uses the [`tpm2_protocol`] crate for command marshaling.
-
-#[allow(unused_imports)]
-use tpm2_protocol as tpm2;
-
 extern crate alloc;
 use alloc::vec::Vec;
 
@@ -136,7 +131,10 @@ impl<S: SpiBus> TpmDriver<S> {
         self.bus.assert_cs();
         let mut rx_header = [0u8; 4];
         self.bus.transfer(&header, &mut rx_header);
-        self.poll_wait_state()?;
+        if let Err(e) = self.poll_wait_state() {
+            self.bus.deassert_cs();
+            return Err(e);
+        }
 
         let tx_zeros = [0u8; MAX_BURST];
         self.bus.transfer(&tx_zeros[..len], &mut buf[..len]);
@@ -154,7 +152,10 @@ impl<S: SpiBus> TpmDriver<S> {
         self.bus.assert_cs();
         let mut rx_header = [0u8; 4];
         self.bus.transfer(&header, &mut rx_header);
-        self.poll_wait_state()?;
+        if let Err(e) = self.poll_wait_state() {
+            self.bus.deassert_cs();
+            return Err(e);
+        }
 
         let mut rx_payload = [0u8; MAX_BURST];
         self.bus.transfer(&data[..len], &mut rx_payload[..len]);
@@ -225,21 +226,32 @@ impl<S: SpiBus> TpmDriver<S> {
         self.write_register(TPM_STS, &STS_COMMAND_READY.to_le_bytes())?;
 
         // Step 3: Poll commandReady
+        let mut ready = false;
         for _ in 0..MAX_POLL_CYCLES {
             let sts = self.read_sts()?;
             if sts & STS_COMMAND_READY != 0 {
+                ready = true;
                 break;
             }
+        }
+        if !ready {
+            return Err(TpmError::Timeout);
         }
 
         // Step 4-5: Write command to FIFO in chunks
         let mut offset = 0;
+        let mut retries = 0usize;
         while offset < command.len() {
             let sts = self.read_sts()?;
             let burst = (Self::burst_count(sts) as usize).min(MAX_BURST);
             if burst == 0 {
-                continue; // TPM not ready for more data yet
+                retries += 1;
+                if retries > MAX_POLL_CYCLES {
+                    return Err(TpmError::Timeout);
+                }
+                continue;
             }
+            retries = 0;
             let chunk = (command.len() - offset).min(burst);
             self.write_register(TPM_DATA_FIFO, &command[offset..offset + chunk])?;
             offset += chunk;
@@ -249,11 +261,16 @@ impl<S: SpiBus> TpmDriver<S> {
         self.write_register(TPM_STS, &STS_TPM_GO.to_le_bytes())?;
 
         // Step 7: Poll dataAvail
+        let mut avail = false;
         for _ in 0..MAX_POLL_CYCLES {
             let sts = self.read_sts()?;
             if sts & STS_DATA_AVAIL != 0 {
+                avail = true;
                 break;
             }
+        }
+        if !avail {
+            return Err(TpmError::Timeout);
         }
 
         // Step 8: Read response header (first 6 bytes to get size)
@@ -261,6 +278,9 @@ impl<S: SpiBus> TpmDriver<S> {
         self.read_register(TPM_DATA_FIFO, &mut header)?;
 
         let resp_size = u32::from_be_bytes([header[2], header[3], header[4], header[5]]) as usize;
+        if resp_size < 10 {
+            return Err(TpmError::ProtocolError);
+        }
         if resp_size > response.len() {
             return Err(TpmError::BufferTooSmall);
         }
@@ -272,12 +292,18 @@ impl<S: SpiBus> TpmDriver<S> {
         if resp_size > 6 {
             let remaining = resp_size - 6;
             let mut read_offset = 0;
+            let mut retries = 0usize;
             while read_offset < remaining {
                 let sts = self.read_sts()?;
                 let burst = (Self::burst_count(sts) as usize).min(MAX_BURST);
                 if burst == 0 {
+                    retries += 1;
+                    if retries > MAX_POLL_CYCLES {
+                        return Err(TpmError::Timeout);
+                    }
                     continue;
                 }
+                retries = 0;
                 let chunk = (remaining - read_offset).min(burst);
                 self.read_register(
                     TPM_DATA_FIFO,
@@ -769,13 +795,20 @@ mod tests {
     /// Sets up TPM_ACCESS (valid + active), TPM_STS (commandReady,
     /// burstCount=64, dataAvail), and a canned response on DATA_FIFO.
     fn mock_command_flow(bus: &mut MockSpiBus, response: &[u8]) {
-        // TPM_ACCESS: valid (bit 7) + active (bit 4) = 0x90
+        // TPM_ACCESS: valid + active
         bus.on_register(TPM_ACCESS, vec![0x90]);
-        // TPM_STS reads: commandReady (bit 6 = 0x40)
+        // TPM_STS reads for execute_command. We need enough entries for:
+        // 1: commandReady poll, 2: burstCount for write, 3: dataAvail poll,
+        // 4+: burstCount for response reads (may need multiple if response > 64).
+        // Queue generous entries — the last one is sticky.
         bus.on_register(TPM_STS, vec![0x40, 0x00, 0x00, 0x00]); // commandReady
-        bus.on_register(TPM_STS, vec![0x40, 0x40, 0x00, 0x00]); // burstCount=64 for write
-        bus.on_register(TPM_STS, vec![0x10, 0x40, 0x00, 0x00]); // dataAvail + burstCount=64
-        bus.on_fifo(TPM_DATA_FIFO, response.to_vec()); // DATA_FIFO: the canned response
+        bus.on_register(TPM_STS, vec![0x40, 0x40, 0x00, 0x00]); // burstCount=64
+        bus.on_register(TPM_STS, vec![0x10, 0x40, 0x00, 0x00]); // dataAvail+burst
+        bus.on_register(TPM_STS, vec![0x10, 0x40, 0x00, 0x00]); // extra for read
+        bus.on_register(TPM_STS, vec![0x10, 0x40, 0x00, 0x00]); // extra
+        bus.on_register(TPM_STS, vec![0x10, 0x40, 0x00, 0x00]); // extra
+                                                                // FIFO response
+        bus.on_fifo(TPM_DATA_FIFO, response.to_vec());
     }
 
     #[test]
@@ -835,22 +868,22 @@ mod tests {
         // DID_VID probe
         bus.on_register(TPM_DID_VID, vec![0x15, 0xD1, 0x00, 0x1A]);
 
-        // Startup: locality check + command flow
-        bus.on_register(TPM_ACCESS, vec![0x90]); // valid + active
-        bus.on_register(TPM_STS, vec![0x40, 0x00, 0x00, 0x00]); // commandReady
-        bus.on_register(TPM_STS, vec![0x40, 0x40, 0x00, 0x00]); // burstCount=64
-        bus.on_register(TPM_STS, vec![0x10, 0x40, 0x00, 0x00]); // dataAvail
-        bus.on_fifo(
-            TPM_DATA_FIFO,
-            vec![
-                0x80, 0x01, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, // success
-            ],
-        );
-
-        // SelfTest: locality check + command flow
+        // Startup: command flow (4 STS reads — writes don't advance cursor)
         bus.on_register(TPM_ACCESS, vec![0x90]);
         bus.on_register(TPM_STS, vec![0x40, 0x00, 0x00, 0x00]);
         bus.on_register(TPM_STS, vec![0x40, 0x40, 0x00, 0x00]);
+        bus.on_register(TPM_STS, vec![0x10, 0x40, 0x00, 0x00]);
+        bus.on_register(TPM_STS, vec![0x10, 0x40, 0x00, 0x00]);
+        bus.on_fifo(
+            TPM_DATA_FIFO,
+            vec![0x80, 0x01, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00],
+        );
+
+        // SelfTest: command flow
+        bus.on_register(TPM_ACCESS, vec![0x90]);
+        bus.on_register(TPM_STS, vec![0x40, 0x00, 0x00, 0x00]);
+        bus.on_register(TPM_STS, vec![0x40, 0x40, 0x00, 0x00]);
+        bus.on_register(TPM_STS, vec![0x10, 0x40, 0x00, 0x00]);
         bus.on_register(TPM_STS, vec![0x10, 0x40, 0x00, 0x00]);
         bus.on_fifo(
             TPM_DATA_FIFO,
@@ -878,6 +911,7 @@ mod tests {
         bus.on_register(TPM_STS, vec![0x40, 0x00, 0x00, 0x00]);
         bus.on_register(TPM_STS, vec![0x40, 0x40, 0x00, 0x00]);
         bus.on_register(TPM_STS, vec![0x10, 0x40, 0x00, 0x00]);
+        bus.on_register(TPM_STS, vec![0x10, 0x40, 0x00, 0x00]);
         bus.on_fifo(
             TPM_DATA_FIFO,
             vec![
@@ -889,6 +923,7 @@ mod tests {
         bus.on_register(TPM_ACCESS, vec![0x90]);
         bus.on_register(TPM_STS, vec![0x40, 0x00, 0x00, 0x00]);
         bus.on_register(TPM_STS, vec![0x40, 0x40, 0x00, 0x00]);
+        bus.on_register(TPM_STS, vec![0x10, 0x40, 0x00, 0x00]);
         bus.on_register(TPM_STS, vec![0x10, 0x40, 0x00, 0x00]);
         bus.on_fifo(
             TPM_DATA_FIFO,

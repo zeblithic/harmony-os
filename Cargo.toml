@@ -18,7 +18,7 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-2.0-or-later"
 repository = "https://github.com/zeblithic/harmony-os"
-rust-version = "1.81"
+rust-version = "1.75"
 
 [workspace.dependencies]
 # Ring 0 — harmony core (consumed under MIT license arm)
@@ -54,4 +54,3 @@ rand_core = { version = "0.6", default-features = false }
 #   cargo update keccak --precise 0.2.0-rc.2
 serde = { version = "1", default-features = false, features = ["derive", "alloc", "rc"] }
 ciborium = { version = "0.2", default-features = false }
-tpm2-protocol = { version = "0.16", default-features = false }
