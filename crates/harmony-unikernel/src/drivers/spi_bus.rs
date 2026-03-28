@@ -45,6 +45,7 @@ pub mod mock {
         /// Current transaction state (within one CS cycle).
         header_buf: Vec<u8>,
         current_addr: Option<u32>,
+        current_is_read: bool,
         wait_states_remaining: usize,
         ack_sent: bool,
         payload_cursor: usize,
@@ -69,6 +70,7 @@ pub mod mock {
                 wait_states: BTreeMap::new(),
                 header_buf: Vec::new(),
                 current_addr: None,
+                current_is_read: false,
                 wait_states_remaining: 0,
                 ack_sent: false,
                 payload_cursor: 0,
@@ -101,18 +103,30 @@ pub mod mock {
         }
 
         /// Get the next response byte for the current address.
+        /// For FIFO addresses, only advances the read offset when the
+        /// current transaction is a read (write transactions to DATA_FIFO
+        /// must not consume queued response bytes).
         fn next_response_byte(&mut self) -> u8 {
             let addr = match self.current_addr {
                 Some(a) => a,
                 None => return 0,
             };
 
-            // Check FIFO mode first
-            if let Some(fifo) = self.fifo_responses.get(&addr) {
-                let offset = self.fifo_offsets.get(&addr).copied().unwrap_or(0);
-                let byte = if offset < fifo.len() { fifo[offset] } else { 0 };
-                self.fifo_offsets.insert(addr, offset + 1);
-                return byte;
+            // Check FIFO mode first — only advance offset for reads
+            if self.fifo_responses.contains_key(&addr) {
+                if self.current_is_read {
+                    let offset = self.fifo_offsets.get(&addr).copied().unwrap_or(0);
+                    let byte = self
+                        .fifo_responses
+                        .get(&addr)
+                        .map(|fifo| if offset < fifo.len() { fifo[offset] } else { 0 })
+                        .unwrap_or(0);
+                    self.fifo_offsets.insert(addr, offset + 1);
+                    return byte;
+                } else {
+                    // Write to FIFO: return 0 without consuming response bytes
+                    return 0;
+                }
             }
 
             // Register mode: use payload_cursor within this CS cycle
@@ -145,6 +159,7 @@ pub mod mock {
                             | (self.header_buf[3] as u32);
                         let is_read = (self.header_buf[0] & 0x80) != 0;
                         self.current_addr = Some(addr);
+                        self.current_is_read = is_read;
                         self.wait_states_remaining =
                             self.wait_states.get(&addr).copied().unwrap_or(0);
                         self.ack_sent = false;
@@ -172,6 +187,7 @@ pub mod mock {
             self.cs_active = true;
             self.header_buf.clear();
             self.current_addr = None;
+            self.current_is_read = false;
             self.ack_sent = false;
             self.payload_cursor = 0;
             // Note: fifo_offsets NOT reset — persists across CS cycles

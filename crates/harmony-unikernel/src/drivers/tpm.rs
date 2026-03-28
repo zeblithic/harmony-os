@@ -165,6 +165,134 @@ impl<S: SpiBus> TpmDriver<S> {
     }
 }
 
+// ── TPM command engine (Layer 2) ─────────────────────────────────────
+
+#[allow(dead_code)]
+impl<S: SpiBus> TpmDriver<S> {
+    /// Ensure locality 0 is active. Request if needed.
+    fn ensure_locality(&mut self) -> Result<(), TpmError> {
+        let mut access = [0u8; 1];
+        self.read_register(TPM_ACCESS, &mut access)?;
+
+        if access[0] & ACCESS_VALID == 0 {
+            return Err(TpmError::LocalityUnavailable);
+        }
+
+        if access[0] & ACCESS_ACTIVE == 0 {
+            // Request locality
+            self.write_register(TPM_ACCESS, &[ACCESS_REQUEST])?;
+            // Poll until active
+            for _ in 0..MAX_POLL_CYCLES {
+                self.read_register(TPM_ACCESS, &mut access)?;
+                if access[0] & ACCESS_ACTIVE != 0 {
+                    return Ok(());
+                }
+            }
+            return Err(TpmError::Timeout);
+        }
+
+        Ok(())
+    }
+
+    /// Read TPM_STS as a 4-byte little-endian u32.
+    fn read_sts(&mut self) -> Result<u32, TpmError> {
+        let mut buf = [0u8; 4];
+        self.read_register(TPM_STS, &mut buf)?;
+        Ok(u32::from_le_bytes(buf))
+    }
+
+    /// Extract burstCount from TPM_STS (bits 23:8).
+    fn burst_count(sts: u32) -> u16 {
+        ((sts >> 8) & 0xFFFF) as u16
+    }
+
+    /// Execute a pre-marshaled TPM command and read the response.
+    ///
+    /// Returns the number of response bytes written to `response`.
+    pub fn execute_command(
+        &mut self,
+        command: &[u8],
+        response: &mut [u8],
+    ) -> Result<usize, TpmError> {
+        // Step 1: Ensure locality is active
+        self.ensure_locality()?;
+
+        // Step 2: Set commandReady
+        self.write_register(TPM_STS, &STS_COMMAND_READY.to_le_bytes())?;
+
+        // Step 3: Poll commandReady
+        for _ in 0..MAX_POLL_CYCLES {
+            let sts = self.read_sts()?;
+            if sts & STS_COMMAND_READY != 0 {
+                break;
+            }
+        }
+
+        // Step 4-5: Write command to FIFO in chunks
+        let mut offset = 0;
+        while offset < command.len() {
+            let sts = self.read_sts()?;
+            let burst = (Self::burst_count(sts) as usize).min(MAX_BURST);
+            if burst == 0 {
+                continue; // TPM not ready for more data yet
+            }
+            let chunk = (command.len() - offset).min(burst);
+            self.write_register(TPM_DATA_FIFO, &command[offset..offset + chunk])?;
+            offset += chunk;
+        }
+
+        // Step 6: Assert tpmGo
+        self.write_register(TPM_STS, &STS_TPM_GO.to_le_bytes())?;
+
+        // Step 7: Poll dataAvail
+        for _ in 0..MAX_POLL_CYCLES {
+            let sts = self.read_sts()?;
+            if sts & STS_DATA_AVAIL != 0 {
+                break;
+            }
+        }
+
+        // Step 8: Read response header (first 6 bytes to get size)
+        let mut header = [0u8; 6];
+        self.read_register(TPM_DATA_FIFO, &mut header)?;
+
+        let resp_size = u32::from_be_bytes([header[2], header[3], header[4], header[5]]) as usize;
+        if resp_size > response.len() {
+            return Err(TpmError::BufferTooSmall);
+        }
+
+        // Copy header into response
+        response[..6].copy_from_slice(&header);
+
+        // Read remaining bytes
+        if resp_size > 6 {
+            let remaining = resp_size - 6;
+            let mut read_offset = 0;
+            while read_offset < remaining {
+                let sts = self.read_sts()?;
+                let burst = (Self::burst_count(sts) as usize).min(MAX_BURST);
+                if burst == 0 {
+                    continue;
+                }
+                let chunk = (remaining - read_offset).min(burst);
+                self.read_register(
+                    TPM_DATA_FIFO,
+                    &mut response[6 + read_offset..6 + read_offset + chunk],
+                )?;
+                read_offset += chunk;
+            }
+        }
+
+        // Check response code (bytes 6-9, big-endian u32)
+        let rc = u32::from_be_bytes([response[6], response[7], response[8], response[9]]);
+        if rc != 0 {
+            return Err(TpmError::CommandFailed { rc });
+        }
+
+        Ok(resp_size)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +367,70 @@ mod tests {
             driver.read_register(TPM_DID_VID, &mut buf).unwrap_err(),
             TpmError::Timeout
         );
+    }
+
+    // ── Command engine tests ─────────────────────────────────────────
+
+    /// Helper: configure MockSpiBus for a successful command execution.
+    /// Sets up TPM_ACCESS (valid + active), TPM_STS (commandReady,
+    /// burstCount=64, dataAvail), and a canned response on DATA_FIFO.
+    fn mock_command_flow(bus: &mut MockSpiBus, response: &[u8]) {
+        // TPM_ACCESS: valid (bit 7) + active (bit 4) = 0x90
+        bus.on_register(TPM_ACCESS, vec![0x90]);
+        // TPM_STS reads: commandReady (bit 6 = 0x40)
+        bus.on_register(TPM_STS, vec![0x40, 0x00, 0x00, 0x00]); // commandReady
+        bus.on_register(TPM_STS, vec![0x40, 0x40, 0x00, 0x00]); // burstCount=64 for write
+        bus.on_register(TPM_STS, vec![0x10, 0x40, 0x00, 0x00]); // dataAvail + burstCount=64
+        bus.on_fifo(TPM_DATA_FIFO, response.to_vec()); // DATA_FIFO: the canned response
+    }
+
+    #[test]
+    fn execute_command_returns_response() {
+        let mut driver = make_driver();
+        // A minimal TPM response: 10-byte header with success RC
+        let response_bytes = [
+            0x80, 0x01, // tag: TPM_ST_NO_SESSIONS
+            0x00, 0x00, 0x00, 0x0A, // size: 10
+            0x00, 0x00, 0x00, 0x00, // RC: success
+        ];
+        mock_command_flow(&mut driver.bus, &response_bytes);
+
+        // A minimal command: 10-byte header
+        let command = [
+            0x80, 0x01, // tag
+            0x00, 0x00, 0x00, 0x0A, // size: 10
+            0x00, 0x00, 0x01, 0x44, // TPM2_Startup
+        ];
+        let mut resp = [0u8; 64];
+        let len = driver.execute_command(&command, &mut resp).unwrap();
+        assert_eq!(len, 10);
+        assert_eq!(&resp[..10], &response_bytes);
+    }
+
+    #[test]
+    fn execute_command_failed_rc() {
+        let mut driver = make_driver();
+        let response_bytes = [
+            0x80, 0x01, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x01,
+            0x00, // RC: TPM_RC_INITIALIZE
+        ];
+        mock_command_flow(&mut driver.bus, &response_bytes);
+
+        let command = [0x80, 0x01, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x01, 0x44];
+        let mut resp = [0u8; 64];
+        let err = driver.execute_command(&command, &mut resp).unwrap_err();
+        assert_eq!(err, TpmError::CommandFailed { rc: 0x100 });
+    }
+
+    #[test]
+    fn execute_command_locality_unavailable() {
+        let mut driver = make_driver();
+        // TPM_ACCESS without valid bit
+        driver.bus.on_register(TPM_ACCESS, vec![0x00]);
+
+        let command = [0x80, 0x01, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x01, 0x44];
+        let mut resp = [0u8; 64];
+        let err = driver.execute_command(&command, &mut resp).unwrap_err();
+        assert_eq!(err, TpmError::LocalityUnavailable);
     }
 }
