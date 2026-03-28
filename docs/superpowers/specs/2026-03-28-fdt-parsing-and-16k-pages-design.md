@@ -46,11 +46,11 @@ pub struct HardwareConfig {
 }
 ```
 
-Each sub-config holds MMIO base address, size, interrupt number, and `compatible` string. The struct lives in `harmony-microkernel` (Ring 2+ all consume it), and Ring 1 can also use it via dependency.
+Each sub-config holds MMIO base address, size, interrupt number, and `compatible` string. `MemoryRegion` stores base address and size in bytes (not page counts) to remain granule-agnostic. The struct lives in `harmony-microkernel` (Ring 2+ all consume it), and Ring 1 can also use it via dependency. `HardwareConfig` uses `Vec`, which requires `alloc` — this is available in all boot paths because boot stubs provide a global allocator (`LockedHeap` in aarch64, `linked_list_allocator` in x86_64) before constructing `HardwareConfig`.
 
 **Population paths:**
-- **FDT path (new):** Boot stub receives DTB pointer → `fdt` crate parses → populates `HardwareConfig`.
-- **UEFI path (existing):** Boot stub queries UEFI protocols → populates `HardwareConfig` from results + platform feature flags.
+- **FDT path (new):** Boot stub receives DTB pointer → `fdt` crate parses → populates `HardwareConfig`. FDT `reg` properties are already base+size in bytes.
+- **UEFI path (existing):** Boot stub queries UEFI protocols → populates `HardwareConfig` from results + platform feature flags. Note: UEFI reports memory in 4KiB EFI pages regardless of OS page size; the population code converts to byte sizes (`efi_pages * 4096`).
 - **Hardcoded path (existing):** Compile-time constants fill `HardwareConfig` directly.
 
 ### FDT Parsing Module
@@ -139,9 +139,25 @@ mod geometry {
 
 The page table walk generalizes from the current hardcoded `(vaddr >> (12 + level * 9)) & 0x1FF` to `(vaddr >> (PAGE_SHIFT + level * LEVEL_BITS)) & ((1 << LEVEL_BITS) - 1)`.
 
-**USER_SPACE_END:** Derived from constants instead of hardcoded. With 4K: `(1 << 48) - PAGE_SIZE`. With 16K: `(1 << 47) - PAGE_SIZE`.
+**Descriptor address mask:** The current `ADDR_MASK = 0x0000_FFFF_FFFF_F000` extracts bits [47:12], which is 4K-specific. This must be generalized:
 
-**TCR_EL1:** The boot stub's MMU setup sets granule bits: `TG0` = `0b00` (4K) or `0b10` (16K); `TG1` = `0b10` (4K) or `0b01` (16K). Lives in the boot crate, not the microkernel.
+```rust
+/// Mask for extracting the output address from a page table descriptor.
+/// Bits [47:PAGE_SHIFT] — varies with granule.
+pub const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_FFFF << PAGE_SHIFT >> PAGE_SHIFT << PAGE_SHIFT;
+// 4K:  0x0000_FFFF_FFFF_F000 (bits [47:12])
+// 16K: 0x0000_FFFF_FFFF_C000 (bits [47:14])
+```
+
+Or more readably: `!(PAGE_SIZE - 1) & 0x0000_FFFF_FFFF_FFFF`. Both `aarch64.rs` and `stage2.rs` currently hardcode this mask and must use the derived constant instead.
+
+**Table entry array size:** The current `table_mut` returns `&mut [u64; 512]`. With 16K, tables have 2048 entries. Change to `&mut [u64]` slice (pointer + ENTRIES_PER_TABLE length) to avoid const-generic array sizes in the return type.
+
+**Frame zeroing:** The current `aarch64.rs` has a hardcoded `write_bytes(new_ptr, 0, 4096)` when zeroing newly allocated intermediate page tables. This must become `write_bytes(new_ptr, 0, PAGE_SIZE as usize)` — partial zeroing on 16K would leave garbage entries that could be interpreted as valid descriptors.
+
+**USER_SPACE_END:** The existing code uses `0x0000_7FFF_FFFF_F000` which is a 47-bit VA space (not 48-bit). This is correct for the current implementation and also sufficient for 16K (which also uses 47-bit VA). Generalize to: `(1u64 << (PAGE_SHIFT + TABLE_LEVELS as u32 * LEVEL_BITS)) - PAGE_SIZE`. This yields `(1 << 48) - 4096` for 4K (expanding to full 48-bit, correcting the current conservative limit) and `(1 << 47) - 16384` for 16K.
+
+**TCR_EL1:** The boot stub's MMU setup sets granule bits: `TG0` = `0b00` (4K) or `0b10` (16K); `TG1` = `0b10` (4K) or `0b01` (16K). `T0SZ`/`T1SZ` must also change: `64 - VA_BITS` where VA_BITS is 48 (4K) or 47 (16K). Lives in the boot crate, not the microkernel.
 
 ### Buddy Allocator Adaptation
 
@@ -162,21 +178,51 @@ pub enum Stage2Granule {
     Sixteen, // 16KiB guest pages
 }
 
+impl Stage2Granule {
+    pub const fn page_size(&self) -> u64 {
+        match self { Self::Four => 4096, Self::Sixteen => 16384 }
+    }
+    pub const fn page_shift(&self) -> u32 {
+        match self { Self::Four => 12, Self::Sixteen => 14 }
+    }
+    pub const fn level_bits(&self) -> u32 {
+        match self { Self::Four => 9, Self::Sixteen => 11 }
+    }
+    pub const fn entries_per_table(&self) -> usize {
+        match self { Self::Four => 512, Self::Sixteen => 2048 }
+    }
+    pub const fn start_level(&self) -> usize {
+        match self { Self::Four => 0, Self::Sixteen => 1 }
+    }
+    pub const fn addr_mask(&self) -> u64 {
+        match self {
+            Self::Four => 0x0000_FFFF_FFFF_F000,
+            Self::Sixteen => 0x0000_FFFF_FFFF_C000,
+        }
+    }
+}
+
 pub struct Stage2PageTable {
     granule: Stage2Granule,
     // ... existing fields
 }
 ```
 
-Stage-2 `map`/`unmap` branch on `granule` for index arithmetic and descriptor format. Not hot-path — stage-2 mappings are set up at VM creation, not per-access.
+Stage-2 `map`/`unmap`/`index` use `self.granule` methods for all arithmetic — index extraction, address masking, frame zeroing size, and table level iteration. The current `Self::index()` hardcoded as `(ipa >> (12 + level * 9)) & 0x1FF` becomes `(ipa >> (self.granule.page_shift() + level as u32 * self.granule.level_bits())) & ((1 << self.granule.level_bits()) - 1)`.
 
-**VTCR_EL2:** `TG0` set at VM creation to match the guest's granule.
+**Intermediate table allocation:** When the host is 16K but the guest is 4K, the buddy allocator can only hand out 16K frames (one order-0 frame). A 4K guest page table uses only the first 4KiB of this 16K frame. The remaining 12KiB is zeroed and unused — wasteful but harmless and correct. Optimizing sub-page allocation is out of scope.
 
-### Linuxulator Changes
+**Guest loader:** `guest_loader.rs` uses hardcoded `4096` for guest IPA layout computation. These remain hardcoded at 4K because the guest loader always prepares a 4K-granule guest image. If 16K guests are needed later, the guest loader can be parameterized.
 
-The local `const PAGE_SIZE: usize = 4096` at linuxulator.rs:1749 is replaced with an import from `harmony_microkernel::vm::PAGE_SIZE`. All existing mmap/brk/mprotect rounding logic already uses `PAGE_SIZE` — it just needs to come from the right source.
+Not hot-path — stage-2 mappings are set up at VM creation, not per-access.
 
-On a 16K host, `sysconf(_SC_PAGESIZE)` returns 16384. No emulation, no sub-page tracking. Binaries requiring 4K pages use the hypervisor microVM path (Phase D+).
+**VTCR_EL2:** `TG0` set at VM creation to match the guest's granule. `T0SZ` set to `64 - guest_va_bits`.
+
+### Linuxulator and ELF Loader Changes
+
+**Linuxulator:** The local `const PAGE_SIZE: usize = 4096` at linuxulator.rs:1749 is replaced with an import from `harmony_microkernel::vm::PAGE_SIZE`. All existing mmap/brk/mprotect rounding logic already uses `PAGE_SIZE` — it just needs to come from the right source. On a 16K host, `sysconf(_SC_PAGESIZE)` returns 16384. No emulation, no sub-page tracking. Binaries requiring 4K pages use the hypervisor microVM path (Phase D+).
+
+**ELF loader:** `elf_loader.rs` has its own `const PAGE_SIZE: u64 = 4096` (line 37) used for ELF segment alignment and the `AT_PAGESZ` auxiliary vector entry (line 370). Both must use the microkernel's `PAGE_SIZE`. On a 16K host, ELF segments are aligned to 16KiB boundaries and `AT_PAGESZ` reports 16384. ELF binaries compiled for 4K alignment will have their segments rounded up to 16K — the extra padding is zeroed and harmless for well-behaved binaries.
 
 ## Testing Strategy
 
