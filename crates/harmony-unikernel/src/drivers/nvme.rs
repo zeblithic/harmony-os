@@ -647,6 +647,35 @@ impl<R: RegisterBank> NvmeDriver<R> {
 
         Ok(self.io.as_mut().unwrap().submit(sqe, self.doorbell_stride))
     }
+
+    /// Build an NVM Write command (opcode 0x01) for one logical block.
+    ///
+    /// Submits via the I/O queue (qid=1).  `data_phys` must be 4 KiB
+    /// aligned (CC.MPS=0).
+    pub fn write_block(
+        &mut self,
+        nsid: u32,
+        lba: u64,
+        data_phys: u64,
+    ) -> Result<AdminCommand, NvmeError> {
+        if self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+
+        let cid = self.next_cid;
+        self.next_cid = self.next_cid.wrapping_add(1);
+
+        let mut sqe = [0u8; 64];
+        let cdw0: u32 = 0x01 | ((cid as u32) << 16);
+        sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
+        sqe[4..8].copy_from_slice(&nsid.to_le_bytes());
+        sqe[24..32].copy_from_slice(&data_phys.to_le_bytes());
+        sqe[40..44].copy_from_slice(&(lba as u32).to_le_bytes());
+        sqe[44..48].copy_from_slice(&((lba >> 32) as u32).to_le_bytes());
+        sqe[48..52].copy_from_slice(&0u32.to_le_bytes());
+
+        Ok(self.io.as_mut().unwrap().submit(sqe, self.doorbell_stride))
+    }
 }
 
 // ── Completion checking ───────────────────────────────────────────────────────
@@ -1563,5 +1592,56 @@ mod tests {
         let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
         assert_eq!(cdw10, 0xABCD_EF00, "LBA low 32 bits");
         assert_eq!(cdw11, 0x0000_0001, "LBA high 32 bits");
+    }
+
+    // ── Write command tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn write_block_builds_correct_sqe() {
+        let mut driver = ready_driver();
+        let cmd = driver.write_block(1, 200, 0xCAFE_0000).unwrap();
+
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x01);
+
+        let nsid = u32::from_le_bytes(cmd.sqe[4..8].try_into().unwrap());
+        assert_eq!(nsid, 1);
+
+        let prp1 = u64::from_le_bytes(cmd.sqe[24..32].try_into().unwrap());
+        assert_eq!(prp1, 0xCAFE_0000);
+
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10, 200);
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11, 0);
+
+        let cdw12 = u32::from_le_bytes(cmd.sqe[48..52].try_into().unwrap());
+        assert_eq!(cdw12, 0);
+    }
+
+    #[test]
+    fn write_block_uses_io_queue_doorbell() {
+        let mut driver = ready_driver();
+        let cmd = driver.write_block(1, 0, 0x1000).unwrap();
+        assert_eq!(cmd.doorbell_offset, 0x1008);
+    }
+
+    #[test]
+    fn write_block_rejects_enabled_state() {
+        let mut driver = enabled_driver();
+        assert_eq!(
+            driver.write_block(1, 0, 0x1000).unwrap_err(),
+            NvmeError::InvalidState
+        );
+    }
+
+    #[test]
+    fn write_block_rejects_disabled_state() {
+        let bank = mock_nvme_bank();
+        let mut driver = NvmeDriver::init(bank).unwrap();
+        assert_eq!(
+            driver.write_block(1, 0, 0x1000).unwrap_err(),
+            NvmeError::InvalidState
+        );
     }
 }
