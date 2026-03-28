@@ -620,12 +620,11 @@ impl<R: RegisterBank> NvmeDriver<R> {
 // ── Block I/O commands ───────────────────────────────────────────────────────
 
 impl<R: RegisterBank> NvmeDriver<R> {
-    /// Build an NVM Read command (opcode 0x02) for one logical block.
-    ///
-    /// Submits via the I/O queue (qid=1).  `data_phys` must be 4 KiB
-    /// aligned (CC.MPS=0).
-    pub fn read_block(
+    /// Build a single-block NVM I/O command (Read or Write) and submit
+    /// via the I/O queue.
+    fn io_rw_command(
         &mut self,
+        opcode: u8,
         nsid: u32,
         lba: u64,
         data_phys: u64,
@@ -638,7 +637,7 @@ impl<R: RegisterBank> NvmeDriver<R> {
         self.next_cid = self.next_cid.wrapping_add(1);
 
         let mut sqe = [0u8; 64];
-        let cdw0: u32 = 0x02 | ((cid as u32) << 16);
+        let cdw0: u32 = (opcode as u32) | ((cid as u32) << 16);
         sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
         sqe[4..8].copy_from_slice(&nsid.to_le_bytes());
         sqe[24..32].copy_from_slice(&data_phys.to_le_bytes());
@@ -653,6 +652,19 @@ impl<R: RegisterBank> NvmeDriver<R> {
             .submit(sqe, self.doorbell_stride))
     }
 
+    /// Build an NVM Read command (opcode 0x02) for one logical block.
+    ///
+    /// Submits via the I/O queue (qid=1).  `data_phys` must be 4 KiB
+    /// aligned (CC.MPS=0).
+    pub fn read_block(
+        &mut self,
+        nsid: u32,
+        lba: u64,
+        data_phys: u64,
+    ) -> Result<AdminCommand, NvmeError> {
+        self.io_rw_command(0x02, nsid, lba, data_phys)
+    }
+
     /// Build an NVM Write command (opcode 0x01) for one logical block.
     ///
     /// Submits via the I/O queue (qid=1).  `data_phys` must be 4 KiB
@@ -663,27 +675,7 @@ impl<R: RegisterBank> NvmeDriver<R> {
         lba: u64,
         data_phys: u64,
     ) -> Result<AdminCommand, NvmeError> {
-        if self.state != NvmeState::Ready {
-            return Err(NvmeError::InvalidState);
-        }
-
-        let cid = self.next_cid;
-        self.next_cid = self.next_cid.wrapping_add(1);
-
-        let mut sqe = [0u8; 64];
-        let cdw0: u32 = 0x01 | ((cid as u32) << 16);
-        sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
-        sqe[4..8].copy_from_slice(&nsid.to_le_bytes());
-        sqe[24..32].copy_from_slice(&data_phys.to_le_bytes());
-        sqe[40..44].copy_from_slice(&(lba as u32).to_le_bytes());
-        sqe[44..48].copy_from_slice(&((lba >> 32) as u32).to_le_bytes());
-        sqe[48..52].copy_from_slice(&0u32.to_le_bytes());
-
-        Ok(self
-            .io
-            .as_mut()
-            .ok_or(NvmeError::InvalidState)?
-            .submit(sqe, self.doorbell_stride))
+        self.io_rw_command(0x01, nsid, lba, data_phys)
     }
 
     /// Build an NVM Flush command (opcode 0x00).
