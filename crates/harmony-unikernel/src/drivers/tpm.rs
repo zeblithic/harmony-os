@@ -137,22 +137,19 @@ impl<S: SpiBus> TpmDriver<S> {
         let header = Self::spi_header(true, len as u8, addr);
 
         self.bus.assert_cs().map_err(Self::bus_err)?;
-        let mut rx_header = [0u8; 4];
-        self.bus
-            .transfer(&header, &mut rx_header)
-            .map_err(Self::bus_err)?;
-        if let Err(e) = self.poll_wait_state() {
-            let _ = self.bus.deassert_cs();
-            return Err(e);
-        }
-
-        let tx_zeros = [0u8; MAX_BURST];
-        self.bus
-            .transfer(&tx_zeros[..len], &mut buf[..len])
-            .map_err(Self::bus_err)?;
-        self.bus.deassert_cs().map_err(Self::bus_err)?;
-
-        Ok(())
+        let result = (|| {
+            let mut rx_header = [0u8; 4];
+            self.bus
+                .transfer(&header, &mut rx_header)
+                .map_err(Self::bus_err)?;
+            self.poll_wait_state()?;
+            let tx_zeros = [0u8; MAX_BURST];
+            self.bus
+                .transfer(&tx_zeros[..len], &mut buf[..len])
+                .map_err(Self::bus_err)
+        })();
+        let _ = self.bus.deassert_cs();
+        result
     }
 
     /// Write `data` to TPM register at `addr`.
@@ -162,22 +159,19 @@ impl<S: SpiBus> TpmDriver<S> {
         let header = Self::spi_header(false, len as u8, addr);
 
         self.bus.assert_cs().map_err(Self::bus_err)?;
-        let mut rx_header = [0u8; 4];
-        self.bus
-            .transfer(&header, &mut rx_header)
-            .map_err(Self::bus_err)?;
-        if let Err(e) = self.poll_wait_state() {
-            let _ = self.bus.deassert_cs();
-            return Err(e);
-        }
-
-        let mut rx_payload = [0u8; MAX_BURST];
-        self.bus
-            .transfer(&data[..len], &mut rx_payload[..len])
-            .map_err(Self::bus_err)?;
-        self.bus.deassert_cs().map_err(Self::bus_err)?;
-
-        Ok(())
+        let result = (|| {
+            let mut rx_header = [0u8; 4];
+            self.bus
+                .transfer(&header, &mut rx_header)
+                .map_err(Self::bus_err)?;
+            self.poll_wait_state()?;
+            let mut rx_payload = [0u8; MAX_BURST];
+            self.bus
+                .transfer(&data[..len], &mut rx_payload[..len])
+                .map_err(Self::bus_err)
+        })();
+        let _ = self.bus.deassert_cs();
+        result
     }
 
     /// Return the current driver state.
@@ -384,8 +378,8 @@ impl<S: SpiBus> TpmDriver<S> {
 
 // ── Key derivation (Layer 3) ──────────────────────────────────────
 
-/// PWAP null-password auth area: authAreaSize(4) + sessionHandle(4)
-/// + nonceCaller(2) + attrs(1) + hmac(2) = 13 bytes.
+/// PWAP null-password auth area (13 bytes). Also inlined in the
+/// static command array of `create_primary_hmac_key` — keep in sync.
 const PWAP_AUTH: [u8; 13] = [
     0x00, 0x00, 0x00, 0x09, // auth area size = 9 bytes (excludes own 4-byte size field)
     0x40, 0x00, 0x00, 0x09, // TPM_RS_PW
@@ -432,7 +426,7 @@ impl<S: SpiBus> TpmDriver<S> {
             // Handle: TPM_RH_OWNER
             0x40, 0x00, 0x00, 0x01,
 
-            // PWAP auth area
+            // PWAP auth area (must match PWAP_AUTH constant)
             0x00, 0x00, 0x00, 0x09,             // auth area size = 9
             0x40, 0x00, 0x00, 0x09,             // TPM_RS_PW
             0x00, 0x00,                         // nonceCaller size = 0
@@ -563,6 +557,12 @@ impl<S: SpiBus> TpmDriver<S> {
             resp[offset + 3],
         ]) as usize;
         offset += 4;
+
+        // Reject empty digest response — would silently skip firmware
+        // binding, producing a key bound only to TPM seed + salt.
+        if digest_count == 0 {
+            return Err(TpmError::ProtocolError);
+        }
 
         let mut digests = Vec::new();
         for _ in 0..digest_count {
