@@ -646,7 +646,11 @@ impl<R: RegisterBank> NvmeDriver<R> {
         sqe[44..48].copy_from_slice(&((lba >> 32) as u32).to_le_bytes());
         sqe[48..52].copy_from_slice(&0u32.to_le_bytes());
 
-        Ok(self.io.as_mut().unwrap().submit(sqe, self.doorbell_stride))
+        Ok(self
+            .io
+            .as_mut()
+            .ok_or(NvmeError::InvalidState)?
+            .submit(sqe, self.doorbell_stride))
     }
 
     /// Build an NVM Write command (opcode 0x01) for one logical block.
@@ -675,7 +679,11 @@ impl<R: RegisterBank> NvmeDriver<R> {
         sqe[44..48].copy_from_slice(&((lba >> 32) as u32).to_le_bytes());
         sqe[48..52].copy_from_slice(&0u32.to_le_bytes());
 
-        Ok(self.io.as_mut().unwrap().submit(sqe, self.doorbell_stride))
+        Ok(self
+            .io
+            .as_mut()
+            .ok_or(NvmeError::InvalidState)?
+            .submit(sqe, self.doorbell_stride))
     }
 
     /// Build an NVM Flush command (opcode 0x00).
@@ -695,7 +703,11 @@ impl<R: RegisterBank> NvmeDriver<R> {
         sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
         sqe[4..8].copy_from_slice(&nsid.to_le_bytes());
 
-        Ok(self.io.as_mut().unwrap().submit(sqe, self.doorbell_stride))
+        Ok(self
+            .io
+            .as_mut()
+            .ok_or(NvmeError::InvalidState)?
+            .submit(sqe, self.doorbell_stride))
     }
 }
 
@@ -743,7 +755,7 @@ impl<R: RegisterBank> NvmeDriver<R> {
         Ok(self
             .io
             .as_mut()
-            .unwrap()
+            .ok_or(NvmeError::InvalidState)?
             .check_completion(cqe_bytes, self.doorbell_stride))
     }
 }
@@ -1682,6 +1694,18 @@ mod tests {
             driver.write_block(1, 0, 0x1000).unwrap_err(),
             NvmeError::InvalidState
         );
+    }
+
+    #[test]
+    fn write_block_large_lba_splits_correctly() {
+        let mut driver = ready_driver();
+        let lba: u64 = 0x1_ABCD_EF00;
+        let cmd = driver.write_block(1, lba, 0x1000).unwrap();
+
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw10, 0xABCD_EF00, "LBA low 32 bits");
+        assert_eq!(cdw11, 0x0000_0001, "LBA high 32 bits");
     }
 
     // ── Flush command tests ───────────────────────────────────────────────
