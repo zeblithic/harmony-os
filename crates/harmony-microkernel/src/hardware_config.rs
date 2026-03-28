@@ -119,6 +119,74 @@ impl Default for HardwareConfig {
 mod tests {
     use super::*;
 
+    /// Parse a DTB blob into HardwareConfig (test-only, mirrors fdt_parse.rs).
+    fn parse_fdt_for_test(dtb: &[u8]) -> HardwareConfig {
+        let fdt = fdt::Fdt::new(dtb).expect("invalid FDT");
+        let mut config = HardwareConfig::default();
+
+        for node in fdt.all_nodes() {
+            if node.name.starts_with("memory") {
+                if let Some(reg) = node.reg() {
+                    for region in reg {
+                        config.memory_regions.push(MemoryRegion {
+                            base: region.starting_address as u64,
+                            size: region.size.unwrap_or(0) as u64,
+                        });
+                    }
+                }
+            }
+        }
+
+        // In fdt 0.1.x, chosen() returns Chosen directly (panics if missing).
+        let chosen = fdt.chosen();
+        config.chosen.bootargs = chosen.bootargs().map(|s| s.to_string());
+
+        for node in fdt.all_nodes() {
+            if let Some(compat) = node.compatible() {
+                for c in compat.all() {
+                    match c {
+                        "arm,pl011" => {
+                            if let Some(reg) = node.reg().and_then(|mut r| r.next()) {
+                                config.serial = Some(SerialConfig {
+                                    base: reg.starting_address as u64,
+                                    size: reg.size.unwrap_or(0x1000) as u64,
+                                    compatible: c.to_string(),
+                                });
+                            }
+                        }
+                        "arm,gic-v3" | "arm,cortex-a15-gic" => {
+                            if let Some(reg) = node.reg().and_then(|mut r| r.next()) {
+                                config.interrupt_controller = Some(InterruptControllerConfig {
+                                    base: reg.starting_address as u64,
+                                    size: reg.size.unwrap_or(0x10000) as u64,
+                                    variant: InterruptControllerVariant::GicV3,
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        config
+    }
+
+    #[test]
+    fn fdt_parse_qemu_virt() {
+        let dtb = include_bytes!("../tests/fixtures/qemu-virt.dtb");
+        let cfg = parse_fdt_for_test(dtb);
+        assert!(!cfg.memory_regions.is_empty(), "should find /memory");
+        assert!(cfg.serial.is_some(), "should find PL011 UART");
+        assert!(cfg.interrupt_controller.is_some(), "should find GIC");
+    }
+
+    #[test]
+    fn fdt_serial_compatible_is_pl011() {
+        let dtb = include_bytes!("../tests/fixtures/qemu-virt.dtb");
+        let cfg = parse_fdt_for_test(dtb);
+        assert_eq!(cfg.serial.unwrap().compatible, "arm,pl011");
+    }
+
     #[test]
     fn hardware_config_default() {
         let cfg = HardwareConfig::default();

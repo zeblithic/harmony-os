@@ -15,6 +15,7 @@ repository = "https://github.com/zeblithic/harmony-os"
 
 [dependencies]
 linked_list_allocator = "0.10"
+fdt = { version = "0.1", default-features = false }
 
 harmony-unikernel = { path = "../harmony-unikernel", default-features = false }
 harmony-identity = { git = "https://github.com/zeblithic/harmony.git", branch = "main", default-features = false }

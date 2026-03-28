@@ -47,6 +47,7 @@ ciborium = { workspace = true, optional = true }
 harmony-unikernel = { workspace = true, features = ["test-utils"] }
 criterion = { workspace = true }
 rand = { version = "0.8", features = ["std"] }
+fdt = "0.1"
 
 [[bench]]
 name = "buddy_alloc"
