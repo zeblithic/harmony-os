@@ -14,6 +14,7 @@ harmony-identity = { workspace = true }
 harmony-platform = { workspace = true }
 harmony-reticulum = { workspace = true }
 rand_core = { workspace = true }
+tpm2-protocol = { workspace = true }
 
 [features]
 default = ["std"]
