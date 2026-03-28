@@ -1746,7 +1746,7 @@ impl SyscallBackend for VmMockBackend {
 
 // ── Memory arena ──────────────────────────────────────────────────
 
-const PAGE_SIZE: usize = 4096;
+const PAGE_SIZE: usize = harmony_microkernel::vm::PAGE_SIZE as usize;
 /// Stack size allocated for new process images (execve).
 const EXECVE_STACK_SIZE: usize = 128 * 1024;
 
@@ -6897,6 +6897,7 @@ mod tests {
         assert_eq!(base as usize, lx.arena_base());
     }
 
+    #[cfg(not(feature = "page-16k"))]
     #[test]
     fn arena_brk_extend_returns_new_brk() {
         let mock = MockBackend::new();
@@ -6906,6 +6907,7 @@ mod tests {
         assert_eq!(new_brk as u64, base + 8192);
     }
 
+    #[cfg(not(feature = "page-16k"))]
     #[test]
     fn arena_brk_aligns_to_4k() {
         let mock = MockBackend::new();
@@ -7238,6 +7240,7 @@ mod tests {
 
     // ── VM-backed mmap/munmap/mprotect/brk tests ─────────────────────
 
+    #[cfg(not(feature = "page-16k"))]
     #[test]
     fn vm_mmap_allocates_via_backend() {
         let mock = VmMockBackend::new(16); // 16 pages budget
@@ -7256,6 +7259,7 @@ mod tests {
         assert_eq!(*vaddr, addr as u64);
     }
 
+    #[cfg(not(feature = "page-16k"))]
     #[test]
     fn vm_munmap_calls_backend() {
         let mock = VmMockBackend::new(16);
@@ -7270,6 +7274,7 @@ mod tests {
         assert_eq!(lx.backend().vm_munmaps[0], (addr as u64, 4096));
     }
 
+    #[cfg(not(feature = "page-16k"))]
     #[test]
     fn vm_mprotect_calls_backend() {
         let mock = VmMockBackend::new(16);
@@ -7298,6 +7303,7 @@ mod tests {
         assert_eq!(result, ENOMEM);
     }
 
+    #[cfg(not(feature = "page-16k"))]
     #[test]
     fn vm_brk_expands_heap_via_backend() {
         let mock = VmMockBackend::new(16);
@@ -8633,6 +8639,7 @@ mod integration_tests {
         (kernel, serial_pid, linux_pid, entropy)
     }
 
+    #[cfg(not(feature = "page-16k"))]
     #[test]
     fn vm_mmap_allocates_region() {
         let (mut kernel, _serial_pid, linux_pid, _entropy) = setup_vm_kernel();
@@ -8645,6 +8652,7 @@ mod integration_tests {
         assert_eq!(addr as u64 % 4096, 0, "mmap address must be page-aligned");
     }
 
+    #[cfg(not(feature = "page-16k"))]
     #[test]
     fn vm_munmap_frees_region() {
         let (mut kernel, _serial_pid, linux_pid, _entropy) = setup_vm_kernel();
@@ -8658,6 +8666,7 @@ mod integration_tests {
         assert_eq!(result, 0, "munmap should succeed");
     }
 
+    #[cfg(not(feature = "page-16k"))]
     #[test]
     fn vm_mprotect_changes_flags() {
         let (mut kernel, _serial_pid, linux_pid, _entropy) = setup_vm_kernel();
@@ -8711,6 +8720,7 @@ mod integration_tests {
         assert_eq!(result, ENOMEM, "should return ENOMEM when budget exceeded");
     }
 
+    #[cfg(not(feature = "page-16k"))]
     #[test]
     fn vm_brk_expands_heap() {
         let (mut kernel, _serial_pid, linux_pid, _entropy) = setup_vm_kernel();
@@ -8734,6 +8744,7 @@ mod integration_tests {
         assert_eq!(probed, new_brk);
     }
 
+    #[cfg(not(feature = "page-16k"))]
     #[test]
     fn test_elf_loading_with_real_vm() {
         use crate::elf::{parse_elf, SegmentFlags};

@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [features]
 default = ["std"]
+page-16k = ["harmony-microkernel/page-16k"]
 std = [
     "harmony-microkernel/kernel",
     "dep:harmony-crypto", "harmony-crypto/std",

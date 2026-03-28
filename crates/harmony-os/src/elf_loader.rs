@@ -34,7 +34,7 @@ pub mod auxv {
 
 // ── Page alignment helpers ──────────────────────────────────────────
 
-const PAGE_SIZE: u64 = 4096;
+use harmony_microkernel::vm::PAGE_SIZE;
 
 /// Round `addr` down to the nearest page boundary.
 fn page_floor(addr: u64) -> u64 {
@@ -896,6 +896,7 @@ mod tests {
 
     // ── Tests ───────────────────────────────────────────────────────
 
+    #[cfg(not(feature = "page-16k"))]
     #[test]
     fn load_static_elf_returns_exe_entry() {
         let code = [0xCC; 16];
@@ -986,6 +987,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "page-16k"))]
     #[test]
     fn et_dyn_loaded_at_base_address() {
         let code = [0xCC; 16];
@@ -1195,6 +1197,7 @@ mod tests {
         assert_eq!(s, "./hello");
     }
 
+    #[cfg(not(feature = "page-16k"))]
     #[test]
     fn stack_auxv_present() {
         let mut stack = vec![0u8; 4096];
@@ -1346,6 +1349,7 @@ mod tests {
         found
     }
 
+    #[cfg(not(feature = "page-16k"))]
     #[test]
     fn end_to_end_static_elf_load() {
         // 1. Build a synthetic ET_EXEC ELF.
