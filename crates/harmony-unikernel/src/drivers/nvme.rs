@@ -241,6 +241,9 @@ pub struct NvmeDriver<R: RegisterBank> {
     /// I/O submission/completion queue pair (None until created).
     #[allow(dead_code)]
     io: Option<QueuePair>,
+    /// Pending I/O queue params cached by create_io_queues(), consumed by
+    /// activate_io_queues().  Ensures software QueuePair matches hardware.
+    pending_io: Option<(u64, u64, u16)>,
     /// Monotonically increasing command identifier.
     next_cid: u16,
     /// Current lifecycle state of the driver.
@@ -368,6 +371,7 @@ impl<R: RegisterBank> NvmeDriver<R> {
             timeout_ms,
             admin: QueuePair::new(0, 0, 0, 0),
             io: None,
+            pending_io: None,
             next_cid: 0,
             state: NvmeState::Disabled,
         };
@@ -458,7 +462,7 @@ impl<R: RegisterBank> NvmeDriver<R> {
     /// # Errors
     ///
     /// Returns [`NvmeError::InvalidState`] if the driver is not in
-    /// [`NvmeState::Enabled`].
+    /// [`NvmeState::Enabled`] or [`NvmeState::Ready`].
     pub fn identify_controller(&mut self, data_phys: u64) -> Result<AdminCommand, NvmeError> {
         if self.state != NvmeState::Enabled && self.state != NvmeState::Ready {
             return Err(NvmeError::InvalidState);
@@ -527,6 +531,9 @@ impl<R: RegisterBank> NvmeDriver<R> {
         self.next_cid = self.next_cid.wrapping_add(1);
 
         let size = size.min(self.max_queue_entries);
+        if size == 0 {
+            return Err(NvmeError::InvalidState);
+        }
 
         let mut sqe = [0u8; 64];
         let cdw0: u32 = 0x05 | ((cid as u32) << 16);
@@ -550,6 +557,9 @@ impl<R: RegisterBank> NvmeDriver<R> {
         self.next_cid = self.next_cid.wrapping_add(1);
 
         let size = size.min(self.max_queue_entries);
+        if size == 0 {
+            return Err(NvmeError::InvalidState);
+        }
 
         let mut sqe = [0u8; 64];
         let cdw0: u32 = 0x01 | ((cid as u32) << 16);
@@ -582,6 +592,9 @@ impl<R: RegisterBank> NvmeDriver<R> {
         let size = size.min(self.max_queue_entries);
         let cq_cmd = self.create_io_cq(cq_phys, size)?;
         let sq_cmd = self.create_io_sq(sq_phys, size)?;
+        // Cache the effective (post-clamp) params so activate_io_queues
+        // creates a QueuePair that matches what the hardware was programmed with.
+        self.pending_io = Some((sq_phys, cq_phys, size));
         Ok([cq_cmd, sq_cmd])
     }
 
@@ -589,19 +602,15 @@ impl<R: RegisterBank> NvmeDriver<R> {
     /// controller.
     ///
     /// Call this after executing both commands from [`create_io_queues`]
-    /// and confirming successful completions.  Transitions the driver to
-    /// [`NvmeState::Ready`].
-    pub fn activate_io_queues(
-        &mut self,
-        sq_phys: u64,
-        cq_phys: u64,
-        size: u16,
-    ) -> Result<(), NvmeError> {
+    /// and confirming successful completions.  Uses the params cached by
+    /// `create_io_queues` to ensure the software QueuePair matches the
+    /// hardware.  Transitions the driver to [`NvmeState::Ready`].
+    pub fn activate_io_queues(&mut self) -> Result<(), NvmeError> {
         if self.state != NvmeState::Enabled {
             return Err(NvmeError::InvalidState);
         }
 
-        let size = size.min(self.max_queue_entries);
+        let (sq_phys, cq_phys, size) = self.pending_io.take().ok_or(NvmeError::InvalidState)?;
         self.io = Some(QueuePair::new(1, sq_phys, cq_phys, size));
         self.state = NvmeState::Ready;
         Ok(())
@@ -692,7 +701,8 @@ pub fn parse_identify_namespace(data: &[u8; 4096]) -> IdentifyNamespace {
     // LBADS is at byte 2 of each entry.
     let fmt_index = (flbas & 0x0F) as usize;
     let lbads = data[128 + fmt_index * 4 + 2];
-    let lba_size_bytes = 1u32 << lbads;
+    // Guard against malformed LBADS values that would overflow a u32 shift.
+    let lba_size_bytes = if lbads < 32 { 1u32 << lbads } else { 0 };
 
     IdentifyNamespace {
         nsze,
@@ -1215,9 +1225,10 @@ mod tests {
     #[test]
     fn create_io_queues_rejects_ready_state() {
         let mut driver = enabled_driver();
-        driver
-            .activate_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
+        let _ = driver
+            .create_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
             .unwrap();
+        driver.activate_io_queues().unwrap();
         assert_eq!(driver.state(), NvmeState::Ready);
         // Already has I/O queues — should reject
         assert_eq!(
@@ -1233,9 +1244,10 @@ mod tests {
         let mut driver = enabled_driver();
         assert_eq!(driver.state(), NvmeState::Enabled);
 
-        driver
-            .activate_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
+        let _ = driver
+            .create_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
             .unwrap();
+        driver.activate_io_queues().unwrap();
 
         assert_eq!(driver.state(), NvmeState::Ready);
         assert!(driver.io.is_some());
@@ -1247,14 +1259,13 @@ mod tests {
     #[test]
     fn activate_io_queues_rejects_double_activation() {
         let mut driver = enabled_driver();
-        driver
-            .activate_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
+        let _ = driver
+            .create_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
             .unwrap();
-        // Now Ready — second call should fail
+        driver.activate_io_queues().unwrap();
+        // Now Ready — second call should fail (state is Ready, not Enabled)
         assert_eq!(
-            driver
-                .activate_io_queues(0xCCCC_0000, 0xDDDD_0000, 16)
-                .unwrap_err(),
+            driver.activate_io_queues().unwrap_err(),
             NvmeError::InvalidState
         );
     }
@@ -1263,8 +1274,19 @@ mod tests {
     fn activate_io_queues_rejects_disabled_state() {
         let bank = mock_nvme_bank();
         let mut driver = NvmeDriver::init(bank).unwrap();
+        // Disabled state — no pending_io either
         assert_eq!(
-            driver.activate_io_queues(0x1000, 0x2000, 16).unwrap_err(),
+            driver.activate_io_queues().unwrap_err(),
+            NvmeError::InvalidState
+        );
+    }
+
+    #[test]
+    fn activate_io_queues_rejects_without_create() {
+        let mut driver = enabled_driver();
+        // Enabled but create_io_queues not called — no pending_io
+        assert_eq!(
+            driver.activate_io_queues().unwrap_err(),
             NvmeError::InvalidState
         );
     }
@@ -1320,9 +1342,10 @@ mod tests {
     #[test]
     fn identify_namespace_works_in_ready_state() {
         let mut driver = enabled_driver();
-        driver
-            .activate_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
+        let _ = driver
+            .create_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
             .unwrap();
+        driver.activate_io_queues().unwrap();
         assert_eq!(driver.state(), NvmeState::Ready);
         // Should succeed in Ready state
         driver.identify_namespace(1, 0x1000).unwrap();
@@ -1392,9 +1415,10 @@ mod tests {
     #[test]
     fn identify_controller_works_in_ready_state() {
         let mut driver = enabled_driver();
-        driver
-            .activate_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
+        let _ = driver
+            .create_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
             .unwrap();
+        driver.activate_io_queues().unwrap();
         assert_eq!(driver.state(), NvmeState::Ready);
 
         // identify_controller should still work in Ready state
@@ -1423,9 +1447,7 @@ mod tests {
         assert_eq!(op0, 0x05); // Create I/O CQ
         assert_eq!(op1, 0x01); // Create I/O SQ
 
-        driver
-            .activate_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
-            .unwrap();
+        driver.activate_io_queues().unwrap();
         assert_eq!(driver.state(), NvmeState::Ready);
 
         // Identify namespace should work in Ready state
