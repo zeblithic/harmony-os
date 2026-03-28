@@ -1778,4 +1778,62 @@ mod tests {
         let cr = driver.check_io_completion(&cqe).unwrap().unwrap();
         assert_eq!(cr.cq_doorbell_offset, 0x100C);
     }
+
+    // ── Phase 3 integration test ──────────────────────────────────────────
+
+    #[test]
+    fn full_phase3_block_io_lifecycle() {
+        let bank = mock_nvme_bank();
+        let mut driver = NvmeDriver::init(bank).unwrap();
+        assert_eq!(driver.state(), NvmeState::Disabled);
+
+        driver.bank.on_read(REG_CSTS, vec![CSTS_RDY]);
+        driver.setup_admin_queue(0x1_0000, 0x2_0000, 32).unwrap();
+        assert_eq!(driver.state(), NvmeState::Enabled);
+
+        let _ = driver.create_io_queues(0x3_0000, 0x4_0000, 32).unwrap();
+        driver.activate_io_queues().unwrap();
+        assert_eq!(driver.state(), NvmeState::Ready);
+
+        let make_cqe = |phase: bool| -> [u8; 16] {
+            let mut cqe = [0u8; 16];
+            let status_word: u16 = if phase { 0x0001 } else { 0x0000 };
+            cqe[14..16].copy_from_slice(&status_word.to_le_bytes());
+            cqe
+        };
+
+        // Read block 42
+        let read_cmd = driver.read_block(1, 42, 0xBEEF_0000).unwrap();
+        let cdw0 = u32::from_le_bytes(read_cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x02);
+        assert_eq!(read_cmd.doorbell_offset, 0x1008);
+
+        let read_cr = driver
+            .check_io_completion(&make_cqe(true))
+            .unwrap()
+            .expect("read completion");
+        assert_eq!(read_cr.cq_doorbell_offset, 0x100C);
+
+        // Write block 42
+        let write_cmd = driver.write_block(1, 42, 0xCAFE_0000).unwrap();
+        let cdw0 = u32::from_le_bytes(write_cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x01);
+
+        let write_cr = driver
+            .check_io_completion(&make_cqe(true))
+            .unwrap()
+            .expect("write completion");
+        assert_eq!(write_cr.completion.status, 0);
+
+        // Flush
+        let flush_cmd = driver.flush(1).unwrap();
+        let cdw0 = u32::from_le_bytes(flush_cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x00);
+
+        let flush_cr = driver
+            .check_io_completion(&make_cqe(true))
+            .unwrap()
+            .expect("flush completion");
+        assert_eq!(flush_cr.completion.status, 0);
+    }
 }
