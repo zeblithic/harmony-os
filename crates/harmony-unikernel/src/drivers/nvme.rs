@@ -46,7 +46,7 @@ const MAX_POLL_ITERATIONS: u32 = 100_000;
 pub struct AdminCommand {
     /// 64-byte SQE to write at `sq_phys + sq_offset`.
     pub sqe: [u8; 64],
-    /// Byte offset into the admin submission queue.
+    /// Byte offset into the submission queue buffer.
     pub sq_offset: u64,
     /// Register offset for the SQ tail doorbell.
     pub doorbell_offset: usize,
