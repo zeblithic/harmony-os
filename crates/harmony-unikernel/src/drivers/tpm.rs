@@ -480,9 +480,12 @@ impl<S: SpiBus> TpmDriver<S> {
         pcr_indices: &[u8],
         resp: &mut [u8],
     ) -> Result<Vec<u8>, TpmError> {
-        // Build the PCR selection bitmask: 3 bytes, bit N of byte N/8.
-        // Reject any index >= 24 — silently dropping would weaken the
-        // PCR binding in a security-critical key derivation.
+        // Reject empty PCR indices — an empty set would produce a key
+        // bound only to the TPM seed + salt, silently skipping firmware
+        // binding. Also reject any index >= 24 (3-byte select field).
+        if pcr_indices.is_empty() {
+            return Err(TpmError::InvalidState);
+        }
         let mut pcr_select = [0u8; 3];
         for &idx in pcr_indices {
             if idx >= 24 {
@@ -596,6 +599,10 @@ impl<S: SpiBus> TpmDriver<S> {
         //   hashAlg: 2
         // Total = 10 + 4 + 13 + 2 + data.len() + 2 = 31 + data.len()
 
+        // TPM2B_MAX_BUFFER size field is u16 — reject oversized data.
+        if data.len() > u16::MAX as usize {
+            return Err(TpmError::BufferTooSmall);
+        }
         let total_size = (31 + data.len()) as u32;
         let data_len = data.len() as u16;
         let handle_bytes = handle.to_be_bytes();
