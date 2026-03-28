@@ -1386,4 +1386,53 @@ mod tests {
         assert_eq!(ns.flbas, 0x12, "raw byte preserved");
         assert_eq!(ns.lba_size_bytes, 512, "uses low nibble (index 2)");
     }
+
+    // ── Phase 2 integration tests ─────────────────────────────────────────
+
+    #[test]
+    fn identify_controller_works_in_ready_state() {
+        let mut driver = enabled_driver();
+        driver
+            .activate_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
+            .unwrap();
+        assert_eq!(driver.state(), NvmeState::Ready);
+
+        // identify_controller should still work in Ready state
+        let cmd = driver.identify_controller(0xDEAD_0000).unwrap();
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x06);
+    }
+
+    #[test]
+    fn full_phase2_lifecycle() {
+        // init → admin queue → create I/O queues → activate → identify namespace
+        let bank = mock_nvme_bank();
+        let mut driver = NvmeDriver::init(bank).unwrap();
+        assert_eq!(driver.state(), NvmeState::Disabled);
+
+        driver.bank.on_read(REG_CSTS, vec![CSTS_RDY]);
+        driver.setup_admin_queue(0x1_0000, 0x2_0000, 32).unwrap();
+        assert_eq!(driver.state(), NvmeState::Enabled);
+
+        let cmds = driver
+            .create_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
+            .unwrap();
+        // Verify we got CQ and SQ commands
+        let op0 = u32::from_le_bytes(cmds[0].sqe[0..4].try_into().unwrap()) & 0xFF;
+        let op1 = u32::from_le_bytes(cmds[1].sqe[0..4].try_into().unwrap()) & 0xFF;
+        assert_eq!(op0, 0x05); // Create I/O CQ
+        assert_eq!(op1, 0x01); // Create I/O SQ
+
+        driver
+            .activate_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
+            .unwrap();
+        assert_eq!(driver.state(), NvmeState::Ready);
+
+        // Identify namespace should work in Ready state
+        let ns_cmd = driver.identify_namespace(1, 0xFEED_0000).unwrap();
+        let ns_cdw0 = u32::from_le_bytes(ns_cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(ns_cdw0 & 0xFF, 0x06);
+        let ns_nsid = u32::from_le_bytes(ns_cmd.sqe[4..8].try_into().unwrap());
+        assert_eq!(ns_nsid, 1);
+    }
 }
