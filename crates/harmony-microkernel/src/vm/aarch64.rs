@@ -117,10 +117,6 @@ const ADDR_MASK: u64 = !(PAGE_SIZE - 1) & 0x0000_FFFF_FFFF_FFFF;
 /// Mask for extracting the per-level index from a shifted virtual address.
 const INDEX_MASK: u64 = (1u64 << geometry::LEVEL_BITS) - 1;
 
-// Compile-time guard: page-16k is only valid on aarch64.
-#[cfg(all(feature = "page-16k", not(target_arch = "aarch64")))]
-compile_error!("page-16k feature is only supported on aarch64 targets");
-
 /// Mask for AP bits [7:6].
 const AP_MASK: u64 = 0b11 << 6;
 
@@ -178,9 +174,11 @@ impl Aarch64PageTable {
 
     /// Extract the page table index from a virtual address at the given level.
     ///
-    /// The index is `LEVEL_BITS` wide, starting at bit `PAGE_SHIFT + level * LEVEL_BITS`.
+    /// The index is `LEVEL_BITS` wide, starting at bit
+    /// `PAGE_SHIFT + (level - START_LEVEL) * LEVEL_BITS`.
     fn index(vaddr: VirtAddr, level: usize) -> usize {
-        ((vaddr.as_u64() >> (PAGE_SHIFT + level as u32 * geometry::LEVEL_BITS)) & INDEX_MASK)
+        let level_offset = (level - geometry::START_LEVEL) as u32;
+        ((vaddr.as_u64() >> (PAGE_SHIFT + level_offset * geometry::LEVEL_BITS)) & INDEX_MASK)
             as usize
     }
 

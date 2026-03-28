@@ -38,11 +38,13 @@ pub unsafe fn parse_fdt(dtb_ptr: *const u8) -> HardwareConfig {
     assert!(found_memory, "FDT: no /memory node found — cannot boot");
 
     // ── /chosen ───────────────────────────────────────────────────────────────
-    // In fdt 0.1.x, `chosen()` returns `Chosen` directly and panics if the
-    // node is missing.  QEMU virt and most real platforms always include it.
-    let chosen = fdt.chosen();
-    config.chosen.bootargs = chosen.bootargs().map(|s| s.to_string());
-    config.chosen.stdout_path = chosen.stdout().map(|n| n.name.to_string());
+    // In fdt 0.1.x, `chosen()` panics if `/chosen` is absent.
+    // Guard with find_node to avoid boot panics on DTBs missing /chosen.
+    if fdt.find_node("/chosen").is_some() {
+        let chosen = fdt.chosen();
+        config.chosen.bootargs = chosen.bootargs().map(|s| s.to_string());
+        config.chosen.stdout_path = chosen.stdout().map(|n| n.name.to_string());
+    }
 
     // ── Peripheral nodes ──────────────────────────────────────────────────────
     for node in fdt.all_nodes() {
@@ -62,12 +64,21 @@ pub unsafe fn parse_fdt(dtb_ptr: *const u8) -> HardwareConfig {
                         });
                     }
                 }
-                "arm,gic-v3" | "arm,cortex-a15-gic" => {
+                "arm,gic-v3" => {
                     if let Some(reg) = node.reg().and_then(|mut r| r.next()) {
                         config.interrupt_controller = Some(InterruptControllerConfig {
                             base: reg.starting_address as u64,
                             size: reg.size.unwrap_or(0x10000) as u64,
                             variant: InterruptControllerVariant::GicV3,
+                        });
+                    }
+                }
+                "arm,cortex-a15-gic" | "arm,gic-400" => {
+                    if let Some(reg) = node.reg().and_then(|mut r| r.next()) {
+                        config.interrupt_controller = Some(InterruptControllerConfig {
+                            base: reg.starting_address as u64,
+                            size: reg.size.unwrap_or(0x10000) as u64,
+                            variant: InterruptControllerVariant::GicV2,
                         });
                     }
                 }
@@ -82,11 +93,10 @@ pub unsafe fn parse_fdt(dtb_ptr: *const u8) -> HardwareConfig {
                 }
                 "virtio,mmio" => {
                     if let Some(reg) = node.reg().and_then(|mut r| r.next()) {
-                        config.network_devices.push(NetworkDeviceConfig {
+                        config.virtio_devices.push(VirtioMmioConfig {
                             base: reg.starting_address as u64,
                             size: reg.size.unwrap_or(0x200) as u64,
                             irq: first_irq(&node),
-                            compatible: compat.to_string(),
                         });
                     }
                 }
@@ -107,12 +117,16 @@ pub unsafe fn parse_fdt(dtb_ptr: *const u8) -> HardwareConfig {
     config
 }
 
+/// Extract the IRQ number from a GIC 3-cell `interrupts` property.
+/// Format: `<type irq_number flags>`, each cell is 4 bytes (big-endian).
+/// Cell 0 (bytes [0..4]) = type (0=SPI, 1=PPI). Cell 1 (bytes [4..8]) = IRQ number.
 fn first_irq(node: &fdt::node::FdtNode) -> u32 {
     node.property("interrupts")
         .and_then(|p| {
             let bytes = p.value;
-            if bytes.len() >= 4 {
-                Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            // GIC 3-cell format: need at least 8 bytes for type + irq_number.
+            if bytes.len() >= 8 {
+                Some(u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]))
             } else {
                 None
             }

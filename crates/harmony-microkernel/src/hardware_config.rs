@@ -33,9 +33,11 @@ pub struct SerialConfig {
 // ── Interrupt controller ──────────────────────────────────────────────────────
 
 /// Supported interrupt-controller hardware variants.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InterruptControllerVariant {
-    /// ARM GICv3 (Generic Interrupt Controller, revision 3).
+    /// ARM GICv2 (e.g. GIC-400, `arm,cortex-a15-gic`).
+    GicV2,
+    /// ARM GICv3 (e.g. GIC-600, `arm,gic-v3`).
     GicV3,
     /// Apple AIC (Apple Interrupt Controller).
     AppleAic,
@@ -49,27 +51,29 @@ pub struct InterruptControllerConfig {
     pub variant: InterruptControllerVariant,
 }
 
-// ── Network device ────────────────────────────────────────────────────────────
+// ── VirtIO MMIO device ───────────────────────────────────────────────────────
 
-/// MMIO-mapped network device.
+/// A VirtIO MMIO transport discovered from the device tree.
+///
+/// `virtio,mmio` is the generic transport compatible — the actual device sub-type
+/// (net, blk, rng, gpu, etc.) requires probing the MMIO DeviceID register at
+/// runtime. FDT parsing only discovers the transport; callers classify after probe.
 #[derive(Debug, Clone)]
-pub struct NetworkDeviceConfig {
+pub struct VirtioMmioConfig {
     pub base: u64,
     pub size: u64,
     pub irq: u32,
-    /// DT `compatible` string (e.g. `"virtio,mmio"`, `"apple,t8103-dwi"`).
-    pub compatible: String,
 }
 
 // ── Block device ──────────────────────────────────────────────────────────────
 
-/// MMIO-mapped block device.
+/// MMIO-mapped block device (NVMe, Apple ANS2, etc.).
 #[derive(Debug, Clone)]
 pub struct BlockDeviceConfig {
     pub base: u64,
     pub size: u64,
     pub irq: u32,
-    /// DT `compatible` string (e.g. `"virtio,mmio"`).
+    /// DT `compatible` string (e.g. `"nvme"`, `"apple,ans2"`).
     pub compatible: String,
 }
 
@@ -92,10 +96,11 @@ pub struct HardwareConfig {
     pub memory_regions: Vec<MemoryRegion>,
     pub serial: Option<SerialConfig>,
     pub interrupt_controller: Option<InterruptControllerConfig>,
-    pub network_devices: Vec<NetworkDeviceConfig>,
+    /// VirtIO MMIO transports — device sub-type determined after MMIO probe.
+    pub virtio_devices: Vec<VirtioMmioConfig>,
     pub block_devices: Vec<BlockDeviceConfig>,
     pub chosen: ChosenConfig,
-    /// Page granule in bytes (4096 for 4 KiB, 16384 for 16 KiB, 65536 for 64 KiB).
+    /// Page granule in bytes (4096 for 4 KiB, 16384 for 16 KiB).
     pub page_granule: usize,
 }
 
@@ -105,10 +110,10 @@ impl Default for HardwareConfig {
             memory_regions: Vec::new(),
             serial: None,
             interrupt_controller: None,
-            network_devices: Vec::new(),
+            virtio_devices: Vec::new(),
             block_devices: Vec::new(),
             chosen: ChosenConfig::default(),
-            page_granule: 4096,
+            page_granule: crate::vm::PAGE_SIZE as usize,
         }
     }
 }
@@ -154,12 +159,21 @@ mod tests {
                                 });
                             }
                         }
-                        "arm,gic-v3" | "arm,cortex-a15-gic" => {
+                        "arm,gic-v3" => {
                             if let Some(reg) = node.reg().and_then(|mut r| r.next()) {
                                 config.interrupt_controller = Some(InterruptControllerConfig {
                                     base: reg.starting_address as u64,
                                     size: reg.size.unwrap_or(0x10000) as u64,
                                     variant: InterruptControllerVariant::GicV3,
+                                });
+                            }
+                        }
+                        "arm,cortex-a15-gic" | "arm,gic-400" => {
+                            if let Some(reg) = node.reg().and_then(|mut r| r.next()) {
+                                config.interrupt_controller = Some(InterruptControllerConfig {
+                                    base: reg.starting_address as u64,
+                                    size: reg.size.unwrap_or(0x10000) as u64,
+                                    variant: InterruptControllerVariant::GicV2,
                                 });
                             }
                         }
@@ -193,10 +207,10 @@ mod tests {
         assert!(cfg.memory_regions.is_empty());
         assert!(cfg.serial.is_none());
         assert!(cfg.interrupt_controller.is_none());
-        assert!(cfg.network_devices.is_empty());
+        assert!(cfg.virtio_devices.is_empty());
         assert!(cfg.block_devices.is_empty());
         assert!(cfg.chosen.bootargs.is_none());
-        assert_eq!(cfg.page_granule, 4096);
+        assert_eq!(cfg.page_granule, crate::vm::PAGE_SIZE as usize);
     }
 
     #[test]
@@ -211,12 +225,14 @@ mod tests {
 
     #[test]
     fn interrupt_controller_variant_matching() {
-        let gic = InterruptControllerVariant::GicV3;
+        let gicv2 = InterruptControllerVariant::GicV2;
+        let gicv3 = InterruptControllerVariant::GicV3;
         let aic = InterruptControllerVariant::AppleAic;
 
-        assert!(matches!(gic, InterruptControllerVariant::GicV3));
-        assert!(matches!(aic, InterruptControllerVariant::AppleAic));
-        // Ensure both variants are distinct
-        assert!(!matches!(gic, InterruptControllerVariant::AppleAic));
+        assert_eq!(gicv2, InterruptControllerVariant::GicV2);
+        assert_eq!(gicv3, InterruptControllerVariant::GicV3);
+        assert_eq!(aic, InterruptControllerVariant::AppleAic);
+        assert_ne!(gicv2, gicv3);
+        assert_ne!(gicv3, aic);
     }
 }

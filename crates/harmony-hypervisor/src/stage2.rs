@@ -197,7 +197,7 @@ impl Stage2PageTable {
         if ipa & (self.granule.page_size() - 1) != 0 {
             return Err(VmError::Unaligned(ipa));
         }
-        if !pa.is_page_aligned() {
+        if pa.as_u64() & (self.granule.page_size() - 1) != 0 {
             return Err(VmError::Unaligned(pa.as_u64()));
         }
 
@@ -306,7 +306,8 @@ impl Stage2PageTable {
     }
 
     fn index(&self, ipa: u64, level: usize) -> usize {
-        ((ipa >> (self.granule.page_shift() + level as u32 * self.granule.level_bits()))
+        let level_offset = (level - self.granule.start_level()) as u32;
+        ((ipa >> (self.granule.page_shift() + level_offset * self.granule.level_bits()))
             & ((1u64 << self.granule.level_bits()) - 1)) as usize
     }
 }

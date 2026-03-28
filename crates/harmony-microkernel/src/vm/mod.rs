@@ -9,6 +9,13 @@ use core::fmt;
 
 use bitflags::bitflags;
 
+// ── Compile-time guards ──────────────────────────────────────────────
+
+// NOTE: page-16k only makes architectural sense on aarch64 (x86_64 doesn't
+// support 16K pages). We don't compile_error! here because page-16k is used
+// on x86_64 hosts for cross-testing the 16K math. The boot crate for
+// Apple Silicon (Phase D) will enforce the target restriction.
+
 // ── Constants ────────────────────────────────────────────────────────
 
 /// Page size in bytes.
