@@ -698,18 +698,20 @@ impl<S: SpiBus> TpmDriver<S> {
         // Step 1: Create primary HMAC key
         let handle = self.create_primary_hmac_key(&mut resp)?;
 
-        // Step 2: Read PCR digests
-        let pcr_digests = self.read_pcr_digests(pcr_indices, &mut resp)?;
+        // Steps 2-3 wrapped in a closure so we can flush the transient
+        // handle unconditionally — even if PCR_Read or HMAC fails.
+        // TPM chips allow only 3-5 concurrent transient objects.
+        let result = (|| {
+            let pcr_digests = self.read_pcr_digests(pcr_indices, &mut resp)?;
+            let mut hmac_input = pcr_digests;
+            hmac_input.extend_from_slice(salt);
+            self.hmac_with_key(handle, &hmac_input, &mut resp)
+        })();
 
-        // Step 3: HMAC(key, pcr_digests || salt)
-        let mut hmac_input = pcr_digests;
-        hmac_input.extend_from_slice(salt);
-        let key = self.hmac_with_key(handle, &hmac_input, &mut resp)?;
+        // Step 4: Flush unconditionally so the transient slot is always released
+        let _ = self.flush_context(handle, &mut resp);
 
-        // Step 4: Flush transient handle
-        self.flush_context(handle, &mut resp)?;
-
-        Ok(key)
+        result
     }
 }
 
