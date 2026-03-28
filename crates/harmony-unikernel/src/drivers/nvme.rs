@@ -172,6 +172,21 @@ pub struct IdentifyController {
     pub num_namespaces: u32,
 }
 
+/// Parsed fields from the 4 KiB Identify Namespace data structure.
+#[derive(Debug, Clone)]
+pub struct IdentifyNamespace {
+    /// Namespace size in logical blocks (bytes 0-7).
+    pub nsze: u64,
+    /// Namespace capacity in logical blocks (bytes 8-15).
+    pub ncap: u64,
+    /// Namespace utilization in logical blocks (bytes 16-23).
+    pub nuse: u64,
+    /// Formatted LBA Size — raw byte 26 (bits 3:0 = LBA format index).
+    pub flbas: u8,
+    /// Logical block size in bytes, derived from LBAF[flbas & 0x0F].LBADS.
+    pub lba_size_bytes: u32,
+}
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// Errors returned by NVMe driver operations.
@@ -655,6 +670,36 @@ pub fn parse_identify_controller(data: &[u8; 4096]) -> IdentifyController {
         firmware_rev,
         max_data_transfer,
         num_namespaces,
+    }
+}
+
+/// Parse the 4 KiB Identify Namespace data structure (NVMe spec §5.15.2.2).
+///
+/// | Bytes   | Field              |
+/// |---------|--------------------|
+/// | 0-7     | NSZE               |
+/// | 8-15    | NCAP               |
+/// | 16-23   | NUSE               |
+/// | 26      | FLBAS              |
+/// | 128+    | LBA Format table   |
+pub fn parse_identify_namespace(data: &[u8; 4096]) -> IdentifyNamespace {
+    let nsze = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    let ncap = u64::from_le_bytes(data[8..16].try_into().unwrap());
+    let nuse = u64::from_le_bytes(data[16..24].try_into().unwrap());
+    let flbas = data[26];
+
+    // LBA Format table starts at byte 128, 4 bytes per entry.
+    // LBADS is at byte 2 of each entry.
+    let fmt_index = (flbas & 0x0F) as usize;
+    let lbads = data[128 + fmt_index * 4 + 2];
+    let lba_size_bytes = 1u32 << lbads;
+
+    IdentifyNamespace {
+        nsze,
+        ncap,
+        nuse,
+        flbas,
+        lba_size_bytes,
     }
 }
 
@@ -1281,5 +1326,64 @@ mod tests {
         assert_eq!(driver.state(), NvmeState::Ready);
         // Should succeed in Ready state
         driver.identify_namespace(1, 0x1000).unwrap();
+    }
+
+    // ── parse_identify_namespace tests ────────────────────────────────────────
+
+    #[test]
+    fn parse_identify_namespace_extracts_fields() {
+        let mut data = [0u8; 4096];
+
+        // NSZE: bytes 0-7
+        data[0..8].copy_from_slice(&1024u64.to_le_bytes());
+        // NCAP: bytes 8-15
+        data[8..16].copy_from_slice(&1000u64.to_le_bytes());
+        // NUSE: bytes 16-23
+        data[16..24].copy_from_slice(&500u64.to_le_bytes());
+        // FLBAS: byte 26 (index 0 into LBA format table)
+        data[26] = 0x00;
+        // LBA Format 0 at byte 128: bytes [MS(2), LBADS(1), RP(1)]
+        // LBADS = byte 130 = 9 → 512 bytes
+        data[130] = 9;
+
+        let ns = parse_identify_namespace(&data);
+        assert_eq!(ns.nsze, 1024);
+        assert_eq!(ns.ncap, 1000);
+        assert_eq!(ns.nuse, 500);
+        assert_eq!(ns.flbas, 0);
+        assert_eq!(ns.lba_size_bytes, 512);
+    }
+
+    #[test]
+    fn parse_identify_namespace_4k_sectors() {
+        let mut data = [0u8; 4096];
+
+        data[0..8].copy_from_slice(&2048u64.to_le_bytes());
+        data[8..16].copy_from_slice(&2048u64.to_le_bytes());
+        data[16..24].copy_from_slice(&100u64.to_le_bytes());
+        // FLBAS: index 1
+        data[26] = 0x01;
+        // LBA Format 1 at byte 132 (128 + 1*4): LBADS at offset 2 = byte 134
+        data[134] = 12; // 2^12 = 4096
+
+        let ns = parse_identify_namespace(&data);
+        assert_eq!(ns.flbas, 1);
+        assert_eq!(ns.lba_size_bytes, 4096);
+    }
+
+    #[test]
+    fn parse_identify_namespace_flbas_uses_low_nibble() {
+        let mut data = [0u8; 4096];
+        data[0..8].copy_from_slice(&100u64.to_le_bytes());
+        data[8..16].copy_from_slice(&100u64.to_le_bytes());
+        data[16..24].copy_from_slice(&50u64.to_le_bytes());
+        // FLBAS byte: 0x12 — low nibble is 2, high nibble (metadata) is 1
+        data[26] = 0x12;
+        // LBA Format 2 at byte 136 (128 + 2*4): LBADS at byte 138
+        data[138] = 9;
+
+        let ns = parse_identify_namespace(&data);
+        assert_eq!(ns.flbas, 0x12, "raw byte preserved");
+        assert_eq!(ns.lba_size_bytes, 512, "uses low nibble (index 2)");
     }
 }
