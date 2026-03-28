@@ -1092,4 +1092,26 @@ mod tests {
 
         assert_eq!(key1, key2);
     }
+
+    // ── Integration test ─────────────────────────────────────────────
+
+    #[test]
+    fn full_tpm_lifecycle() {
+        // Configure mock with ALL responses (init + derive) before calling init().
+        // init() consumes the bus, so the full sequence must be pre-loaded.
+        let mut bus = MockSpiBus::new();
+        mock_init_flow(&mut bus);
+        mock_derive_flow(&mut bus);
+
+        // 1. init() succeeds → Ready state
+        let mut driver = TpmDriver::init(bus).unwrap();
+        assert_eq!(driver.state(), TpmState::Ready);
+
+        // 2. derive_hardware_key([0], b"harmony-os") returns 32 bytes
+        let key = driver.derive_hardware_key(&[0], b"harmony-os").unwrap();
+        assert_eq!(key.len(), 32);
+
+        // 3. Key is non-zero
+        assert!(key.iter().any(|&b| b != 0));
+    }
 }
