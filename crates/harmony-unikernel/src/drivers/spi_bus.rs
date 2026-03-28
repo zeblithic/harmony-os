@@ -33,6 +33,7 @@ pub mod mock {
     ///   across multiple CS cycles. Used for TPM_DATA_FIFO where the
     ///   command engine reads the header (6 bytes) and payload in
     ///   separate read_register calls.
+    #[derive(Debug)]
     pub struct MockSpiBus {
         /// Register responses: each CS cycle pops the next entry.
         responses: BTreeMap<u32, Vec<Vec<u8>>>,

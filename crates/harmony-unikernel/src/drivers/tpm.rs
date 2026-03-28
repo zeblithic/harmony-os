@@ -86,6 +86,7 @@ pub enum TpmState {
 // ── Driver struct ────────────────────────────────────────────────────
 
 /// TPM 2.0 driver for hardware key derivation via HMAC.
+#[derive(Debug)]
 pub struct TpmDriver<S: SpiBus> {
     #[allow(dead_code)]
     bus: S,
@@ -293,6 +294,49 @@ impl<S: SpiBus> TpmDriver<S> {
     }
 }
 
+// ── Initialization ───────────────────────────────────────────────────
+
+/// TPM_RC_INITIALIZE — returned when Startup was already called by firmware.
+const TPM_RC_INITIALIZE: u32 = 0x00000100;
+
+impl<S: SpiBus> TpmDriver<S> {
+    /// Initialize the TPM: probe DID/VID, run Startup + SelfTest.
+    pub fn init(bus: S) -> Result<Self, TpmError> {
+        let mut driver = Self {
+            bus,
+            state: TpmState::Uninitialized,
+        };
+
+        // Step 1: Probe DID/VID to verify SPI connectivity
+        let mut did_vid = [0u8; 4];
+        driver.read_register(TPM_DID_VID, &mut did_vid)?;
+
+        // Step 2: TPM2_Startup(TPM_SU_CLEAR)
+        // Tag=0x8001 (NO_SESSIONS), Size=12, CC=0x00000144, SU=0x0000
+        let startup_cmd = [
+            0x80, 0x01, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x01, 0x44, 0x00, 0x00,
+        ];
+        let mut resp = [0u8; 64];
+        match driver.execute_command(&startup_cmd, &mut resp) {
+            Ok(_) => {}
+            Err(TpmError::CommandFailed { rc }) if rc == TPM_RC_INITIALIZE => {
+                // Firmware already called Startup — that's fine
+            }
+            Err(e) => return Err(e),
+        }
+
+        // Step 3: TPM2_SelfTest(fullTest=yes)
+        // Tag=0x8001, Size=11, CC=0x00000143, fullTest=0x01
+        let selftest_cmd = [
+            0x80, 0x01, 0x00, 0x00, 0x00, 0x0B, 0x00, 0x00, 0x01, 0x43, 0x01,
+        ];
+        driver.execute_command(&selftest_cmd, &mut resp)?;
+
+        driver.state = TpmState::Ready;
+        Ok(driver)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +475,87 @@ mod tests {
         let command = [0x80, 0x01, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x01, 0x44];
         let mut resp = [0u8; 64];
         let err = driver.execute_command(&command, &mut resp).unwrap_err();
+        assert_eq!(err, TpmError::LocalityUnavailable);
+    }
+
+    // ── Init tests ───────────────────────────────────────────────────
+
+    /// Helper: configure mock for a successful init sequence.
+    fn mock_init_flow(bus: &mut MockSpiBus) {
+        // DID_VID probe
+        bus.on_register(TPM_DID_VID, vec![0x15, 0xD1, 0x00, 0x1A]);
+
+        // Startup: locality check + command flow
+        bus.on_register(TPM_ACCESS, vec![0x90]); // valid + active
+        bus.on_register(TPM_STS, vec![0x40, 0x00, 0x00, 0x00]); // commandReady
+        bus.on_register(TPM_STS, vec![0x40, 0x40, 0x00, 0x00]); // burstCount=64
+        bus.on_register(TPM_STS, vec![0x10, 0x40, 0x00, 0x00]); // dataAvail
+        bus.on_fifo(
+            TPM_DATA_FIFO,
+            vec![
+                0x80, 0x01, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, // success
+            ],
+        );
+
+        // SelfTest: locality check + command flow
+        bus.on_register(TPM_ACCESS, vec![0x90]);
+        bus.on_register(TPM_STS, vec![0x40, 0x00, 0x00, 0x00]);
+        bus.on_register(TPM_STS, vec![0x40, 0x40, 0x00, 0x00]);
+        bus.on_register(TPM_STS, vec![0x10, 0x40, 0x00, 0x00]);
+        bus.on_fifo(
+            TPM_DATA_FIFO,
+            vec![
+                0x80, 0x01, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, // success
+            ],
+        );
+    }
+
+    #[test]
+    fn init_succeeds_and_transitions_to_ready() {
+        let mut bus = MockSpiBus::new();
+        mock_init_flow(&mut bus);
+        let driver = TpmDriver::init(bus).unwrap();
+        assert_eq!(driver.state(), TpmState::Ready);
+    }
+
+    #[test]
+    fn init_accepts_tpm_rc_initialize() {
+        let mut bus = MockSpiBus::new();
+        bus.on_register(TPM_DID_VID, vec![0x15, 0xD1, 0x00, 0x1A]);
+
+        // Startup returns TPM_RC_INITIALIZE
+        bus.on_register(TPM_ACCESS, vec![0x90]);
+        bus.on_register(TPM_STS, vec![0x40, 0x00, 0x00, 0x00]);
+        bus.on_register(TPM_STS, vec![0x40, 0x40, 0x00, 0x00]);
+        bus.on_register(TPM_STS, vec![0x10, 0x40, 0x00, 0x00]);
+        bus.on_fifo(
+            TPM_DATA_FIFO,
+            vec![
+                0x80, 0x01, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x01, 0x00, // RC = 0x100
+            ],
+        );
+
+        // SelfTest succeeds
+        bus.on_register(TPM_ACCESS, vec![0x90]);
+        bus.on_register(TPM_STS, vec![0x40, 0x00, 0x00, 0x00]);
+        bus.on_register(TPM_STS, vec![0x40, 0x40, 0x00, 0x00]);
+        bus.on_register(TPM_STS, vec![0x10, 0x40, 0x00, 0x00]);
+        bus.on_fifo(
+            TPM_DATA_FIFO,
+            vec![0x80, 0x01, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00],
+        );
+
+        let driver = TpmDriver::init(bus).unwrap();
+        assert_eq!(driver.state(), TpmState::Ready);
+    }
+
+    #[test]
+    fn init_locality_unavailable() {
+        let mut bus = MockSpiBus::new();
+        bus.on_register(TPM_DID_VID, vec![0x15, 0xD1, 0x00, 0x1A]);
+        bus.on_register(TPM_ACCESS, vec![0x00]); // no valid bit
+
+        let err = TpmDriver::init(bus).unwrap_err();
         assert_eq!(err, TpmError::LocalityUnavailable);
     }
 }
