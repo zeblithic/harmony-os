@@ -68,6 +68,8 @@ pub enum TpmError {
     InvalidState,
     /// tpm2-protocol marshaling/unmarshaling failed.
     ProtocolError,
+    /// SPI bus hardware error during transfer.
+    BusError,
 }
 
 // ── Driver state ─────────────────────────────────────────────────────
@@ -101,20 +103,26 @@ impl<S: SpiBus> TpmDriver<S> {
     /// `size`: number of bytes to transfer (1-64).
     /// `addr`: 24-bit TPM register address.
     fn spi_header(is_read: bool, size: u8, addr: u32) -> [u8; 4] {
+        debug_assert!(size > 0, "SPI PTP transfer size must be at least 1");
         let dir = if is_read { 0x80 } else { 0x00 };
         [
-            dir | (size - 1),
+            dir | size.saturating_sub(1),
             ((addr >> 16) & 0xFF) as u8,
             ((addr >> 8) & 0xFF) as u8,
             (addr & 0xFF) as u8,
         ]
     }
 
+    /// Map any bus error to TpmError::BusError.
+    fn bus_err<E: core::fmt::Debug>(_: E) -> TpmError {
+        TpmError::BusError
+    }
+
     /// Poll MISO for wait-state ACK (bit 0 set).
     fn poll_wait_state(&mut self) -> Result<(), TpmError> {
         for _ in 0..MAX_WAIT_CYCLES {
             let mut rx = [0u8; 1];
-            self.bus.transfer(&[0x00], &mut rx);
+            self.bus.transfer(&[0x00], &mut rx).map_err(Self::bus_err)?;
             if rx[0] & 0x01 != 0 {
                 return Ok(());
             }
@@ -128,17 +136,21 @@ impl<S: SpiBus> TpmDriver<S> {
         let len = buf.len().min(MAX_BURST);
         let header = Self::spi_header(true, len as u8, addr);
 
-        self.bus.assert_cs();
+        self.bus.assert_cs().map_err(Self::bus_err)?;
         let mut rx_header = [0u8; 4];
-        self.bus.transfer(&header, &mut rx_header);
+        self.bus
+            .transfer(&header, &mut rx_header)
+            .map_err(Self::bus_err)?;
         if let Err(e) = self.poll_wait_state() {
-            self.bus.deassert_cs();
+            let _ = self.bus.deassert_cs();
             return Err(e);
         }
 
         let tx_zeros = [0u8; MAX_BURST];
-        self.bus.transfer(&tx_zeros[..len], &mut buf[..len]);
-        self.bus.deassert_cs();
+        self.bus
+            .transfer(&tx_zeros[..len], &mut buf[..len])
+            .map_err(Self::bus_err)?;
+        self.bus.deassert_cs().map_err(Self::bus_err)?;
 
         Ok(())
     }
@@ -149,17 +161,21 @@ impl<S: SpiBus> TpmDriver<S> {
         let len = data.len().min(MAX_BURST);
         let header = Self::spi_header(false, len as u8, addr);
 
-        self.bus.assert_cs();
+        self.bus.assert_cs().map_err(Self::bus_err)?;
         let mut rx_header = [0u8; 4];
-        self.bus.transfer(&header, &mut rx_header);
+        self.bus
+            .transfer(&header, &mut rx_header)
+            .map_err(Self::bus_err)?;
         if let Err(e) = self.poll_wait_state() {
-            self.bus.deassert_cs();
+            let _ = self.bus.deassert_cs();
             return Err(e);
         }
 
         let mut rx_payload = [0u8; MAX_BURST];
-        self.bus.transfer(&data[..len], &mut rx_payload[..len]);
-        self.bus.deassert_cs();
+        self.bus
+            .transfer(&data[..len], &mut rx_payload[..len])
+            .map_err(Self::bus_err)?;
+        self.bus.deassert_cs().map_err(Self::bus_err)?;
 
         Ok(())
     }

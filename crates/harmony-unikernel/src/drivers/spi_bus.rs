@@ -8,13 +8,17 @@
 /// control. The real implementation drives RP1 SPI hardware; the
 /// mock records all transactions for testing.
 pub trait SpiBus {
+    /// Error type for bus-level failures (DMA fault, FIFO overrun, etc.).
+    /// Use `core::convert::Infallible` for mocks that never fail.
+    type Error: core::fmt::Debug;
+
     /// Full-duplex SPI transfer: simultaneously send `tx` and
     /// receive into `rx`. Both slices must have the same length.
-    fn transfer(&mut self, tx: &[u8], rx: &mut [u8]);
+    fn transfer(&mut self, tx: &[u8], rx: &mut [u8]) -> Result<(), Self::Error>;
     /// Assert chip select (drive CS# low).
-    fn assert_cs(&mut self);
+    fn assert_cs(&mut self) -> Result<(), Self::Error>;
     /// Deassert chip select (drive CS# high).
-    fn deassert_cs(&mut self);
+    fn deassert_cs(&mut self) -> Result<(), Self::Error>;
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -148,7 +152,9 @@ pub mod mock {
     }
 
     impl SpiBus for MockSpiBus {
-        fn transfer(&mut self, tx: &[u8], rx: &mut [u8]) {
+        type Error = core::convert::Infallible;
+
+        fn transfer(&mut self, tx: &[u8], rx: &mut [u8]) -> Result<(), Self::Error> {
             for i in 0..tx.len().min(rx.len()) {
                 if self.current_addr.is_none() {
                     // Collecting 4-byte header
@@ -182,9 +188,10 @@ pub mod mock {
                     }
                 }
             }
+            Ok(())
         }
 
-        fn assert_cs(&mut self) {
+        fn assert_cs(&mut self) -> Result<(), Self::Error> {
             self.cs_active = true;
             self.header_buf.clear();
             self.current_addr = None;
@@ -192,9 +199,10 @@ pub mod mock {
             self.ack_sent = false;
             self.payload_cursor = 0;
             // Note: fifo_offsets NOT reset — persists across CS cycles
+            Ok(())
         }
 
-        fn deassert_cs(&mut self) {
+        fn deassert_cs(&mut self) -> Result<(), Self::Error> {
             // Advance register response cursor only for read transactions.
             // Write transactions should not consume queued responses.
             if let Some(addr) = self.current_addr.take() {
@@ -209,6 +217,7 @@ pub mod mock {
             }
             self.cs_active = false;
             self.header_buf.clear();
+            Ok(())
         }
     }
 }
@@ -224,23 +233,23 @@ mod tests {
         let mut bus = MockSpiBus::new();
         bus.on_register(0xD40F00, vec![0x15, 0xD1, 0x00, 0x1A]); // fake DID_VID
 
-        bus.assert_cs();
+        bus.assert_cs().unwrap();
         // Send read header: direction=read(0x80)|size=3, addr=0xD40F00
         let tx_header = [0x80 | 3, 0xD4, 0x0F, 0x00];
         let mut rx = [0u8; 4];
-        bus.transfer(&tx_header, &mut rx);
+        bus.transfer(&tx_header, &mut rx).unwrap();
 
         // Wait-state ACK (0 wait states configured = immediate ACK)
         let mut ack = [0u8; 1];
-        bus.transfer(&[0x00], &mut ack);
+        bus.transfer(&[0x00], &mut ack).unwrap();
         assert_eq!(ack[0], 0x01, "immediate ACK");
 
         // Read 4 payload bytes
         let mut payload = [0u8; 4];
-        bus.transfer(&[0x00; 4], &mut payload);
+        bus.transfer(&[0x00; 4], &mut payload).unwrap();
         assert_eq!(payload, [0x15, 0xD1, 0x00, 0x1A]);
 
-        bus.deassert_cs();
+        bus.deassert_cs().unwrap();
     }
 
     #[test]
@@ -249,47 +258,47 @@ mod tests {
         bus.on_register(0xD40018, vec![0x42]);
         bus.set_wait_states(0xD40018, 3);
 
-        bus.assert_cs();
+        bus.assert_cs().unwrap();
         let tx_header = [0x80, 0xD4, 0x00, 0x18]; // read 1 byte from STS
         let mut rx = [0u8; 4];
-        bus.transfer(&tx_header, &mut rx);
+        bus.transfer(&tx_header, &mut rx).unwrap();
 
         // 3 wait states then ACK
         for _ in 0..3 {
             let mut ws = [0u8; 1];
-            bus.transfer(&[0x00], &mut ws);
+            bus.transfer(&[0x00], &mut ws).unwrap();
             assert_eq!(ws[0], 0x00, "wait state");
         }
         let mut ack = [0u8; 1];
-        bus.transfer(&[0x00], &mut ack);
+        bus.transfer(&[0x00], &mut ack).unwrap();
         assert_eq!(ack[0], 0x01, "ACK after wait states");
 
         let mut payload = [0u8; 1];
-        bus.transfer(&[0x00], &mut payload);
+        bus.transfer(&[0x00], &mut payload).unwrap();
         assert_eq!(payload[0], 0x42);
 
-        bus.deassert_cs();
+        bus.deassert_cs().unwrap();
     }
 
     #[test]
     fn mock_records_write_transactions() {
         let mut bus = MockSpiBus::new();
 
-        bus.assert_cs();
+        bus.assert_cs().unwrap();
         // Write header: direction=write(0x00)|size=1, addr=0xD40018
         let tx_header = [1u8, 0xD4, 0x00, 0x18];
         let mut rx = [0u8; 4];
-        bus.transfer(&tx_header, &mut rx);
+        bus.transfer(&tx_header, &mut rx).unwrap();
 
         // ACK
         let mut ack = [0u8; 1];
-        bus.transfer(&[0x00], &mut ack);
+        bus.transfer(&[0x00], &mut ack).unwrap();
 
         // Write payload byte
         let mut rx_payload = [0u8; 1];
-        bus.transfer(&[0x40], &mut rx_payload); // commandReady = bit 6
+        bus.transfer(&[0x40], &mut rx_payload).unwrap(); // commandReady = bit 6
 
-        bus.deassert_cs();
+        bus.deassert_cs().unwrap();
 
         assert_eq!(bus.transactions.len(), 1);
         assert_eq!(bus.transactions[0].0, 0xD40018); // addr
