@@ -480,12 +480,15 @@ impl<S: SpiBus> TpmDriver<S> {
         pcr_indices: &[u8],
         resp: &mut [u8],
     ) -> Result<Vec<u8>, TpmError> {
-        // Build the PCR selection bitmask: 3 bytes, bit N of byte N/8
+        // Build the PCR selection bitmask: 3 bytes, bit N of byte N/8.
+        // Reject any index >= 24 — silently dropping would weaken the
+        // PCR binding in a security-critical key derivation.
         let mut pcr_select = [0u8; 3];
         for &idx in pcr_indices {
-            if idx < 24 {
-                pcr_select[(idx / 8) as usize] |= 1 << (idx % 8);
+            if idx >= 24 {
+                return Err(TpmError::InvalidState);
             }
+            pcr_select[(idx / 8) as usize] |= 1 << (idx % 8);
         }
 
         // Command structure:
