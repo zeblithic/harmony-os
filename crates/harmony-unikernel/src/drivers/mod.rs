@@ -17,5 +17,7 @@ pub mod nvme;
 pub mod pl011;
 pub mod register_bank;
 pub mod sdhci;
+pub mod spi_bus;
+pub mod tpm;
 
 pub use register_bank::RegisterBank;
