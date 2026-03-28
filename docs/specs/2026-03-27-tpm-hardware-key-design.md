@@ -62,9 +62,11 @@ Located in a new `spi_bus.rs` in `drivers/`, alongside
 ## TpmDriver Struct
 
 ```rust
+/// Locality 0 base offset for all register addresses.
+const LOCALITY: u8 = 0;
+
 pub struct TpmDriver<S: SpiBus> {
     bus: S,
-    locality: u8,       // always 0
     state: TpmState,
 }
 
@@ -81,7 +83,7 @@ Every TPM register access uses a 4-byte SPI header:
 
 | Byte | Field | Description |
 |------|-------|-------------|
-| 0 | Direction + Size | Bit 7: 1=read, 0=write. Bits 5:0: byte count |
+| 0 | Direction + Size | Bit 7: 1=read, 0=write. Bits 5:0: transfer_size − 1 (e.g., 4-byte read → SIZE=3) |
 | 1 | Address [23:16] | High byte of 24-bit register address |
 | 2 | Address [15:8] | Middle byte |
 | 3 | Address [7:0] | Low byte |
@@ -112,7 +114,8 @@ fn poll_wait_state(&mut self) -> Result<(), TpmError>
 Sequences FIFO-based command execution:
 
 1. Read `TPM_ACCESS_0` — verify `tpmRegValidSts` (bit 7) and
-   `activeLocality` (bit 5). Request locality if needed.
+   `activeLocality` (bit 4). If not active, request by writing
+   `requestUse` (bit 1), then poll until `activeLocality` is set.
 2. Write `TPM_STS_0` with `commandReady` (bit 6)
 3. Poll `TPM_STS_0` until `commandReady` is set
 4. Read `burstCount` (bits 23:8 of TPM_STS_0)
@@ -133,6 +136,33 @@ Response buffer is caller-provided (stack-allocated). Largest
 expected response is ~600 bytes (CreatePrimary). A 1024-byte buffer
 covers all commands.
 
+## Authorization
+
+TPM 2.0 commands that access protected objects require authorization
+sessions. Two of our four commands need PWAP (Password Authorization
+Protocol) sessions:
+
+| Command | Authorization | Session Tag |
+|---------|--------------|-------------|
+| TPM2_Startup | None | `TPM_ST_NO_SESSIONS` |
+| TPM2_SelfTest | None | `TPM_ST_NO_SESSIONS` |
+| TPM2_CreatePrimary | PWAP (owner hierarchy) | `TPM_ST_SESSIONS` |
+| TPM2_PCR_Read | None | `TPM_ST_NO_SESSIONS` |
+| TPM2_HMAC | PWAP (key handle) | `TPM_ST_SESSIONS` |
+| TPM2_FlushContext | None | `TPM_ST_NO_SESSIONS` |
+
+PWAP uses `TPM_RS_PW` (0x40000009) as the session handle with an
+empty HMAC field (null password — factory default). The
+`TpmsAuthCommand` structure is:
+- `sessionHandle`: `TPM_RS_PW` (0x40000009)
+- `nonceCaller`: empty (zero-length `TPM2B`)
+- `sessionAttributes`: 0x01 (`continueSession`)
+- `hmac`: empty (null password)
+
+Commands with sessions use tag `TPM_ST_SESSIONS` (0x8002); commands
+without use `TPM_ST_NO_SESSIONS` (0x8001). The `tpm2-protocol` crate
+handles this via the `TpmSt` enum and `TpmsAuthCommand` struct.
+
 ## Hardware Key Derivation (Layer 3)
 
 ### Public API
@@ -149,7 +179,9 @@ pub fn derive_hardware_key(
 ### init() Sequence
 
 1. Probe `TPM_DID_VID` to verify SPI connectivity
-2. `TPM2_Startup(TPM_SU_CLEAR)` (command code 0x00000144)
+2. `TPM2_Startup(TPM_SU_CLEAR)` (command code 0x00000144). If the
+   TPM returns `TPM_RC_INITIALIZE` (0x00000100), treat as success —
+   firmware already called Startup. Any other non-zero RC is an error.
 3. `TPM2_SelfTest(fullTest=yes)` (command code 0x00000143)
 4. Transition to `TpmState::Ready`
 
@@ -204,6 +236,8 @@ pub enum TpmError {
     BufferTooSmall,
     /// TPM driver is in the wrong state for the operation.
     InvalidState,
+    /// tpm2-protocol marshaling/unmarshaling failed.
+    ProtocolError,
 }
 ```
 
@@ -218,8 +252,10 @@ pub enum TpmError {
 
 - `crates/harmony-unikernel/src/drivers/mod.rs` — add `pub mod
   spi_bus;` and `pub mod tpm;`
-- `crates/harmony-unikernel/Cargo.toml` — add `tpm2-protocol`
-  dependency
+- `Cargo.toml` (workspace root) — add `tpm2-protocol = "0.16"`
+  to `[workspace.dependencies]`
+- `crates/harmony-unikernel/Cargo.toml` — add `tpm2-protocol =
+  { workspace = true }` to `[dependencies]`
 
 ## Testing
 
@@ -227,11 +263,29 @@ All tests use `MockSpiBus` — no hardware needed.
 
 ### MockSpiBus Design
 
-More sophisticated than MockRegisterBank:
-- Records outgoing SPI frames for assertion
-- Plays back pre-configured response sequences per register address
-- Simulates configurable wait-state count (N bytes of 0x00 before
-  ACK)
+More sophisticated than MockRegisterBank. The mock parses the 4-byte
+SPI PTP header from `tx[0..4]` on each `transfer` call to determine
+which register is being accessed, then plays back the corresponding
+response.
+
+```rust
+pub struct MockSpiBus {
+    /// Pre-configured responses keyed by register address.
+    responses: BTreeMap<u32, VecDeque<Vec<u8>>>,
+    /// Number of 0x00 wait-state bytes before ACK per register.
+    wait_states: BTreeMap<u32, usize>,
+    /// Recorded (tx, rx) pairs for assertion.
+    pub transactions: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl MockSpiBus {
+    pub fn new() -> Self;
+    /// Queue a response for reads from `addr`.
+    pub fn on_register(&mut self, addr: u32, response: Vec<u8>);
+    /// Set wait-state count for `addr` (default 0).
+    pub fn set_wait_states(&mut self, addr: u32, count: usize);
+}
+```
 
 ### SPI PTP transport tests
 - Probe reads TPM_DID_VID: correct SPI header format
@@ -248,8 +302,10 @@ More sophisticated than MockRegisterBank:
 
 ### Init tests
 - Startup + SelfTest sequence: correct command codes sent
+- Startup returns TPM_RC_INITIALIZE (0x100): treated as success
 - Locality check: valid bits → success
 - Locality unavailable: missing valid bits → error
+- Locality request: requestUse (bit 1) written, activeLocality (bit 4) polled
 
 ### Key derivation tests
 - Full HMAC workflow: mock all 4 responses, verify 32-byte output
