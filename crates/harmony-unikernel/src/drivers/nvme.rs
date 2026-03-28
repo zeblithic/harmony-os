@@ -63,6 +63,7 @@ pub struct Completion {
 }
 
 /// Completion with doorbell info for the caller to ring.
+#[derive(Debug)]
 pub struct CompletionResult {
     pub completion: Completion,
     pub cq_doorbell_offset: usize,
@@ -726,6 +727,24 @@ impl<R: RegisterBank> NvmeDriver<R> {
         cqe_bytes: &[u8; 16],
     ) -> Result<Option<CompletionResult>, NvmeError> {
         Ok(self.admin.check_completion(cqe_bytes, self.doorbell_stride))
+    }
+
+    /// Parse a raw 16-byte I/O completion queue entry.
+    ///
+    /// Delegates to the I/O [`QueuePair`]'s completion checking.
+    /// Requires [`NvmeState::Ready`].
+    pub fn check_io_completion(
+        &mut self,
+        cqe_bytes: &[u8; 16],
+    ) -> Result<Option<CompletionResult>, NvmeError> {
+        if self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+        Ok(self
+            .io
+            .as_mut()
+            .unwrap()
+            .check_completion(cqe_bytes, self.doorbell_stride))
     }
 }
 
@@ -1707,5 +1726,56 @@ mod tests {
         let bank = mock_nvme_bank();
         let mut driver = NvmeDriver::init(bank).unwrap();
         assert_eq!(driver.flush(1).unwrap_err(), NvmeError::InvalidState);
+    }
+
+    // ── I/O completion tests ──────────────────────────────────────────────
+
+    #[test]
+    fn check_io_completion_phase_match() {
+        let mut driver = ready_driver();
+        let _ = driver.read_block(1, 0, 0x1000).unwrap();
+
+        let mut cqe = [0u8; 16];
+        cqe[0..4].copy_from_slice(&0x42u32.to_le_bytes());
+        cqe[12..14].copy_from_slice(&0u16.to_le_bytes());
+        cqe[14..16].copy_from_slice(&0x0001u16.to_le_bytes());
+
+        let cr = driver
+            .check_io_completion(&cqe)
+            .unwrap()
+            .expect("phase matches");
+        assert_eq!(cr.completion.result, 0x42);
+        assert_eq!(cr.completion.status, 0);
+        assert_eq!(cr.cq_doorbell_offset, 0x100C);
+    }
+
+    #[test]
+    fn check_io_completion_phase_mismatch() {
+        let mut driver = ready_driver();
+        let mut cqe = [0u8; 16];
+        cqe[14..16].copy_from_slice(&0x0000u16.to_le_bytes());
+
+        let result = driver.check_io_completion(&cqe).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn check_io_completion_rejects_enabled_state() {
+        let mut driver = enabled_driver();
+        let cqe = [0u8; 16];
+        assert_eq!(
+            driver.check_io_completion(&cqe).unwrap_err(),
+            NvmeError::InvalidState
+        );
+    }
+
+    #[test]
+    fn check_io_completion_uses_io_cq_doorbell() {
+        let mut driver = ready_driver();
+        let mut cqe = [0u8; 16];
+        cqe[14..16].copy_from_slice(&0x0001u16.to_le_bytes());
+
+        let cr = driver.check_io_completion(&cqe).unwrap().unwrap();
+        assert_eq!(cr.cq_doorbell_offset, 0x100C);
     }
 }
