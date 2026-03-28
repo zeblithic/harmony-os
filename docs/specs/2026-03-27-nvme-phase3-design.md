@@ -20,6 +20,12 @@ Phase 3 adds the NVM I/O commands that use the I/O queue pair for
 actual block storage. These are the first commands to go through the
 I/O submission/completion queues rather than the admin queues.
 
+Note: The Phase 2 spec documents `activate_io_queues` with three
+parameters, but the implementation was updated during PR review to
+take no parameters — it uses cached params from `create_io_queues()`
+to prevent size divergence between software and hardware. Phase 3
+builds on the as-implemented API: `activate_io_queues()` (no args).
+
 ## Design Decisions
 
 - **Read + Write + Flush scope**: Three NVM I/O commands. No TRIM
@@ -53,7 +59,7 @@ pub fn read_block(
     &mut self,
     nsid: u32,
     lba: u64,
-    data_phys: u64,
+    data_phys: u64,  // must be 4 KiB aligned (CC.MPS=0)
 ) -> Result<AdminCommand, NvmeError>
 ```
 
@@ -76,7 +82,7 @@ pub fn write_block(
     &mut self,
     nsid: u32,
     lba: u64,
-    data_phys: u64,
+    data_phys: u64,  // must be 4 KiB aligned (CC.MPS=0)
 ) -> Result<AdminCommand, NvmeError>
 ```
 
@@ -138,6 +144,7 @@ All tests use MockRegisterBank — no hardware needed.
 ### Write command tests
 - Correct SQE: opcode=0x01, NSID, PRP1, LBA, NLB=0
 - Uses I/O queue doorbell
+- Rejects non-Ready state (Enabled, Disabled)
 
 ### Flush command tests
 - Correct SQE: opcode=0x00, NSID, no PRP, no LBA
@@ -152,7 +159,8 @@ All tests use MockRegisterBank — no hardware needed.
 
 ### Integration test
 - Full lifecycle: init → admin queue → create I/O queues → activate →
-  read_block → check_io_completion → write_block → flush
+  read_block → check_io_completion → write_block → check_io_completion
+  → flush → check_io_completion
 
 ## Out of Scope
 
