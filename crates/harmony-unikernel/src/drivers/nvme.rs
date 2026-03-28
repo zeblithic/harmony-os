@@ -467,6 +467,36 @@ impl<R: RegisterBank> NvmeDriver<R> {
 
         Ok(self.admin.submit(sqe, self.doorbell_stride))
     }
+
+    /// Build an Identify Namespace admin command (opcode 0x06, CNS=0).
+    ///
+    /// The caller must DMA-map a 4 KiB buffer and pass its physical
+    /// address as `data_phys`.  `nsid` identifies the namespace (typically 1).
+    pub fn identify_namespace(
+        &mut self,
+        nsid: u32,
+        data_phys: u64,
+    ) -> Result<AdminCommand, NvmeError> {
+        if self.state != NvmeState::Enabled && self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+
+        let cid = self.next_cid;
+        self.next_cid = self.next_cid.wrapping_add(1);
+
+        let mut sqe = [0u8; 64];
+        // CDW0: opcode=0x06, CID
+        let cdw0: u32 = 0x06 | ((cid as u32) << 16);
+        sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
+        // CDW1 (NSID): bytes 4-7
+        sqe[4..8].copy_from_slice(&nsid.to_le_bytes());
+        // PRP1: data_phys
+        sqe[24..32].copy_from_slice(&data_phys.to_le_bytes());
+        // CDW10: CNS=0x00 (Identify Namespace)
+        sqe[40..44].copy_from_slice(&0u32.to_le_bytes());
+
+        Ok(self.admin.submit(sqe, self.doorbell_stride))
+    }
 }
 
 // ── I/O queue creation ───────────────────────────────────────────────────────
@@ -1192,5 +1222,64 @@ mod tests {
             driver.activate_io_queues(0x1000, 0x2000, 16).unwrap_err(),
             NvmeError::InvalidState
         );
+    }
+
+    // ── Identify Namespace tests ──────────────────────────────────────────
+
+    #[test]
+    fn identify_namespace_builds_correct_sqe() {
+        let mut driver = enabled_driver();
+        let data_phys: u64 = 0xFEED_0000;
+        let cmd = driver.identify_namespace(1, data_phys).unwrap();
+
+        // Opcode 0x06 (Identify)
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x06);
+
+        // NSID at bytes 4-7
+        let nsid = u32::from_le_bytes(cmd.sqe[4..8].try_into().unwrap());
+        assert_eq!(nsid, 1);
+
+        // PRP1
+        let prp1 = u64::from_le_bytes(cmd.sqe[24..32].try_into().unwrap());
+        assert_eq!(prp1, data_phys);
+
+        // CDW10: CNS=0x00
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10, 0x00);
+    }
+
+    #[test]
+    fn identify_namespace_different_nsids() {
+        let mut driver = enabled_driver();
+        let cmd1 = driver.identify_namespace(1, 0x1000).unwrap();
+        let cmd2 = driver.identify_namespace(2, 0x2000).unwrap();
+
+        let nsid1 = u32::from_le_bytes(cmd1.sqe[4..8].try_into().unwrap());
+        let nsid2 = u32::from_le_bytes(cmd2.sqe[4..8].try_into().unwrap());
+        assert_ne!(nsid1, nsid2);
+        assert_eq!(nsid1, 1);
+        assert_eq!(nsid2, 2);
+    }
+
+    #[test]
+    fn identify_namespace_rejects_disabled_state() {
+        let bank = mock_nvme_bank();
+        let mut driver = NvmeDriver::init(bank).unwrap();
+        assert_eq!(
+            driver.identify_namespace(1, 0x1000).unwrap_err(),
+            NvmeError::InvalidState
+        );
+    }
+
+    #[test]
+    fn identify_namespace_works_in_ready_state() {
+        let mut driver = enabled_driver();
+        driver
+            .activate_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
+            .unwrap();
+        assert_eq!(driver.state(), NvmeState::Ready);
+        // Should succeed in Ready state
+        driver.identify_namespace(1, 0x1000).unwrap();
     }
 }
