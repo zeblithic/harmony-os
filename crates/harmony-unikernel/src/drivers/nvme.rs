@@ -239,7 +239,6 @@ pub struct NvmeDriver<R: RegisterBank> {
     /// Admin submission/completion queue pair.
     admin: QueuePair,
     /// I/O submission/completion queue pair (None until created).
-    #[allow(dead_code)]
     io: Option<QueuePair>,
     /// Pending I/O queue params cached by create_io_queues(), consumed by
     /// activate_io_queues().  Ensures software QueuePair matches hardware.
@@ -614,6 +613,39 @@ impl<R: RegisterBank> NvmeDriver<R> {
         self.io = Some(QueuePair::new(1, sq_phys, cq_phys, size));
         self.state = NvmeState::Ready;
         Ok(())
+    }
+}
+
+// ── Block I/O commands ───────────────────────────────────────────────────────
+
+impl<R: RegisterBank> NvmeDriver<R> {
+    /// Build an NVM Read command (opcode 0x02) for one logical block.
+    ///
+    /// Submits via the I/O queue (qid=1).  `data_phys` must be 4 KiB
+    /// aligned (CC.MPS=0).
+    pub fn read_block(
+        &mut self,
+        nsid: u32,
+        lba: u64,
+        data_phys: u64,
+    ) -> Result<AdminCommand, NvmeError> {
+        if self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+
+        let cid = self.next_cid;
+        self.next_cid = self.next_cid.wrapping_add(1);
+
+        let mut sqe = [0u8; 64];
+        let cdw0: u32 = 0x02 | ((cid as u32) << 16);
+        sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
+        sqe[4..8].copy_from_slice(&nsid.to_le_bytes());
+        sqe[24..32].copy_from_slice(&data_phys.to_le_bytes());
+        sqe[40..44].copy_from_slice(&(lba as u32).to_le_bytes());
+        sqe[44..48].copy_from_slice(&((lba >> 32) as u32).to_le_bytes());
+        sqe[48..52].copy_from_slice(&0u32.to_le_bytes());
+
+        Ok(self.io.as_mut().unwrap().submit(sqe, self.doorbell_stride))
     }
 }
 
@@ -1456,5 +1488,80 @@ mod tests {
         assert_eq!(ns_cdw0 & 0xFF, 0x06);
         let ns_nsid = u32::from_le_bytes(ns_cmd.sqe[4..8].try_into().unwrap());
         assert_eq!(ns_nsid, 1);
+    }
+
+    // ── ready_driver helper ───────────────────────────────────────────────────
+
+    /// Helper: produce a Ready driver with I/O queues active.
+    fn ready_driver() -> NvmeDriver<MockRegisterBank> {
+        let mut driver = enabled_driver();
+        let _ = driver.create_io_queues(0x3_0000, 0x4_0000, 32).unwrap();
+        driver.activate_io_queues().unwrap();
+        driver
+    }
+
+    // ── Read command tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn read_block_builds_correct_sqe() {
+        let mut driver = ready_driver();
+        let cmd = driver.read_block(1, 100, 0xBEEF_0000).unwrap();
+
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x02);
+
+        let nsid = u32::from_le_bytes(cmd.sqe[4..8].try_into().unwrap());
+        assert_eq!(nsid, 1);
+
+        let prp1 = u64::from_le_bytes(cmd.sqe[24..32].try_into().unwrap());
+        assert_eq!(prp1, 0xBEEF_0000);
+
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10, 100);
+
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11, 0);
+
+        let cdw12 = u32::from_le_bytes(cmd.sqe[48..52].try_into().unwrap());
+        assert_eq!(cdw12, 0);
+    }
+
+    #[test]
+    fn read_block_uses_io_queue_doorbell() {
+        let mut driver = ready_driver();
+        let cmd = driver.read_block(1, 0, 0x1000).unwrap();
+        assert_eq!(cmd.doorbell_offset, 0x1008);
+    }
+
+    #[test]
+    fn read_block_rejects_enabled_state() {
+        let mut driver = enabled_driver();
+        assert_eq!(driver.state(), NvmeState::Enabled);
+        assert_eq!(
+            driver.read_block(1, 0, 0x1000).unwrap_err(),
+            NvmeError::InvalidState
+        );
+    }
+
+    #[test]
+    fn read_block_rejects_disabled_state() {
+        let bank = mock_nvme_bank();
+        let mut driver = NvmeDriver::init(bank).unwrap();
+        assert_eq!(
+            driver.read_block(1, 0, 0x1000).unwrap_err(),
+            NvmeError::InvalidState
+        );
+    }
+
+    #[test]
+    fn read_block_large_lba_splits_correctly() {
+        let mut driver = ready_driver();
+        let lba: u64 = 0x1_ABCD_EF00;
+        let cmd = driver.read_block(1, lba, 0x1000).unwrap();
+
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw10, 0xABCD_EF00, "LBA low 32 bits");
+        assert_eq!(cdw11, 0x0000_0001, "LBA high 32 bits");
     }
 }
