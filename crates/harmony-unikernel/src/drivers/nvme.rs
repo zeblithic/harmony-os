@@ -676,6 +676,26 @@ impl<R: RegisterBank> NvmeDriver<R> {
 
         Ok(self.io.as_mut().unwrap().submit(sqe, self.doorbell_stride))
     }
+
+    /// Build an NVM Flush command (opcode 0x00).
+    ///
+    /// Submits via the I/O queue (qid=1).  Flushes all pending writes
+    /// for `nsid` to non-volatile media.  No data transfer.
+    pub fn flush(&mut self, nsid: u32) -> Result<AdminCommand, NvmeError> {
+        if self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+
+        let cid = self.next_cid;
+        self.next_cid = self.next_cid.wrapping_add(1);
+
+        let mut sqe = [0u8; 64];
+        let cdw0: u32 = (cid as u32) << 16;
+        sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
+        sqe[4..8].copy_from_slice(&nsid.to_le_bytes());
+
+        Ok(self.io.as_mut().unwrap().submit(sqe, self.doorbell_stride))
+    }
 }
 
 // ── Completion checking ───────────────────────────────────────────────────────
@@ -1643,5 +1663,49 @@ mod tests {
             driver.write_block(1, 0, 0x1000).unwrap_err(),
             NvmeError::InvalidState
         );
+    }
+
+    // ── Flush command tests ───────────────────────────────────────────────
+
+    #[test]
+    fn flush_builds_correct_sqe() {
+        let mut driver = ready_driver();
+        let cmd = driver.flush(1).unwrap();
+
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x00);
+
+        let nsid = u32::from_le_bytes(cmd.sqe[4..8].try_into().unwrap());
+        assert_eq!(nsid, 1);
+
+        let prp1 = u64::from_le_bytes(cmd.sqe[24..32].try_into().unwrap());
+        assert_eq!(prp1, 0);
+
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        let cdw12 = u32::from_le_bytes(cmd.sqe[48..52].try_into().unwrap());
+        assert_eq!(cdw10, 0);
+        assert_eq!(cdw11, 0);
+        assert_eq!(cdw12, 0);
+    }
+
+    #[test]
+    fn flush_uses_io_queue_doorbell() {
+        let mut driver = ready_driver();
+        let cmd = driver.flush(1).unwrap();
+        assert_eq!(cmd.doorbell_offset, 0x1008);
+    }
+
+    #[test]
+    fn flush_rejects_enabled_state() {
+        let mut driver = enabled_driver();
+        assert_eq!(driver.flush(1).unwrap_err(), NvmeError::InvalidState);
+    }
+
+    #[test]
+    fn flush_rejects_disabled_state() {
+        let bank = mock_nvme_bank();
+        let mut driver = NvmeDriver::init(bank).unwrap();
+        assert_eq!(driver.flush(1).unwrap_err(), NvmeError::InvalidState);
     }
 }
