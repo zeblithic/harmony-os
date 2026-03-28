@@ -143,13 +143,13 @@ The page table walk generalizes from the current hardcoded `(vaddr >> (12 + leve
 
 ```rust
 /// Mask for extracting the output address from a page table descriptor.
-/// Bits [47:PAGE_SHIFT] — varies with granule.
-pub const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_FFFF << PAGE_SHIFT >> PAGE_SHIFT << PAGE_SHIFT;
-// 4K:  0x0000_FFFF_FFFF_F000 (bits [47:12])
-// 16K: 0x0000_FFFF_FFFF_C000 (bits [47:14])
+/// Clears the page offset bits [PAGE_SHIFT-1:0] and reserved bits [63:48].
+/// 4K:  0x0000_FFFF_FFFF_F000 (bits [47:12])
+/// 16K: 0x0000_FFFF_FFFF_C000 (bits [47:14])
+pub const ADDR_MASK: u64 = !(PAGE_SIZE - 1) & 0x0000_FFFF_FFFF_FFFF;
 ```
 
-Or more readably: `!(PAGE_SIZE - 1) & 0x0000_FFFF_FFFF_FFFF`. Both `aarch64.rs` and `stage2.rs` currently hardcode this mask and must use the derived constant instead.
+Both `aarch64.rs` and `stage2.rs` currently hardcode this mask as `0x0000_FFFF_FFFF_F000` and must use the derived constant instead.
 
 **Table entry array size:** The current `table_mut` returns `&mut [u64; 512]`. With 16K, tables have 2048 entries. Change to `&mut [u64]` slice (pointer + ENTRIES_PER_TABLE length) to avoid const-generic array sizes in the return type.
 
