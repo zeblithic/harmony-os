@@ -12,6 +12,9 @@
 #[allow(unused_imports)]
 use tpm2_protocol as tpm2;
 
+extern crate alloc;
+use alloc::vec::Vec;
+
 use super::spi_bus::SpiBus;
 
 // ── TPM register addresses (Locality 0) ──────────────────────────────
@@ -337,6 +340,353 @@ impl<S: SpiBus> TpmDriver<S> {
     }
 }
 
+// ── Key derivation (Layer 3) ──────────────────────────────────────
+
+/// PWAP null-password auth area: authAreaSize(4) + sessionHandle(4)
+/// + nonceCaller(2) + attrs(1) + hmac(2) = 13 bytes.
+const PWAP_AUTH: [u8; 13] = [
+    0x00, 0x00, 0x00, 0x09, // auth area size = 9 bytes (excludes own 4-byte size field)
+    0x40, 0x00, 0x00, 0x09, // TPM_RS_PW
+    0x00, 0x00, // nonceCaller size = 0
+    0x01, // sessionAttributes = continueSession
+    0x00, 0x00, // hmac size = 0
+];
+
+#[allow(dead_code)]
+impl<S: SpiBus> TpmDriver<S> {
+    /// Create an HMAC primary key under TPM_RH_OWNER.
+    ///
+    /// Sends TPM2_CreatePrimary (CC=0x00000131) with KEYEDHASH/SHA256
+    /// parameters and PWAP auth. Returns the transient object handle.
+    fn create_primary_hmac_key(&mut self, resp: &mut [u8]) -> Result<u32, TpmError> {
+        // Build the entire command as one contiguous array.
+        // Total structure:
+        //   Header: tag(2) + size(4) + CC(4) = 10
+        //   Handle: TPM_RH_OWNER = 4
+        //   PWAP auth: 13
+        //   inSensitive: TPM2B_SENSITIVE_CREATE = size(2)=4, inner: userAuth size(2)=0 + data size(2)=0 = 4+2=6
+        //     Wait — TPM2B_SENSITIVE_CREATE: size(2) + TPMS_SENSITIVE_CREATE
+        //     TPMS_SENSITIVE_CREATE: userAuth TPM2B(2) + data TPM2B(2) = 4 bytes inner
+        //     So TPM2B_SENSITIVE_CREATE = size(2)=4 + 4 bytes = 6 bytes total
+        //   inPublic: TPM2B_PUBLIC = size(2) + TPMT_PUBLIC
+        //     TPMT_PUBLIC: type(2) + nameAlg(2) + attrs(4) + authPolicy TPM2B(2) + params(4) + unique TPM2B(2) = 16
+        //     TPM2B_PUBLIC: size(2)=16 + 16 = 18 bytes total
+        //   outsideInfo: TPM2B = size(2)=0 = 2 bytes
+        //   creationPCR: TPML_PCR_SELECTION = count(4)=0 = 4 bytes
+        //
+        // Total = 10 + 4 + 13 + 6 + 18 + 2 + 4 = 57 bytes
+
+        let total_size: u32 = 57;
+        #[rustfmt::skip]
+        let cmd: [u8; 57] = [
+            // Header
+            0x80, 0x02,                         // tag: TPM_ST_SESSIONS
+            (total_size >> 24) as u8,
+            (total_size >> 16) as u8,
+            (total_size >> 8) as u8,
+            total_size as u8,                   // size: 57
+            0x00, 0x00, 0x01, 0x31,             // CC: TPM2_CreatePrimary
+
+            // Handle: TPM_RH_OWNER
+            0x40, 0x00, 0x00, 0x01,
+
+            // PWAP auth area
+            0x00, 0x00, 0x00, 0x09,             // auth area size = 9
+            0x40, 0x00, 0x00, 0x09,             // TPM_RS_PW
+            0x00, 0x00,                         // nonceCaller size = 0
+            0x01,                               // sessionAttributes = continueSession
+            0x00, 0x00,                         // hmac size = 0
+
+            // inSensitive: TPM2B_SENSITIVE_CREATE
+            0x00, 0x04,                         // size = 4
+            0x00, 0x00,                         // userAuth size = 0
+            0x00, 0x00,                         // data size = 0
+
+            // inPublic: TPM2B_PUBLIC
+            0x00, 0x10,                         // size = 16 (TPMT_PUBLIC)
+            0x00, 0x08,                         // type: TPM_ALG_KEYEDHASH
+            0x00, 0x0B,                         // nameAlg: TPM_ALG_SHA256
+            0x00, 0x04, 0x00, 0x72,             // objectAttributes
+            0x00, 0x00,                         // authPolicy size = 0
+            0x00, 0x05,                         // scheme: TPM_ALG_HMAC
+            0x00, 0x0B,                         // hashAlg: TPM_ALG_SHA256
+            0x00, 0x00,                         // unique size = 0
+
+            // outsideInfo: TPM2B
+            0x00, 0x00,                         // size = 0
+
+            // creationPCR: TPML_PCR_SELECTION
+            0x00, 0x00, 0x00, 0x00,             // count = 0
+        ];
+
+        let n = self.execute_command(&cmd, resp)?;
+        if n < 14 {
+            return Err(TpmError::ProtocolError);
+        }
+
+        // Response bytes 10-13 = object handle (big-endian u32)
+        let handle = u32::from_be_bytes([resp[10], resp[11], resp[12], resp[13]]);
+        Ok(handle)
+    }
+
+    /// Read SHA-256 PCR digests for the given indices.
+    ///
+    /// Sends TPM2_PCR_Read (CC=0x0000017E) and returns the concatenated
+    /// 32-byte digests.
+    fn read_pcr_digests(
+        &mut self,
+        pcr_indices: &[u8],
+        resp: &mut [u8],
+    ) -> Result<Vec<u8>, TpmError> {
+        // Build the PCR selection bitmask: 3 bytes, bit N of byte N/8
+        let mut pcr_select = [0u8; 3];
+        for &idx in pcr_indices {
+            if idx < 24 {
+                pcr_select[(idx / 8) as usize] |= 1 << (idx % 8);
+            }
+        }
+
+        // Command structure:
+        //   Header: tag(2) + size(4) + CC(4) = 10
+        //   pcrSelectionIn: TPML_PCR_SELECTION
+        //     count(4) = 1
+        //     TPMS_PCR_SELECTION: hash(2) + sizeOfSelect(1) + select(3) = 6
+        // Total = 10 + 4 + 6 = 20 bytes
+        let total_size: u32 = 20;
+        let cmd: [u8; 20] = [
+            // Header
+            0x80,
+            0x01, // tag: TPM_ST_NO_SESSIONS
+            (total_size >> 24) as u8,
+            (total_size >> 16) as u8,
+            (total_size >> 8) as u8,
+            total_size as u8,
+            0x00,
+            0x00,
+            0x01,
+            0x7E, // CC: TPM2_PCR_Read
+            // pcrSelectionIn: TPML_PCR_SELECTION
+            0x00,
+            0x00,
+            0x00,
+            0x01, // count = 1
+            // TPMS_PCR_SELECTION
+            0x00,
+            0x0B, // hash: TPM_ALG_SHA256
+            0x03, // sizeOfSelect = 3
+            pcr_select[0],
+            pcr_select[1],
+            pcr_select[2],
+        ];
+
+        let n = self.execute_command(&cmd, resp)?;
+
+        // Response layout (after 10-byte header):
+        //   pcrUpdateCounter: 4 bytes  (offset 10)
+        //   pcrSelectionOut: TPML_PCR_SELECTION
+        //     count(4)                  (offset 14)
+        //     For each: hash(2) + sizeOfSelect(1) + select(sizeOfSelect)
+        //   pcrValues: TPML_DIGEST
+        //     count(4) then for each: size(2) + digest bytes
+
+        if n < 18 {
+            return Err(TpmError::ProtocolError);
+        }
+
+        // Parse pcrSelectionOut to skip it
+        let sel_count = u32::from_be_bytes([resp[14], resp[15], resp[16], resp[17]]) as usize;
+        let mut offset = 18;
+        for _ in 0..sel_count {
+            if offset + 3 > n {
+                return Err(TpmError::ProtocolError);
+            }
+            let size_of_select = resp[offset + 2] as usize;
+            offset += 3 + size_of_select; // hash(2) + sizeOfSelect(1) + select bytes
+        }
+
+        // Parse pcrValues: TPML_DIGEST
+        if offset + 4 > n {
+            return Err(TpmError::ProtocolError);
+        }
+        let digest_count = u32::from_be_bytes([
+            resp[offset],
+            resp[offset + 1],
+            resp[offset + 2],
+            resp[offset + 3],
+        ]) as usize;
+        offset += 4;
+
+        let mut digests = Vec::new();
+        for _ in 0..digest_count {
+            if offset + 2 > n {
+                return Err(TpmError::ProtocolError);
+            }
+            let digest_size = u16::from_be_bytes([resp[offset], resp[offset + 1]]) as usize;
+            offset += 2;
+            if offset + digest_size > n {
+                return Err(TpmError::ProtocolError);
+            }
+            digests.extend_from_slice(&resp[offset..offset + digest_size]);
+            offset += digest_size;
+        }
+
+        Ok(digests)
+    }
+
+    /// Compute HMAC over `data` using the key at `handle`.
+    ///
+    /// Sends TPM2_HMAC (CC=0x00000155) with PWAP auth.
+    /// Returns the 32-byte SHA-256 HMAC output.
+    fn hmac_with_key(
+        &mut self,
+        handle: u32,
+        data: &[u8],
+        resp: &mut [u8],
+    ) -> Result<[u8; 32], TpmError> {
+        // Command structure:
+        //   Header: tag(2) + size(4) + CC(4) = 10
+        //   handle: 4
+        //   PWAP auth: 13
+        //   buffer: TPM2B_MAX_BUFFER = size(2) + data
+        //   hashAlg: 2
+        // Total = 10 + 4 + 13 + 2 + data.len() + 2 = 31 + data.len()
+
+        let total_size = (31 + data.len()) as u32;
+        let data_len = data.len() as u16;
+        let handle_bytes = handle.to_be_bytes();
+
+        // Build command dynamically since data length varies
+        let mut cmd = Vec::with_capacity(total_size as usize);
+
+        // Header
+        cmd.extend_from_slice(&[0x80, 0x02]); // tag: TPM_ST_SESSIONS
+        cmd.extend_from_slice(&total_size.to_be_bytes());
+        cmd.extend_from_slice(&[0x00, 0x00, 0x01, 0x55]); // CC: TPM2_HMAC
+
+        // Handle
+        cmd.extend_from_slice(&handle_bytes);
+
+        // PWAP auth
+        cmd.extend_from_slice(&PWAP_AUTH);
+
+        // buffer: TPM2B_MAX_BUFFER
+        cmd.extend_from_slice(&data_len.to_be_bytes());
+        cmd.extend_from_slice(data);
+
+        // hashAlg: TPM_ALG_SHA256
+        cmd.extend_from_slice(&[0x00, 0x0B]);
+
+        let n = self.execute_command(&cmd, resp)?;
+
+        // Response (TPM_ST_SESSIONS): header(10) + auth response area + outHMAC
+        // Auth response area: parameterSize(4) + auth response
+        //   auth response: nonce(2) + attrs(1) + hmac(2) = 5 bytes minimum
+        //   parameterSize includes everything after it until end
+        //
+        // For PWAP with null password:
+        //   parameterSize(4) = size of (outHMAC)
+        //   outHMAC: TPM2B_DIGEST = size(2) + 32 bytes = 34
+        //   Then trailing auth: nonce(2=0) + attrs(1) + hmac(2=0) = 5
+        //
+        // Actually the layout for session response is:
+        //   header(10) + parameterSize(4) + parameters + authArea
+        // Where parameterSize tells us how many bytes of parameters follow,
+        // then the auth area comes after.
+        //
+        // For TPM2_HMAC: parameters = outHMAC: TPM2B_DIGEST
+        // So parameterSize = 2 + 32 = 34
+
+        if n < 14 {
+            return Err(TpmError::ProtocolError);
+        }
+
+        // parameterSize at offset 10
+        let param_size = u32::from_be_bytes([resp[10], resp[11], resp[12], resp[13]]) as usize;
+        if param_size < 34 {
+            return Err(TpmError::ProtocolError);
+        }
+
+        // outHMAC starts at offset 14
+        let hmac_size = u16::from_be_bytes([resp[14], resp[15]]) as usize;
+        if hmac_size != 32 || 14 + 2 + hmac_size > n {
+            return Err(TpmError::ProtocolError);
+        }
+
+        let mut result = [0u8; 32];
+        result.copy_from_slice(&resp[16..48]);
+        Ok(result)
+    }
+
+    /// Release a transient object handle.
+    ///
+    /// Sends TPM2_FlushContext (CC=0x00000165), no auth.
+    fn flush_context(&mut self, handle: u32, resp: &mut [u8]) -> Result<(), TpmError> {
+        // Command: header(10) + handle(4) = 14 bytes
+        let total_size: u32 = 14;
+        let handle_bytes = handle.to_be_bytes();
+        let cmd: [u8; 14] = [
+            // Header
+            0x80,
+            0x01, // tag: TPM_ST_NO_SESSIONS
+            (total_size >> 24) as u8,
+            (total_size >> 16) as u8,
+            (total_size >> 8) as u8,
+            total_size as u8,
+            0x00,
+            0x00,
+            0x01,
+            0x65, // CC: TPM2_FlushContext
+            // Handle
+            handle_bytes[0],
+            handle_bytes[1],
+            handle_bytes[2],
+            handle_bytes[3],
+        ];
+
+        self.execute_command(&cmd, resp)?;
+        Ok(())
+    }
+
+    /// Derive a 32-byte hardware-bound key from TPM primary seed,
+    /// PCR digests, and caller-provided salt.
+    ///
+    /// Executes 4 TPM commands:
+    /// 1. `TPM2_CreatePrimary` — derive HMAC key under owner hierarchy
+    /// 2. `TPM2_PCR_Read` — read SHA-256 digests for requested PCRs
+    /// 3. `TPM2_HMAC` — HMAC(key, pcr_digests || salt)
+    /// 4. `TPM2_FlushContext` — release transient handle
+    ///
+    /// Requires `TpmState::Ready`. Can be called multiple times with
+    /// different PCR sets or salts.
+    pub fn derive_hardware_key(
+        &mut self,
+        pcr_indices: &[u8],
+        salt: &[u8],
+    ) -> Result<[u8; 32], TpmError> {
+        if self.state != TpmState::Ready {
+            return Err(TpmError::InvalidState);
+        }
+
+        let mut resp = [0u8; 1024];
+
+        // Step 1: Create primary HMAC key
+        let handle = self.create_primary_hmac_key(&mut resp)?;
+
+        // Step 2: Read PCR digests
+        let pcr_digests = self.read_pcr_digests(pcr_indices, &mut resp)?;
+
+        // Step 3: HMAC(key, pcr_digests || salt)
+        let mut hmac_input = pcr_digests;
+        hmac_input.extend_from_slice(salt);
+        let key = self.hmac_with_key(handle, &hmac_input, &mut resp)?;
+
+        // Step 4: Flush transient handle
+        self.flush_context(handle, &mut resp)?;
+
+        Ok(key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,5 +907,189 @@ mod tests {
 
         let err = TpmDriver::init(bus).unwrap_err();
         assert_eq!(err, TpmError::LocalityUnavailable);
+    }
+
+    // ── Key derivation tests ──────────────────────────────────────────
+
+    /// Fake 32-byte PCR digest (all 0xAA).
+    const FAKE_PCR_DIGEST: [u8; 32] = [0xAA; 32];
+
+    /// Fake 32-byte HMAC output (deterministic for testing).
+    const FAKE_HMAC_OUTPUT: [u8; 32] = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E,
+        0x1F, 0x20,
+    ];
+
+    /// Build the mock CreatePrimary response.
+    /// tag=0x8002, size, RC=0, handle=0x80000001, then padding.
+    fn create_primary_response() -> Vec<u8> {
+        let mut resp = vec![0u8; 64];
+        // tag: TPM_ST_SESSIONS
+        resp[0] = 0x80;
+        resp[1] = 0x02;
+        // size: 64
+        resp[2] = 0x00;
+        resp[3] = 0x00;
+        resp[4] = 0x00;
+        resp[5] = 0x40;
+        // RC: success
+        resp[6] = 0x00;
+        resp[7] = 0x00;
+        resp[8] = 0x00;
+        resp[9] = 0x00;
+        // object handle: 0x80000001
+        resp[10] = 0x80;
+        resp[11] = 0x00;
+        resp[12] = 0x00;
+        resp[13] = 0x01;
+        resp
+    }
+
+    /// Build the mock PCR_Read response for 1 PCR (PCR 0).
+    /// tag=0x8001, RC=0, pcrUpdateCounter, selectionOut, pcrValues with 1 digest.
+    fn pcr_read_response() -> Vec<u8> {
+        // Layout:
+        //   header: tag(2) + size(4) + RC(4) = 10
+        //   pcrUpdateCounter: 4                         (offset 10)
+        //   pcrSelectionOut: count(4) + hash(2) + sizeOfSelect(1) + select(3) = 10  (offset 14)
+        //   pcrValues: count(4) + size(2) + digest(32) = 38  (offset 24)
+        // Total = 10 + 4 + 10 + 38 = 62
+        let total_size: u32 = 62;
+        let mut resp = vec![0u8; total_size as usize];
+        // tag: TPM_ST_NO_SESSIONS
+        resp[0] = 0x80;
+        resp[1] = 0x01;
+        // size
+        resp[2] = (total_size >> 24) as u8;
+        resp[3] = (total_size >> 16) as u8;
+        resp[4] = (total_size >> 8) as u8;
+        resp[5] = total_size as u8;
+        // RC: success
+        // (already 0)
+        // pcrUpdateCounter = 1
+        resp[13] = 0x01;
+        // pcrSelectionOut: count = 1
+        resp[17] = 0x01;
+        // hash: TPM_ALG_SHA256 = 0x000B
+        resp[18] = 0x00;
+        resp[19] = 0x0B;
+        // sizeOfSelect = 3
+        resp[20] = 0x03;
+        // select: PCR 0 = bit 0 of byte 0
+        resp[21] = 0x01;
+        resp[22] = 0x00;
+        resp[23] = 0x00;
+        // pcrValues: count = 1
+        resp[27] = 0x01;
+        // digest: size = 32
+        resp[28] = 0x00;
+        resp[29] = 0x20;
+        // digest bytes
+        resp[30..62].copy_from_slice(&FAKE_PCR_DIGEST);
+        resp
+    }
+
+    /// Build the mock HMAC response.
+    /// tag=0x8002, RC=0, parameterSize(4)=34, outHMAC: size(2)+digest(32),
+    /// then trailing auth.
+    fn hmac_response() -> Vec<u8> {
+        // Layout:
+        //   header: tag(2) + size(4) + RC(4) = 10
+        //   parameterSize(4) = 34           (offset 10)
+        //   outHMAC: size(2) + digest(32)   (offset 14)
+        //   trailing auth: nonce(2) + attrs(1) + hmac(2) = 5  (offset 48)
+        // Total = 10 + 4 + 34 + 5 = 53
+        let total_size: u32 = 53;
+        let mut resp = vec![0u8; total_size as usize];
+        // tag: TPM_ST_SESSIONS
+        resp[0] = 0x80;
+        resp[1] = 0x02;
+        // size
+        resp[2] = (total_size >> 24) as u8;
+        resp[3] = (total_size >> 16) as u8;
+        resp[4] = (total_size >> 8) as u8;
+        resp[5] = total_size as u8;
+        // RC: success (already 0)
+        // parameterSize = 34 (0x22)
+        resp[13] = 0x22;
+        // outHMAC: size = 32
+        resp[14] = 0x00;
+        resp[15] = 0x20;
+        // HMAC digest
+        resp[16..48].copy_from_slice(&FAKE_HMAC_OUTPUT);
+        // trailing auth: nonce size=0, attrs=continueSession, hmac size=0
+        resp[48] = 0x00;
+        resp[49] = 0x00;
+        resp[50] = 0x01;
+        resp[51] = 0x00;
+        resp[52] = 0x00;
+        resp
+    }
+
+    /// Build the mock FlushContext response.
+    fn flush_context_response() -> Vec<u8> {
+        vec![
+            0x80, 0x01, // tag: TPM_ST_NO_SESSIONS
+            0x00, 0x00, 0x00, 0x0A, // size: 10
+            0x00, 0x00, 0x00, 0x00, // RC: success
+        ]
+    }
+
+    /// Helper: set up mock bus for a full derive_hardware_key workflow
+    /// (4 command executions: CreatePrimary, PCR_Read, HMAC, FlushContext).
+    fn mock_derive_flow(bus: &mut MockSpiBus) {
+        // CreatePrimary
+        mock_command_flow(bus, &create_primary_response());
+        // PCR_Read
+        mock_command_flow(bus, &pcr_read_response());
+        // HMAC
+        mock_command_flow(bus, &hmac_response());
+        // FlushContext
+        mock_command_flow(bus, &flush_context_response());
+    }
+
+    #[test]
+    fn derive_hardware_key_requires_ready_state() {
+        let mut driver = make_driver();
+        assert_eq!(driver.state(), TpmState::Uninitialized);
+
+        let err = driver.derive_hardware_key(&[0], b"salt").unwrap_err();
+        assert_eq!(err, TpmError::InvalidState);
+    }
+
+    #[test]
+    fn derive_hardware_key_returns_32_bytes() {
+        let mut bus = MockSpiBus::new();
+        mock_init_flow(&mut bus);
+        mock_derive_flow(&mut bus);
+
+        let mut driver = TpmDriver::init(bus).unwrap();
+        assert_eq!(driver.state(), TpmState::Ready);
+
+        let key = driver.derive_hardware_key(&[0], b"test-salt").unwrap();
+        assert_eq!(key.len(), 32);
+        assert_eq!(key, FAKE_HMAC_OUTPUT);
+        // Verify still in Ready state (can call again)
+        assert_eq!(driver.state(), TpmState::Ready);
+    }
+
+    #[test]
+    fn derive_hardware_key_deterministic() {
+        // First call
+        let mut bus1 = MockSpiBus::new();
+        mock_init_flow(&mut bus1);
+        mock_derive_flow(&mut bus1);
+        let mut driver1 = TpmDriver::init(bus1).unwrap();
+        let key1 = driver1.derive_hardware_key(&[0], b"salt").unwrap();
+
+        // Second call with identical mocks
+        let mut bus2 = MockSpiBus::new();
+        mock_init_flow(&mut bus2);
+        mock_derive_flow(&mut bus2);
+        let mut driver2 = TpmDriver::init(bus2).unwrap();
+        let key2 = driver2.derive_hardware_key(&[0], b"salt").unwrap();
+
+        assert_eq!(key1, key2);
     }
 }

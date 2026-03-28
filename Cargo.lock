@@ -855,6 +855,7 @@ dependencies = [
  "harmony-platform",
  "harmony-reticulum",
  "rand_core 0.6.4",
+ "tpm2-protocol",
 ]
 
 [[package]]
@@ -1846,6 +1847,12 @@ dependencies = [
  "portable-atomic",
  "rustversion",
 ]
+
+[[package]]
+name = "tpm2-protocol"
+version = "0.16.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1da3067f1cf7eb426a2343b33700bcf9edb2a2e1ced63c296a883dcc4b068ad6"
 
 [[package]]
 name = "typenum"
