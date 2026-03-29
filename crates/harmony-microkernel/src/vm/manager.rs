@@ -2007,8 +2007,10 @@ mod tests {
     #[test]
     fn user_space_end_consistent_with_geometry() {
         use super::super::PAGE_SIZE;
-        assert!(USER_SPACE_END < (1u64 << 48));
-        assert!(USER_SPACE_END > 0);
+        // Bounds are compile-time truths; verified by const assertions:
+        const _: () = assert!(USER_SPACE_END < (1u64 << 48));
+        const _: () = assert!(USER_SPACE_END > 0);
+        // Page alignment is the real runtime check:
         assert_eq!(USER_SPACE_END & (PAGE_SIZE - 1), 0);
     }
 }

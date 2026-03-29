@@ -279,7 +279,8 @@ mod tests {
     fn page_constants_consistent() {
         assert_eq!(PAGE_SIZE, 1u64 << PAGE_SHIFT);
         assert!(PAGE_SIZE.is_power_of_two());
-        assert!(PAGE_SIZE >= 4096);
+        // PAGE_SIZE >= 4096 is a compile-time truth; verified by const assertion:
+        const _: () = assert!(PAGE_SIZE >= 4096);
     }
 
     #[test]
