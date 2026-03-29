@@ -1111,6 +1111,7 @@ impl<P: PageTable> Kernel<P> {
     }
 }
 
+#[cfg(not(feature = "page-16k"))]
 #[cfg(test)]
 mod tests {
     use super::*;

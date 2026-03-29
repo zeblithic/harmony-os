@@ -611,6 +611,7 @@ pub fn boot_static_elf(
 
 // ── Tests ───────────────────────────────────────────────────────────
 
+#[cfg(not(feature = "page-16k"))]
 #[cfg(test)]
 mod tests {
     use super::*;

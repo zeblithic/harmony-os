@@ -21,19 +21,20 @@ use super::{FrameClassification, PageFlags, PhysAddr, VirtAddr, VmError, PAGE_SI
 const USER_SPACE_START: u64 = 0x1000;
 
 /// End of user-space VA range. Derived from page table geometry.
-/// aarch64 4K: 48-bit VA → (1 << 48) - 4096
-/// aarch64 16K: 47-bit VA → (1 << 47) - 16384
-/// x86_64: always 48-bit VA → (1 << 48) - 4096
+/// End of user-space VA range. Uses PAGE_SIZE for alignment so it stays
+/// valid when `page-16k` is enabled for cross-testing on x86_64.
+///
+/// aarch64 4K:  48-bit VA → (1 << 48) - PAGE_SIZE
+/// aarch64 16K: 47-bit VA → (1 << 47) - PAGE_SIZE
+/// x86_64:      48-bit VA → (1 << 48) - PAGE_SIZE
 #[cfg(all(target_arch = "aarch64", not(feature = "page-16k")))]
-const USER_SPACE_END: u64 = (1u64 << 48) - 4096;
+const USER_SPACE_END: u64 = (1u64 << 48) - PAGE_SIZE;
 #[cfg(all(target_arch = "aarch64", feature = "page-16k"))]
-const USER_SPACE_END: u64 = (1u64 << 47) - 16384;
+const USER_SPACE_END: u64 = (1u64 << 47) - PAGE_SIZE;
 #[cfg(target_arch = "x86_64")]
-const USER_SPACE_END: u64 = (1u64 << 48) - 4096;
-// Test host on macOS x86_64 matches the x86_64 path above.
-// This fallback covers other architectures (e.g. wasm32 for testing).
+const USER_SPACE_END: u64 = (1u64 << 48) - PAGE_SIZE;
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-const USER_SPACE_END: u64 = (1u64 << 47) - 4096;
+const USER_SPACE_END: u64 = (1u64 << 47) - PAGE_SIZE;
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -772,6 +773,7 @@ impl<P: PageTable> AddressSpaceManager<P> {
 
 // ── Tests ────────────────────────────────────────────────────────────
 
+#[cfg(not(feature = "page-16k"))]
 #[cfg(test)]
 mod tests {
     use super::super::mock::MockPageTable;

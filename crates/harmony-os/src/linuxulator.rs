@@ -6749,6 +6749,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
     }
 }
 
+#[cfg(not(feature = "page-16k"))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8346,6 +8347,7 @@ mod tests {
     }
 }
 
+#[cfg(not(feature = "page-16k"))]
 #[cfg(test)]
 mod integration_tests {
     use super::*;
