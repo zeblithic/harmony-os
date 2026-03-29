@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [features]
 default = []
+page-16k = ["harmony-microkernel/page-16k"]
 
 [dependencies]
 harmony-microkernel = { workspace = true, default-features = false }

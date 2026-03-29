@@ -17,11 +17,23 @@ use super::{FrameClassification, PageFlags, PhysAddr, VirtAddr, VmError, PAGE_SI
 
 // ── Constants ────────────────────────────────────────────────────────
 
-/// Start of the user-space virtual address range (skip null-page guard).
-const USER_SPACE_START: u64 = 0x1000;
+/// Start of the user-space virtual address range (one page above zero = null guard).
+const USER_SPACE_START: u64 = PAGE_SIZE;
 
-/// End of the user-space virtual address range (guard before kernel half).
-const USER_SPACE_END: u64 = 0x0000_7FFF_FFFF_F000;
+/// End of user-space VA range, derived from page table geometry.
+/// Uses PAGE_SIZE for alignment so it stays valid under `page-16k`.
+///
+/// aarch64 4K:  48-bit VA → (1 << 48) - PAGE_SIZE
+/// aarch64 16K: 47-bit VA → (1 << 47) - PAGE_SIZE
+/// x86_64:      48-bit VA → (1 << 48) - PAGE_SIZE
+#[cfg(all(target_arch = "aarch64", not(feature = "page-16k")))]
+const USER_SPACE_END: u64 = (1u64 << 48) - PAGE_SIZE;
+#[cfg(all(target_arch = "aarch64", feature = "page-16k"))]
+const USER_SPACE_END: u64 = (1u64 << 47) - PAGE_SIZE;
+#[cfg(target_arch = "x86_64")]
+const USER_SPACE_END: u64 = (1u64 << 48) - PAGE_SIZE;
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+const USER_SPACE_END: u64 = (1u64 << 47) - PAGE_SIZE;
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -760,6 +772,7 @@ impl<P: PageTable> AddressSpaceManager<P> {
 
 // ── Tests ────────────────────────────────────────────────────────────
 
+#[cfg(not(feature = "page-16k"))]
 #[cfg(test)]
 mod tests {
     use super::super::mock::MockPageTable;
@@ -1988,5 +2001,15 @@ mod tests {
             regions.get(&VirtAddr(0x6000)).unwrap().flags,
             rw_user_flags()
         );
+    }
+
+    #[test]
+    fn user_space_end_consistent_with_geometry() {
+        use super::super::PAGE_SIZE;
+        // Bounds are compile-time truths; verified by const assertions:
+        const _: () = assert!(USER_SPACE_END < (1u64 << 48));
+        const _: () = assert!(USER_SPACE_END > 0);
+        // Page alignment is the real runtime check:
+        assert_eq!(USER_SPACE_END & (PAGE_SIZE - 1), 0);
     }
 }

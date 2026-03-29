@@ -8,6 +8,7 @@
 extern crate alloc;
 
 mod bump_alloc;
+mod fdt_parse;
 mod mmu;
 mod pl011;
 mod rndr;

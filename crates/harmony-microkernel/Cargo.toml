@@ -12,6 +12,10 @@ default = ["kernel"]
 std = [
     "harmony-unikernel/std",
 ]
+# 16 KiB page granule for aarch64 targets (Apple Silicon, etc.).
+# Switches PAGE_SIZE from 4096 to 16384 at compile time.
+page-16k = []
+
 # Kernel struct + IPC dispatch. Requires in-memory identity stores from
 # harmony-identity/test-utils (production-grade despite the feature name).
 kernel = [
@@ -43,6 +47,7 @@ ciborium = { workspace = true, optional = true }
 harmony-unikernel = { workspace = true, features = ["test-utils"] }
 criterion = { workspace = true }
 rand = { version = "0.8", features = ["std"] }
+fdt = "0.1"
 
 [[bench]]
 name = "buddy_alloc"

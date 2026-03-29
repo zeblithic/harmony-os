@@ -98,6 +98,7 @@ impl PageTable for MockPageTable {
     }
 }
 
+#[cfg(not(feature = "page-16k"))]
 #[cfg(test)]
 mod tests {
     use super::*;

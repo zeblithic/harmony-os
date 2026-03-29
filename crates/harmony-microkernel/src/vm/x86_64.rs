@@ -368,6 +368,7 @@ impl PageTable for X86_64PageTable {
     }
 }
 
+#[cfg(not(feature = "page-16k"))]
 #[cfg(test)]
 mod tests {
     use super::*;

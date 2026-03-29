@@ -9,13 +9,30 @@ use core::fmt;
 
 use bitflags::bitflags;
 
+// ── Compile-time guards ──────────────────────────────────────────────
+
+// NOTE: page-16k only makes architectural sense on aarch64 (x86_64 doesn't
+// support 16K pages). We don't compile_error! here because page-16k is used
+// on x86_64 hosts for cross-testing the 16K math. The boot crate for
+// Apple Silicon (Phase D) will enforce the target restriction.
+
 // ── Constants ────────────────────────────────────────────────────────
 
-/// Page size in bytes (4 KiB).
+/// Page size in bytes.
+#[cfg(not(feature = "page-16k"))]
 pub const PAGE_SIZE: u64 = 4096;
 
+/// Page size in bytes.
+#[cfg(feature = "page-16k")]
+pub const PAGE_SIZE: u64 = 16384;
+
 /// Number of bits to shift for page-frame alignment.
+#[cfg(not(feature = "page-16k"))]
 pub const PAGE_SHIFT: u32 = 12;
+
+/// Number of bits to shift for page-frame alignment.
+#[cfg(feature = "page-16k")]
+pub const PAGE_SHIFT: u32 = 14;
 
 // ── Address newtypes ─────────────────────────────────────────────────
 
@@ -230,6 +247,7 @@ mod tests {
     use super::*;
     use alloc::format;
 
+    #[cfg(not(feature = "page-16k"))]
     #[test]
     fn virt_addr_page_align() {
         let addr = VirtAddr(4097);
@@ -243,6 +261,7 @@ mod tests {
         assert_eq!(aligned.page_align_up(), aligned);
     }
 
+    #[cfg(not(feature = "page-16k"))]
     #[test]
     fn phys_addr_page_align() {
         let addr = PhysAddr(4097);
@@ -251,6 +270,42 @@ mod tests {
         assert!(!addr.is_page_aligned());
 
         let aligned = PhysAddr(4096);
+        assert!(aligned.is_page_aligned());
+        assert_eq!(aligned.page_align_down(), aligned);
+        assert_eq!(aligned.page_align_up(), aligned);
+    }
+
+    #[test]
+    fn page_constants_consistent() {
+        assert_eq!(PAGE_SIZE, 1u64 << PAGE_SHIFT);
+        assert!(PAGE_SIZE.is_power_of_two());
+        // PAGE_SIZE >= 4096 is a compile-time truth; verified by const assertion:
+        const _: () = assert!(PAGE_SIZE >= 4096);
+    }
+
+    #[test]
+    fn virt_addr_page_align_generic() {
+        let page = PAGE_SIZE;
+        let addr = VirtAddr(page + 1);
+        assert_eq!(addr.page_align_down(), VirtAddr(page));
+        assert_eq!(addr.page_align_up(), VirtAddr(page * 2));
+        assert!(!addr.is_page_aligned());
+
+        let aligned = VirtAddr(page);
+        assert!(aligned.is_page_aligned());
+        assert_eq!(aligned.page_align_down(), aligned);
+        assert_eq!(aligned.page_align_up(), aligned);
+    }
+
+    #[test]
+    fn phys_addr_page_align_generic() {
+        let page = PAGE_SIZE;
+        let addr = PhysAddr(page + 1);
+        assert_eq!(addr.page_align_down(), PhysAddr(page));
+        assert_eq!(addr.page_align_up(), PhysAddr(page * 2));
+        assert!(!addr.is_page_aligned());
+
+        let aligned = PhysAddr(page);
         assert!(aligned.is_page_aligned());
         assert_eq!(aligned.page_align_down(), aligned);
         assert_eq!(aligned.page_align_up(), aligned);

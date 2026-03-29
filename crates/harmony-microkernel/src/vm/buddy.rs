@@ -2,8 +2,8 @@
 //! Buddy allocator for physical frame management.
 //!
 //! Manages a contiguous region of physical memory using the buddy system.
-//! Supports allocation at power-of-two orders (order 0 = 1 frame = 4 KiB,
-//! order 10 = 1024 frames = 4 MiB), splitting larger blocks down to serve
+//! Supports allocation at power-of-two orders (order 0 = 1 frame = PAGE_SIZE,
+//! order 10 = 1024 frames), splitting larger blocks down to serve
 //! smaller requests, and coalescing freed blocks with their buddies on the
 //! way back up.
 
@@ -524,6 +524,16 @@ mod tests {
     fn zero_frames_rejected() {
         let err = BuddyAllocator::new(PhysAddr(0x10_0000), 0).unwrap_err();
         assert_eq!(err, VmError::InvalidOrder(0));
+    }
+
+    #[test]
+    fn frame_size_matches_page_size() {
+        use super::super::{PAGE_SHIFT, PAGE_SIZE};
+        assert_eq!(PAGE_SIZE, 1u64 << PAGE_SHIFT);
+        let base = PhysAddr(PAGE_SIZE * 16);
+        let mut alloc = BuddyAllocator::new(base, 16).unwrap();
+        let frame = alloc.alloc(0);
+        assert!(frame.is_ok(), "order-0 alloc should succeed with 16 frames");
     }
 
     #[test]

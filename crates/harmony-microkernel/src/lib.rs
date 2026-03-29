@@ -21,6 +21,7 @@ pub mod fid_tracker;
 pub mod genet_server;
 pub mod gpio_server;
 pub mod guest_loader;
+pub mod hardware_config;
 pub mod hv_manager;
 pub mod hv_server;
 #[cfg(feature = "kernel")]

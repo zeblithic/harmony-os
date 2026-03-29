@@ -1,17 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! aarch64 4-level translation table implementation (L0 → L1 → L2 → L3).
+//! aarch64 translation table implementation supporting both 4 KiB and 16 KiB granules.
 //!
 //! This module provides `Aarch64PageTable`, a concrete [`PageTable`] implementation
-//! for aarch64 with 4 KiB granule. It manipulates a standard 4-level hierarchy:
+//! for aarch64. The page granule is selected at compile time via the `page-16k`
+//! feature flag. Table geometry (entry count, level range, index width) is
+//! encapsulated in the [`geometry`] submodule.
+//!
+//! ## 4 KiB granule (default) — 4-level walk, 48-bit VA
 //!
 //! | Level | VA bits  | Purpose                     |
 //! |-------|----------|-----------------------------|
-//! | 3     | [47:39]  | L0 table                    |
+//! | 3     | [47:39]  | L0 table (512 entries)      |
 //! | 2     | [38:30]  | L1 table                    |
 //! | 1     | [29:21]  | L2 table                    |
 //! | 0     | [20:12]  | L3 table (leaf page desc.)  |
 //!
-//! Each table contains 512 entries of 8 bytes, fitting exactly in one 4 KiB frame.
+//! ## 16 KiB granule (`page-16k`) — 3-level walk, 47-bit VA
+//!
+//! | Level | VA bits  | Purpose                     |
+//! |-------|----------|-----------------------------|
+//! | 3     | [46:36]  | L1 table (2048 entries)     |
+//! | 2     | [35:25]  | L2 table                    |
+//! | 1     | [24:14]  | L3 table (leaf page desc.)  |
 //!
 //! # Design
 //!
@@ -21,10 +31,10 @@
 //! in tests it can be an identity map over a heap-allocated arena.
 //!
 //! Intermediate (non-leaf) table descriptors use `DESC_TABLE` with no AP
-//! restrictions — permission enforcement happens at the leaf (L3) level.
+//! restrictions — permission enforcement happens at the leaf level.
 
 use super::page_table::PageTable;
-use super::{PageFlags, PhysAddr, VirtAddr, VmError};
+use super::{PageFlags, PhysAddr, VirtAddr, VmError, PAGE_SHIFT, PAGE_SIZE};
 
 // ── aarch64 descriptor bits ─────────────────────────────────────────
 
@@ -64,8 +74,48 @@ const ATTR_NORMAL: u64 = 0 << 2;
 /// AttrIndx[2:0] = 1 — device/uncacheable memory (MAIR slot 1).
 const ATTR_DEVICE: u64 = 1 << 2;
 
-/// Mask for extracting the output address from a descriptor (bits [47:12]).
-const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+// ── Page table geometry ───────────────────────────────────────────
+
+/// 4 KiB granule: 4-level walk (L0-L3), 9-bit index, 512 entries per table.
+#[cfg(not(feature = "page-16k"))]
+#[allow(dead_code)]
+pub(crate) mod geometry {
+    /// Number of entries in each page table level.
+    pub const ENTRIES_PER_TABLE: usize = 512;
+    /// Number of VA bits resolved per table level.
+    pub const LEVEL_BITS: u32 = 9;
+    /// Total number of table levels in the walk.
+    pub const TABLE_LEVELS: usize = 4;
+    /// The lowest level (leaf) in the walk.
+    pub const START_LEVEL: usize = 0;
+    /// The highest level (root) in the walk.
+    pub const MAX_LEVEL: usize = 3;
+}
+
+/// 16 KiB granule: 3-level walk (L1-L3), 11-bit index, 2048 entries per table.
+#[cfg(feature = "page-16k")]
+#[allow(dead_code)]
+pub(crate) mod geometry {
+    /// Number of entries in each page table level.
+    pub const ENTRIES_PER_TABLE: usize = 2048;
+    /// Number of VA bits resolved per table level.
+    pub const LEVEL_BITS: u32 = 11;
+    /// Total number of table levels in the walk.
+    pub const TABLE_LEVELS: usize = 3;
+    /// The lowest level (leaf) in the walk.
+    pub const START_LEVEL: usize = 1;
+    /// The highest level (root) in the walk.
+    pub const MAX_LEVEL: usize = 3;
+}
+
+/// Mask for extracting the output address from a descriptor.
+///
+/// Clears the low page-offset bits and the top 16 bits (which hold
+/// attributes in the aarch64 descriptor format).
+const ADDR_MASK: u64 = !(PAGE_SIZE - 1) & 0x0000_FFFF_FFFF_FFFF;
+
+/// Mask for extracting the per-level index from a shifted virtual address.
+const INDEX_MASK: u64 = (1u64 << geometry::LEVEL_BITS) - 1;
 
 /// Mask for AP bits [7:6].
 const AP_MASK: u64 = 0b11 << 6;
@@ -80,9 +130,9 @@ const INTERMEDIATE_FLAGS: u64 = DESC_TABLE;
 
 // ── Aarch64PageTable ────────────────────────────────────────────────
 
-/// Concrete aarch64 4-level page table.
+/// Concrete aarch64 page table (4 KiB or 16 KiB granule).
 ///
-/// Walks an L0 → L1 → L2 → L3 hierarchy stored in physical frames.
+/// Walks the translation hierarchy stored in physical frames.
 /// The `phys_to_virt` function is used to obtain writable pointers to page
 /// table frames during manipulation.
 pub struct Aarch64PageTable {
@@ -97,18 +147,18 @@ impl Aarch64PageTable {
     ///
     /// # Safety
     ///
-    /// - `root` must point to a valid, zeroed, 4 KiB-aligned frame.
+    /// - `root` must point to a valid, zeroed, `PAGE_SIZE`-aligned frame.
     /// - `phys_to_virt` must correctly map physical addresses to writable
     ///   virtual addresses for the lifetime of this struct.
     pub unsafe fn new(root: PhysAddr, phys_to_virt: fn(PhysAddr) -> *mut u8) -> Self {
         Self { root, phys_to_virt }
     }
 
-    /// Obtain a mutable reference to a 512-entry page table at `table_paddr`.
+    /// Obtain a mutable slice over the page table at `table_paddr`.
     ///
     /// The physical address is translated through `phys_to_virt` and cast
-    /// to a `[u64; 512]` array. The caller must ensure the address points to
-    /// a valid page table frame.
+    /// to a `[u64]` slice of `geometry::ENTRIES_PER_TABLE` entries.
+    /// The caller must ensure the address points to a valid page table frame.
     ///
     /// # Why `&self` returns `&mut`
     ///
@@ -117,19 +167,19 @@ impl Aarch64PageTable {
     /// standard pattern in OS kernels: the page table struct is a handle,
     /// and the actual table data lives in separately-managed physical frames.
     #[allow(clippy::mut_from_ref)]
-    fn table_mut(&self, table_paddr: PhysAddr) -> &mut [u64; 512] {
-        let ptr = (self.phys_to_virt)(table_paddr);
-        unsafe { &mut *(ptr as *mut [u64; 512]) }
+    fn table_mut(&self, table_paddr: PhysAddr) -> &mut [u64] {
+        let ptr = (self.phys_to_virt)(table_paddr) as *mut u64;
+        unsafe { core::slice::from_raw_parts_mut(ptr, geometry::ENTRIES_PER_TABLE) }
     }
 
-    /// Extract the 9-bit page table index from a virtual address at the given level.
+    /// Extract the page table index from a virtual address at the given level.
     ///
-    /// - Level 3 (L0): bits [47:39]
-    /// - Level 2 (L1): bits [38:30]
-    /// - Level 1 (L2): bits [29:21]
-    /// - Level 0 (L3): bits [20:12]
+    /// The index is `LEVEL_BITS` wide, starting at bit
+    /// `PAGE_SHIFT + (level - START_LEVEL) * LEVEL_BITS`.
     fn index(vaddr: VirtAddr, level: usize) -> usize {
-        ((vaddr.as_u64() >> (12 + level * 9)) & 0x1FF) as usize
+        let level_offset = (level - geometry::START_LEVEL) as u32;
+        ((vaddr.as_u64() >> (PAGE_SHIFT + level_offset * geometry::LEVEL_BITS)) & INDEX_MASK)
+            as usize
     }
 
     /// Translate [`PageFlags`] to aarch64 descriptor bits for a leaf (L3) entry.
@@ -211,8 +261,8 @@ impl Aarch64PageTable {
         desc & 0b11 != DESC_INVALID
     }
 
-    /// Returns `true` if all 512 entries in the table are invalid.
-    fn is_table_empty(table: &[u64; 512]) -> bool {
+    /// Returns `true` if all entries in the table are invalid.
+    fn is_table_empty(table: &[u64]) -> bool {
         table.iter().all(|&e| !Self::is_valid(e))
     }
 }
@@ -232,10 +282,11 @@ impl PageTable for Aarch64PageTable {
             return Err(VmError::Unaligned(paddr.as_u64()));
         }
 
-        // Walk levels 3 (L0) → 1 (L2), creating intermediate tables as needed.
+        // Walk from root down to one level above the leaf, creating
+        // intermediate tables as needed.
         let mut table_paddr = self.root;
 
-        for level in (1..=3).rev() {
+        for level in ((geometry::START_LEVEL + 1)..=geometry::MAX_LEVEL).rev() {
             let table = self.table_mut(table_paddr);
             let idx = Self::index(vaddr, level);
             let entry = table[idx];
@@ -247,10 +298,10 @@ impl PageTable for Aarch64PageTable {
                 // Allocate a new frame for the intermediate table.
                 let new_frame = frame_alloc().ok_or(VmError::OutOfMemory)?;
 
-                // Zero the new frame so all 512 entries start as invalid.
+                // Zero the new frame so all entries start as invalid.
                 let new_ptr = (self.phys_to_virt)(new_frame);
                 unsafe {
-                    core::ptr::write_bytes(new_ptr, 0, 4096);
+                    core::ptr::write_bytes(new_ptr, 0, PAGE_SIZE as usize);
                 }
 
                 // Install the intermediate table descriptor.
@@ -261,9 +312,9 @@ impl PageTable for Aarch64PageTable {
             }
         }
 
-        // Level 0 (L3): install the leaf page descriptor.
+        // Leaf level: install the leaf page descriptor.
         let pt = self.table_mut(table_paddr);
-        let idx = Self::index(vaddr, 0);
+        let idx = Self::index(vaddr, geometry::START_LEVEL);
 
         if Self::is_valid(pt[idx]) {
             return Err(VmError::RegionConflict(vaddr));
@@ -282,11 +333,17 @@ impl PageTable for Aarch64PageTable {
             return Err(VmError::Unaligned(vaddr.as_u64()));
         }
 
-        // Walk levels 3 → 1, recording (parent_paddr, parent_idx) for pruning.
+        // Walk from root down to one above leaf, recording
+        // (parent_paddr, parent_idx) for pruning.
+        // Fixed-size array avoids heap allocation — max 3 intermediates (4-level walk).
         let mut table_paddr = self.root;
-        let mut walk: [(PhysAddr, usize); 3] = [(PhysAddr(0), 0); 3];
+        let intermediates = geometry::MAX_LEVEL - geometry::START_LEVEL;
+        let mut walk = [(PhysAddr(0), 0usize); 3];
 
-        for (i, level) in (1..=3).rev().enumerate() {
+        for (i, level) in ((geometry::START_LEVEL + 1)..=geometry::MAX_LEVEL)
+            .rev()
+            .enumerate()
+        {
             let table = self.table_mut(table_paddr);
             let idx = Self::index(vaddr, level);
             let entry = table[idx];
@@ -298,10 +355,10 @@ impl PageTable for Aarch64PageTable {
             table_paddr = PhysAddr(entry & ADDR_MASK);
         }
 
-        // Level 0: clear the leaf descriptor.
+        // Leaf level: clear the leaf descriptor.
         let leaf_table_paddr = table_paddr;
         let pt = self.table_mut(leaf_table_paddr);
-        let idx = Self::index(vaddr, 0);
+        let idx = Self::index(vaddr, geometry::START_LEVEL);
         let entry = pt[idx];
 
         if !Self::is_valid(entry) {
@@ -311,14 +368,10 @@ impl PageTable for Aarch64PageTable {
         let old_paddr = PhysAddr(entry & ADDR_MASK);
         pt[idx] = 0;
 
-        // Bottom-up prune: walk was filled top-down as walk[0]=(L3/root, idx→L2),
-        // walk[1]=(L2, idx→L1), walk[2]=(L1, idx→L0/leaf). Reverse so we process
-        // L0→L1→L2 direction. Root (L3) is never freed.
+        // Bottom-up prune: walk was filled top-down (root first), reverse
+        // to process leaf-ward first. Root is never freed.
         let mut child_paddr = leaf_table_paddr;
-        for &(parent_paddr, parent_idx) in walk.iter().rev() {
-            if parent_paddr.as_u64() == 0 {
-                break;
-            }
+        for &(parent_paddr, parent_idx) in walk[..intermediates].iter().rev() {
             let child_table = self.table_mut(child_paddr);
             if Self::is_table_empty(child_table) {
                 // Invalidate parent entry before freeing the child frame —
@@ -340,10 +393,10 @@ impl PageTable for Aarch64PageTable {
             return Err(VmError::Unaligned(vaddr.as_u64()));
         }
 
-        // Walk levels 3 → 1.
+        // Walk from root down to one above leaf.
         let mut table_paddr = self.root;
 
-        for level in (1..=3).rev() {
+        for level in ((geometry::START_LEVEL + 1)..=geometry::MAX_LEVEL).rev() {
             let table = self.table_mut(table_paddr);
             let idx = Self::index(vaddr, level);
             let entry = table[idx];
@@ -354,9 +407,9 @@ impl PageTable for Aarch64PageTable {
             table_paddr = PhysAddr(entry & ADDR_MASK);
         }
 
-        // Level 0: update flags, preserving the physical address.
+        // Leaf level: update flags, preserving the physical address.
         let pt = self.table_mut(table_paddr);
-        let idx = Self::index(vaddr, 0);
+        let idx = Self::index(vaddr, geometry::START_LEVEL);
         let entry = pt[idx];
 
         if !Self::is_valid(entry) {
@@ -370,10 +423,10 @@ impl PageTable for Aarch64PageTable {
     }
 
     fn translate(&self, vaddr: VirtAddr) -> Option<(PhysAddr, PageFlags)> {
-        // Walk all 4 levels, returning None if any intermediate descriptor is invalid.
+        // Walk all levels, returning None if any intermediate descriptor is invalid.
         let mut table_paddr = self.root;
 
-        for level in (1..=3).rev() {
+        for level in ((geometry::START_LEVEL + 1)..=geometry::MAX_LEVEL).rev() {
             let table = self.table_mut(table_paddr);
             let idx = Self::index(vaddr, level);
             let entry = table[idx];
@@ -384,9 +437,9 @@ impl PageTable for Aarch64PageTable {
             table_paddr = PhysAddr(entry & ADDR_MASK);
         }
 
-        // Level 0: read the leaf descriptor.
+        // Leaf level: read the leaf descriptor.
         let pt = self.table_mut(table_paddr);
-        let idx = Self::index(vaddr, 0);
+        let idx = Self::index(vaddr, geometry::START_LEVEL);
         let entry = pt[idx];
 
         if !Self::is_valid(entry) {
@@ -439,7 +492,10 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    /// Verify R/W + USER → AP_RW_ALL with AF and DESC_TABLE.
+    /// Shorthand for page size as usize — avoids `as usize` casts throughout.
+    const PS: usize = PAGE_SIZE as usize;
+
+    /// Verify R/W + USER -> AP_RW_ALL with AF and DESC_TABLE.
     #[test]
     fn flags_to_desc_rw_user() {
         let flags = PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::USER;
@@ -457,14 +513,14 @@ mod tests {
             AP_RW_ALL,
             "AP must be RW_ALL for writable+user"
         );
-        // Not executable → both UXN and PXN set.
+        // Not executable -> both UXN and PXN set.
         assert_ne!(desc & UXN, 0, "UXN must be set when not executable");
         assert_ne!(desc & PXN, 0, "PXN must be set when not executable");
         // Normal memory attribute.
         assert_eq!(desc & ATTR_IDX_MASK, ATTR_NORMAL, "should be normal memory");
     }
 
-    /// Verify READABLE only → AP_RO_EL1, AF, UXN|PXN set (not executable).
+    /// Verify READABLE only -> AP_RO_EL1, AF, UXN|PXN set (not executable).
     #[test]
     fn flags_to_desc_ro_kernel() {
         let flags = PageFlags::READABLE;
@@ -482,7 +538,7 @@ mod tests {
         assert_ne!(desc & PXN, 0, "PXN set when not executable");
     }
 
-    /// Verify READABLE|EXECUTABLE → no UXN, no PXN.
+    /// Verify READABLE|EXECUTABLE -> no UXN, no PXN.
     #[test]
     fn flags_to_desc_executable() {
         let flags = PageFlags::READABLE | PageFlags::EXECUTABLE;
@@ -495,7 +551,7 @@ mod tests {
             AP_RO_EL1,
             "AP must be RO_EL1 for kernel read-only"
         );
-        // Executable → both XN bits clear.
+        // Executable -> both XN bits clear.
         assert_eq!(desc & UXN, 0, "UXN must be clear for executable");
         assert_eq!(desc & PXN, 0, "PXN must be clear for executable");
     }
@@ -513,7 +569,7 @@ mod tests {
         );
     }
 
-    /// Encode flags → descriptor → decode back to flags. Roundtrip must match.
+    /// Encode flags -> descriptor -> decode back to flags. Roundtrip must match.
     #[test]
     fn desc_to_flags_roundtrip() {
         let test_cases = vec![
@@ -542,17 +598,12 @@ mod tests {
         }
     }
 
-    /// Verify VA index extraction matches expected 9-bit values.
+    /// Verify VA index extraction matches expected 9-bit values (4K granule).
+    #[cfg(not(feature = "page-16k"))]
     #[test]
     fn index_extraction() {
-        // VA = 0x0000_7F_BF_DF_EF_F000
-        //   L0 index (level 3, bits [47:39]) = 0xFF = 255
-        //   L1 index (level 2, bits [38:30]) = 0x1EF = ... let's compute manually.
-        //
-        // Use a simpler example: VA where each level index is distinct.
-        // bits [47:39] = L0, [38:30] = L1, [29:21] = L2, [20:12] = L3
-        //
-        // L0=1, L1=2, L2=3, L3=4 →
+        // 4K granule: 9-bit index per level, PAGE_SHIFT=12.
+        // L0=1, L1=2, L2=3, L3=4 ->
         // VA = (1 << 39) | (2 << 30) | (3 << 21) | (4 << 12)
         let va = VirtAddr((1 << 39) | (2 << 30) | (3 << 21) | (4 << 12));
         assert_eq!(Aarch64PageTable::index(va, 3), 1, "L0 index");
@@ -560,7 +611,7 @@ mod tests {
         assert_eq!(Aarch64PageTable::index(va, 1), 3, "L2 index");
         assert_eq!(Aarch64PageTable::index(va, 0), 4, "L3 index");
 
-        // All zeros → all indices zero.
+        // All zeros -> all indices zero.
         let va0 = VirtAddr(0);
         for level in 0..4 {
             assert_eq!(Aarch64PageTable::index(va0, level), 0);
@@ -573,29 +624,102 @@ mod tests {
         }
     }
 
+    /// Verify VA index extraction matches expected 11-bit values (16K granule).
+    #[cfg(feature = "page-16k")]
+    #[test]
+    fn index_extraction_16k() {
+        // 16K granule: 11-bit index per level, PAGE_SHIFT=14, levels 1-3.
+        // L1=5, L2=7, L3=9 ->
+        // VA = (5 << 36) | (7 << 25) | (9 << 14)
+        let va = VirtAddr((5u64 << 36) | (7u64 << 25) | (9u64 << 14));
+        assert_eq!(Aarch64PageTable::index(va, 3), 5, "L1 index (level 3)");
+        assert_eq!(Aarch64PageTable::index(va, 2), 7, "L2 index (level 2)");
+        assert_eq!(Aarch64PageTable::index(va, 1), 9, "L3 index (level 1)");
+
+        // All zeros -> all indices zero.
+        let va0 = VirtAddr(0);
+        for level in 1..=3 {
+            assert_eq!(Aarch64PageTable::index(va0, level), 0);
+        }
+
+        // Max 11-bit index = 2047.
+        let va_max = VirtAddr(0x0000_7FFF_FFFF_C000);
+        for level in 1..=3 {
+            assert_eq!(Aarch64PageTable::index(va_max, level), 2047);
+        }
+    }
+
     /// Verify that an invalid descriptor produces empty PageFlags.
     #[test]
     fn desc_to_flags_invalid() {
         let flags = Aarch64PageTable::desc_to_flags(0);
-        assert_eq!(flags, PageFlags::empty(), "invalid descriptor → no flags");
+        assert_eq!(flags, PageFlags::empty(), "invalid descriptor -> no flags");
+    }
+
+    /// Verify geometry constants are self-consistent.
+    #[test]
+    fn geometry_constants_consistent() {
+        // ENTRIES_PER_TABLE must equal 2^LEVEL_BITS.
+        assert_eq!(
+            geometry::ENTRIES_PER_TABLE,
+            1 << geometry::LEVEL_BITS,
+            "ENTRIES_PER_TABLE must be 2^LEVEL_BITS"
+        );
+
+        // TABLE_LEVELS must equal MAX_LEVEL - START_LEVEL + 1.
+        assert_eq!(
+            geometry::TABLE_LEVELS,
+            geometry::MAX_LEVEL - geometry::START_LEVEL + 1,
+            "TABLE_LEVELS must span START_LEVEL..=MAX_LEVEL"
+        );
+
+        // One table fits exactly in one page.
+        assert_eq!(
+            geometry::ENTRIES_PER_TABLE * core::mem::size_of::<u64>(),
+            PS,
+            "one table must fit in exactly one page"
+        );
+
+        // ADDR_MASK must clear low PAGE_SHIFT bits.
+        assert_eq!(
+            ADDR_MASK & ((1u64 << PAGE_SHIFT) - 1),
+            0,
+            "ADDR_MASK must clear low PAGE_SHIFT bits"
+        );
+
+        // INDEX_MASK must have LEVEL_BITS set.
+        assert_eq!(
+            INDEX_MASK,
+            (1u64 << geometry::LEVEL_BITS) - 1,
+            "INDEX_MASK must be (1 << LEVEL_BITS) - 1"
+        );
+    }
+
+    /// Verify that 16K granule covers 47-bit VA space (not 48-bit).
+    #[cfg(feature = "page-16k")]
+    #[test]
+    fn page_table_47bit_va_limit() {
+        // 16K granule: 3 levels * 11 bits + 14 bit page offset = 47 bits.
+        let va_bits = geometry::TABLE_LEVELS as u32 * geometry::LEVEL_BITS + PAGE_SHIFT;
+        assert_eq!(va_bits, 47, "16K granule must cover 47-bit VA space");
     }
 
     // ── Integration tests using heap-backed page table arena ────────
 
-    /// Size of the test arena: enough for root + 3 intermediate + 1 leaf = 5 tables.
+    /// Size of the test arena: enough for root + intermediates + extra headroom.
     const ARENA_TABLES: usize = 8;
-    const ARENA_SIZE: usize = ARENA_TABLES * 4096;
+    const ARENA_SIZE: usize = ARENA_TABLES * PS;
 
-    /// Create a test arena and return (arena_vec, base_address, phys_to_virt_fn).
+    /// Create a test arena and return (arena_vec, base_address).
     ///
     /// The arena is a heap-allocated buffer whose address serves as both the
     /// "physical" and virtual address, making `phys_to_virt` an identity function
     /// offset to the arena base.
     fn test_arena() -> (Vec<u8>, PhysAddr) {
         // Allocate page-aligned memory.
-        let mut arena = vec![0u8; ARENA_SIZE + 4096];
+        let mut arena = vec![0u8; ARENA_SIZE + PS];
         let base = arena.as_mut_ptr() as u64;
-        let aligned_base = (base + 4095) & !4095;
+        let aligned_base = (base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         // We'll use the aligned base as our "physical address" origin.
         // Leak the vec to get a stable address for the test duration.
         let arena = arena.into_boxed_slice();
@@ -609,7 +733,7 @@ mod tests {
         paddr.as_u64() as *mut u8
     }
 
-    /// Allocator that hands out consecutive 4 KiB frames from the arena.
+    /// Allocator that hands out consecutive PAGE_SIZE frames from the arena.
     struct TestAllocator {
         next: u64,
         limit: u64,
@@ -619,7 +743,7 @@ mod tests {
         fn new(base: u64, count: usize) -> Self {
             Self {
                 next: base,
-                limit: base + (count as u64) * 4096,
+                limit: base + (count as u64) * PAGE_SIZE,
             }
         }
 
@@ -628,7 +752,7 @@ mod tests {
                 return None;
             }
             let addr = PhysAddr(self.next);
-            self.next += 4096;
+            self.next += PAGE_SIZE;
             Some(addr)
         }
     }
@@ -636,22 +760,22 @@ mod tests {
     #[test]
     fn map_and_translate() {
         let (_arena, arena_base) = test_arena();
-        let aligned = (arena_base.as_u64() + 4095) & !4095;
+        let aligned = (arena_base.as_u64() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
         // Root table = first page-aligned frame in arena.
         let root = PhysAddr(aligned);
         // Zero the root frame.
         unsafe {
-            core::ptr::write_bytes(root.as_u64() as *mut u8, 0, 4096);
+            core::ptr::write_bytes(root.as_u64() as *mut u8, 0, PS);
         }
 
         // Allocator hands out frames starting after the root.
-        let mut allocator = TestAllocator::new(aligned + 4096, ARENA_TABLES - 1);
+        let mut allocator = TestAllocator::new(aligned + PAGE_SIZE, ARENA_TABLES - 1);
 
         let mut pt = unsafe { Aarch64PageTable::new(root, identity_phys_to_virt) };
 
-        let vaddr = VirtAddr(0x1000); // page-aligned
-        let paddr = PhysAddr(0xDEAD_B000); // page-aligned
+        let vaddr = VirtAddr(PAGE_SIZE); // page-aligned
+        let paddr = PhysAddr(0xDEAD_0000); // page-aligned for both 4K and 16K
         let flags = PageFlags::READABLE | PageFlags::WRITABLE | PageFlags::USER;
 
         let result = pt.map(vaddr, paddr, flags, &mut || allocator.alloc());
@@ -668,15 +792,15 @@ mod tests {
     #[test]
     fn map_then_unmap() {
         let (_arena, arena_base) = test_arena();
-        let aligned = (arena_base.as_u64() + 4095) & !4095;
+        let aligned = (arena_base.as_u64() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let root = PhysAddr(aligned);
         unsafe {
-            core::ptr::write_bytes(root.as_u64() as *mut u8, 0, 4096);
+            core::ptr::write_bytes(root.as_u64() as *mut u8, 0, PS);
         }
-        let mut allocator = TestAllocator::new(aligned + 4096, ARENA_TABLES - 1);
+        let mut allocator = TestAllocator::new(aligned + PAGE_SIZE, ARENA_TABLES - 1);
         let mut pt = unsafe { Aarch64PageTable::new(root, identity_phys_to_virt) };
 
-        let vaddr = VirtAddr(0x2000);
+        let vaddr = VirtAddr(2 * PAGE_SIZE);
         let paddr = PhysAddr(0xBEEF_0000);
         let flags = PageFlags::READABLE | PageFlags::EXECUTABLE;
 
@@ -692,15 +816,15 @@ mod tests {
     #[test]
     fn set_flags_updates_permissions() {
         let (_arena, arena_base) = test_arena();
-        let aligned = (arena_base.as_u64() + 4095) & !4095;
+        let aligned = (arena_base.as_u64() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let root = PhysAddr(aligned);
         unsafe {
-            core::ptr::write_bytes(root.as_u64() as *mut u8, 0, 4096);
+            core::ptr::write_bytes(root.as_u64() as *mut u8, 0, PS);
         }
-        let mut allocator = TestAllocator::new(aligned + 4096, ARENA_TABLES - 1);
+        let mut allocator = TestAllocator::new(aligned + PAGE_SIZE, ARENA_TABLES - 1);
         let mut pt = unsafe { Aarch64PageTable::new(root, identity_phys_to_virt) };
 
-        let vaddr = VirtAddr(0x3000);
+        let vaddr = VirtAddr(3 * PAGE_SIZE);
         let paddr = PhysAddr(0xCAFE_0000);
         let flags = PageFlags::READABLE | PageFlags::WRITABLE;
 
@@ -719,15 +843,15 @@ mod tests {
     #[test]
     fn double_map_returns_conflict() {
         let (_arena, arena_base) = test_arena();
-        let aligned = (arena_base.as_u64() + 4095) & !4095;
+        let aligned = (arena_base.as_u64() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let root = PhysAddr(aligned);
         unsafe {
-            core::ptr::write_bytes(root.as_u64() as *mut u8, 0, 4096);
+            core::ptr::write_bytes(root.as_u64() as *mut u8, 0, PS);
         }
-        let mut allocator = TestAllocator::new(aligned + 4096, ARENA_TABLES - 1);
+        let mut allocator = TestAllocator::new(aligned + PAGE_SIZE, ARENA_TABLES - 1);
         let mut pt = unsafe { Aarch64PageTable::new(root, identity_phys_to_virt) };
 
-        let vaddr = VirtAddr(0x4000);
+        let vaddr = VirtAddr(4 * PAGE_SIZE);
         let paddr = PhysAddr(0xAAAA_0000);
         let flags = PageFlags::READABLE;
 
@@ -735,7 +859,7 @@ mod tests {
             .unwrap();
 
         // Second map to same vaddr should fail.
-        let result = pt.map(vaddr, PhysAddr(0xBBBB_0000), flags, &mut || {
+        let result = pt.map(vaddr, PhysAddr(0xBBBC_0000), flags, &mut || {
             allocator.alloc()
         });
         assert_eq!(
@@ -748,14 +872,14 @@ mod tests {
     #[test]
     fn unmap_unmapped_returns_not_mapped() {
         let (_arena, arena_base) = test_arena();
-        let aligned = (arena_base.as_u64() + 4095) & !4095;
+        let aligned = (arena_base.as_u64() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let root = PhysAddr(aligned);
         unsafe {
-            core::ptr::write_bytes(root.as_u64() as *mut u8, 0, 4096);
+            core::ptr::write_bytes(root.as_u64() as *mut u8, 0, PS);
         }
         let mut pt = unsafe { Aarch64PageTable::new(root, identity_phys_to_virt) };
 
-        let vaddr = VirtAddr(0x5000);
+        let vaddr = VirtAddr(5 * PAGE_SIZE);
         assert_eq!(
             pt.unmap(vaddr, &mut |_| {}),
             Err(VmError::NotMapped(vaddr)),
@@ -766,34 +890,34 @@ mod tests {
     #[test]
     fn unaligned_address_errors() {
         let (_arena, arena_base) = test_arena();
-        let aligned = (arena_base.as_u64() + 4095) & !4095;
+        let aligned = (arena_base.as_u64() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let root = PhysAddr(aligned);
         unsafe {
-            core::ptr::write_bytes(root.as_u64() as *mut u8, 0, 4096);
+            core::ptr::write_bytes(root.as_u64() as *mut u8, 0, PS);
         }
         let mut pt = unsafe { Aarch64PageTable::new(root, identity_phys_to_virt) };
 
-        let unaligned = VirtAddr(0x1001);
+        let unaligned = VirtAddr(PAGE_SIZE + 1);
         let flags = PageFlags::READABLE;
 
         assert_eq!(
-            pt.map(unaligned, PhysAddr(0x2000), flags, &mut || None),
-            Err(VmError::Unaligned(0x1001))
+            pt.map(unaligned, PhysAddr(2 * PAGE_SIZE), flags, &mut || None),
+            Err(VmError::Unaligned(PAGE_SIZE + 1))
         );
         assert_eq!(
             pt.unmap(unaligned, &mut |_| {}),
-            Err(VmError::Unaligned(0x1001))
+            Err(VmError::Unaligned(PAGE_SIZE + 1))
         );
         assert_eq!(
             pt.set_flags(unaligned, flags),
-            Err(VmError::Unaligned(0x1001))
+            Err(VmError::Unaligned(PAGE_SIZE + 1))
         );
     }
 
     #[test]
     fn root_paddr_returns_root() {
         let (_arena, arena_base) = test_arena();
-        let aligned = (arena_base.as_u64() + 4095) & !4095;
+        let aligned = (arena_base.as_u64() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let root = PhysAddr(aligned);
         let pt = unsafe { Aarch64PageTable::new(root, identity_phys_to_virt) };
         assert_eq!(pt.root_paddr(), root);
@@ -811,7 +935,7 @@ mod tests {
         fn new(base: u64, count: usize) -> Self {
             Self {
                 next: base,
-                limit: base + (count as u64) * 4096,
+                limit: base + (count as u64) * PAGE_SIZE,
                 alloc_count: 0,
                 freed: Vec::new(),
             }
@@ -822,8 +946,8 @@ mod tests {
                 return None;
             }
             let addr = PhysAddr(self.next);
-            self.next += 4096;
-            unsafe { core::ptr::write_bytes(addr.as_u64() as *mut u8, 0, 4096) };
+            self.next += PAGE_SIZE;
+            unsafe { core::ptr::write_bytes(addr.as_u64() as *mut u8, 0, PS) };
             self.alloc_count += 1;
             Some(addr)
         }
@@ -833,24 +957,25 @@ mod tests {
         }
     }
 
+    /// 4K: mapping one page needs 3 intermediate tables, all freed on unmap.
+    #[cfg(not(feature = "page-16k"))]
     #[test]
     fn unmap_prunes_empty_intermediate() {
         let (_arena, arena_base) = test_arena();
-        let aligned = (arena_base.as_u64() + 4095) & !4095;
+        let aligned = (arena_base.as_u64() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let root = PhysAddr(aligned);
-        unsafe { core::ptr::write_bytes(root.as_u64() as *mut u8, 0, 4096) };
-        let mut alloc = TrackingAllocator::new(aligned + 4096, ARENA_TABLES - 1);
+        unsafe { core::ptr::write_bytes(root.as_u64() as *mut u8, 0, PS) };
+        let mut alloc = TrackingAllocator::new(aligned + PAGE_SIZE, ARENA_TABLES - 1);
         let mut pt = unsafe { Aarch64PageTable::new(root, identity_phys_to_virt) };
 
-        let vaddr = VirtAddr(0x1000);
+        let vaddr = VirtAddr(PAGE_SIZE);
         let paddr = PhysAddr(0xBEEF_0000);
         pt.map(vaddr, paddr, PageFlags::READABLE, &mut || alloc.alloc())
             .unwrap();
 
-        let intermediates_allocated = alloc.alloc_count;
         assert_eq!(
-            intermediates_allocated, 3,
-            "mapping one page needs 3 intermediate tables"
+            alloc.alloc_count, 3,
+            "4K: mapping one page needs 3 intermediate tables"
         );
 
         let result = pt.unmap(vaddr, &mut |frame| alloc.dealloc(frame)).unwrap();
@@ -862,17 +987,49 @@ mod tests {
         );
     }
 
+    /// 16K: mapping one page needs 2 intermediate tables, all freed on unmap.
+    #[cfg(feature = "page-16k")]
+    #[test]
+    fn unmap_prunes_empty_intermediate_16k() {
+        let (_arena, arena_base) = test_arena();
+        let aligned = (arena_base.as_u64() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let root = PhysAddr(aligned);
+        unsafe { core::ptr::write_bytes(root.as_u64() as *mut u8, 0, PS) };
+        let mut alloc = TrackingAllocator::new(aligned + PAGE_SIZE, ARENA_TABLES - 1);
+        let mut pt = unsafe { Aarch64PageTable::new(root, identity_phys_to_virt) };
+
+        let vaddr = VirtAddr(PAGE_SIZE);
+        let paddr = PhysAddr(0xBEEF_0000);
+        pt.map(vaddr, paddr, PageFlags::READABLE, &mut || alloc.alloc())
+            .unwrap();
+
+        assert_eq!(
+            alloc.alloc_count, 2,
+            "16K: mapping one page needs 2 intermediate tables"
+        );
+
+        let result = pt.unmap(vaddr, &mut |frame| alloc.dealloc(frame)).unwrap();
+        assert_eq!(result, paddr);
+        assert_eq!(
+            alloc.freed.len(),
+            2,
+            "all 2 intermediate tables should be freed"
+        );
+    }
+
+    /// 4K: siblings share intermediates; only freed when both unmapped.
+    #[cfg(not(feature = "page-16k"))]
     #[test]
     fn unmap_preserves_sibling_intermediates() {
         let (_arena, arena_base) = test_arena();
-        let aligned = (arena_base.as_u64() + 4095) & !4095;
+        let aligned = (arena_base.as_u64() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let root = PhysAddr(aligned);
-        unsafe { core::ptr::write_bytes(root.as_u64() as *mut u8, 0, 4096) };
-        let mut alloc = TrackingAllocator::new(aligned + 4096, ARENA_TABLES - 1);
+        unsafe { core::ptr::write_bytes(root.as_u64() as *mut u8, 0, PS) };
+        let mut alloc = TrackingAllocator::new(aligned + PAGE_SIZE, ARENA_TABLES - 1);
         let mut pt = unsafe { Aarch64PageTable::new(root, identity_phys_to_virt) };
 
-        let vaddr1 = VirtAddr(0x1000);
-        let vaddr2 = VirtAddr(0x2000);
+        let vaddr1 = VirtAddr(PAGE_SIZE);
+        let vaddr2 = VirtAddr(2 * PAGE_SIZE);
         pt.map(
             vaddr1,
             PhysAddr(0xA000_0000),
@@ -895,7 +1052,46 @@ mod tests {
         assert_eq!(
             alloc.freed.len(),
             3,
-            "all intermediates freed after last sibling removed"
+            "all 3 intermediates freed after last sibling removed"
+        );
+    }
+
+    /// 16K: siblings share intermediates; only freed when both unmapped.
+    #[cfg(feature = "page-16k")]
+    #[test]
+    fn unmap_preserves_sibling_intermediates_16k() {
+        let (_arena, arena_base) = test_arena();
+        let aligned = (arena_base.as_u64() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let root = PhysAddr(aligned);
+        unsafe { core::ptr::write_bytes(root.as_u64() as *mut u8, 0, PS) };
+        let mut alloc = TrackingAllocator::new(aligned + PAGE_SIZE, ARENA_TABLES - 1);
+        let mut pt = unsafe { Aarch64PageTable::new(root, identity_phys_to_virt) };
+
+        let vaddr1 = VirtAddr(PAGE_SIZE);
+        let vaddr2 = VirtAddr(2 * PAGE_SIZE);
+        pt.map(
+            vaddr1,
+            PhysAddr(0xA000_0000),
+            PageFlags::READABLE,
+            &mut || alloc.alloc(),
+        )
+        .unwrap();
+        pt.map(
+            vaddr2,
+            PhysAddr(0xB000_0000),
+            PageFlags::READABLE,
+            &mut || alloc.alloc(),
+        )
+        .unwrap();
+
+        pt.unmap(vaddr1, &mut |frame| alloc.dealloc(frame)).unwrap();
+        assert_eq!(alloc.freed.len(), 0, "sibling keeps intermediate alive");
+
+        pt.unmap(vaddr2, &mut |frame| alloc.dealloc(frame)).unwrap();
+        assert_eq!(
+            alloc.freed.len(),
+            2,
+            "all 2 intermediates freed after last sibling removed"
         );
     }
 }
