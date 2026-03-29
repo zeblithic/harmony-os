@@ -371,10 +371,7 @@ impl PageTable for Aarch64PageTable {
         // Bottom-up prune: walk was filled top-down (root first), reverse
         // to process leaf-ward first. Root is never freed.
         let mut child_paddr = leaf_table_paddr;
-        for &(parent_paddr, parent_idx) in walk.iter().rev() {
-            if parent_paddr.as_u64() == 0 {
-                break;
-            }
+        for &(parent_paddr, parent_idx) in walk[..intermediates].iter().rev() {
             let child_table = self.table_mut(child_paddr);
             if Self::is_table_empty(child_table) {
                 // Invalidate parent entry before freeing the child frame —
