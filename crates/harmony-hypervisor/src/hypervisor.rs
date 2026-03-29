@@ -161,9 +161,10 @@ impl Hypervisor {
                 return Err(HypervisorError::OutOfMemory);
             }
         };
+        let granule = Stage2Granule::Four;
         let ptr = (self.phys_to_virt)(root);
-        unsafe { core::ptr::write_bytes(ptr, 0, 4096) };
-        let stage2 = Stage2PageTable::new(root, vmid, Stage2Granule::Four, self.phys_to_virt);
+        unsafe { core::ptr::write_bytes(ptr, 0, granule.entries_per_table() * 8) };
+        let stage2 = Stage2PageTable::new(root, vmid, granule, self.phys_to_virt);
         let mac = [0x02, 0x00, 0x00, 0x00, 0x00, vmid.0];
         let virtio_net = VirtioNetDevice::new(mac);
         let vm = Vm {

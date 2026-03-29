@@ -156,15 +156,29 @@ pub struct Stage2PageTable {
 impl Stage2PageTable {
     /// Creates a new Stage-2 page table rooted at `root`.
     ///
-    /// **Precondition**: the page at `root` must already be zero-initialized.
-    /// `hvc_vm_create` satisfies this via `write_bytes`; callers in other
-    /// contexts must do the same.
+    /// **Precondition**: the page at `root` must already be zero-initialized
+    /// for at least `granule.entries_per_table() * 8` bytes. `hvc_vm_create`
+    /// satisfies this via `write_bytes`; callers in other contexts must do
+    /// the same.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the guest granule requires larger tables than the host can
+    /// allocate (i.e., `granule.page_size() > PAGE_SIZE`). A 16K guest on a
+    /// 4K host would cause OOB writes when indexing intermediate tables.
     pub fn new(
         root: PhysAddr,
         vmid: VmId,
         granule: Stage2Granule,
         phys_to_virt: fn(PhysAddr) -> *mut u8,
     ) -> Self {
+        assert!(
+            granule.page_size() <= PAGE_SIZE,
+            "guest granule ({} KiB) exceeds host page size ({} KiB) — \
+             intermediate table frames would be undersized",
+            granule.page_size() / 1024,
+            PAGE_SIZE / 1024,
+        );
         Self {
             root,
             vmid,
