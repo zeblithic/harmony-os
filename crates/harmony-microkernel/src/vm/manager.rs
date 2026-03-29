@@ -17,8 +17,8 @@ use super::{FrameClassification, PageFlags, PhysAddr, VirtAddr, VmError, PAGE_SI
 
 // ── Constants ────────────────────────────────────────────────────────
 
-/// Start of the user-space virtual address range (skip null-page guard).
-const USER_SPACE_START: u64 = 0x1000;
+/// Start of the user-space virtual address range (one page above zero = null guard).
+const USER_SPACE_START: u64 = PAGE_SIZE;
 
 /// End of user-space VA range, derived from page table geometry.
 /// Uses PAGE_SIZE for alignment so it stays valid under `page-16k`.

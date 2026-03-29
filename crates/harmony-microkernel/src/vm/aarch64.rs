@@ -335,9 +335,10 @@ impl PageTable for Aarch64PageTable {
 
         // Walk from root down to one above leaf, recording
         // (parent_paddr, parent_idx) for pruning.
+        // Fixed-size array avoids heap allocation — max 3 intermediates (4-level walk).
         let mut table_paddr = self.root;
         let intermediates = geometry::MAX_LEVEL - geometry::START_LEVEL;
-        let mut walk = alloc::vec![(PhysAddr(0), 0usize); intermediates];
+        let mut walk = [(PhysAddr(0), 0usize); 3];
 
         for (i, level) in ((geometry::START_LEVEL + 1)..=geometry::MAX_LEVEL)
             .rev()
