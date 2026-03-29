@@ -20,9 +20,8 @@ use super::{FrameClassification, PageFlags, PhysAddr, VirtAddr, VmError, PAGE_SI
 /// Start of the user-space virtual address range (skip null-page guard).
 const USER_SPACE_START: u64 = 0x1000;
 
-/// End of user-space VA range. Derived from page table geometry.
-/// End of user-space VA range. Uses PAGE_SIZE for alignment so it stays
-/// valid when `page-16k` is enabled for cross-testing on x86_64.
+/// End of user-space VA range, derived from page table geometry.
+/// Uses PAGE_SIZE for alignment so it stays valid under `page-16k`.
 ///
 /// aarch64 4K:  48-bit VA → (1 << 48) - PAGE_SIZE
 /// aarch64 16K: 47-bit VA → (1 << 47) - PAGE_SIZE

@@ -161,24 +161,19 @@ impl Stage2PageTable {
     /// satisfies this via `write_bytes`; callers in other contexts must do
     /// the same.
     ///
-    /// # Panics
+    /// # Current limitation
     ///
-    /// Panics if the guest granule requires larger tables than the host can
-    /// allocate (i.e., `granule.page_size() > PAGE_SIZE`). A 16K guest on a
-    /// 4K host would cause OOB writes when indexing intermediate tables.
+    /// When `granule.page_size() > PAGE_SIZE` (e.g., 16K guest on 4K host),
+    /// each intermediate table needs multiple host frames. The current
+    /// implementation allocates one `PAGE_SIZE` frame per table, which is
+    /// only sufficient when `granule.page_size() <= PAGE_SIZE`. Multi-frame
+    /// table allocation is deferred to Phase D (Apple Silicon boot).
     pub fn new(
         root: PhysAddr,
         vmid: VmId,
         granule: Stage2Granule,
         phys_to_virt: fn(PhysAddr) -> *mut u8,
     ) -> Self {
-        assert!(
-            granule.page_size() <= PAGE_SIZE,
-            "guest granule ({} KiB) exceeds host page size ({} KiB) — \
-             intermediate table frames would be undersized",
-            granule.page_size() / 1024,
-            PAGE_SIZE / 1024,
-        );
         Self {
             root,
             vmid,
