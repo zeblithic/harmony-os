@@ -120,6 +120,9 @@ pub unsafe fn parse_fdt(dtb_ptr: *const u8) -> HardwareConfig {
 /// Extract the IRQ number from a GIC 3-cell `interrupts` property.
 /// Format: `<type irq_number flags>`, each cell is 4 bytes (big-endian).
 /// Cell 0 (bytes [0..4]) = type (0=SPI, 1=PPI). Cell 1 (bytes [4..8]) = IRQ number.
+///
+/// **Limitation:** This assumes GIC encoding. Apple AIC uses a different cell
+/// layout — AIC IRQ parsing is deferred to Phase B (harmony-os-1hc).
 fn first_irq(node: &fdt::node::FdtNode) -> u32 {
     node.property("interrupts")
         .and_then(|p| {
