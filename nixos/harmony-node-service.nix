@@ -23,8 +23,14 @@
 
     listenAddress = lib.mkOption {
       type = lib.types.str;
-      default = "0.0.0.0:4242";
-      description = "UDP address to listen on for Reticulum packets";
+      default = "0.0.0.0";
+      description = "UDP bind address for Reticulum packets";
+    };
+
+    port = lib.mkOption {
+      type = lib.types.port;
+      default = 4242;
+      description = "UDP port for Reticulum packets (used by both the service and the firewall)";
     };
 
     cacheCapacity = lib.mkOption {
@@ -47,7 +53,7 @@
         Type = "simple";
         DynamicUser = true;
         StateDirectory = "harmony";
-        ExecStart = "${cfg.package}/bin/harmony run --identity-file /var/lib/harmony/id.key --listen-address ${cfg.listenAddress} --cache-capacity ${toString cfg.cacheCapacity}";
+        ExecStart = "${cfg.package}/bin/harmony run --identity-file /var/lib/harmony/id.key --listen-address ${cfg.listenAddress}:${toString cfg.port} --cache-capacity ${toString cfg.cacheCapacity}";
         Restart = "on-failure";
         RestartSec = "5s";
 
@@ -60,7 +66,7 @@
       };
     };
 
-    # Open UDP port for Harmony Reticulum
-    networking.firewall.allowedUDPPorts = [ 4242 ];
+    # Open UDP port for Harmony Reticulum (derived from the same port option)
+    networking.firewall.allowedUDPPorts = [ config.services.harmony-node.port ];
   };
 }
