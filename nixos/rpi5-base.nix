@@ -33,19 +33,32 @@
     "ro"
   ];
 
-  # The sd-image-aarch64 module includes dw-hdmi in availableKernelModules,
-  # but the RPi Foundation kernel (6.12+) doesn't ship this module.
+  # mkForce is required here because the NixOS defaults include dw-hdmi in
+  # availableKernelModules, but the RPi Foundation kernel (6.12+) doesn't
+  # ship this module — the initrd module-shrunk build fails if it's present.
+  # NixOS has no list-filtering mechanism, so we must replace the entire list.
+  #
+  # This consolidates modules from three sources:
+  #   - nixos-hardware RPi5: nvme, usbhid, usb-storage
+  #   - NixOS defaults (minus dw-hdmi): vc4, xhci_pci
+  #   - RPi5-specific: pcie_brcmstb, reset-raspberrypi, bcm2835_dma,
+  #     i2c_bcm2835, dwc2, mmc_block, sdhci_iproc
+  #
+  # If nixos-hardware adds new modules for RPi5, they must be added here too.
   boot.initrd.availableKernelModules = lib.mkForce [
+    # From nixos-hardware raspberry-pi-5
+    "nvme"
     "usbhid"
-    "usb_storage"
+    "usb-storage"
+    # From NixOS defaults (dw-hdmi excluded — absent in RPi kernel 6.12+)
     "vc4"
+    "xhci_pci"
+    # RPi5-specific
     "pcie_brcmstb"
     "reset-raspberrypi"
     "bcm2835_dma"
     "i2c_bcm2835"
     "dwc2"
-    "xhci_pci"
-    "nvme"
     "mmc_block"
     "sdhci_iproc"
   ];
