@@ -93,6 +93,10 @@ CONFIGTXT
 
   # Pre-configured WiFi networks (RPi5 has built-in Broadcom WiFi).
   # Prioritized: MLO (WiFi 7) > 5GHz > 2.4GHz. Ethernet always preferred if available.
+  #
+  # TODO(harmony-os-wifi-secrets): The PSK is committed in plaintext. This is
+  # intentionally accepted for now (it's the org name, not a secret), but should
+  # be migrated to agenix or sops-nix for proper secrets management.
   networking.networkmanager.ensureProfiles.profiles = {
     "zHARMONY-MLO" = {
       connection = {
@@ -169,7 +173,7 @@ CONFIGTXT
     enable = true;
     settings = {
       PermitRootLogin = "prohibit-password";
-      PasswordAuthentication = true;
+      PasswordAuthentication = false;  # Key-only auth; no password login over SSH
     };
   };
 
@@ -178,12 +182,17 @@ CONFIGTXT
   users.users.zeblith = {
     isNormalUser = true;
     extraGroups = [ "wheel" "networkmanager" "dialout" ];
+    # initialPassword kept for local console access (HDMI + keyboard) only.
+    # SSH requires key auth (PasswordAuthentication = false above).
+    # TODO(harmony-os-user-secrets): Migrate to hashedPasswordFile via agenix/sops-nix.
     initialPassword = "harmony";
     openssh.authorizedKeys.keys = [
-      # Add SSH public key(s) here for passwordless access
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM+Y/OkDTbAa/T0TXHESg7ZRkXOj0rJQ3qUlCR9STo7t zeblith@gmail.com"
     ];
   };
 
+  # TODO(harmony-os-sudo-hardening): Re-enable wheelNeedsPassword once
+  # hashedPasswordFile is in place via agenix/sops-nix.
   security.sudo.wheelNeedsPassword = false;
 
   # --- Packages ---

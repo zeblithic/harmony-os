@@ -41,26 +41,22 @@
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
 
-      serviceConfig = {
+      serviceConfig = let
+        cfg = config.services.harmony-node;
+      in {
         Type = "simple";
         DynamicUser = true;
         StateDirectory = "harmony";
-        ExecStart = lib.concatStringsSep " " [
-          "${config.services.harmony-node.package}/bin/harmony"
-          "run"
-          "--identity-file" "/var/lib/harmony/id.key"
-          "--listen-address" config.services.harmony-node.listenAddress
-          "--cache-capacity" (toString config.services.harmony-node.cacheCapacity)
-        ];
+        ExecStart = "${cfg.package}/bin/harmony run --identity-file /var/lib/harmony/id.key --listen-address ${cfg.listenAddress} --cache-capacity ${toString cfg.cacheCapacity}";
         Restart = "on-failure";
         RestartSec = "5s";
 
-        # Hardening
+        # Hardening (ReadWritePaths not needed — DynamicUser + StateDirectory
+        # already grants write access to /var/lib/harmony)
         ProtectSystem = "strict";
         ProtectHome = true;
         PrivateTmp = true;
         NoNewPrivileges = true;
-        ReadWritePaths = [ "/var/lib/harmony" ];
       };
     };
 
