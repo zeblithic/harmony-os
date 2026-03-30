@@ -18,8 +18,7 @@ crates/harmony-test-elf/Cargo.lock
 # Direnv cache
 .direnv/
 
-# Beads / Dolt files (added by bd init)
-*.db
-.beads-credential-key
+# Pre-built binary (cross-compiled outside Nix)
 deploy/harmony-node-aarch64
+# Nix build result symlinks
 result*
