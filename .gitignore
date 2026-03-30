@@ -17,3 +17,9 @@ crates/harmony-test-elf/Cargo.lock
 
 # Direnv cache
 .direnv/
+
+# Beads / Dolt files (added by bd init)
+*.db
+.beads-credential-key
+deploy/harmony-node-aarch64
+result*
