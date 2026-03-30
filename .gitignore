@@ -17,3 +17,8 @@ crates/harmony-test-elf/Cargo.lock
 
 # Direnv cache
 .direnv/
+
+# Pre-built binary (cross-compiled outside Nix)
+deploy/harmony-node-aarch64
+# Nix build result symlinks
+result*
