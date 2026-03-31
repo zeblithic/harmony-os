@@ -92,11 +92,12 @@
       '';
 
       # NixOS configurations for Raspberry Pi 5 SD card images.
-      # Three hosts sharing a common base, each with a unique hostname.
+      # Four hosts sharing a common base, each with a unique hostname.
       # Build from any x86_64 or aarch64 host:
-      #   nix build .#sdImage-luna  --system aarch64-linux
-      #   nix build .#sdImage-terra --system aarch64-linux
-      #   nix build .#sdImage-sol   --system aarch64-linux
+      #   nix build .#sdImage-luna    --system aarch64-linux
+      #   nix build .#sdImage-terra   --system aarch64-linux
+      #   nix build .#sdImage-sol     --system aarch64-linux
+      #   nix build .#sdImage-archive --system aarch64-linux
       # On x86_64 hosts, this uses QEMU binfmt emulation (qemu-user-static).
       mkRpi5 = hostConfig: nixpkgs.lib.nixosSystem {
         system = "aarch64-linux";
@@ -109,14 +110,16 @@
       };
 
       nixosOutputs = {
-        nixosConfigurations.rpi5-luna  = mkRpi5 ./nixos/luna.nix;
-        nixosConfigurations.rpi5-terra = mkRpi5 ./nixos/terra.nix;
-        nixosConfigurations.rpi5-sol   = mkRpi5 ./nixos/sol.nix;
+        nixosConfigurations.rpi5-luna     = mkRpi5 ./nixos/luna.nix;
+        nixosConfigurations.rpi5-terra    = mkRpi5 ./nixos/terra.nix;
+        nixosConfigurations.rpi5-sol      = mkRpi5 ./nixos/sol.nix;
+        nixosConfigurations.rpi5-archive  = mkRpi5 ./nixos/archivist.nix;
 
         packages.aarch64-linux = {
-          sdImage-luna  = self.nixosConfigurations.rpi5-luna.config.system.build.sdImage;
-          sdImage-terra = self.nixosConfigurations.rpi5-terra.config.system.build.sdImage;
-          sdImage-sol   = self.nixosConfigurations.rpi5-sol.config.system.build.sdImage;
+          sdImage-luna    = self.nixosConfigurations.rpi5-luna.config.system.build.sdImage;
+          sdImage-terra   = self.nixosConfigurations.rpi5-terra.config.system.build.sdImage;
+          sdImage-sol     = self.nixosConfigurations.rpi5-sol.config.system.build.sdImage;
+          sdImage-archive = self.nixosConfigurations.rpi5-archive.config.system.build.sdImage;
         };
       };
     in
