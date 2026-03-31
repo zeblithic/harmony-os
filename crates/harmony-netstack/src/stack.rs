@@ -320,7 +320,7 @@ impl TcpProvider for NetStack {
             return Err(e);
         }
         let new_smoltcp = self.resolve_tcp(new_listener)?;
-        if let Err(e) = self
+        if let Err(_) = self
             .sockets
             .get_mut::<tcp::Socket>(new_smoltcp)
             .listen(port)
