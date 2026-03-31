@@ -351,6 +351,9 @@ impl TcpProvider for NetStack {
         // Restore port binding for handle (now the new listener).
         self.tcp_bound_ports.insert(handle, port);
         self.tcp_listen_ports.insert(port, handle);
+        // Remove the stale port binding for new_listener — it's now the
+        // accepted (established) connection, not a listener.
+        self.tcp_bound_ports.remove(&new_listener);
 
         Ok(Some(new_listener))
     }

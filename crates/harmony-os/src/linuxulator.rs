@@ -3171,7 +3171,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 }
             }
             FdKind::Socket { socket_id } => {
-                let (tcp_handle, nonblock) = match self.sockets.get(&socket_id) {
+                let (tcp_handle, _nonblock) = match self.sockets.get(&socket_id) {
                     Some(s) => (s.tcp_handle, s.nonblock),
                     None => return EBADF,
                 };
@@ -3296,7 +3296,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 }
             }
             FdKind::Socket { socket_id } => {
-                let (tcp_handle, nonblock) = match self.sockets.get(&socket_id) {
+                let (tcp_handle, _nonblock) = match self.sockets.get(&socket_id) {
                     Some(s) => (s.tcp_handle, s.nonblock),
                     None => return EBADF,
                 };
@@ -3991,11 +3991,13 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             // Parse port from sockaddr_in (bytes 2-3, big-endian).
             let port_bytes = unsafe { [*(addr as *const u8).add(2), *(addr as *const u8).add(3)] };
             let port = u16::from_be_bytes(port_bytes);
-            if let Some(state) = self.sockets.get_mut(&socket_id) {
-                state.bound_port = port;
-            }
             match self.tcp.tcp_bind(h, port) {
-                Ok(()) => 0,
+                Ok(()) => {
+                    if let Some(state) = self.sockets.get_mut(&socket_id) {
+                        state.bound_port = port;
+                    }
+                    0
+                }
                 Err(e) => net_error_to_errno(e),
             }
         } else {
@@ -4176,13 +4178,10 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 unsafe { *ptr.add(7) },
             );
             match self.tcp.tcp_connect(h, ip, port) {
-                Ok(()) => {
-                    if nonblock {
-                        EINPROGRESS
-                    } else {
-                        0
-                    }
-                }
+                // v1: always return EINPROGRESS since tcp_connect only
+                // queues the SYN. True blocking connect (wait for handshake)
+                // requires yield/coroutine (harmony-os-cqy).
+                Ok(()) => EINPROGRESS,
                 Err(e) => net_error_to_errno(e),
             }
         } else {
