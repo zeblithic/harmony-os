@@ -320,7 +320,11 @@ impl TcpProvider for NetStack {
             return Err(e);
         }
         let new_smoltcp = self.resolve_tcp(new_listener)?;
-        if let Err(e) = self.sockets.get_mut::<tcp::Socket>(new_smoltcp).listen(port) {
+        if let Err(e) = self
+            .sockets
+            .get_mut::<tcp::Socket>(new_smoltcp)
+            .listen(port)
+        {
             let _ = self.tcp_close_internal(new_listener);
             self.tcp_bound_ports.insert(handle, port);
             self.tcp_listen_ports.insert(port, handle);
@@ -349,7 +353,12 @@ impl TcpProvider for NetStack {
         port: u16,
     ) -> Result<(), NetError> {
         let smoltcp_handle = self.resolve_tcp(handle)?;
-        let local_port = 49152 + (handle.0 as u16 % 16384);
+        // Use explicitly bound port if available, otherwise assign an ephemeral port.
+        let local_port = self
+            .tcp_bound_ports
+            .get(&handle)
+            .copied()
+            .unwrap_or_else(|| 49152 + (handle.0 as u16 % 16384));
         let remote = (IpAddress::Ipv4(addr), port);
         // Both self.iface and self.sockets are separate fields — the borrow
         // checker allows simultaneous mutable borrows of distinct fields.

@@ -109,19 +109,19 @@ impl DhcpClient {
     }
 
     /// Apply the static fallback IP and gateway to `iface`.
+    ///
+    /// Only marks `fallback_applied` if a fallback IP was actually configured.
+    /// Without a fallback IP, there's nothing to apply and `is_configured()`
+    /// should not report true.
     fn apply_fallback(&mut self, iface: &mut Interface) {
         if let Some(cidr) = self.fallback_ip {
             apply_ip(iface, cidr);
-        }
-        match self.fallback_gateway {
-            Some(gw) => {
+            if let Some(gw) = self.fallback_gateway {
                 let _ = iface.routes_mut().add_default_ipv4_route(gw);
             }
-            None => {
-                iface.routes_mut().remove_default_ipv4_route();
-            }
+            self.fallback_applied = true;
         }
-        self.fallback_applied = true;
+        // No fallback_ip → nothing to apply, don't mark as configured.
     }
 }
 

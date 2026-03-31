@@ -3988,8 +3988,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 return EINVAL;
             }
             // Parse port from sockaddr_in (bytes 2-3, big-endian).
-            let port_bytes =
-                unsafe { [*(addr as *const u8).add(2), *(addr as *const u8).add(3)] };
+            let port_bytes = unsafe { [*(addr as *const u8).add(2), *(addr as *const u8).add(3)] };
             let port = u16::from_be_bytes(port_bytes);
             if let Some(state) = self.sockets.get_mut(&socket_id) {
                 state.bound_port = port;
@@ -4218,6 +4217,9 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         };
         if let Some(h) = tcp_handle {
             let count = len as usize;
+            if count > 0 && buf == 0 {
+                return EFAULT;
+            }
             let data = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
             match self.tcp.tcp_send(h, data) {
                 Ok(n) => n as i64,
@@ -4254,6 +4256,9 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         };
         if let Some(h) = tcp_handle {
             let count = len as usize;
+            if count > 0 && buf == 0 {
+                return EFAULT;
+            }
             let data = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, count) };
             match self.tcp.tcp_recv(h, data) {
                 Ok(n) => n as i64,
@@ -4262,7 +4267,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                     // a yield/coroutine mechanism (harmony-os-cqy).
                     EAGAIN
                 }
-                Err(_) => 0, // EOF / error
+                Err(e) => net_error_to_errno(e),
             }
         } else {
             // Stub: return EOF.
@@ -4610,13 +4615,17 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             });
 
             // Also look up if this socket is a listener (for accept readiness).
-            let is_listener = self.fd_table.get(&fd).and_then(|entry| {
-                if let FdKind::Socket { socket_id } = &entry.kind {
-                    self.sockets.get(socket_id).map(|s| s.listening)
-                } else {
-                    None
-                }
-            }).unwrap_or(false);
+            let is_listener = self
+                .fd_table
+                .get(&fd)
+                .and_then(|entry| {
+                    if let FdKind::Socket { socket_id } = &entry.kind {
+                        self.sockets.get(socket_id).map(|s| s.listening)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(false);
 
             let ready_events: u32 = if let Some(h) = tcp_handle {
                 let state = self.tcp.tcp_state(h);
