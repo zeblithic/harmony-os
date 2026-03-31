@@ -229,7 +229,8 @@ CONFIGTXT
     # TODO(harmony-os-user-secrets): Migrate to hashedPasswordFile via agenix/sops-nix.
     initialPassword = "harmony";
     openssh.authorizedKeys.keys = [
-      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM+Y/OkDTbAa/T0TXHESg7ZRkXOj0rJQ3qUlCR9STo7t zeblith@gmail.com"
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM+Y/OkDTbAa/T0TXHESg7ZRkXOj0rJQ3qUlCR9STo7t zeblith@gmail.com"  # AVALON
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC9fSUat8x5KnIbuqbThWn7fqm3ork11fsvaqxAY/b5F zeblith@gmail.com"  # MacBook Pro
     ];
   };
 
