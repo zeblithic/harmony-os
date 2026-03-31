@@ -80,7 +80,7 @@
 
       serviceConfig = let
         dataDirArgs = lib.optionalString (cfg.dataDir != null)
-          " --data-dir ${cfg.dataDir}";
+          " --data-dir '${cfg.dataDir}'";
         diskQuotaArgs = lib.optionalString (cfg.diskQuota != null)
           " --disk-quota '${cfg.diskQuota}'";
       in {
