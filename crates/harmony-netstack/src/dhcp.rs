@@ -74,11 +74,13 @@ impl DhcpClient {
             Some(dhcpv4::Event::Configured(config)) => {
                 apply_ip(iface, config.address);
                 if let Some(gw) = config.router {
-                    iface.routes_mut().add_default_ipv4_route(gw).unwrap();
+                    let _ = iface.routes_mut().add_default_ipv4_route(gw);
                 } else {
                     iface.routes_mut().remove_default_ipv4_route();
                 }
                 self.configured = true;
+                // Reset fallback so it can re-apply if this lease is later lost.
+                self.fallback_applied = false;
                 true
             }
             Some(dhcpv4::Event::Deconfigured) => {
@@ -113,7 +115,7 @@ impl DhcpClient {
         }
         match self.fallback_gateway {
             Some(gw) => {
-                iface.routes_mut().add_default_ipv4_route(gw).unwrap();
+                let _ = iface.routes_mut().add_default_ipv4_route(gw);
             }
             None => {
                 iface.routes_mut().remove_default_ipv4_route();

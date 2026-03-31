@@ -264,6 +264,11 @@ impl TcpProvider for NetStack {
             .map(|(p, _)| *p)
             .ok_or(NetError::InvalidHandle)?;
 
+        // Remove the old handle's port binding BEFORE creating the replacement
+        // listener, otherwise tcp_bind sees the port as already in use.
+        self.tcp_bound_ports.remove(&handle);
+        self.tcp_listen_ports.remove(&port);
+
         // Create a new socket to replace the listener on the same port.
         let new_listener = self.tcp_create()?;
         self.tcp_bind(new_listener, port)?;

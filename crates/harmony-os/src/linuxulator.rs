@@ -4616,15 +4616,29 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 }
             });
 
+            // Also look up if this socket is a listener (for accept readiness).
+            let is_listener = self.fd_table.get(&fd).and_then(|entry| {
+                if let FdKind::Socket { socket_id } = &entry.kind {
+                    self.sockets.get(socket_id).map(|s| s.listening)
+                } else {
+                    None
+                }
+            }).unwrap_or(false);
+
             let ready_events: u32 = if let Some(h) = tcp_handle {
                 let state = self.tcp.tcp_state(h);
                 let mut ev = 0u32;
 
                 // EPOLLIN: data available, accepted connection ready, or EOF.
-                if mask & EPOLLIN != 0
-                    && (self.tcp.tcp_can_recv(h) || state == TcpSocketState::CloseWait)
-                {
-                    ev |= EPOLLIN;
+                if mask & EPOLLIN != 0 {
+                    if self.tcp.tcp_can_recv(h) || state == TcpSocketState::CloseWait {
+                        ev |= EPOLLIN;
+                    }
+                    // A listening socket that transitioned to Established means
+                    // a connection is ready to accept.
+                    if is_listener && state == TcpSocketState::Established {
+                        ev |= EPOLLIN;
+                    }
                 }
 
                 // EPOLLOUT: writable when established and send buffer available.
