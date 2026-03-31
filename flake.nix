@@ -80,7 +80,7 @@
 
       # Wrap the pre-built harmony-node static binary as a Nix package.
       # The binary is cross-compiled outside Nix via:
-      #   cargo build -p harmony-node --features no-neon \
+      #   cargo build -p harmony-node --features nix-cache,no-neon \
       #     --target aarch64-unknown-linux-musl --profile release-cross
       # and placed at deploy/harmony-node-aarch64 in this repo.
       harmonyNodePkg = let

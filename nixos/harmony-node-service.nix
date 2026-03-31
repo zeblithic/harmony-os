@@ -68,6 +68,10 @@
         assertion = cfg.diskQuota == null || cfg.dataDir != null;
         message = "services.harmony-node.diskQuota requires services.harmony-node.dataDir to be set.";
       }
+      {
+        assertion = cfg.nixCachePort == null || cfg.dataDir != null;
+        message = "services.harmony-node.nixCachePort requires services.harmony-node.dataDir to be set (NAR files are stored persistently in the CAS).";
+      }
     ];
 
     # Static service user — DynamicUser doesn't work with external mount points
