@@ -63,8 +63,8 @@
   # NOTE: These are system-wide knobs — they affect all mounted filesystems
   # (SD card root, SSD, HDD). The values are tuned for the archivist's
   # primary workload (sustained sequential writes to a large XFS volume).
-  # If SD card I/O latency is noticeable, consider reducing
-  # vfs_cache_pressure to 150-200.
+  # If SD card I/O latency is acceptable, consider raising
+  # vfs_cache_pressure to 300 for more aggressive metadata reclaim.
   boot.kernel.sysctl = {
     # Dirty page limits — prevent massive I/O stalls from accumulated writes.
     # 2% of 8GB = ~160MB background flush threshold.
@@ -72,10 +72,10 @@
     "vm.dirty_background_ratio" = 2;
     "vm.dirty_ratio" = 5;
 
-    # Reclaim inode/dentry caches more aggressively than default (100).
-    # Frees RAM for the harmony-node process. System-wide — affects all
-    # filesystems including the SD card root. 200 is a moderate value;
-    # increase to 300 if XFS metadata pressure causes OOM under load.
+    # Reclaim inode/dentry caches 2x faster than default (100).
+    # Frees RAM for the harmony-node process at the cost of slightly
+    # more frequent directory lookups on the SD card root.
+    # Increase to 300 if XFS metadata pressure causes OOM under load.
     "vm.vfs_cache_pressure" = 200;
 
     # Reserve 32MB for atomic kernel operations (network interrupt handling).
