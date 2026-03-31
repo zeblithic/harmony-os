@@ -41,6 +41,8 @@ pub struct NetStack {
     tcp_handles: Vec<Option<SocketHandle>>,
     tcp_bound_ports: BTreeMap<TcpHandle, u16>,
     tcp_listen_ports: BTreeMap<u16, TcpHandle>,
+    /// Next ephemeral port to assign for outbound TCP connections.
+    tcp_next_ephemeral: u16,
     /// Handles that userspace has called tcp_close() on. Only these are
     /// eligible for reaping once smoltcp reaches Closed/TimeWait.
     tcp_user_closed: alloc::collections::BTreeSet<TcpHandle>,
@@ -122,6 +124,7 @@ impl NetStack {
             tcp_handles,
             tcp_bound_ports: BTreeMap::new(),
             tcp_listen_ports: BTreeMap::new(),
+            tcp_next_ephemeral: 49152,
             tcp_user_closed: alloc::collections::BTreeSet::new(),
             dhcp,
         }
@@ -366,11 +369,16 @@ impl TcpProvider for NetStack {
     ) -> Result<(), NetError> {
         let smoltcp_handle = self.resolve_tcp(handle)?;
         // Use explicitly bound port if available, otherwise assign an ephemeral port.
+        // Ephemeral ports wrap around the 49152–65535 range.
         let local_port = self
             .tcp_bound_ports
             .get(&handle)
             .copied()
-            .unwrap_or_else(|| 49152 + (handle.0 as u16 % 16384));
+            .unwrap_or_else(|| {
+                let port = self.tcp_next_ephemeral;
+                self.tcp_next_ephemeral = if port == 65535 { 49152 } else { port + 1 };
+                port
+            });
         let remote = (IpAddress::Ipv4(addr), port);
         // Both self.iface and self.sockets are separate fields — the borrow
         // checker allows simultaneous mutable borrows of distinct fields.
