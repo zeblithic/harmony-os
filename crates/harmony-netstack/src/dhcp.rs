@@ -85,7 +85,9 @@ impl DhcpClient {
                 true
             }
             Some(dhcpv4::Event::Deconfigured) => {
-                apply_ip(iface, Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0));
+                // Clear the IP address entirely — don't set 0.0.0.0/0 which
+                // would tell smoltcp the interface has connectivity to all of IPv4.
+                iface.update_ip_addrs(|addrs| addrs.clear());
                 iface.routes_mut().remove_default_ipv4_route();
                 self.configured = false;
                 true

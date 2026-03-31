@@ -328,10 +328,11 @@ impl TcpProvider for NetStack {
             return Err(e);
         }
         let new_smoltcp = self.resolve_tcp(new_listener)?;
-        if let Err(_) = self
+        if self
             .sockets
             .get_mut::<tcp::Socket>(new_smoltcp)
             .listen(port)
+            .is_err()
         {
             let _ = self.tcp_close_internal(new_listener);
             self.tcp_bound_ports.insert(handle, port);

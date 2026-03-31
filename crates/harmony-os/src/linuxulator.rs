@@ -42,6 +42,7 @@ const ECONNREFUSED: i64 = -111;
 const ECONNRESET: i64 = -104;
 const EINPROGRESS: i64 = -115;
 const ENFILE: i64 = -23;
+const ENOTCONN: i64 = -107;
 
 // Clock IDs (shared by clock_gettime and clock_getres)
 const CLOCK_REALTIME: i32 = 0;
@@ -113,7 +114,7 @@ fn net_error_to_errno(e: NetError) -> i64 {
         NetError::WouldBlock => EAGAIN,
         NetError::ConnectionRefused => ECONNREFUSED,
         NetError::ConnectionReset => ECONNRESET,
-        NetError::NotConnected => EBADF,
+        NetError::NotConnected => ENOTCONN,
         NetError::AddrInUse => EADDRINUSE,
         NetError::InvalidHandle => EBADF,
         NetError::SocketLimit => ENFILE,
@@ -4217,7 +4218,10 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         };
         if let Some(h) = tcp_handle {
             let count = len as usize;
-            if count > 0 && buf == 0 {
+            if count == 0 {
+                return 0;
+            }
+            if buf == 0 {
                 return EFAULT;
             }
             let data = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
@@ -4256,7 +4260,10 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         };
         if let Some(h) = tcp_handle {
             let count = len as usize;
-            if count > 0 && buf == 0 {
+            if count == 0 {
+                return 0;
+            }
+            if buf == 0 {
                 return EFAULT;
             }
             let data = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, count) };
