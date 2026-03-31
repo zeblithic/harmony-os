@@ -13,6 +13,9 @@ smoltcp = { version = "0.11", default-features = false, features = [
     "medium-ethernet",
     "proto-ipv4",
     "socket-udp",
+    "socket-tcp",
+    "socket-dhcpv4",
+    "proto-dhcpv4",
     "alloc",
 ] }
 
