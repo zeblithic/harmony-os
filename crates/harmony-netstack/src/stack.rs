@@ -41,6 +41,9 @@ pub struct NetStack {
     tcp_handles: Vec<Option<SocketHandle>>,
     tcp_bound_ports: BTreeMap<TcpHandle, u16>,
     tcp_listen_ports: BTreeMap<u16, TcpHandle>,
+    /// Handles that userspace has called tcp_close() on. Only these are
+    /// eligible for reaping once smoltcp reaches Closed/TimeWait.
+    tcp_user_closed: alloc::collections::BTreeSet<TcpHandle>,
     // DHCP
     dhcp: Option<DhcpClient>,
 }
@@ -119,6 +122,7 @@ impl NetStack {
             tcp_handles,
             tcp_bound_ports: BTreeMap::new(),
             tcp_listen_ports: BTreeMap::new(),
+            tcp_user_closed: alloc::collections::BTreeSet::new(),
             dhcp,
         }
     }
@@ -156,20 +160,23 @@ impl NetStack {
         self.device.drain_tx()
     }
 
-    /// Remove sockets that have completed their TCP close handshake.
-    /// Called during poll() to clean up finished connections.
+    /// Remove sockets that userspace has closed AND whose TCP close handshake
+    /// has completed in smoltcp. Sockets that the remote closed but userspace
+    /// hasn't called tcp_close() on are NOT reaped — userspace can still read
+    /// EOF from them.
     fn tcp_reap_closed(&mut self) {
         for (slot, opt_handle) in self.tcp_handles.iter_mut().enumerate() {
             if let Some(smoltcp_handle) = *opt_handle {
+                let handle = TcpHandle(slot as u32);
+                // Only reap if userspace has called tcp_close() on this handle.
+                if !self.tcp_user_closed.contains(&handle) {
+                    continue;
+                }
                 let state = self.sockets.get::<tcp::Socket>(smoltcp_handle).state();
                 if state == tcp::State::Closed || state == tcp::State::TimeWait {
-                    let handle = TcpHandle(slot as u32);
-                    if !self.tcp_listen_ports.values().any(|h| *h == handle)
-                        && !self.tcp_bound_ports.contains_key(&handle)
-                    {
-                        self.sockets.remove(smoltcp_handle);
-                        *opt_handle = None;
-                    }
+                    self.sockets.remove(smoltcp_handle);
+                    *opt_handle = None;
+                    self.tcp_user_closed.remove(&handle);
                 }
             }
         }
@@ -191,6 +198,7 @@ impl NetStack {
         self.tcp_handles[handle.0 as usize] = None;
         self.tcp_listen_ports.retain(|_, h| *h != handle);
         self.tcp_bound_ports.remove(&handle);
+        self.tcp_user_closed.remove(&handle);
         Ok(())
     }
 }
@@ -409,9 +417,10 @@ impl TcpProvider for NetStack {
         // Remove from listener/port tracking immediately.
         self.tcp_listen_ports.retain(|_, h| *h != handle);
         self.tcp_bound_ports.remove(&handle);
-        // DON'T remove from SocketSet yet — smoltcp needs subsequent poll()
-        // calls to transmit the FIN and complete the TCP close handshake.
-        // The socket will be reaped by tcp_reap_closed() during poll().
+        // Mark as user-closed so tcp_reap_closed() can remove it once smoltcp
+        // finishes the FIN handshake. Until then, the handle stays valid so
+        // userspace can still read EOF (0) instead of getting EBADF.
+        self.tcp_user_closed.insert(handle);
         Ok(())
     }
 

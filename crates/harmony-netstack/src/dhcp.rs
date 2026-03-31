@@ -73,10 +73,11 @@ impl DhcpClient {
         match event {
             Some(dhcpv4::Event::Configured(config)) => {
                 apply_ip(iface, config.address);
+                // Remove any existing default route (e.g., from fallback) before
+                // adding the DHCP-provided one, so we don't leave a stale gateway.
+                iface.routes_mut().remove_default_ipv4_route();
                 if let Some(gw) = config.router {
                     let _ = iface.routes_mut().add_default_ipv4_route(gw);
-                } else {
-                    iface.routes_mut().remove_default_ipv4_route();
                 }
                 self.configured = true;
                 // Reset fallback so it can re-apply if this lease is later lost.
