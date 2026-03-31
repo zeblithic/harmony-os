@@ -22,3 +22,4 @@ crates/harmony-test-elf/Cargo.lock
 deploy/harmony-node-aarch64
 # Nix build result symlinks
 result*
+.beads/
