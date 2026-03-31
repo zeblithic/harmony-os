@@ -25,7 +25,9 @@
   # If no SSD is attached, the mount fails silently (nofail) and
   # harmony-node starts with in-memory cache only (data-dir won't exist).
   #
-  # To label a drive:  sudo mkfs.ext4 -L HARMONY-DATA /dev/sdX1
+  # To prepare a drive:
+  #   sudo mkfs.ext4 -L HARMONY-DATA /dev/sdX1
+  #   sudo mount /dev/sdX1 /mnt && sudo chown harmony-node:harmony-node /mnt && sudo umount /mnt
   fileSystems."/mnt/harmony-data" = {
     device = "/dev/disk/by-label/HARMONY-DATA";
     fsType = "ext4";
@@ -37,9 +39,10 @@
     ];
   };
 
-  # Create mount point
+  # Create mount point owned by the service user so harmony-node can
+  # write even before the SSD is mounted (automount triggers on access).
   systemd.tmpfiles.rules = [
-    "d /mnt/harmony-data 0750 root root -"
+    "d /mnt/harmony-data 0750 harmony-node harmony-node -"
   ];
 
   # --- Boot ---
