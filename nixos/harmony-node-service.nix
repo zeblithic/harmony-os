@@ -92,13 +92,15 @@
         Restart = "on-failure";
         RestartSec = "5s";
 
-        # Hardening
-        ProtectSystem = "strict";
+        # Hardening — use "full" instead of "strict" to avoid ReadWritePaths.
+        # "strict" + ReadWritePaths bind-mounts the data dir during namespace
+        # setup, which triggers x-systemd.automount and blocks for 5s when
+        # no SSD is present. "full" makes /usr and /boot read-only but
+        # leaves /mnt writable, so no bind-mount is needed.
+        ProtectSystem = "full";
         ProtectHome = true;
         PrivateTmp = true;
         NoNewPrivileges = true;
-      } // lib.optionalAttrs (cfg.dataDir != null) {
-        ReadWritePaths = [ cfg.dataDir ];
       };
     };
 
