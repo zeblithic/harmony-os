@@ -3311,7 +3311,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                             // a yield/coroutine mechanism (harmony-os-cqy).
                             EAGAIN
                         }
-                        Err(_) => 0, // EOF / error
+                        Err(e) => net_error_to_errno(e),
                     }
                 } else {
                     // Stub: no data, return EOF.
@@ -3976,21 +3976,21 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
     }
 
     /// Linux bind(2): bind socket to a local address/port.
-    fn sys_bind(&mut self, fd: i32, addr: u64, _addrlen: u32) -> i64 {
+    fn sys_bind(&mut self, fd: i32, addr: u64, addrlen: u32) -> i64 {
         let socket_id = match self.require_socket(fd) {
             Ok(id) => id,
             Err(e) => return e,
         };
         let tcp_handle = self.sockets.get(&socket_id).and_then(|s| s.tcp_handle);
         if let Some(h) = tcp_handle {
-            // Parse port from sockaddr_in (bytes 2-3, big-endian).
-            let port = if addr != 0 {
-                let port_bytes =
-                    unsafe { [*(addr as *const u8).add(2), *(addr as *const u8).add(3)] };
-                u16::from_be_bytes(port_bytes)
-            } else {
+            // sockaddr_in is 16 bytes minimum (sin_family + sin_port + sin_addr + sin_zero).
+            if addr == 0 || addrlen < 4 {
                 return EINVAL;
-            };
+            }
+            // Parse port from sockaddr_in (bytes 2-3, big-endian).
+            let port_bytes =
+                unsafe { [*(addr as *const u8).add(2), *(addr as *const u8).add(3)] };
+            let port = u16::from_be_bytes(port_bytes);
             if let Some(state) = self.sockets.get_mut(&socket_id) {
                 state.bound_port = port;
             }
@@ -4153,7 +4153,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
     }
 
     /// Linux connect(2): connect socket to a remote address.
-    fn sys_connect(&mut self, fd: i32, addr: u64, _addrlen: u32) -> i64 {
+    fn sys_connect(&mut self, fd: i32, addr: u64, addrlen: u32) -> i64 {
         let socket_id = match self.require_socket(fd) {
             Ok(id) => id,
             Err(e) => return e,
@@ -4163,7 +4163,8 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             None => return EBADF,
         };
         if let Some(h) = tcp_handle {
-            if addr == 0 {
+            // sockaddr_in needs at least 8 bytes (family + port + addr).
+            if addr == 0 || addrlen < 8 {
                 return EINVAL;
             }
             let ptr = addr as *const u8;
@@ -4633,8 +4634,9 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                     }
                 }
 
-                // EPOLLOUT: writable when established and send buffer available.
+                // EPOLLOUT: writable when established (not listening) and send buffer available.
                 if mask & EPOLLOUT != 0
+                    && !is_listener
                     && self.tcp.tcp_can_send(h)
                     && state == TcpSocketState::Established
                 {
