@@ -16,22 +16,24 @@
 #   sudo mkfs.xfs -L HARMONY-ARCHIVE /dev/sdX1
 #   sudo mount /dev/sdX1 /mnt && sudo chown harmony-node:harmony-node /mnt && sudo umount /mnt
 
-{ ... }:
+{ lib, ... }:
 {
   imports = [ ./rpi5-base.nix ];
   networking.hostName = "harmony-archive";
 
-  # Ensure XFS kernel module is available (appended to base's mkForce list)
+  # Load the XFS kernel module after boot so it is available when the
+  # automount first triggers. Not needed in initrd (the HDD is not
+  # mounted there); boot.kernelModules and boot.initrd.availableKernelModules
+  # are independent NixOS options with separate merge semantics.
   boot.kernelModules = [ "xfs" ];
 
   # --- Archivist overrides ---
+  # mkForce required because rpi5-base.nix sets these to different values
+  # and NixOS's nullOr str type cannot merge two non-null strings.
 
-  # Larger cache for archival workload
   services.harmony-node.cacheCapacity = 8192;
-
-  # Point to the XFS HDD mount, not the SSD mount
-  services.harmony-node.dataDir = "/mnt/harmony-archive";
-  services.harmony-node.diskQuota = "20 TiB";
+  services.harmony-node.dataDir = lib.mkForce "/mnt/harmony-archive";
+  services.harmony-node.diskQuota = lib.mkForce "20 TiB";
 
   # --- XFS HDD auto-mount ---
   # The archivist's primary storage — USB HDD labeled HARMONY-ARCHIVE.
@@ -57,6 +59,12 @@
   # Based on Gemini research (2026-03-30): XFS metadata caching can
   # consume all available RAM on a 22TB volume. These settings constrain
   # dirty pages and VFS cache to prevent OOM under sustained write load.
+  #
+  # NOTE: These are system-wide knobs — they affect all mounted filesystems
+  # (SD card root, SSD, HDD). The values are tuned for the archivist's
+  # primary workload (sustained sequential writes to a large XFS volume).
+  # If SD card I/O latency is noticeable, consider reducing
+  # vfs_cache_pressure to 150-200.
   boot.kernel.sysctl = {
     # Dirty page limits — prevent massive I/O stalls from accumulated writes.
     # 2% of 8GB = ~160MB background flush threshold.
@@ -64,10 +72,11 @@
     "vm.dirty_background_ratio" = 2;
     "vm.dirty_ratio" = 5;
 
-    # Aggressively reclaim XFS inode/dentry caches.
-    # Default is 100 (balanced). 300 penalizes metadata caching heavily,
-    # freeing RAM for the harmony-node process and page cache.
-    "vm.vfs_cache_pressure" = 300;
+    # Reclaim inode/dentry caches more aggressively than default (100).
+    # Frees RAM for the harmony-node process. System-wide — affects all
+    # filesystems including the SD card root. 200 is a moderate value;
+    # increase to 300 if XFS metadata pressure causes OOM under load.
+    "vm.vfs_cache_pressure" = 200;
 
     # Reserve 32MB for atomic kernel operations (network interrupt handling).
     # Prevents UDP ingest bursts from exhausting memory during XFS flushes.

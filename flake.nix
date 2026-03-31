@@ -92,11 +92,12 @@
       '';
 
       # NixOS configurations for Raspberry Pi 5 SD card images.
-      # Three hosts sharing a common base, each with a unique hostname.
+      # Four hosts sharing a common base, each with a unique hostname.
       # Build from any x86_64 or aarch64 host:
-      #   nix build .#sdImage-luna  --system aarch64-linux
-      #   nix build .#sdImage-terra --system aarch64-linux
-      #   nix build .#sdImage-sol   --system aarch64-linux
+      #   nix build .#sdImage-luna    --system aarch64-linux
+      #   nix build .#sdImage-terra   --system aarch64-linux
+      #   nix build .#sdImage-sol     --system aarch64-linux
+      #   nix build .#sdImage-archive --system aarch64-linux
       # On x86_64 hosts, this uses QEMU binfmt emulation (qemu-user-static).
       mkRpi5 = hostConfig: nixpkgs.lib.nixosSystem {
         system = "aarch64-linux";
