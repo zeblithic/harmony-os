@@ -38,9 +38,40 @@
       default = 1024;
       description = "W-TinyLFU cache item capacity";
     };
+
+    dataDir = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Runtime path for persistent CAS book and memo storage. When null, uses in-memory cache only.";
+    };
+
+    diskQuota = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "3.5 TiB";
+      description = "Maximum disk usage for persistent storage (e.g. '3.5 TiB', '500 GiB'). Requires dataDir.";
+    };
   };
 
-  config = lib.mkIf config.services.harmony-node.enable {
+  config = lib.mkIf config.services.harmony-node.enable (let
+    cfg = config.services.harmony-node;
+  in {
+    assertions = [
+      {
+        assertion = cfg.diskQuota == null || cfg.dataDir != null;
+        message = "services.harmony-node.diskQuota requires services.harmony-node.dataDir to be set.";
+      }
+    ];
+
+    # Static service user — DynamicUser doesn't work with external mount points
+    # (the transient UID can't own files on a real ext4 filesystem).
+    users.users.harmony-node = {
+      isSystemUser = true;
+      group = "harmony-node";
+      home = "/var/lib/harmony";
+    };
+    users.groups.harmony-node = {};
+
     systemd.services.harmony-node = {
       description = "Harmony mesh node — Reticulum/Zenoh P2P network";
       after = [ "network-online.target" ];
@@ -48,18 +79,25 @@
       wantedBy = [ "multi-user.target" ];
 
       serviceConfig = let
-        cfg = config.services.harmony-node;
+        dataDirArgs = lib.optionalString (cfg.dataDir != null)
+          " --data-dir '${cfg.dataDir}'";
+        diskQuotaArgs = lib.optionalString (cfg.diskQuota != null)
+          " --disk-quota '${cfg.diskQuota}'";
       in {
         Type = "simple";
-        DynamicUser = true;
+        User = "harmony-node";
+        Group = "harmony-node";
         StateDirectory = "harmony";
-        ExecStart = "${cfg.package}/bin/harmony run --identity-file /var/lib/harmony/id.key --listen-address ${cfg.listenAddress}:${toString cfg.port} --cache-capacity ${toString cfg.cacheCapacity}";
+        ExecStart = "${cfg.package}/bin/harmony run --identity-file /var/lib/harmony/id.key --listen-address ${cfg.listenAddress}:${toString cfg.port} --cache-capacity ${toString cfg.cacheCapacity}${dataDirArgs}${diskQuotaArgs}";
         Restart = "on-failure";
         RestartSec = "5s";
 
-        # Hardening (ReadWritePaths not needed — DynamicUser + StateDirectory
-        # already grants write access to /var/lib/harmony)
-        ProtectSystem = "strict";
+        # Hardening — use "full" instead of "strict" to avoid ReadWritePaths.
+        # "strict" + ReadWritePaths bind-mounts the data dir during namespace
+        # setup, which triggers x-systemd.automount and blocks for 5s when
+        # no SSD is present. "full" makes /usr and /boot read-only but
+        # leaves /mnt writable, so no bind-mount is needed.
+        ProtectSystem = "full";
         ProtectHome = true;
         PrivateTmp = true;
         NoNewPrivileges = true;
@@ -67,6 +105,6 @@
     };
 
     # Open UDP port for Harmony Reticulum (derived from the same port option)
-    networking.firewall.allowedUDPPorts = [ config.services.harmony-node.port ];
-  };
+    networking.firewall.allowedUDPPorts = [ cfg.port ];
+  });
 }
