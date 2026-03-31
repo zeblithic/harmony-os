@@ -32,10 +32,11 @@
     device = "/dev/disk/by-label/HARMONY-DATA";
     fsType = "ext4";
     options = [
-      "nofail"           # Don't block boot if SSD is absent
-      "noatime"          # Skip access-time writes (reduces SSD wear)
-      "x-systemd.automount"  # Mount on first access, not at boot
+      "nofail"                    # Don't block boot if SSD is absent
+      "noatime"                   # Skip access-time writes (reduces SSD wear)
+      "x-systemd.automount"       # Mount on first access, not at boot
       "x-systemd.idle-timeout=0"  # Never unmount once mounted
+      "x-systemd.device-timeout=5s"  # Fail fast if SSD isn't plugged in
     ];
   };
 
