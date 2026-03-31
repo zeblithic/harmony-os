@@ -29,6 +29,7 @@ std = [
 [dependencies]
 # Ring 2 — base types (Fid, FileServer, IpcError) are always available
 harmony-microkernel = { workspace = true, default-features = false }
+harmony-netstack = { path = "../harmony-netstack", default-features = false }
 
 # Ring 0 — full protocol stack, only with std
 harmony-crypto = { workspace = true, optional = true }

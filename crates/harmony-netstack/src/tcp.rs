@@ -50,4 +50,17 @@ pub trait TcpProvider {
     fn tcp_can_send(&self, handle: TcpHandle) -> bool;
     /// Drive the underlying network stack. Must be called periodically.
     fn tcp_poll(&mut self, now_ms: i64);
+    /// Create a forked copy of this provider for a child process.
+    ///
+    /// Returns `None` if this provider does not support fork (e.g. a real
+    /// network stack that cannot be duplicated). When `None` is returned,
+    /// `fork(2)` inside the Linuxulator returns `ENOSYS`.
+    ///
+    /// The default implementation returns `None`.
+    fn tcp_fork(&self) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
