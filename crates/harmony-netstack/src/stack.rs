@@ -137,6 +137,9 @@ impl NetStack {
             dhcp.check_lease(&mut self.iface, &mut self.sockets, now);
         }
 
+        // Reap TCP sockets that have completed their close handshake.
+        self.tcp_reap_closed();
+
         let socket = self.sockets.get_mut::<udp::Socket>(self.udp_handle);
         while socket.can_recv() {
             match socket.recv() {
@@ -153,12 +156,42 @@ impl NetStack {
         self.device.drain_tx()
     }
 
+    /// Remove sockets that have completed their TCP close handshake.
+    /// Called during poll() to clean up finished connections.
+    fn tcp_reap_closed(&mut self) {
+        for (slot, opt_handle) in self.tcp_handles.iter_mut().enumerate() {
+            if let Some(smoltcp_handle) = *opt_handle {
+                let state = self.sockets.get::<tcp::Socket>(smoltcp_handle).state();
+                if state == tcp::State::Closed || state == tcp::State::TimeWait {
+                    let handle = TcpHandle(slot as u32);
+                    if !self.tcp_listen_ports.values().any(|h| *h == handle)
+                        && !self.tcp_bound_ports.contains_key(&handle)
+                    {
+                        self.sockets.remove(smoltcp_handle);
+                        *opt_handle = None;
+                    }
+                }
+            }
+        }
+    }
+
     /// Resolve a `TcpHandle` to the underlying smoltcp `SocketHandle`.
     fn resolve_tcp(&self, handle: TcpHandle) -> Result<SocketHandle, NetError> {
         self.tcp_handles
             .get(handle.0 as usize)
             .and_then(|h| *h)
             .ok_or(NetError::InvalidHandle)
+    }
+
+    /// Immediately remove a TCP socket (used for cleanup in error paths).
+    fn tcp_close_internal(&mut self, handle: TcpHandle) -> Result<(), NetError> {
+        let smoltcp_handle = self.resolve_tcp(handle)?;
+        self.sockets.get_mut::<tcp::Socket>(smoltcp_handle).abort();
+        self.sockets.remove(smoltcp_handle);
+        self.tcp_handles[handle.0 as usize] = None;
+        self.tcp_listen_ports.retain(|_, h| *h != handle);
+        self.tcp_bound_ports.remove(&handle);
+        Ok(())
     }
 }
 
@@ -264,38 +297,47 @@ impl TcpProvider for NetStack {
             .map(|(p, _)| *p)
             .ok_or(NetError::InvalidHandle)?;
 
-        // Remove the old handle's port binding BEFORE creating the replacement
-        // listener, otherwise tcp_bind sees the port as already in use.
+        // Temporarily remove port bookkeeping so the replacement listener can
+        // bind to the same port. If anything fails below, we restore it.
         self.tcp_bound_ports.remove(&handle);
         self.tcp_listen_ports.remove(&port);
 
         // Create a new socket to replace the listener on the same port.
-        let new_listener = self.tcp_create()?;
-        self.tcp_bind(new_listener, port)?;
+        let new_listener = match self.tcp_create() {
+            Ok(h) => h,
+            Err(e) => {
+                // Restore bookkeeping — the original listener is still valid.
+                self.tcp_bound_ports.insert(handle, port);
+                self.tcp_listen_ports.insert(port, handle);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.tcp_bind(new_listener, port) {
+            // Clean up the new socket and restore original listener.
+            let _ = self.tcp_close_internal(new_listener);
+            self.tcp_bound_ports.insert(handle, port);
+            self.tcp_listen_ports.insert(port, handle);
+            return Err(e);
+        }
         let new_smoltcp = self.resolve_tcp(new_listener)?;
-        self.sockets
-            .get_mut::<tcp::Socket>(new_smoltcp)
-            .listen(port)
-            .map_err(|_| NetError::AddrInUse)?;
+        if let Err(e) = self.sockets.get_mut::<tcp::Socket>(new_smoltcp).listen(port) {
+            let _ = self.tcp_close_internal(new_listener);
+            self.tcp_bound_ports.insert(handle, port);
+            self.tcp_listen_ports.insert(port, handle);
+            return Err(NetError::AddrInUse);
+        }
 
-        // Swap: new_listener takes over as the port's listener,
-        // original handle (now Established) becomes the accepted connection.
-        // We swap the smoltcp handles so that:
-        //   - `handle` maps to the NEW listening socket
-        //   - `new_listener` maps to the OLD established socket
-        // This means the original fd (pointing to `handle`) stays a listener,
-        // and the caller gets `new_listener` as the accepted connection.
+        // Swap smoltcp handles so that:
+        //   - `handle` maps to the NEW listening socket (caller's fd stays a listener)
+        //   - `new_listener` maps to the OLD established socket (returned as accepted)
         let old_smoltcp = self.tcp_handles[handle.0 as usize];
         let new_smoltcp_opt = self.tcp_handles[new_listener.0 as usize];
         self.tcp_handles[handle.0 as usize] = new_smoltcp_opt;
         self.tcp_handles[new_listener.0 as usize] = old_smoltcp;
 
-        // Update listen_ports to point to the handle that now holds the new listener socket.
+        // Restore port binding for handle (now the new listener).
+        self.tcp_bound_ports.insert(handle, port);
         self.tcp_listen_ports.insert(port, handle);
-
-        // Update bound_ports: new_listener is now the established connection (no port binding needed),
-        // handle retains its port binding for the new listener socket.
-        self.tcp_bound_ports.remove(&new_listener);
 
         Ok(Some(new_listener))
     }
@@ -353,11 +395,14 @@ impl TcpProvider for NetStack {
 
     fn tcp_close(&mut self, handle: TcpHandle) -> Result<(), NetError> {
         let smoltcp_handle = self.resolve_tcp(handle)?;
-        self.sockets.get_mut::<tcp::Socket>(smoltcp_handle).close();
+        let socket = self.sockets.get_mut::<tcp::Socket>(smoltcp_handle);
+        socket.close();
+        // Remove from listener/port tracking immediately.
         self.tcp_listen_ports.retain(|_, h| *h != handle);
         self.tcp_bound_ports.remove(&handle);
-        self.sockets.remove(smoltcp_handle);
-        self.tcp_handles[handle.0 as usize] = None;
+        // DON'T remove from SocketSet yet — smoltcp needs subsequent poll()
+        // calls to transmit the FIN and complete the TCP close handshake.
+        // The socket will be reaped by tcp_reap_closed() during poll().
         Ok(())
     }
 

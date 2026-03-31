@@ -3182,11 +3182,9 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                     match self.tcp.tcp_send(h, data) {
                         Ok(n) => n as i64,
                         Err(NetError::WouldBlock) => {
-                            if nonblock {
-                                EAGAIN
-                            } else {
-                                0
-                            }
+                            // v1: always return EAGAIN. True blocking requires
+                            // a yield/coroutine mechanism (harmony-os-cqy).
+                            EAGAIN
                         }
                         Err(_) => EPIPE,
                     }
@@ -3309,11 +3307,9 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                     match self.tcp.tcp_recv(h, buf) {
                         Ok(n) => n as i64,
                         Err(NetError::WouldBlock) => {
-                            if nonblock {
-                                EAGAIN
-                            } else {
-                                0
-                            }
+                            // v1: always return EAGAIN. True blocking requires
+                            // a yield/coroutine mechanism (harmony-os-cqy).
+                            EAGAIN
                         }
                         Err(_) => 0, // EOF / error
                     }
@@ -4225,11 +4221,9 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             match self.tcp.tcp_send(h, data) {
                 Ok(n) => n as i64,
                 Err(NetError::WouldBlock) => {
-                    if nonblock {
-                        EAGAIN
-                    } else {
-                        0
-                    }
+                    // v1: always return EAGAIN. True blocking requires
+                    // a yield/coroutine mechanism (harmony-os-cqy).
+                    EAGAIN
                 }
                 Err(_) => EPIPE,
             }
@@ -4263,11 +4257,9 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             match self.tcp.tcp_recv(h, data) {
                 Ok(n) => n as i64,
                 Err(NetError::WouldBlock) => {
-                    if nonblock {
-                        EAGAIN
-                    } else {
-                        0
-                    }
+                    // v1: always return EAGAIN. True blocking requires
+                    // a yield/coroutine mechanism (harmony-os-cqy).
+                    EAGAIN
                 }
                 Err(_) => 0, // EOF / error
             }
