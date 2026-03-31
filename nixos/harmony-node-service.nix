@@ -40,9 +40,9 @@
     };
 
     dataDir = lib.mkOption {
-      type = lib.types.nullOr lib.types.path;
+      type = lib.types.nullOr lib.types.str;
       default = null;
-      description = "Persistent storage directory for CAS books and memos. When null, uses in-memory cache only.";
+      description = "Runtime path for persistent CAS book and memo storage. When null, uses in-memory cache only.";
     };
 
     diskQuota = lib.mkOption {
