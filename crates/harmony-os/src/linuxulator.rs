@@ -4160,7 +4160,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             Ok(id) => id,
             Err(e) => return e,
         };
-        let (tcp_handle, nonblock) = match self.sockets.get(&socket_id) {
+        let (tcp_handle, _nonblock) = match self.sockets.get(&socket_id) {
             Some(s) => (s.tcp_handle, s.nonblock),
             None => return EBADF,
         };
@@ -4211,7 +4211,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             Ok(id) => id,
             Err(e) => return e,
         };
-        let (tcp_handle, nonblock) = match self.sockets.get(&socket_id) {
+        let (tcp_handle, _nonblock) = match self.sockets.get(&socket_id) {
             Some(s) => (s.tcp_handle, s.nonblock),
             None => return EBADF,
         };
@@ -4253,7 +4253,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             Ok(id) => id,
             Err(e) => return e,
         };
-        let (tcp_handle, nonblock) = match self.sockets.get(&socket_id) {
+        let (tcp_handle, _nonblock) = match self.sockets.get(&socket_id) {
             Some(s) => (s.tcp_handle, s.nonblock),
             None => return EBADF,
         };
