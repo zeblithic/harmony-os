@@ -375,10 +375,13 @@ impl TcpProvider for NetStack {
             .get(&handle)
             .copied()
             .unwrap_or_else(|| {
-                let port = self.tcp_next_ephemeral;
-                self.tcp_next_ephemeral = if port == 65535 { 49152 } else { port + 1 };
-                port
+                let p = self.tcp_next_ephemeral;
+                self.tcp_next_ephemeral = if p == 65535 { 49152 } else { p + 1 };
+                p
             });
+        // Track the ephemeral port so tcp_bind can detect conflicts and
+        // tcp_close cleans it up.
+        self.tcp_bound_ports.entry(handle).or_insert(local_port);
         let remote = (IpAddress::Ipv4(addr), port);
         // Both self.iface and self.sockets are separate fields — the borrow
         // checker allows simultaneous mutable borrows of distinct fields.
