@@ -38,6 +38,19 @@
       default = 1024;
       description = "W-TinyLFU cache item capacity";
     };
+
+    dataDir = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = "Persistent storage directory for CAS books and memos. When null, uses in-memory cache only.";
+    };
+
+    diskQuota = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "3.5 TiB";
+      description = "Maximum disk usage for persistent storage (e.g. '3.5 TiB', '500 GiB'). Requires dataDir.";
+    };
   };
 
   config = lib.mkIf config.services.harmony-node.enable {
@@ -49,20 +62,26 @@
 
       serviceConfig = let
         cfg = config.services.harmony-node;
+        dataDirArgs = lib.optionalString (cfg.dataDir != null)
+          " --data-dir ${cfg.dataDir}";
+        diskQuotaArgs = lib.optionalString (cfg.diskQuota != null)
+          " --disk-quota '${cfg.diskQuota}'";
       in {
         Type = "simple";
         DynamicUser = true;
         StateDirectory = "harmony";
-        ExecStart = "${cfg.package}/bin/harmony run --identity-file /var/lib/harmony/id.key --listen-address ${cfg.listenAddress}:${toString cfg.port} --cache-capacity ${toString cfg.cacheCapacity}";
+        ExecStart = "${cfg.package}/bin/harmony run --identity-file /var/lib/harmony/id.key --listen-address ${cfg.listenAddress}:${toString cfg.port} --cache-capacity ${toString cfg.cacheCapacity}${dataDirArgs}${diskQuotaArgs}";
         Restart = "on-failure";
         RestartSec = "5s";
 
-        # Hardening (ReadWritePaths not needed — DynamicUser + StateDirectory
-        # already grants write access to /var/lib/harmony)
+        # Hardening
         ProtectSystem = "strict";
         ProtectHome = true;
         PrivateTmp = true;
         NoNewPrivileges = true;
+      } // lib.optionalAttrs (cfg.dataDir != null) {
+        # Grant write access to the external data directory (outside StateDirectory)
+        ReadWritePaths = [ cfg.dataDir ];
       };
     };
 

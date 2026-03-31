@@ -16,7 +16,31 @@
   services.harmony-node = {
     enable = true;
     package = harmonyNodePkg;
+    dataDir = "/mnt/harmony-data";
+    diskQuota = "3.5 TiB";
   };
+
+  # --- USB SSD auto-mount ---
+  # Auto-mount any USB drive labeled HARMONY-DATA at /mnt/harmony-data.
+  # If no SSD is attached, the mount fails silently (nofail) and
+  # harmony-node starts with in-memory cache only (data-dir won't exist).
+  #
+  # To label a drive:  sudo mkfs.ext4 -L HARMONY-DATA /dev/sdX1
+  fileSystems."/mnt/harmony-data" = {
+    device = "/dev/disk/by-label/HARMONY-DATA";
+    fsType = "ext4";
+    options = [
+      "nofail"           # Don't block boot if SSD is absent
+      "noatime"          # Skip access-time writes (reduces SSD wear)
+      "x-systemd.automount"  # Mount on first access, not at boot
+      "x-systemd.idle-timeout=0"  # Never unmount once mounted
+    ];
+  };
+
+  # Create mount point
+  systemd.tmpfiles.rules = [
+    "d /mnt/harmony-data 0750 root root -"
+  ];
 
   # --- Boot ---
 
