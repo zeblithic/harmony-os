@@ -13,7 +13,7 @@ crates/harmony-test-elf/Cargo.lock
 
 # Dolt database files (added by bd init)
 .dolt/
-.beads/*.db
+.beads/
 
 # Direnv cache
 .direnv/
