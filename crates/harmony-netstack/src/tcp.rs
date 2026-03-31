@@ -4,7 +4,7 @@
 use smoltcp::wire::Ipv4Address;
 
 /// Opaque handle to a TCP socket managed by NetStack.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TcpHandle(pub u32);
 
 /// Simplified TCP socket state for epoll readiness checking.
