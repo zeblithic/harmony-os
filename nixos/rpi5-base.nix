@@ -18,6 +18,7 @@
     package = harmonyNodePkg;
     dataDir = "/mnt/harmony-data";
     diskQuota = "3.5 TiB";
+    nixCachePort = 5000;
   };
 
   # --- USB SSD auto-mount ---

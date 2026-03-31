@@ -51,6 +51,13 @@
       example = "3.5 TiB";
       description = "Maximum disk usage for persistent storage (e.g. '3.5 TiB', '500 GiB'). Requires dataDir.";
     };
+
+    nixCachePort = lib.mkOption {
+      type = lib.types.nullOr lib.types.port;
+      default = null;
+      example = 5000;
+      description = "TCP port for Nix binary cache HTTP server. When set, harmony-node serves narinfo and NAR files. Requires the nix-cache feature in the binary.";
+    };
   };
 
   config = lib.mkIf config.services.harmony-node.enable (let
@@ -60,6 +67,10 @@
       {
         assertion = cfg.diskQuota == null || cfg.dataDir != null;
         message = "services.harmony-node.diskQuota requires services.harmony-node.dataDir to be set.";
+      }
+      {
+        assertion = cfg.nixCachePort == null || cfg.dataDir != null;
+        message = "services.harmony-node.nixCachePort requires services.harmony-node.dataDir to be set (NAR files are stored persistently in the CAS).";
       }
     ];
 
@@ -83,12 +94,14 @@
           " --data-dir '${cfg.dataDir}'";
         diskQuotaArgs = lib.optionalString (cfg.diskQuota != null)
           " --disk-quota '${cfg.diskQuota}'";
+        nixCacheArgs = lib.optionalString (cfg.nixCachePort != null)
+          " --nix-cache-port ${toString cfg.nixCachePort}";
       in {
         Type = "simple";
         User = "harmony-node";
         Group = "harmony-node";
         StateDirectory = "harmony";
-        ExecStart = "${cfg.package}/bin/harmony run --identity-file /var/lib/harmony/id.key --listen-address ${cfg.listenAddress}:${toString cfg.port} --cache-capacity ${toString cfg.cacheCapacity}${dataDirArgs}${diskQuotaArgs}";
+        ExecStart = "${cfg.package}/bin/harmony run --identity-file /var/lib/harmony/id.key --listen-address ${cfg.listenAddress}:${toString cfg.port} --cache-capacity ${toString cfg.cacheCapacity}${dataDirArgs}${diskQuotaArgs}${nixCacheArgs}";
         Restart = "on-failure";
         RestartSec = "5s";
 
@@ -106,5 +119,9 @@
 
     # Open UDP port for Harmony Reticulum (derived from the same port option)
     networking.firewall.allowedUDPPorts = [ cfg.port ];
+
+    # Open TCP port for Nix binary cache HTTP server (if configured)
+    networking.firewall.allowedTCPPorts = lib.mkIf (cfg.nixCachePort != null)
+      [ cfg.nixCachePort ];
   });
 }
