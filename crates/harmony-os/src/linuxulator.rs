@@ -4073,7 +4073,9 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 Ok(Some(accepted_handle)) => {
                     let new_socket_id = self.next_socket_id;
                     self.next_socket_id += 1;
-                    let new_nonblock = flags & SOCK_NONBLOCK != 0 || nonblock;
+                    // Per Linux accept4 semantics, the accepted socket's blocking
+                    // mode is determined solely by flags, not inherited from the listener.
+                    let new_nonblock = flags & SOCK_NONBLOCK != 0;
                     self.sockets.insert(
                         new_socket_id,
                         SocketState {
