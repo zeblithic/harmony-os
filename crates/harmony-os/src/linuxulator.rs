@@ -6650,6 +6650,53 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         const SEEK_CUR: i32 = 1;
         const SEEK_END: i32 = 2;
 
+        // Handle EmbeddedFile lseek — these are seekable regular files.
+        if let Some(FdEntry {
+            kind:
+                FdKind::EmbeddedFile {
+                    ref path,
+                    offset: cur_offset,
+                },
+            ..
+        }) = self.fd_table.get(&fd)
+        {
+            let file_size = self
+                .embedded_fs
+                .as_ref()
+                .and_then(|efs| efs.get(path))
+                .map(|f| f.data.len() as i64)
+                .unwrap_or(0);
+            let cur = *cur_offset as i64;
+            let new_offset = match whence {
+                SEEK_SET => offset,
+                SEEK_CUR => match cur.checked_add(offset) {
+                    Some(v) => v,
+                    None => return EOVERFLOW,
+                },
+                SEEK_END => match file_size.checked_add(offset) {
+                    Some(v) => v,
+                    None => return EOVERFLOW,
+                },
+                _ => return EINVAL,
+            };
+            if new_offset < 0 {
+                return EINVAL;
+            }
+            // Update offset — need to re-borrow mutably.
+            if let Some(FdEntry {
+                kind:
+                    FdKind::EmbeddedFile {
+                        offset: ref mut off,
+                        ..
+                    },
+                ..
+            }) = self.fd_table.get_mut(&fd)
+            {
+                *off = new_offset as u64;
+            }
+            return new_offset;
+        }
+
         let (entry_fid, entry_offset, entry_file_type) = match self.fd_table.get(&fd) {
             Some(FdEntry {
                 kind:
