@@ -121,20 +121,37 @@ unsafe extern "C" fn rust_syscall_handler(
 #[no_mangle]
 extern "C" fn syscall_entry() {
     naked_asm!(
-        // Save registers that sysretq needs and callee-saved regs
-        "push rcx",          // return RIP
-        "push r11",          // return RFLAGS
+        // ── Save ALL registers preserved by the Linux syscall ABI ──
+        //
+        // The `syscall` instruction only clobbers RAX (return value),
+        // RCX (saved RIP), and R11 (saved RFLAGS). The kernel must
+        // preserve everything else: RBX, RBP, RSP, R12-R15 (callee-saved)
+        // AND RDI, RSI, RDX, R8, R9, R10 (argument registers that
+        // userspace expects to survive the syscall).
+        //
+        // We save RCX/R11 for sysretq, and all caller-saved argument
+        // registers because rust_syscall_handler (SysV) will clobber them.
+        "push rcx",          // return RIP (saved by syscall hw)
+        "push r11",          // return RFLAGS (saved by syscall hw)
         "push rbx",
         "push rbp",
         "push r12",
         "push r13",
         "push r14",
         "push r15",
+        // Argument registers — must survive the Rust call
+        "push rdi",          // a1
+        "push rsi",          // a2
+        "push rdx",          // a3
+        "push r10",          // a4
+        "push r8",           // a5
+        "push r9",           // a6
 
         // Force 16-byte stack alignment for SysV ABI.
-        // User RSP may not be aligned when syscall fires.
-        // Save original RSP, align, and restore after the call.
-        "mov rbp, rsp",      // save original RSP in rbp (already saved above)
+        // 14 pushes (14*8 = 112 bytes) = even, so if RSP was 16-aligned
+        // before the first push, it's still 16-aligned now.
+        // But user RSP may not be aligned, so force it.
+        "mov rbp, rsp",      // save frame pointer
         "and rsp, -16",      // force 16-byte alignment
 
         // Set up arguments for rust_syscall_handler(nr, a1, a2, a3, a4, a5, a6)
@@ -142,8 +159,8 @@ extern "C" fn syscall_entry() {
         //
         // Current:  RAX=nr, RDI=a1, RSI=a2, RDX=a3, R10=a4, R8=a5, R9=a6
         // Need:     RDI=nr, RSI=a1, RDX=a2, RCX=a3, R8=a4, R9=a5, [stack]=a6
-        "sub rsp, 8",        // alignment: aligned - 8 - 8(a6) = aligned - 16, then call pushes 8 → -24 mod 16 = 8...
-        "push r9",           // a6 as 7th stack arg at [rsp]
+        "sub rsp, 8",        // alignment padding
+        "push r9",           // a6 as 7th stack arg
 
         // Shuffle registers: Linux ABI → SysV calling convention
         "mov r9, r8",        // r9 = a5
@@ -155,10 +172,18 @@ extern "C" fn syscall_entry() {
 
         "call rust_syscall_handler",
 
-        // Return value is in RAX. Restore original RSP.
+        // Return value is in RAX. Restore frame pointer / stack.
         "mov rsp, rbp",
 
-        // Restore callee-saved registers
+        // ── Restore ALL saved registers ──
+        // Argument registers (in reverse push order)
+        "pop r9",
+        "pop r8",
+        "pop r10",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        // Callee-saved registers
         "pop r15",
         "pop r14",
         "pop r13",
@@ -168,15 +193,10 @@ extern "C" fn syscall_entry() {
         "pop r11",           // return RFLAGS
         "pop rcx",           // return RIP
 
-        // Restore RFLAGS from R11 (syscall saved original RFLAGS there,
-        // and FMASK cleared IF on entry — must re-enable interrupts).
-        "push r11",
-        "popfq",
+        // Keep IF disabled (no IDT for hardware interrupts).
+        "cli",
 
-        // In our flat Ring 0 MVP (no privilege separation), we use jmp
-        // instead of sysretq. sysretq forces RPL=3 on CS which requires
-        // valid Ring 3 GDT entries and user-accessible page mappings.
-        // Since everything runs in Ring 0, a simple jmp is correct.
+        // jmp back to caller
         "jmp rcx",
     );
 }

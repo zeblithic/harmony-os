@@ -23,6 +23,15 @@ fn main() {
             build_image();
             run_qemu();
         }
+        Some("build-image-ring3") => {
+            build_kernel_with_features(&["ring3"]);
+            build_image();
+        }
+        Some("run-ring3") => {
+            build_kernel_with_features(&["ring3"]);
+            build_image();
+            run_qemu();
+        }
         Some("qemu-test") => {
             qemu_test::run(&args[2..]);
         }
@@ -34,6 +43,7 @@ fn main() {
             eprintln!("  build-image       Build kernel + bootable BIOS disk image");
             eprintln!("  build-image-test  Build kernel with qemu-test feature + disk image");
             eprintln!("  run               Build image + launch QEMU");
+            eprintln!("  run-ring3         Build with ring3 (Linuxulator) + launch QEMU with networking");
             eprintln!("  qemu-test         Build + boot both architectures, verify serial milestones");
             std::process::exit(1);
         }
@@ -107,6 +117,14 @@ fn run_qemu() {
             "isa-debug-exit,iobase=0xf4,iosize=0x04",
             "-cpu",
             "qemu64,+rdrand",
+            "-m",
+            "256M",
+            // VirtIO NIC with user-mode networking (matches kernel's 10.0.2.x config).
+            // Port-forward host 2222 → guest 2222 for SSH testing.
+            "-netdev",
+            "user,id=net0,hostfwd=tcp::2222-:2222",
+            "-device",
+            "virtio-net-pci,netdev=net0",
         ])
         .status()
         .expect("failed to launch QEMU — is qemu-system-x86_64 installed?");

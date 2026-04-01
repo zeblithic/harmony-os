@@ -6,6 +6,7 @@
 
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 
 extern crate alloc;
 
@@ -33,14 +34,17 @@ use harmony_unikernel::{KernelEntropy, MemoryState, RuntimeAction, UnikernelRunt
 // Embedded SSH userspace binaries (ring3 only)
 // ---------------------------------------------------------------------------
 
+// Embedded SSH userspace binaries — architecture selected at compile time.
+// harmony-boot targets x86_64-unknown-none (QEMU), harmony-boot-aarch64
+// targets aarch64-unknown-uefi (RPi5). Each includes matching static musl
+// binaries so the Linuxulator can exec them.
 #[cfg(feature = "ring3")]
-static DROPBEAR_BIN: &[u8] = include_bytes!("../../../deploy/dropbear-aarch64");
+static DROPBEAR_BIN: &[u8] = include_bytes!("../../../deploy/dropbear-x86_64");
 #[cfg(feature = "ring3")]
-static BUSYBOX_BIN: &[u8] = include_bytes!("../../../deploy/busybox-aarch64");
-// No host key embedded — when dropbear is wired as init (Task 5 / QEMU
-// testing), it MUST be invoked with `-R` to generate an ephemeral key on
-// first connection. Without `-R` and without a key file, dropbear refuses
-// to start. Production key provisioning tracked under harmony-os-g7v.
+static BUSYBOX_BIN: &[u8] = include_bytes!("../../../deploy/busybox-x86_64");
+// No host key embedded — dropbear MUST be invoked with `-R` to generate an
+// ephemeral key on first connection. Without `-R` and without a key file,
+// dropbear refuses to start. Production key provisioning: harmony-os-g7v.
 
 use virtio::net::ETH_HEADER_LEN;
 
@@ -210,6 +214,126 @@ fn rdrand_available() -> bool {
         );
     }
     ecx & (1 << 30) != 0
+}
+
+// ---------------------------------------------------------------------------
+// Page table NX fixup
+// ---------------------------------------------------------------------------
+
+/// Map an ELF's linked virtual addresses to the physical memory where its
+/// segments were loaded.
+///
+/// A static non-PIE binary has absolute virtual addresses baked into the
+/// code (GOT, init arrays, data references). If we load the segments into
+/// heap memory at a different virtual address, any absolute reference
+/// faults. This function creates page-table entries so the ELF's linked
+/// addresses (`seg.vaddr`) resolve to the physical frames backing our
+/// heap copy.
+///
+/// Also clears NX on executable segments so the CPU can fetch instructions.
+///
+/// # Safety
+/// - Must be called in Ring 0.
+/// - `phys_offset` must be the bootloader's physical-to-virtual mapping offset.
+/// - `heap_base_virt` is the virtual address of the contiguous heap allocation
+///   holding all loaded segments at offsets `seg.vaddr - vaddr_min`.
+#[cfg(feature = "ring3")]
+unsafe fn map_elf_at_linked_addresses(
+    phys_offset: u64,
+    heap_base_virt: usize,
+    vaddr_min: u64,
+    vaddr_max: u64,
+    segments: &[harmony_os::elf::ElfSegment],
+) -> usize {
+    const PRESENT: u64 = 1;
+    const WRITABLE: u64 = 1 << 1;
+    const NX_BIT: u64 = 1 << 63;
+    const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+    const PAGE_SIZE: usize = 0x1000;
+
+    let cr3: u64;
+    core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+    let pml4_phys = cr3 & ADDR_MASK;
+    let pml4 = (pml4_phys + phys_offset) as *mut u64;
+
+    // Helper: allocate a zeroed, PAGE-ALIGNED 4 KiB page for an intermediate
+    // page table. The CPU reads the table address from bits 12-51 of the
+    // entry — if the physical address isn't page-aligned, the hardware
+    // truncates the low bits and reads the wrong memory.
+    let mut alloc_pt_page = || -> (usize, u64) {
+        let layout = core::alloc::Layout::from_size_align(PAGE_SIZE, PAGE_SIZE)
+            .expect("page table layout");
+        let ptr = alloc::alloc::alloc_zeroed(layout);
+        assert!(!ptr.is_null(), "page table allocation failed");
+        let virt = ptr as usize;
+        let phys = virt as u64 - phys_offset;
+        (virt, phys)
+    };
+
+    // Helper: ensure an entry at the given page-table level exists and
+    // points to a sub-table. Returns the virtual address of the sub-table.
+    let ensure_table =
+        |entry: *mut u64, alloc: &mut dyn FnMut() -> (usize, u64)| -> *mut u64 {
+            let val = core::ptr::read_volatile(entry);
+            if val & PRESENT != 0 {
+                // Entry exists — return pointer to sub-table
+                ((val & ADDR_MASK) + phys_offset) as *mut u64
+            } else {
+                // Allocate new sub-table
+                let (virt, phys) = alloc();
+                core::ptr::write_volatile(entry, phys | PRESENT | WRITABLE);
+                virt as *mut u64
+            }
+        };
+
+    let mut mapped = 0usize;
+    let start_page = vaddr_min & !(PAGE_SIZE as u64 - 1);
+    let end_page = (vaddr_max + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
+
+    let mut vaddr = start_page;
+    while vaddr < end_page {
+        let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+        let pml3_idx = ((vaddr >> 30) & 0x1FF) as usize;
+        let pml2_idx = ((vaddr >> 21) & 0x1FF) as usize;
+        let pml1_idx = ((vaddr >> 12) & 0x1FF) as usize;
+
+        // Walk/create intermediate tables
+        let pml3 = ensure_table(pml4.add(pml4_idx), &mut alloc_pt_page);
+        let pml2 = ensure_table(pml3.add(pml3_idx), &mut alloc_pt_page);
+        let pml1 = ensure_table(pml2.add(pml2_idx), &mut alloc_pt_page);
+
+        // Compute the physical address of the heap byte backing this virtual page.
+        // heap_base_virt + (vaddr - vaddr_min) is the virtual addr in the heap mapping.
+        // Subtract phys_offset to get the physical address.
+        let heap_virt_for_page = heap_base_virt as u64 + (vaddr - vaddr_min);
+        let phys_addr = heap_virt_for_page - phys_offset;
+
+        // Determine flags from segment permissions
+        let mut flags = PRESENT | WRITABLE; // default RW
+        // Check if any executable segment covers this page
+        let page_end = vaddr + PAGE_SIZE as u64;
+        let mut is_exec = false;
+        for seg in segments {
+            let seg_start = seg.vaddr;
+            let seg_end = seg.vaddr + seg.memsz;
+            if seg_start < page_end && seg_end > vaddr && seg.flags.execute {
+                is_exec = true;
+                break;
+            }
+        }
+        if !is_exec {
+            flags |= NX_BIT;
+        }
+
+        core::ptr::write_volatile(pml1.add(pml1_idx), phys_addr | flags);
+        mapped += 1;
+        vaddr += PAGE_SIZE as u64;
+    }
+
+    // Flush TLB
+    core::arch::asm!("mov {0}, cr3", "mov cr3, {0}", out(reg) _, options(nostack));
+
+    mapped
 }
 
 // ---------------------------------------------------------------------------
@@ -411,7 +535,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // 3. Heap init — find first usable region >= 4 MiB
     //    (2MB kernel stack + 2MB runtime allocations)
-    const MIN_HEAP_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
+    const MIN_HEAP_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
     let mut heap_start: Option<u64> = None;
     let mut heap_size: usize = 0;
 
@@ -420,8 +544,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let size = (region.end - region.start) as usize;
             if size >= MIN_HEAP_SIZE {
                 heap_start = Some(region.start);
-                heap_size = if size > 4 * 1024 * 1024 {
-                    4 * 1024 * 1024
+                heap_size = if size > 16 * 1024 * 1024 {
+                    16 * 1024 * 1024
                 } else {
                     size
                 };
@@ -712,8 +836,8 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             }
         }
 
-        // 1. Load ELF
-        let elf_bytes = include_bytes!("../test-bins/hello.elf");
+        // 1. Load ELF (dropbear — arch-specific binary selected at top of file)
+        let elf_bytes = DROPBEAR_BIN;
         let parsed = match parse_elf(elf_bytes) {
             Ok(p) => p,
             Err(e) => {
@@ -725,7 +849,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         };
         let _ = writeln!(
             serial,
-            "[LINUX] loaded hello.elf ({} bytes, {} segments)",
+            "[LINUX] loaded dropbear ({} bytes, {} segments)",
             elf_bytes.len(),
             parsed.segments.len()
         );
@@ -759,8 +883,12 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                 }
             }
         };
+        // Add 16 KiB of headroom beyond the ELF's declared memsz. musl's
+        // static TLS struct (struct pthread, ~1-2 KiB) lives at the tail
+        // of .bss and may extend beyond the last segment's vaddr+memsz.
+        const ELF_HEADROOM: usize = 16 * 1024;
         let total_size = match vaddr_max.checked_sub(vaddr_min) {
-            Some(sz) => sz as usize,
+            Some(sz) => sz as usize + ELF_HEADROOM,
             None => {
                 let _ = writeln!(serial, "[LINUX] vaddr range overflow");
                 loop {
@@ -768,7 +896,19 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                 }
             }
         };
-        let mut mem = alloc::vec![0u8; total_size];
+        // Allocate with PAGE alignment (4 KiB). The page-table mapping
+        // assumes page offsets match between the ELF's linked addresses
+        // (e.g. 0x400000, page offset 0x000) and the heap allocation.
+        // A non-page-aligned allocation would shift the within-page
+        // offsets, causing reads to hit wrong bytes.
+        let mem_layout = core::alloc::Layout::from_size_align(total_size, 0x1000)
+            .expect("ELF mem layout");
+        let mem_ptr = unsafe { alloc::alloc::alloc_zeroed(mem_layout) };
+        if mem_ptr.is_null() {
+            let _ = writeln!(serial, "[LINUX] failed to allocate {} bytes (page-aligned)", total_size);
+            loop { x86_64::instructions::hlt(); }
+        }
+        let mut mem = unsafe { core::slice::from_raw_parts_mut(mem_ptr, total_size) };
 
         // Load each segment at its correct offset within the allocation
         for seg in &parsed.segments {
@@ -778,25 +918,43 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                 .copy_from_slice(&elf_bytes[seg.offset as usize..seg.offset as usize + filesz]);
         }
 
-        // Compute entry point with checked arithmetic
-        let real_entry = match parsed.entry_point.checked_sub(vaddr_min) {
-            Some(offset) if (offset as usize) < total_size => {
-                mem.as_ptr() as usize + offset as usize
+        // Validate entry point
+        if parsed.entry_point < vaddr_min || parsed.entry_point >= vaddr_max {
+            let _ = writeln!(
+                serial,
+                "[LINUX] entry_point 0x{:x} outside segment range 0x{:x}..0x{:x}",
+                parsed.entry_point, vaddr_min, vaddr_max
+            );
+            loop {
+                x86_64::instructions::hlt();
             }
-            Some(_) => {
-                let _ = writeln!(serial, "[LINUX] entry_point beyond loaded region");
-                loop {
-                    x86_64::instructions::hlt();
-                }
-            }
-            None => {
-                let _ = writeln!(serial, "[LINUX] entry_point < vaddr_min");
-                loop {
-                    x86_64::instructions::hlt();
-                }
-            }
+        }
+
+        // 2b. Map ELF at its linked virtual addresses.
+        //
+        // The binary is a static non-PIE (ET_EXEC) with absolute addresses
+        // baked into the code. We loaded its data into a heap allocation,
+        // but the code expects to run at its linked addresses (e.g. 0x400000+).
+        // Create page-table entries so the linked addresses map to the heap
+        // frames containing the actual data.
+        let mapped_pages = unsafe {
+            map_elf_at_linked_addresses(
+                phys_offset,
+                mem.as_ptr() as usize,
+                vaddr_min,
+                vaddr_max + ELF_HEADROOM as u64,
+                &parsed.segments,
+            )
         };
-        let _ = writeln!(serial, "[LINUX] entry=0x{:x} stack=<pending>", real_entry);
+
+        // Use the ELF's original linked entry point — the page tables now
+        // resolve it to our heap copy.
+        let real_entry = parsed.entry_point as usize;
+        let _ = writeln!(
+            serial,
+            "[LINUX] mapped {} pages at linked addresses 0x{:x}..0x{:x}, entry=0x{:x}",
+            mapped_pages, vaddr_min, vaddr_max, real_entry
+        );
 
         // 3. Allocate stack
         let stack_size = 64 * 1024; // 64 KiB
@@ -814,9 +972,10 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         //       after this block will race with the Linuxulator's TCP calls.
         static mut LINUXULATOR: Option<Linuxulator<DirectBackend, RawPtrTcpProvider>> = None;
         unsafe {
-            LINUXULATOR = Some(Linuxulator::with_tcp(
+            LINUXULATOR = Some(Linuxulator::with_tcp_and_arena(
                 DirectBackend::new(),
                 RawPtrTcpProvider(netstack.as_ptr()),
+                4 * 1024 * 1024, // 4 MiB arena — dropbear needs room for TLS + heap
             ));
             LINUXULATOR
                 .as_mut()
@@ -891,17 +1050,161 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             syscall::setup_msrs(0x08, 0x00);
         }
 
-        serial.log("LINUX", "jumping to ELF entry point");
+        // 9. Set up Linux stack ABI and jump to dropbear.
+        //
+        // musl's _start expects the System V AMD64 initial stack layout:
+        //   RSP+0:  argc
+        //   RSP+8:  argv[0] → "/bin/dropbear\0"
+        //   ...     argv[1..argc-1]
+        //   RSP+?:  NULL (argv terminator)
+        //   RSP+?:  NULL (envp terminator — no environment variables)
+        //   RSP+?:  AT_PHDR (3), <addr> — program header table address
+        //   RSP+?:  AT_PHENT (4), 56  — program header entry size
+        //   RSP+?:  AT_PHNUM (5), <n> — number of program headers
+        //   RSP+?:  AT_PAGESZ (6), 4096 — musl needs this for mmap alignment
+        //   RSP+?:  AT_ENTRY (9), <entry> — entry point
+        //   RSP+?:  AT_NULL (0), 0     — auxiliary vector terminator
+        //
+        // The argv strings are placed below the pointer table on the stack.
+        // dropbear flags: -R (ephemeral host key), -F (foreground), -E (log
+        // to stderr), -p 2222 (listen port).
+        let argv_strings: &[&[u8]] = &[
+            b"/bin/dropbear\0",
+            b"-R\0",
+            b"-F\0",
+            b"-E\0",
+            b"-p\0",
+            b"2222\0",
+        ];
+        let argc = argv_strings.len();
 
-        // 9. Jump to the binary
-        // Set RSP to stack_top and jump to entry. When the binary calls
+        // Write strings into the top of the stack, then build the pointer table
+        // below them. We work downward from stack_top.
+        let mut str_ptr = stack_top;
+
+        // Phase 1: copy strings onto the stack, collecting their addresses.
+        let mut argv_ptrs = alloc::vec::Vec::with_capacity(argc);
+        for s in argv_strings {
+            str_ptr -= s.len();
+            str_ptr &= !0x7; // align to 8 bytes
+            unsafe {
+                core::ptr::copy_nonoverlapping(s.as_ptr(), str_ptr as *mut u8, s.len());
+            }
+            argv_ptrs.push(str_ptr as u64);
+        }
+
+        // Phase 2: build the initial stack frame below the strings.
+        // Layout (growing downward):
+        //   [auxv: PHDR,PHENT,PHNUM,PAGESZ,ENTRY,NULL] (12 × 8 = 96 bytes)
+        //   [envp NULL terminator]                 (1 × 8 = 8 bytes)
+        //   [argv NULL terminator]                 (1 × 8 = 8 bytes)
+        //   [argv pointers]                        (argc × 8 bytes)
+        //   [argc]                                 (1 × 8 = 8 bytes)
+        let auxv_pairs = 5 + 1; // 5 real entries + AT_NULL terminator
+        let frame_slots = 1 + argc + 1 + 1 + auxv_pairs * 2;
+        let frame_base = (str_ptr - frame_slots * 8) & !0xF; // 16-byte aligned
+
+        unsafe {
+            let mut p = frame_base as *mut u64;
+            // argc
+            *p = argc as u64;
+            p = p.add(1);
+            // argv pointers
+            for ptr in &argv_ptrs {
+                *p = *ptr;
+                p = p.add(1);
+            }
+            // argv NULL terminator
+            *p = 0;
+            p = p.add(1);
+            // envp NULL terminator
+            *p = 0;
+            p = p.add(1);
+            // Auxiliary vector — musl scans these to find program headers,
+            // page size, and entry point. Without AT_PHDR/AT_PHNUM, musl
+            // cannot find PT_TLS and computes garbage TLS sizes.
+            // AT_PHDR (3) — address of program header table
+            *p = 3; p = p.add(1);
+            *p = vaddr_min + parsed.phdr_offset; p = p.add(1);
+            // AT_PHENT (4) — size of one program header entry
+            *p = 4; p = p.add(1);
+            *p = parsed.phdr_entry_size as u64; p = p.add(1);
+            // AT_PHNUM (5) — number of program headers
+            *p = 5; p = p.add(1);
+            *p = parsed.phdr_count as u64; p = p.add(1);
+            // AT_PAGESZ (6)
+            *p = 6; p = p.add(1);
+            *p = 4096; p = p.add(1);
+            // AT_ENTRY (9) — original entry point
+            *p = 9; p = p.add(1);
+            *p = parsed.entry_point; p = p.add(1);
+            // AT_NULL (0) — terminator
+            *p = 0; p = p.add(1);
+            *p = 0;
+        }
+
+        let _ = writeln!(
+            serial,
+            "[LINUX] stack ABI: argc={}, argv[0]={:#x}, frame={:#x}",
+            argc, argv_ptrs[0], frame_base
+        );
+        // Diagnostic: dump addressing info to verify the mapping.
+        let entry_offset = (parsed.entry_point - vaddr_min) as usize;
+        let heap_entry_virt = mem.as_ptr() as usize + entry_offset;
+        let heap_entry_phys = heap_entry_virt as u64 - phys_offset;
+        // Enable SSE/SSE2 — musl uses XMM registers for memset/memcpy.
+        // CR0: clear EM (bit 2) = no x87 emulation, set MP (bit 1)
+        // CR4: set OSFXSR (bit 9) = enable FXSAVE/FXRSTOR + SSE
+        //      set OSXMMEXCPT (bit 10) = enable #XM for unmasked SSE exceptions
+        unsafe {
+            core::arch::asm!(
+                "mov rax, cr0",
+                "and ax, 0xFFFB",   // clear EM (bit 2)
+                "or ax, 0x2",       // set MP (bit 1)
+                "mov cr0, rax",
+                "mov rax, cr4",
+                "or ax, 0x600",     // set OSFXSR (bit 9) + OSXMMEXCPT (bit 10)
+                "mov cr4, rax",
+                out("rax") _,
+                options(nostack),
+            );
+        }
+        serial.log("SSE", "enabled (CR0.EM=0, CR4.OSFXSR=1)");
+
+        // Install a minimal IDT with a page-fault handler that prints CR2
+        // to serial before halting. This replaces the bootloader's default
+        // IDT which just triple-faults on #PF.
+        {
+            use x86_64::structures::idt::InterruptDescriptorTable;
+
+            static mut IDT: InterruptDescriptorTable = InterruptDescriptorTable::new();
+            unsafe {
+                IDT.page_fault.set_handler_fn(page_fault_handler);
+                IDT.general_protection_fault.set_handler_fn(gpf_handler);
+                IDT.double_fault.set_handler_fn(double_fault_handler);
+                IDT.load();
+            }
+            serial.log("IDT", "installed #PF/#GP/#DF handlers");
+        }
+
+        serial.log("LINUX", "jumping to dropbear entry point");
+
+        // Mask all PIC interrupts before entering userspace. There is no
+        // proper IDT for hardware interrupts; if the syscall trampoline
+        // re-enables IF via popfq, the next PIT tick would triple-fault.
+        unsafe {
+            Port::<u8>::new(0x21).write(0xFF); // master PIC: mask all IRQs
+            Port::<u8>::new(0xA1).write(0xFF); // slave PIC: mask all IRQs
+        }
+
+        // Set RSP to the prepared frame and jump. When the binary calls
         // `syscall`, the CPU will vector to syscall_entry via LSTAR.
         // After exit_group, we check the flag and continue.
         unsafe {
             core::arch::asm!(
                 "mov rsp, {stack}",
                 "jmp {entry}",
-                stack = in(reg) stack_top,
+                stack = in(reg) frame_base,
                 entry = in(reg) real_entry,
                 options(noreturn),
             );
@@ -996,6 +1299,79 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
 
         core::hint::spin_loop();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Exception handlers (for debugging userspace faults)
+// ---------------------------------------------------------------------------
+
+/// Write a hex value to serial (COM1) using direct port I/O.
+/// Safe to call from exception handlers where normal logging may not work.
+fn serial_write_hex(val: u64) {
+    let write_byte = |b: u8| {
+        unsafe {
+            while Port::<u8>::new(0x3F8 + 5).read() & 0x20 == 0 {
+                core::hint::spin_loop();
+            }
+            Port::new(0x3F8).write(b);
+        }
+    };
+    for &b in b"0x" { write_byte(b); }
+    for shift in (0..16).rev() {
+        let nibble = ((val >> (shift * 4)) & 0xF) as u8;
+        write_byte(if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 });
+    }
+}
+
+fn serial_write_str(s: &[u8]) {
+    for &b in s {
+        unsafe {
+            while Port::<u8>::new(0x3F8 + 5).read() & 0x20 == 0 {
+                core::hint::spin_loop();
+            }
+            Port::new(0x3F8).write(b);
+        }
+    }
+}
+
+use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
+
+extern "x86-interrupt" fn page_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: PageFaultErrorCode,
+) {
+    let cr2: u64;
+    unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2) };
+    serial_write_str(b"\n[#PF] addr=");
+    serial_write_hex(cr2);
+    serial_write_str(b" code=");
+    serial_write_hex(error_code.bits() as u64);
+    serial_write_str(b" rip=");
+    serial_write_hex(stack_frame.instruction_pointer.as_u64());
+    serial_write_str(b"\n");
+    loop { x86_64::instructions::hlt(); }
+}
+
+extern "x86-interrupt" fn gpf_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) {
+    serial_write_str(b"\n[#GP] code=");
+    serial_write_hex(error_code);
+    serial_write_str(b" rip=");
+    serial_write_hex(stack_frame.instruction_pointer.as_u64());
+    serial_write_str(b"\n");
+    loop { x86_64::instructions::hlt(); }
+}
+
+extern "x86-interrupt" fn double_fault_handler(
+    stack_frame: InterruptStackFrame,
+    _error_code: u64,
+) -> ! {
+    serial_write_str(b"\n[#DF] rip=");
+    serial_write_hex(stack_frame.instruction_pointer.as_u64());
+    serial_write_str(b"\n");
+    loop { x86_64::instructions::hlt(); }
 }
 
 // ---------------------------------------------------------------------------

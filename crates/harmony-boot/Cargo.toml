@@ -17,7 +17,7 @@ harmony-netstack = { path = "../harmony-netstack", default-features = false }
 smoltcp = { version = "0.11", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-udp", "alloc"] }
 bootloader_api = "0.11"
 linked_list_allocator = "0.10"
-x86_64 = { version = "0.15", default-features = false, features = ["instructions"] }
+x86_64 = { version = "0.15", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
 
 # Ring 2 microkernel (optional — only with `ring2` feature)
 harmony-microkernel = { path = "../harmony-microkernel", default-features = false, optional = true }
