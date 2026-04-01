@@ -213,6 +213,181 @@ fn qemu_debug_exit(value: u32) {
 }
 
 // ---------------------------------------------------------------------------
+// RefCell-based TCP provider for shared NetStack access
+// ---------------------------------------------------------------------------
+
+/// Wraps a `&RefCell<NetStack>` and implements `TcpProvider` by borrowing
+/// on each call. Provided for future use when a scoped (non-static) Linuxulator
+/// is constructed in the event loop path.
+#[allow(dead_code)]
+struct RefCellTcpProvider<'a>(&'a core::cell::RefCell<harmony_netstack::NetStack>);
+
+impl<'a> harmony_netstack::TcpProvider for RefCellTcpProvider<'a> {
+    fn tcp_create(&mut self) -> Result<harmony_netstack::TcpHandle, harmony_netstack::NetError> {
+        self.0.borrow_mut().tcp_create()
+    }
+    fn tcp_bind(
+        &mut self,
+        h: harmony_netstack::TcpHandle,
+        port: u16,
+    ) -> Result<(), harmony_netstack::NetError> {
+        self.0.borrow_mut().tcp_bind(h, port)
+    }
+    fn tcp_listen(
+        &mut self,
+        h: harmony_netstack::TcpHandle,
+        backlog: usize,
+    ) -> Result<(), harmony_netstack::NetError> {
+        self.0.borrow_mut().tcp_listen(h, backlog)
+    }
+    fn tcp_accept(
+        &mut self,
+        h: harmony_netstack::TcpHandle,
+    ) -> Result<Option<harmony_netstack::TcpHandle>, harmony_netstack::NetError> {
+        self.0.borrow_mut().tcp_accept(h)
+    }
+    fn tcp_connect(
+        &mut self,
+        h: harmony_netstack::TcpHandle,
+        addr: smoltcp::wire::Ipv4Address,
+        port: u16,
+    ) -> Result<(), harmony_netstack::NetError> {
+        self.0.borrow_mut().tcp_connect(h, addr, port)
+    }
+    fn tcp_send(
+        &mut self,
+        h: harmony_netstack::TcpHandle,
+        data: &[u8],
+    ) -> Result<usize, harmony_netstack::NetError> {
+        self.0.borrow_mut().tcp_send(h, data)
+    }
+    fn tcp_recv(
+        &mut self,
+        h: harmony_netstack::TcpHandle,
+        buf: &mut [u8],
+    ) -> Result<usize, harmony_netstack::NetError> {
+        self.0.borrow_mut().tcp_recv(h, buf)
+    }
+    fn tcp_close(
+        &mut self,
+        h: harmony_netstack::TcpHandle,
+    ) -> Result<(), harmony_netstack::NetError> {
+        self.0.borrow_mut().tcp_close(h)
+    }
+    fn tcp_state(&self, h: harmony_netstack::TcpHandle) -> harmony_netstack::TcpSocketState {
+        self.0.borrow().tcp_state(h)
+    }
+    fn tcp_can_recv(&self, h: harmony_netstack::TcpHandle) -> bool {
+        self.0.borrow().tcp_can_recv(h)
+    }
+    fn tcp_can_send(&self, h: harmony_netstack::TcpHandle) -> bool {
+        self.0.borrow().tcp_can_send(h)
+    }
+    fn tcp_poll(&mut self, now_ms: i64) {
+        self.0.borrow_mut().tcp_poll(now_ms)
+    }
+    fn tcp_fork(&self) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        // RefCell wrapper holds a reference — cannot be forked.
+        None
+    }
+}
+
+/// Wraps a raw `*mut NetStack` and implements `TcpProvider`.
+///
+/// Used only in the ring3 `static mut LINUXULATOR` where a `'static` bound
+/// is required and a reference-based wrapper cannot satisfy it. The raw
+/// pointer is valid for the entire boot lifetime because `netstack` is a
+/// local variable in `kernel_continue` which never returns.
+///
+/// # Safety invariant
+/// The caller must ensure the pointer remains valid and no aliasing mutable
+/// borrows coexist with calls to this type. In practice this is guaranteed
+/// because the ring3 path exits via `jmp` (noreturn) before the event loop
+/// that also touches the netstack, so the two code paths never interleave.
+#[cfg(feature = "ring3")]
+struct RawPtrTcpProvider(*mut harmony_netstack::NetStack);
+
+#[cfg(feature = "ring3")]
+unsafe impl Send for RawPtrTcpProvider {}
+
+#[cfg(feature = "ring3")]
+impl harmony_netstack::TcpProvider for RawPtrTcpProvider {
+    fn tcp_create(&mut self) -> Result<harmony_netstack::TcpHandle, harmony_netstack::NetError> {
+        unsafe { (*self.0).tcp_create() }
+    }
+    fn tcp_bind(
+        &mut self,
+        h: harmony_netstack::TcpHandle,
+        port: u16,
+    ) -> Result<(), harmony_netstack::NetError> {
+        unsafe { (*self.0).tcp_bind(h, port) }
+    }
+    fn tcp_listen(
+        &mut self,
+        h: harmony_netstack::TcpHandle,
+        backlog: usize,
+    ) -> Result<(), harmony_netstack::NetError> {
+        unsafe { (*self.0).tcp_listen(h, backlog) }
+    }
+    fn tcp_accept(
+        &mut self,
+        h: harmony_netstack::TcpHandle,
+    ) -> Result<Option<harmony_netstack::TcpHandle>, harmony_netstack::NetError> {
+        unsafe { (*self.0).tcp_accept(h) }
+    }
+    fn tcp_connect(
+        &mut self,
+        h: harmony_netstack::TcpHandle,
+        addr: smoltcp::wire::Ipv4Address,
+        port: u16,
+    ) -> Result<(), harmony_netstack::NetError> {
+        unsafe { (*self.0).tcp_connect(h, addr, port) }
+    }
+    fn tcp_send(
+        &mut self,
+        h: harmony_netstack::TcpHandle,
+        data: &[u8],
+    ) -> Result<usize, harmony_netstack::NetError> {
+        unsafe { (*self.0).tcp_send(h, data) }
+    }
+    fn tcp_recv(
+        &mut self,
+        h: harmony_netstack::TcpHandle,
+        buf: &mut [u8],
+    ) -> Result<usize, harmony_netstack::NetError> {
+        unsafe { (*self.0).tcp_recv(h, buf) }
+    }
+    fn tcp_close(
+        &mut self,
+        h: harmony_netstack::TcpHandle,
+    ) -> Result<(), harmony_netstack::NetError> {
+        unsafe { (*self.0).tcp_close(h) }
+    }
+    fn tcp_state(&self, h: harmony_netstack::TcpHandle) -> harmony_netstack::TcpSocketState {
+        unsafe { (*self.0).tcp_state(h) }
+    }
+    fn tcp_can_recv(&self, h: harmony_netstack::TcpHandle) -> bool {
+        unsafe { (*self.0).tcp_can_recv(h) }
+    }
+    fn tcp_can_send(&self, h: harmony_netstack::TcpHandle) -> bool {
+        unsafe { (*self.0).tcp_can_send(h) }
+    }
+    fn tcp_poll(&mut self, now_ms: i64) {
+        unsafe { (*self.0).tcp_poll(now_ms) }
+    }
+    fn tcp_fork(&self) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        // Raw pointer wrapper cannot be forked safely.
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RuntimeAction dispatch
 // ---------------------------------------------------------------------------
 
@@ -220,7 +395,7 @@ fn qemu_debug_exit(value: u32) {
 fn dispatch_actions(
     actions: &[RuntimeAction],
     virtio_net: &mut Option<virtio::net::VirtioNet>,
-    netstack: &mut harmony_netstack::NetStack,
+    netstack: &core::cell::RefCell<harmony_netstack::NetStack>,
     serial: &mut SerialWriter<impl FnMut(u8)>,
 ) {
     use core::fmt::Write;
@@ -235,7 +410,10 @@ fn dispatch_actions(
                         }
                     }
                     "udp0" => {
-                        let _ = harmony_platform::NetworkInterface::send(netstack, raw);
+                        let _ = harmony_platform::NetworkInterface::send(
+                            &mut *netstack.borrow_mut(),
+                            raw,
+                        );
                     }
                     _ => {}
                 }
@@ -424,7 +602,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     const NETSTACK_PREFIX: u8 = 24;
     const NETSTACK_GW: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
 
-    let mut netstack = {
+    let netstack = {
         use harmony_netstack::NetStackBuilder;
 
         let mac = virtio_net
@@ -433,14 +611,17 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             .unwrap_or([0x02, 0, 0, 0, 0, 0]);
         NetStackBuilder::new()
             .mac(mac)
-            .static_ip(Ipv4Cidr::new(NETSTACK_IP, NETSTACK_PREFIX))
-            .gateway(NETSTACK_GW)
+            .dhcp(true)
+            .fallback_ip(Ipv4Cidr::new(NETSTACK_IP, NETSTACK_PREFIX))
+            .fallback_gateway(NETSTACK_GW)
             .port(4242)
             .enable_broadcast(true)
+            .tcp_max_sockets(16)
             .build(smoltcp::time::Instant::from_millis(pit.now_ms() as i64))
     };
+    let netstack = core::cell::RefCell::new(netstack);
 
-    serial.log("NETSTACK", "udp0 at 10.0.2.15/24, port 4242");
+    serial.log("NETSTACK", "udp0 DHCP (fallback 10.0.2.15/24), port 4242, tcp_max_sockets=16");
 
     // 5. Event loop
     let persistence = MemoryState::new();
@@ -681,9 +862,18 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
 
         // 4. Create Linuxulator with global storage
         // We store it in a static to make it accessible from the syscall handler.
-        static mut LINUXULATOR: Option<Linuxulator<DirectBackend>> = None;
+        // RawPtrTcpProvider holds a raw pointer into `netstack` (which is a local
+        // in kernel_continue). This is safe because:
+        //   (a) kernel_continue never returns (noreturn asm at the end), so
+        //       `netstack` stays alive for the remainder of the program;
+        //   (b) the ring3 path exits via `jmp {entry}` (noreturn), so no code
+        //       after this block will race with the Linuxulator's TCP calls.
+        static mut LINUXULATOR: Option<Linuxulator<DirectBackend, RawPtrTcpProvider>> = None;
         unsafe {
-            LINUXULATOR = Some(Linuxulator::new(DirectBackend::new()));
+            LINUXULATOR = Some(Linuxulator::with_tcp(
+                DirectBackend::new(),
+                RawPtrTcpProvider(netstack.as_ptr()),
+            ));
             LINUXULATOR
                 .as_mut()
                 .unwrap()
@@ -766,7 +956,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                     }
                     0x0800 | 0x0806 => {
                         // IP or ARP — feed to netstack
-                        netstack.ingest(frame);
+                        netstack.borrow_mut().ingest(frame);
                     }
                     _ => {} // Drop unknown EtherTypes
                 }
@@ -775,34 +965,42 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         // Dispatch Harmony packets (borrow on virtio_net is released)
         for payload in harmony_packets {
             let actions = runtime.handle_packet("eth0", payload, now);
-            dispatch_actions(&actions, &mut virtio_net, &mut netstack, &mut serial);
+            dispatch_actions(&actions, &mut virtio_net, &netstack, &mut serial);
         }
 
         // Process IP stack (inbound)
-        netstack.poll(smoltcp_now);
+        netstack.borrow_mut().poll(smoltcp_now);
 
         // Flush outbound frames from ARP/IP processing
         if let Some(ref mut net) = virtio_net {
-            for frame in netstack.drain_tx() {
+            let frames: alloc::vec::Vec<_> = netstack.borrow_mut().drain_tx().collect();
+            for frame in frames {
                 let _ = net.send_raw(&frame);
             }
         }
 
         // Handle UDP-received Harmony packets
-        while let Some(pkt) = harmony_platform::NetworkInterface::receive(&mut netstack) {
+        // Collect packets first to avoid holding borrow across dispatch_actions.
+        let udp_packets: alloc::vec::Vec<_> = {
+            let mut ns = netstack.borrow_mut();
+            core::iter::from_fn(|| harmony_platform::NetworkInterface::receive(&mut *ns))
+                .collect()
+        };
+        for pkt in udp_packets {
             let actions = runtime.handle_packet("udp0", pkt, now);
-            dispatch_actions(&actions, &mut virtio_net, &mut netstack, &mut serial);
+            dispatch_actions(&actions, &mut virtio_net, &netstack, &mut serial);
         }
 
         // Timer tick
         let actions = runtime.tick(now);
-        dispatch_actions(&actions, &mut virtio_net, &mut netstack, &mut serial);
+        dispatch_actions(&actions, &mut virtio_net, &netstack, &mut serial);
 
         // Flush outbound UDP frames (re-sample time so smoltcp sees elapsed millis)
         let smoltcp_now = smoltcp::time::Instant::from_millis(pit.now_ms() as i64);
-        netstack.poll(smoltcp_now);
+        netstack.borrow_mut().poll(smoltcp_now);
         if let Some(ref mut net) = virtio_net {
-            for frame in netstack.drain_tx() {
+            let frames: alloc::vec::Vec<_> = netstack.borrow_mut().drain_tx().collect();
+            for frame in frames {
                 let _ = net.send_raw(&frame);
             }
         }
