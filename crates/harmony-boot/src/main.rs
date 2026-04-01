@@ -37,9 +37,10 @@ use harmony_unikernel::{KernelEntropy, MemoryState, RuntimeAction, UnikernelRunt
 static DROPBEAR_BIN: &[u8] = include_bytes!("../../../deploy/dropbear-aarch64");
 #[cfg(feature = "ring3")]
 static BUSYBOX_BIN: &[u8] = include_bytes!("../../../deploy/busybox-aarch64");
-// Host key: dropbear uses -R flag to generate an ephemeral key on first
-// connection. For production, provision unique keys on first boot
-// (see harmony-os-g7v for SSH public key auth follow-up).
+// No host key embedded — when dropbear is wired as init (Task 5 / QEMU
+// testing), it MUST be invoked with `-R` to generate an ephemeral key on
+// first connection. Without `-R` and without a key file, dropbear refuses
+// to start. Production key provisioning tracked under harmony-os-g7v.
 
 use virtio::net::ETH_HEADER_LEN;
 
@@ -848,6 +849,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                 false,
             );
             efs.add_file("/etc/shells", b"/bin/sh\n", false);
+            // No host key registered — dropbear -R generates one at startup.
 
             // Minimal /etc/group for busybox id/whoami
             efs.add_file("/etc/group", b"root:x:0:\n", false);
