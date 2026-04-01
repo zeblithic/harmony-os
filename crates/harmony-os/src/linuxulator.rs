@@ -9,6 +9,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::elf_loader::{self, ElfLoader, InterpreterLoader};
+use crate::embedded_fs::EmbeddedFs;
 use harmony_microkernel::vm::{FrameClassification, PageFlags, VmError};
 use harmony_microkernel::{Fid, FileStat, FileType, IpcError, OpenMode, QPath};
 use harmony_netstack::tcp::{NetError, TcpHandle, TcpProvider, TcpSocketState};
@@ -21,6 +22,7 @@ const ESRCH: i64 = -3;
 const EBADF: i64 = -9;
 const EAGAIN: i64 = -11;
 const ENOMEM: i64 = -12;
+const EACCES: i64 = -13;
 const EFAULT: i64 = -14;
 const ENOTDIR: i64 = -20;
 const EINVAL: i64 = -22;
@@ -2047,6 +2049,11 @@ enum FdKind {
     SignalFd { signalfd_id: usize },
     /// timerfd descriptor for timer expiration.
     TimerFd { timerfd_id: usize },
+    /// An in-memory file served from the embedded filesystem.
+    EmbeddedFile {
+        path: alloc::string::String,
+        offset: u64,
+    },
 }
 
 /// Shared state for an eventfd instance.
@@ -2301,6 +2308,8 @@ pub struct Linuxulator<B: SyscallBackend, T: TcpProvider = NoTcp> {
     on_alt_stack: bool,
     /// Restored register state from rt_sigreturn, consumed by caller.
     pending_signal_return: Option<SignalReturn>,
+    /// Optional in-memory filesystem for embedded binaries and config files.
+    embedded_fs: Option<EmbeddedFs>,
 }
 
 impl<B: SyscallBackend> Linuxulator<B, NoTcp> {
@@ -2369,7 +2378,17 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             alt_stack_flags: SS_DISABLE,
             on_alt_stack: false,
             pending_signal_return: None,
+            embedded_fs: None,
         }
+    }
+
+    /// Register an embedded filesystem for serving files without 9P.
+    ///
+    /// File-related syscalls (`openat`, `read`, `stat`, `execve`, `faccessat`)
+    /// check this overlay first and fall through to the 9P backend only when
+    /// the requested path is not found here.
+    pub fn set_embedded_fs(&mut self, fs: EmbeddedFs) {
+        self.embedded_fs = Some(fs);
     }
 
     /// Allocate the next fid for a backend call.
@@ -3200,6 +3219,8 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             FdKind::Epoll { .. } => EINVAL,
             FdKind::SignalFd { .. } => EINVAL,
             FdKind::TimerFd { .. } => EINVAL,
+            // EmbeddedFs files are read-only static data.
+            FdKind::EmbeddedFile { .. } => EROFS,
         }
     }
 
@@ -3398,6 +3419,50 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 buf.copy_from_slice(&count_val.to_le_bytes());
                 8
             }
+            FdKind::EmbeddedFile {
+                ref path,
+                ref offset,
+            } => {
+                if count == 0 {
+                    return 0;
+                }
+                // Clone path and snapshot offset to satisfy the borrow checker
+                // before mutably borrowing the fd_table entry for the offset update.
+                let path_clone = path.clone();
+                let file_offset = *offset;
+                let n = if let Some(ref efs) = self.embedded_fs {
+                    if let Some(file) = efs.get(&path_clone) {
+                        let start = (file_offset as usize).min(file.data.len());
+                        let end = start.saturating_add(count).min(file.data.len());
+                        let n = end - start;
+                        if n > 0 {
+                            // Safety: buf_ptr points to valid writable user memory of at least
+                            // `count` bytes — same trust model as the FdKind::File arm above.
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    file.data[start..end].as_ptr(),
+                                    buf_ptr as *mut u8,
+                                    n,
+                                );
+                            }
+                        }
+                        n
+                    } else {
+                        0 // file vanished — treat as EOF
+                    }
+                } else {
+                    0 // no embedded_fs — should not happen if fd was created correctly
+                };
+                // Advance the stored offset.
+                if let Some(FdEntry {
+                    kind: FdKind::EmbeddedFile { ref mut offset, .. },
+                    ..
+                }) = self.fd_table.get_mut(&fd)
+                {
+                    *offset += n as u64;
+                }
+                n as i64
+            }
         }
     }
 
@@ -3473,6 +3538,8 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                     self.timerfds.remove(&timerfd_id);
                 }
             }
+            // EmbeddedFile data is static — nothing to release on close.
+            FdKind::EmbeddedFile { .. } => {}
         }
     }
 
@@ -5034,6 +5101,8 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             alt_stack_flags: self.alt_stack_flags,
             on_alt_stack: false,
             pending_signal_return: None,
+            // EmbeddedFs contains only &'static references — clone is cheap.
+            embedded_fs: self.embedded_fs.clone(),
         };
         // Move shared pipe/eventfd state to child
         core::mem::swap(&mut self.pipes, &mut child.pipes);
@@ -5454,6 +5523,28 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 }
                 Err(e) => ipc_err_to_errno(e),
             },
+            FdKind::EmbeddedFile { ref path, .. } => {
+                let path_clone = path.clone();
+                if let Some(ref efs) = self.embedded_fs {
+                    if let Some(file) = efs.get(&path_clone) {
+                        let mode: u32 = if file.executable {
+                            0o100755 // S_IFREG | rwxr-xr-x
+                        } else {
+                            0o100644 // S_IFREG | rw-r--r--
+                        };
+                        let size = file.data.len() as u64;
+                        let stat = FileStat {
+                            qpath: 0,
+                            name: alloc::sync::Arc::from(path_clone.as_str()),
+                            size,
+                            file_type: FileType::Regular,
+                        };
+                        write_linux_stat_with_mode(statbuf_ptr, &stat, Some(mode));
+                        return 0;
+                    }
+                }
+                ENOENT
+            }
         }
     }
 
@@ -5476,6 +5567,34 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         } else {
             return EBADF;
         };
+
+        // Check EmbeddedFs first — if the path is a registered embedded file,
+        // open it as an EmbeddedFile fd (no 9P round-trip needed).
+        let efs_hit = self
+            .embedded_fs
+            .as_ref()
+            .is_some_and(|efs| efs.get(&path).is_some());
+        if efs_hit {
+            // Embedded files are read-only — reject write access upfront.
+            if flags & 0x03 != 0 {
+                // O_WRONLY (1) or O_RDWR (2)
+                return EROFS;
+            }
+            let fd_flags = if flags & O_CLOEXEC != 0 {
+                FD_CLOEXEC
+            } else {
+                0
+            };
+            let fd = self.alloc_fd();
+            self.fd_table.insert(
+                fd,
+                FdEntry {
+                    kind: FdKind::EmbeddedFile { path, offset: 0 },
+                    flags: fd_flags,
+                },
+            );
+            return fd as i64;
+        }
 
         let fid = self.alloc_fid();
         let mode = flags_to_open_mode(flags);
@@ -5554,38 +5673,60 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         let argv = read_string_array(argv_ptr, 256);
         let envp = read_string_array(envp_ptr, 256);
 
-        // Read ELF binary from filesystem.
-        let fid = self.alloc_fid();
-        if let Err(e) = self.backend.walk(&path, fid) {
-            return ipc_err_to_errno(e);
-        }
-        if let Err(e) = self.backend.open(fid, OpenMode::Read) {
-            let _ = self.backend.clunk(fid);
-            return ipc_err_to_errno(e);
-        }
+        // Fetch ELF bytes — prefer EmbeddedFs, fall back to 9P.
+        let embedded_elf: Option<Vec<u8>> = if let Some(ref efs) = self.embedded_fs {
+            if let Some(file) = efs.get(&path) {
+                if !file.executable {
+                    return EACCES;
+                }
+                if file.data.is_empty() {
+                    return ENOEXEC;
+                }
+                Some(file.data.to_vec())
+            } else {
+                None // Not in EmbeddedFs — fall through to 9P
+            }
+        } else {
+            None
+        };
 
-        let file_size = match self.backend.stat(fid) {
-            Ok(stat) => stat.size,
-            Err(e) => {
+        let elf_bytes: Vec<u8> = if let Some(bytes) = embedded_elf {
+            bytes
+        } else {
+            // Read ELF binary from 9P filesystem.
+            let fid = self.alloc_fid();
+            if let Err(e) = self.backend.walk(&path, fid) {
+                return ipc_err_to_errno(e);
+            }
+            if let Err(e) = self.backend.open(fid, OpenMode::Read) {
                 let _ = self.backend.clunk(fid);
                 return ipc_err_to_errno(e);
             }
-        };
 
-        const MAX_ELF_SIZE: u64 = 4 * 1024 * 1024; // 4 MiB
-        if file_size > MAX_ELF_SIZE {
-            let _ = self.backend.clunk(fid);
-            return ENOMEM;
-        }
+            let file_size = match self.backend.stat(fid) {
+                Ok(stat) => stat.size,
+                Err(e) => {
+                    let _ = self.backend.clunk(fid);
+                    return ipc_err_to_errno(e);
+                }
+            };
 
-        let elf_bytes = match self.backend.read(fid, 0, file_size as u32) {
-            Ok(bytes) => bytes,
-            Err(e) => {
+            const MAX_ELF_SIZE: u64 = 4 * 1024 * 1024; // 4 MiB
+            if file_size > MAX_ELF_SIZE {
                 let _ = self.backend.clunk(fid);
-                return ipc_err_to_errno(e);
+                return ENOMEM;
             }
+
+            let bytes = match self.backend.read(fid, 0, file_size as u32) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = self.backend.clunk(fid);
+                    return ipc_err_to_errno(e);
+                }
+            };
+            let _ = self.backend.clunk(fid);
+            bytes
         };
-        let _ = self.backend.clunk(fid);
 
         // Load ELF via InterpreterLoader.
         let mut loader = InterpreterLoader::default();
@@ -6509,6 +6650,53 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         const SEEK_CUR: i32 = 1;
         const SEEK_END: i32 = 2;
 
+        // Handle EmbeddedFile lseek — these are seekable regular files.
+        if let Some(FdEntry {
+            kind:
+                FdKind::EmbeddedFile {
+                    ref path,
+                    offset: cur_offset,
+                },
+            ..
+        }) = self.fd_table.get(&fd)
+        {
+            let file_size = self
+                .embedded_fs
+                .as_ref()
+                .and_then(|efs| efs.get(path))
+                .map(|f| f.data.len() as i64)
+                .unwrap_or(0);
+            let cur = *cur_offset as i64;
+            let new_offset = match whence {
+                SEEK_SET => offset,
+                SEEK_CUR => match cur.checked_add(offset) {
+                    Some(v) => v,
+                    None => return EOVERFLOW,
+                },
+                SEEK_END => match file_size.checked_add(offset) {
+                    Some(v) => v,
+                    None => return EOVERFLOW,
+                },
+                _ => return EINVAL,
+            };
+            if new_offset < 0 {
+                return EINVAL;
+            }
+            // Update offset — need to re-borrow mutably.
+            if let Some(FdEntry {
+                kind:
+                    FdKind::EmbeddedFile {
+                        offset: ref mut off,
+                        ..
+                    },
+                ..
+            }) = self.fd_table.get_mut(&fd)
+            {
+                *off = new_offset as u64;
+            }
+            return new_offset;
+        }
+
         let (entry_fid, entry_offset, entry_file_type) = match self.fd_table.get(&fd) {
             Some(FdEntry {
                 kind:
@@ -6682,6 +6870,32 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             return EBADF;
         };
 
+        // Check EmbeddedFs before issuing a 9P walk.
+        if let Some(ref efs) = self.embedded_fs {
+            if let Some(file) = efs.get(&resolved) {
+                let mode: u32 = if file.executable { 0o100755 } else { 0o100644 };
+                let size = file.data.len() as u64;
+                let stat = FileStat {
+                    qpath: 0,
+                    name: alloc::sync::Arc::from(resolved.as_str()),
+                    size,
+                    file_type: FileType::Regular,
+                };
+                write_linux_stat_with_mode(statbuf_ptr, &stat, Some(mode));
+                return 0;
+            } else if efs.exists(&resolved) {
+                // Directory entry derived from embedded files.
+                let stat = FileStat {
+                    qpath: 0,
+                    name: alloc::sync::Arc::from(resolved.as_str()),
+                    size: 0,
+                    file_type: FileType::Directory,
+                };
+                write_linux_stat_with_mode(statbuf_ptr, &stat, Some(0o040755));
+                return 0;
+            }
+        }
+
         let fid = self.alloc_fid();
         if let Err(e) = self.backend.walk(&resolved, fid) {
             return ipc_err_to_errno(e);
@@ -6721,6 +6935,15 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         } else {
             return EBADF;
         };
+
+        // Check EmbeddedFs before issuing a 9P walk.
+        let efs_exists = self
+            .embedded_fs
+            .as_ref()
+            .is_some_and(|efs| efs.exists(&resolved));
+        if efs_exists {
+            return 0;
+        }
 
         let fid = self.alloc_fid();
         if let Err(e) = self.backend.walk(&resolved, fid) {
