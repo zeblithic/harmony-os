@@ -23,3 +23,4 @@ deploy/harmony-node-aarch64
 # Nix build result symlinks
 result*
 .beads/
+deploy/.build-userspace/
