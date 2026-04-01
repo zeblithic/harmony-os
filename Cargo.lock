@@ -814,6 +814,7 @@ dependencies = [
  "harmony-crypto",
  "harmony-identity",
  "harmony-microkernel",
+ "harmony-netstack",
  "harmony-reticulum",
  "harmony-unikernel",
  "harmony-workflow",

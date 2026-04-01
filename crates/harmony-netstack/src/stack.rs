@@ -1,16 +1,29 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::socket::udp;
+use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 
 use harmony_platform::{NetworkInterface as HarmonyNetworkInterface, PlatformError};
 
 use crate::device::FrameBuffer;
+use crate::dhcp::DhcpClient;
 use crate::peers::PeerTable;
+use crate::tcp::{NetError, TcpHandle, TcpProvider, TcpSocketState};
+
+/// Configuration for DHCP-based address acquisition with a static fallback.
+pub struct DhcpConfig {
+    /// Static CIDR to apply when DHCP acquisition times out.
+    pub fallback_ip: Option<Ipv4Cidr>,
+    /// Default gateway to configure alongside the fallback IP.
+    pub fallback_gateway: Option<Ipv4Address>,
+    /// How long (ms) to wait for a DHCP lease before applying fallback.
+    pub fallback_timeout_ms: i64,
+}
 
 /// UDP/IP network interface for Harmony mesh traffic.
 ///
@@ -24,41 +37,82 @@ pub struct NetStack {
     udp_handle: SocketHandle,
     peers: PeerTable,
     rx_queue: VecDeque<Vec<u8>>,
+    // TCP
+    tcp_handles: Vec<Option<SocketHandle>>,
+    tcp_bound_ports: BTreeMap<TcpHandle, u16>,
+    tcp_listen_ports: BTreeMap<u16, TcpHandle>,
+    /// Next ephemeral port to assign for outbound TCP connections.
+    tcp_next_ephemeral: u16,
+    /// Handles that userspace has called tcp_close() on. Only these are
+    /// eligible for reaping once smoltcp reaches Closed/TimeWait.
+    tcp_user_closed: alloc::collections::BTreeSet<TcpHandle>,
+    // DHCP
+    dhcp: Option<DhcpClient>,
 }
 
 impl NetStack {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         mac: [u8; 6],
-        ip: Ipv4Cidr,
+        ip: Option<Ipv4Cidr>,
         gateway: Option<Ipv4Address>,
         port: u16,
         broadcast: bool,
         peers: &[(Ipv4Address, u16)],
+        tcp_max_sockets: usize,
+        dhcp_config: Option<DhcpConfig>,
         now: Instant,
     ) -> Self {
         let mut device = FrameBuffer::new();
 
         let config = Config::new(EthernetAddress(mac).into());
         let mut iface = Interface::new(config, &mut device, now);
-        iface.update_ip_addrs(|addrs| {
-            addrs.push(IpCidr::Ipv4(ip)).unwrap();
-        });
-        if let Some(gw) = gateway {
-            iface.routes_mut().add_default_ipv4_route(gw).unwrap();
+
+        // Only apply static IP immediately when not using DHCP.
+        // When DHCP is configured, the DhcpClient will apply the lease address.
+        if dhcp_config.is_none() {
+            if let Some(cidr) = ip {
+                iface.update_ip_addrs(|addrs| {
+                    addrs.push(IpCidr::Ipv4(cidr)).unwrap();
+                });
+            }
+            if let Some(gw) = gateway {
+                iface.routes_mut().add_default_ipv4_route(gw).unwrap();
+            }
         }
+
+        // Build socket storage with room for UDP + TCP slots + DHCP + spare.
+        let socket_capacity = tcp_max_sockets + 3;
+        let mut storage = Vec::with_capacity(socket_capacity);
+        for _ in 0..socket_capacity {
+            storage.push(smoltcp::iface::SocketStorage::EMPTY);
+        }
+        let mut sockets = SocketSet::new(storage);
 
         let rx_buf = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; 8192]);
         let tx_buf = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; 8192]);
         let mut socket = udp::Socket::new(rx_buf, tx_buf);
         socket.bind(port).expect("failed to bind UDP socket");
-
-        let mut sockets = SocketSet::new(vec![]);
         let udp_handle = sockets.add(socket);
 
         let mut peer_table = PeerTable::new(port, broadcast);
         for &(addr, peer_port) in peers {
             peer_table.add_peer(addr, peer_port);
         }
+
+        // Initialize DHCP client if requested. It registers its own socket in
+        // `sockets` and will configure the interface address on first lease.
+        let dhcp = dhcp_config.map(|cfg| {
+            DhcpClient::new(
+                &mut sockets,
+                cfg.fallback_ip,
+                cfg.fallback_gateway,
+                cfg.fallback_timeout_ms,
+                now,
+            )
+        });
+
+        let tcp_handles = vec![None; tcp_max_sockets];
 
         Self {
             device,
@@ -67,6 +121,12 @@ impl NetStack {
             udp_handle,
             peers: peer_table,
             rx_queue: VecDeque::new(),
+            tcp_handles,
+            tcp_bound_ports: BTreeMap::new(),
+            tcp_listen_ports: BTreeMap::new(),
+            tcp_next_ephemeral: 49152,
+            tcp_user_closed: alloc::collections::BTreeSet::new(),
+            dhcp,
         }
     }
 
@@ -78,6 +138,14 @@ impl NetStack {
     /// Drive the smoltcp interface and drain received UDP payloads into the rx queue.
     pub fn poll(&mut self, now: Instant) {
         self.iface.poll(now, &mut self.device, &mut self.sockets);
+
+        // Process any DHCP lease events produced during the interface poll.
+        if let Some(ref mut dhcp) = self.dhcp {
+            dhcp.check_lease(&mut self.iface, &mut self.sockets, now);
+        }
+
+        // Reap TCP sockets that have completed their close handshake.
+        self.tcp_reap_closed();
 
         let socket = self.sockets.get_mut::<udp::Socket>(self.udp_handle);
         while socket.can_recv() {
@@ -93,6 +161,48 @@ impl NetStack {
     /// Drain outbound Ethernet frames produced by smoltcp (ARP replies, UDP packets, etc.).
     pub fn drain_tx(&mut self) -> impl Iterator<Item = Vec<u8>> + '_ {
         self.device.drain_tx()
+    }
+
+    /// Remove sockets that userspace has closed AND whose TCP close handshake
+    /// has completed in smoltcp. Sockets that the remote closed but userspace
+    /// hasn't called tcp_close() on are NOT reaped — userspace can still read
+    /// EOF from them.
+    fn tcp_reap_closed(&mut self) {
+        for (slot, opt_handle) in self.tcp_handles.iter_mut().enumerate() {
+            if let Some(smoltcp_handle) = *opt_handle {
+                let handle = TcpHandle(slot as u32);
+                // Only reap if userspace has called tcp_close() on this handle.
+                if !self.tcp_user_closed.contains(&handle) {
+                    continue;
+                }
+                let state = self.sockets.get::<tcp::Socket>(smoltcp_handle).state();
+                if state == tcp::State::Closed || state == tcp::State::TimeWait {
+                    self.sockets.remove(smoltcp_handle);
+                    *opt_handle = None;
+                    self.tcp_user_closed.remove(&handle);
+                }
+            }
+        }
+    }
+
+    /// Resolve a `TcpHandle` to the underlying smoltcp `SocketHandle`.
+    fn resolve_tcp(&self, handle: TcpHandle) -> Result<SocketHandle, NetError> {
+        self.tcp_handles
+            .get(handle.0 as usize)
+            .and_then(|h| *h)
+            .ok_or(NetError::InvalidHandle)
+    }
+
+    /// Immediately remove a TCP socket (used for cleanup in error paths).
+    fn tcp_close_internal(&mut self, handle: TcpHandle) -> Result<(), NetError> {
+        let smoltcp_handle = self.resolve_tcp(handle)?;
+        self.sockets.get_mut::<tcp::Socket>(smoltcp_handle).abort();
+        self.sockets.remove(smoltcp_handle);
+        self.tcp_handles[handle.0 as usize] = None;
+        self.tcp_listen_ports.retain(|_, h| *h != handle);
+        self.tcp_bound_ports.remove(&handle);
+        self.tcp_user_closed.remove(&handle);
+        Ok(())
     }
 }
 
@@ -136,6 +246,232 @@ impl HarmonyNetworkInterface for NetStack {
         } else {
             Ok(())
         }
+    }
+}
+
+impl TcpProvider for NetStack {
+    fn tcp_create(&mut self) -> Result<TcpHandle, NetError> {
+        // Find the first free slot.
+        let slot = self
+            .tcp_handles
+            .iter()
+            .position(|h| h.is_none())
+            .ok_or(NetError::SocketLimit)?;
+
+        let rx_buf = tcp::SocketBuffer::new(vec![0u8; 8192]);
+        let tx_buf = tcp::SocketBuffer::new(vec![0u8; 8192]);
+        let socket = tcp::Socket::new(rx_buf, tx_buf);
+        let smoltcp_handle = self.sockets.add(socket);
+        self.tcp_handles[slot] = Some(smoltcp_handle);
+        Ok(TcpHandle(slot as u32))
+    }
+
+    fn tcp_bind(&mut self, handle: TcpHandle, port: u16) -> Result<(), NetError> {
+        // Validate the handle exists.
+        let _ = self.resolve_tcp(handle)?;
+        // Check for duplicate port binding.
+        if self.tcp_bound_ports.values().any(|&p| p == port) {
+            return Err(NetError::AddrInUse);
+        }
+        self.tcp_bound_ports.insert(handle, port);
+        Ok(())
+    }
+
+    fn tcp_listen(&mut self, handle: TcpHandle, _backlog: usize) -> Result<(), NetError> {
+        let smoltcp_handle = self.resolve_tcp(handle)?;
+        let port = self
+            .tcp_bound_ports
+            .get(&handle)
+            .copied()
+            .ok_or(NetError::NotConnected)?;
+        self.sockets
+            .get_mut::<tcp::Socket>(smoltcp_handle)
+            .listen(port)
+            .map_err(|_| NetError::AddrInUse)?;
+        self.tcp_listen_ports.insert(port, handle);
+        Ok(())
+    }
+
+    fn tcp_accept(&mut self, handle: TcpHandle) -> Result<Option<TcpHandle>, NetError> {
+        let smoltcp_handle = self.resolve_tcp(handle)?;
+        let state = self.sockets.get::<tcp::Socket>(smoltcp_handle).state();
+
+        if state != tcp::State::Established {
+            return Ok(None);
+        }
+
+        // Find which port this handle was listening on.
+        let port = self
+            .tcp_listen_ports
+            .iter()
+            .find(|(_, h)| **h == handle)
+            .map(|(p, _)| *p)
+            .ok_or(NetError::InvalidHandle)?;
+
+        // Temporarily remove port bookkeeping so the replacement listener can
+        // bind to the same port. If anything fails below, we restore it.
+        self.tcp_bound_ports.remove(&handle);
+        self.tcp_listen_ports.remove(&port);
+
+        // Create a new socket to replace the listener on the same port.
+        let new_listener = match self.tcp_create() {
+            Ok(h) => h,
+            Err(e) => {
+                // Restore bookkeeping — the original listener is still valid.
+                self.tcp_bound_ports.insert(handle, port);
+                self.tcp_listen_ports.insert(port, handle);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.tcp_bind(new_listener, port) {
+            // Clean up the new socket and restore original listener.
+            let _ = self.tcp_close_internal(new_listener);
+            self.tcp_bound_ports.insert(handle, port);
+            self.tcp_listen_ports.insert(port, handle);
+            return Err(e);
+        }
+        let new_smoltcp = self.resolve_tcp(new_listener)?;
+        if self
+            .sockets
+            .get_mut::<tcp::Socket>(new_smoltcp)
+            .listen(port)
+            .is_err()
+        {
+            let _ = self.tcp_close_internal(new_listener);
+            self.tcp_bound_ports.insert(handle, port);
+            self.tcp_listen_ports.insert(port, handle);
+            return Err(NetError::AddrInUse);
+        }
+
+        // Swap smoltcp handles so that:
+        //   - `handle` maps to the NEW listening socket (caller's fd stays a listener)
+        //   - `new_listener` maps to the OLD established socket (returned as accepted)
+        let old_smoltcp = self.tcp_handles[handle.0 as usize];
+        let new_smoltcp_opt = self.tcp_handles[new_listener.0 as usize];
+        self.tcp_handles[handle.0 as usize] = new_smoltcp_opt;
+        self.tcp_handles[new_listener.0 as usize] = old_smoltcp;
+
+        // Restore port binding for handle (now the new listener).
+        self.tcp_bound_ports.insert(handle, port);
+        self.tcp_listen_ports.insert(port, handle);
+        // Remove the stale port binding for new_listener — it's now the
+        // accepted (established) connection, not a listener.
+        self.tcp_bound_ports.remove(&new_listener);
+
+        Ok(Some(new_listener))
+    }
+
+    fn tcp_connect(
+        &mut self,
+        handle: TcpHandle,
+        addr: Ipv4Address,
+        port: u16,
+    ) -> Result<(), NetError> {
+        let smoltcp_handle = self.resolve_tcp(handle)?;
+        // Use explicitly bound port if available, otherwise assign an ephemeral port.
+        // Ephemeral ports wrap around the 49152–65535 range.
+        let local_port = self
+            .tcp_bound_ports
+            .get(&handle)
+            .copied()
+            .unwrap_or_else(|| {
+                let p = self.tcp_next_ephemeral;
+                self.tcp_next_ephemeral = if p == 65535 { 49152 } else { p + 1 };
+                p
+            });
+        // Track the ephemeral port so tcp_bind can detect conflicts and
+        // tcp_close cleans it up.
+        self.tcp_bound_ports.entry(handle).or_insert(local_port);
+        let remote = (IpAddress::Ipv4(addr), port);
+        // Both self.iface and self.sockets are separate fields — the borrow
+        // checker allows simultaneous mutable borrows of distinct fields.
+        let cx = self.iface.context();
+        self.sockets
+            .get_mut::<tcp::Socket>(smoltcp_handle)
+            .connect(cx, remote, local_port)
+            .map_err(|_| NetError::ConnectionRefused)
+    }
+
+    fn tcp_send(&mut self, handle: TcpHandle, data: &[u8]) -> Result<usize, NetError> {
+        let smoltcp_handle = self.resolve_tcp(handle)?;
+        let socket = self.sockets.get_mut::<tcp::Socket>(smoltcp_handle);
+        if !socket.may_send() {
+            return Err(NetError::NotConnected);
+        }
+        match socket.send_slice(data) {
+            Ok(0) => Err(NetError::WouldBlock),
+            Ok(n) => Ok(n),
+            Err(_) => Err(NetError::ConnectionReset),
+        }
+    }
+
+    fn tcp_recv(&mut self, handle: TcpHandle, buf: &mut [u8]) -> Result<usize, NetError> {
+        let smoltcp_handle = self.resolve_tcp(handle)?;
+        let socket = self.sockets.get_mut::<tcp::Socket>(smoltcp_handle);
+        if !socket.may_recv() {
+            // CloseWait: remote has sent FIN — we were connected and the
+            // connection is half-closed. Signal EOF to the caller.
+            if socket.state() == tcp::State::CloseWait {
+                return Ok(0);
+            }
+            // Any other non-receivable state (Closed, Listen, SynSent, …)
+            // means no established connection exists.
+            return Err(NetError::NotConnected);
+        }
+        match socket.recv_slice(buf) {
+            Ok(0) => Err(NetError::WouldBlock),
+            Ok(n) => Ok(n),
+            Err(_) => Err(NetError::ConnectionReset),
+        }
+    }
+
+    fn tcp_close(&mut self, handle: TcpHandle) -> Result<(), NetError> {
+        let smoltcp_handle = self.resolve_tcp(handle)?;
+        let socket = self.sockets.get_mut::<tcp::Socket>(smoltcp_handle);
+        socket.close();
+        // Remove from listener/port tracking immediately.
+        self.tcp_listen_ports.retain(|_, h| *h != handle);
+        self.tcp_bound_ports.remove(&handle);
+        // Mark as user-closed so tcp_reap_closed() can remove it once smoltcp
+        // finishes the FIN handshake. Until then, the handle stays valid so
+        // userspace can still read EOF (0) instead of getting EBADF.
+        self.tcp_user_closed.insert(handle);
+        Ok(())
+    }
+
+    fn tcp_state(&self, handle: TcpHandle) -> TcpSocketState {
+        match self.resolve_tcp(handle) {
+            Ok(h) => {
+                let s = self.sockets.get::<tcp::Socket>(h);
+                match s.state() {
+                    tcp::State::Closed | tcp::State::TimeWait => TcpSocketState::Closed,
+                    tcp::State::Listen => TcpSocketState::Listen,
+                    tcp::State::SynSent | tcp::State::SynReceived => TcpSocketState::Connecting,
+                    tcp::State::Established => TcpSocketState::Established,
+                    tcp::State::CloseWait => TcpSocketState::CloseWait,
+                    _ => TcpSocketState::Closing,
+                }
+            }
+            Err(_) => TcpSocketState::Closed,
+        }
+    }
+
+    fn tcp_can_recv(&self, handle: TcpHandle) -> bool {
+        self.resolve_tcp(handle)
+            .ok()
+            .map(|h| self.sockets.get::<tcp::Socket>(h).can_recv())
+            .unwrap_or(false)
+    }
+
+    fn tcp_can_send(&self, handle: TcpHandle) -> bool {
+        self.resolve_tcp(handle)
+            .ok()
+            .map(|h| self.sockets.get::<tcp::Socket>(h).can_send())
+            .unwrap_or(false)
+    }
+
+    fn tcp_poll(&mut self, now_ms: i64) {
+        self.poll(Instant::from_millis(now_ms));
     }
 }
 
@@ -381,5 +717,81 @@ mod tests {
             .build(Instant::ZERO);
         // 1500 (Ethernet MTU) - 20 (IP header) - 8 (UDP header) = 1472
         assert_eq!(HarmonyNetworkInterface::mtu(&stack), 1472);
+    }
+}
+
+#[cfg(test)]
+mod tcp_tests {
+    use super::*;
+    use crate::builder::NetStackBuilder;
+    use crate::tcp::TcpProvider;
+
+    fn build_tcp_stack() -> NetStack {
+        NetStackBuilder::new()
+            .static_ip(Ipv4Cidr::new(Ipv4Address::new(10, 0, 0, 1), 24))
+            .tcp_max_sockets(4)
+            .build(Instant::from_millis(0))
+    }
+
+    #[test]
+    fn tcp_create_returns_unique_handles() {
+        let mut s = build_tcp_stack();
+        let h1 = s.tcp_create().unwrap();
+        let h2 = s.tcp_create().unwrap();
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn tcp_create_beyond_limit() {
+        let mut s = build_tcp_stack();
+        for _ in 0..4 {
+            s.tcp_create().unwrap();
+        }
+        assert!(matches!(s.tcp_create(), Err(NetError::SocketLimit)));
+    }
+
+    #[test]
+    fn tcp_close_invalidates_handle() {
+        let mut s = build_tcp_stack();
+        let h = s.tcp_create().unwrap();
+        s.tcp_close(h).unwrap();
+        assert_eq!(s.tcp_state(h), TcpSocketState::Closed);
+    }
+
+    #[test]
+    fn tcp_listen_changes_state() {
+        let mut s = build_tcp_stack();
+        let h = s.tcp_create().unwrap();
+        s.tcp_bind(h, 8080).unwrap();
+        s.tcp_listen(h, 1).unwrap();
+        assert_eq!(s.tcp_state(h), TcpSocketState::Listen);
+    }
+
+    #[test]
+    fn tcp_recv_unconnected_errors() {
+        let mut s = build_tcp_stack();
+        let h = s.tcp_create().unwrap();
+        let mut buf = [0u8; 64];
+        assert!(matches!(
+            s.tcp_recv(h, &mut buf),
+            Err(NetError::NotConnected)
+        ));
+    }
+
+    #[test]
+    fn dhcp_builder_doesnt_panic() {
+        let _s = NetStackBuilder::new()
+            .dhcp(true)
+            .fallback_ip(Ipv4Cidr::new(Ipv4Address::new(10, 0, 0, 1), 24))
+            .fallback_gateway(Ipv4Address::new(10, 0, 0, 1))
+            .build(Instant::from_millis(0));
+    }
+
+    #[test]
+    fn static_ip_builder_still_works() {
+        let s = NetStackBuilder::new()
+            .static_ip(Ipv4Cidr::new(Ipv4Address::new(10, 0, 0, 1), 24))
+            .build(Instant::from_millis(0));
+        assert_eq!(s.name(), "udp0");
     }
 }

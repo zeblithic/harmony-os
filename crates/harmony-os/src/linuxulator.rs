@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 use crate::elf_loader::{self, ElfLoader, InterpreterLoader};
 use harmony_microkernel::vm::{FrameClassification, PageFlags, VmError};
 use harmony_microkernel::{Fid, FileStat, FileType, IpcError, OpenMode, QPath};
+use harmony_netstack::tcp::{NetError, TcpHandle, TcpProvider, TcpSocketState};
 
 // ── Linux errno constants ───────────────────────────────────────────
 
@@ -36,6 +37,12 @@ const ENOTSOCK: i64 = -88;
 const ECHILD: i64 = -10;
 const ENOEXEC: i64 = -8;
 const EEXIST: i64 = -17;
+const EADDRINUSE: i64 = -98;
+const ECONNREFUSED: i64 = -111;
+const ECONNRESET: i64 = -104;
+const EINPROGRESS: i64 = -115;
+const ENFILE: i64 = -23;
+const ENOTCONN: i64 = -107;
 
 // Clock IDs (shared by clock_gettime and clock_getres)
 const CLOCK_REALTIME: i32 = 0;
@@ -99,6 +106,71 @@ fn vm_err_to_errno(e: VmError) -> i64 {
         VmError::PageTableError => ENOMEM,
         VmError::ProcessExists(_) => EINVAL,
         VmError::Overflow(_) => EINVAL,
+    }
+}
+
+fn net_error_to_errno(e: NetError) -> i64 {
+    match e {
+        NetError::WouldBlock => EAGAIN,
+        NetError::ConnectionRefused => ECONNREFUSED,
+        NetError::ConnectionReset => ECONNRESET,
+        NetError::NotConnected => ENOTCONN,
+        NetError::AddrInUse => EADDRINUSE,
+        NetError::InvalidHandle => EBADF,
+        NetError::SocketLimit => ENFILE,
+    }
+}
+
+// ── NoTcp — no-op TcpProvider for non-networked Linuxulators ────
+
+/// No-op [`TcpProvider`] used when TCP is not available.
+///
+/// All operations return errors; `tcp_fork()` returns `Some(NoTcp)` so
+/// that `fork(2)` still works in the default `Linuxulator<B>` config.
+pub struct NoTcp;
+
+impl TcpProvider for NoTcp {
+    fn tcp_create(&mut self) -> Result<TcpHandle, NetError> {
+        Err(NetError::SocketLimit)
+    }
+    fn tcp_bind(&mut self, _: TcpHandle, _: u16) -> Result<(), NetError> {
+        Err(NetError::InvalidHandle)
+    }
+    fn tcp_listen(&mut self, _: TcpHandle, _: usize) -> Result<(), NetError> {
+        Err(NetError::InvalidHandle)
+    }
+    fn tcp_accept(&mut self, _: TcpHandle) -> Result<Option<TcpHandle>, NetError> {
+        Err(NetError::InvalidHandle)
+    }
+    fn tcp_connect(
+        &mut self,
+        _: TcpHandle,
+        _: harmony_netstack::smoltcp::wire::Ipv4Address,
+        _: u16,
+    ) -> Result<(), NetError> {
+        Err(NetError::InvalidHandle)
+    }
+    fn tcp_send(&mut self, _: TcpHandle, _: &[u8]) -> Result<usize, NetError> {
+        Err(NetError::InvalidHandle)
+    }
+    fn tcp_recv(&mut self, _: TcpHandle, _: &mut [u8]) -> Result<usize, NetError> {
+        Err(NetError::InvalidHandle)
+    }
+    fn tcp_close(&mut self, _: TcpHandle) -> Result<(), NetError> {
+        Err(NetError::InvalidHandle)
+    }
+    fn tcp_state(&self, _: TcpHandle) -> TcpSocketState {
+        TcpSocketState::Closed
+    }
+    fn tcp_can_recv(&self, _: TcpHandle) -> bool {
+        false
+    }
+    fn tcp_can_send(&self, _: TcpHandle) -> bool {
+        false
+    }
+    fn tcp_poll(&mut self, _: i64) {}
+    fn tcp_fork(&self) -> Option<NoTcp> {
+        Some(NoTcp)
     }
 }
 
@@ -1994,6 +2066,11 @@ struct SocketState {
     /// sockets return EAGAIN on subsequent calls to prevent infinite accept
     /// loops in event-driven callers (epoll always reports ready).
     accepted_once: bool,
+    /// Handle into the TcpProvider, if the socket was successfully created
+    /// via tcp_create. None for stub/AF_UNIX/AF_INET6 sockets.
+    tcp_handle: Option<TcpHandle>,
+    /// Port this socket is bound to (0 = unbound).
+    bound_port: u16,
 }
 
 /// Shared state for an epoll instance.
@@ -2105,9 +2182,9 @@ fn default_signal_action(signum: u32) -> DefaultAction {
 }
 
 /// A child process created by fork/clone.
-struct ChildProcess<B: SyscallBackend> {
+struct ChildProcess<B: SyscallBackend, T: TcpProvider> {
     pid: i32,
-    linuxulator: Linuxulator<B>,
+    linuxulator: Linuxulator<B, T>,
 }
 
 /// Result of a successful execve — new entry point and stack pointer
@@ -2129,8 +2206,13 @@ struct FdEntry {
 ///
 /// Owns a POSIX-style fd table and dispatches Linux syscalls to a
 /// [`SyscallBackend`]. Created once per Linux process.
-pub struct Linuxulator<B: SyscallBackend> {
+///
+/// The `T` type parameter selects the TCP provider. Use the default
+/// [`NoTcp`] when networking is not required.
+pub struct Linuxulator<B: SyscallBackend, T: TcpProvider = NoTcp> {
     backend: B,
+    /// TCP provider for SOCK_STREAM sockets. [`NoTcp`] by default.
+    tcp: T,
     /// Maps Linux fd (0, 1, 2, ...) → 9P fid + file offset.
     fd_table: BTreeMap<i32, FdEntry>,
     /// Next fid to allocate for backend calls.
@@ -2180,7 +2262,7 @@ pub struct Linuxulator<B: SyscallBackend> {
     /// Next PID to assign to a child.
     next_child_pid: i32,
     /// Active children (running, not yet exited).
-    children: Vec<ChildProcess<B>>,
+    children: Vec<ChildProcess<B, T>>,
     /// Exited children: (pid, exit_code, killed_by_signal) triples consumed by waitpid/wait4.
     exited_children: Vec<(i32, i32, Option<u32>)>,
     /// Arena size used for this process (inherited by children on fork).
@@ -2221,16 +2303,29 @@ pub struct Linuxulator<B: SyscallBackend> {
     pending_signal_return: Option<SignalReturn>,
 }
 
-impl<B: SyscallBackend> Linuxulator<B> {
-    /// Create a new Linuxulator with default 1 MiB arena.
+impl<B: SyscallBackend> Linuxulator<B, NoTcp> {
+    /// Create a new Linuxulator with default 1 MiB arena and no TCP support.
     pub fn new(backend: B) -> Self {
-        Self::with_arena(backend, 1024 * 1024) // 1 MiB default
+        Self::with_tcp_and_arena(backend, NoTcp, 1024 * 1024)
     }
 
-    /// Create a new Linuxulator with a custom arena size.
+    /// Create a new Linuxulator with a custom arena size and no TCP support.
     pub fn with_arena(backend: B, arena_size: usize) -> Self {
+        Self::with_tcp_and_arena(backend, NoTcp, arena_size)
+    }
+}
+
+impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
+    /// Create a Linuxulator with a custom TCP provider and default 1 MiB arena.
+    pub fn with_tcp(backend: B, tcp: T) -> Self {
+        Self::with_tcp_and_arena(backend, tcp, 1024 * 1024)
+    }
+
+    /// Create a Linuxulator with a custom TCP provider and custom arena size.
+    pub fn with_tcp_and_arena(backend: B, tcp: T, arena_size: usize) -> Self {
         Self {
             backend,
+            tcp,
             fd_table: BTreeMap::new(),
             next_fid: 100, // avoid collision with server root fids
             exit_code: None,
@@ -2452,7 +2547,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
     }
 
     /// Return the deepest actively-running Linuxulator in the process tree.
-    pub fn active_process(&mut self) -> &mut Linuxulator<B> {
+    pub fn active_process(&mut self) -> &mut Linuxulator<B, T> {
         // Determine which path to take using a shared borrow (dropped immediately).
         let last_exited = self
             .children
@@ -2478,7 +2573,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
     }
 
     /// Check for a newly-forked child that needs its first syscall dispatched.
-    pub fn pending_fork_child(&mut self) -> Option<(i32, &mut Linuxulator<B>)> {
+    pub fn pending_fork_child(&mut self) -> Option<(i32, &mut Linuxulator<B, T>)> {
         if let Some(child) = self.children.last_mut() {
             if child.linuxulator.exit_code.is_none() {
                 return Some((child.pid, &mut child.linuxulator));
@@ -3075,9 +3170,32 @@ impl<B: SyscallBackend> Linuxulator<B> {
                     Err(e) => ipc_err_to_errno(e),
                 }
             }
-            FdKind::Socket { .. } => {
-                // Stub: pretend all bytes written.
-                count.min(i64::MAX as usize) as i64
+            FdKind::Socket { socket_id } => {
+                let (tcp_handle, _nonblock) = match self.sockets.get(&socket_id) {
+                    Some(s) => (s.tcp_handle, s.nonblock),
+                    None => return EBADF,
+                };
+                if let Some(h) = tcp_handle {
+                    if count == 0 {
+                        return 0;
+                    }
+                    if buf_ptr == 0 {
+                        return EFAULT;
+                    }
+                    let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
+                    match self.tcp.tcp_send(h, data) {
+                        Ok(n) => n as i64,
+                        Err(NetError::WouldBlock) => {
+                            // v1: always return EAGAIN. True blocking requires
+                            // a yield/coroutine mechanism (harmony-os-cqy).
+                            EAGAIN
+                        }
+                        Err(_) => EPIPE,
+                    }
+                } else {
+                    // Stub: pretend all bytes written.
+                    count.min(i64::MAX as usize) as i64
+                }
             }
             FdKind::Epoll { .. } => EINVAL,
             FdKind::SignalFd { .. } => EINVAL,
@@ -3180,9 +3298,32 @@ impl<B: SyscallBackend> Linuxulator<B> {
                     Err(e) => ipc_err_to_errno(e),
                 }
             }
-            FdKind::Socket { .. } => {
-                // Stub: no data, return EOF.
-                0
+            FdKind::Socket { socket_id } => {
+                let (tcp_handle, _nonblock) = match self.sockets.get(&socket_id) {
+                    Some(s) => (s.tcp_handle, s.nonblock),
+                    None => return EBADF,
+                };
+                if let Some(h) = tcp_handle {
+                    if count == 0 {
+                        return 0;
+                    }
+                    if buf_ptr == 0 {
+                        return EFAULT;
+                    }
+                    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, count) };
+                    match self.tcp.tcp_recv(h, buf) {
+                        Ok(n) => n as i64,
+                        Err(NetError::WouldBlock) => {
+                            // v1: always return EAGAIN. True blocking requires
+                            // a yield/coroutine mechanism (harmony-os-cqy).
+                            EAGAIN
+                        }
+                        Err(e) => net_error_to_errno(e),
+                    }
+                } else {
+                    // Stub: no data, return EOF.
+                    0
+                }
             }
             FdKind::Epoll { .. } => EINVAL,
             FdKind::SignalFd { signalfd_id } => {
@@ -3300,7 +3441,11 @@ impl<B: SyscallBackend> Linuxulator<B> {
                     |e| matches!(&e.kind, FdKind::Socket { socket_id: id } if *id == socket_id),
                 );
                 if !still_referenced {
-                    self.sockets.remove(&socket_id);
+                    if let Some(state) = self.sockets.remove(&socket_id) {
+                        if let Some(h) = state.tcp_handle {
+                            let _ = self.tcp.tcp_close(h);
+                        }
+                    }
                 }
             }
             FdKind::Epoll { epoll_id } => {
@@ -3785,6 +3930,15 @@ impl<B: SyscallBackend> Linuxulator<B> {
         let flags = sock_type & (SOCK_CLOEXEC | SOCK_NONBLOCK);
         let base_type = sock_type & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
 
+        const SOCK_STREAM: i32 = 1;
+
+        // Attempt to create a real TCP handle for AF_INET SOCK_STREAM sockets.
+        let tcp_handle = if domain == AF_INET && base_type == SOCK_STREAM {
+            self.tcp.tcp_create().ok()
+        } else {
+            None
+        };
+
         let socket_id = self.next_socket_id;
         self.next_socket_id += 1;
         self.sockets.insert(
@@ -3795,6 +3949,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 listening: false,
                 nonblock: flags & SOCK_NONBLOCK != 0,
                 accepted_once: false,
+                tcp_handle,
+                bound_port: 0,
             },
         );
 
@@ -3826,100 +3982,218 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
     }
 
-    /// Linux bind(2): stub — no-op.
-    fn sys_bind(&self, fd: i32, _addr: u64, _addrlen: u32) -> i64 {
-        match self.require_socket(fd) {
-            Ok(_) => 0,
-            Err(e) => e,
+    /// Linux bind(2): bind socket to a local address/port.
+    fn sys_bind(&mut self, fd: i32, addr: u64, addrlen: u32) -> i64 {
+        let socket_id = match self.require_socket(fd) {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+        let tcp_handle = self.sockets.get(&socket_id).and_then(|s| s.tcp_handle);
+        if let Some(h) = tcp_handle {
+            // sockaddr_in is 16 bytes minimum (sin_family + sin_port + sin_addr + sin_zero).
+            if addr == 0 || addrlen < 4 {
+                return EINVAL;
+            }
+            // Parse port from sockaddr_in (bytes 2-3, big-endian).
+            let port_bytes = unsafe { [*(addr as *const u8).add(2), *(addr as *const u8).add(3)] };
+            let port = u16::from_be_bytes(port_bytes);
+            match self.tcp.tcp_bind(h, port) {
+                Ok(()) => {
+                    if let Some(state) = self.sockets.get_mut(&socket_id) {
+                        state.bound_port = port;
+                    }
+                    0
+                }
+                Err(e) => net_error_to_errno(e),
+            }
+        } else {
+            0 // stub no-op
         }
     }
 
     /// Linux listen(2): mark socket as listening.
-    fn sys_listen(&mut self, fd: i32, _backlog: i32) -> i64 {
+    fn sys_listen(&mut self, fd: i32, backlog: i32) -> i64 {
         const SOCK_STREAM: i32 = 1;
         const SOCK_SEQPACKET: i32 = 5;
         const EOPNOTSUPP: i64 = -95;
-        match self.require_socket(fd) {
-            Ok(socket_id) => {
-                if let Some(state) = self.sockets.get_mut(&socket_id) {
-                    if state.sock_type != SOCK_STREAM && state.sock_type != SOCK_SEQPACKET {
-                        return EOPNOTSUPP;
-                    }
-                    state.listening = true;
-                }
-                0
+        let socket_id = match self.require_socket(fd) {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+        let tcp_handle = self.sockets.get(&socket_id).and_then(|s| s.tcp_handle);
+        if let Some(state) = self.sockets.get_mut(&socket_id) {
+            if state.sock_type != SOCK_STREAM && state.sock_type != SOCK_SEQPACKET {
+                return EOPNOTSUPP;
             }
-            Err(e) => e,
+        }
+        if let Some(h) = tcp_handle {
+            match self.tcp.tcp_listen(h, backlog as usize) {
+                Ok(()) => {
+                    if let Some(state) = self.sockets.get_mut(&socket_id) {
+                        state.listening = true;
+                    }
+                    0
+                }
+                Err(e) => net_error_to_errno(e),
+            }
+        } else {
+            if let Some(state) = self.sockets.get_mut(&socket_id) {
+                state.listening = true;
+            }
+            0
         }
     }
 
-    /// Linux accept4(2): create a new stub socket fd from a listening socket.
+    /// Linux accept4(2): create a new socket fd from a listening socket.
     fn sys_accept4(&mut self, fd: i32, addr: u64, addrlen_ptr: u64, flags: i32) -> i64 {
+        const SOCK_CLOEXEC: i32 = 0o2000000;
+        const SOCK_NONBLOCK: i32 = 0o4000;
+
         let socket_id = match self.require_socket(fd) {
             Ok(id) => id,
             Err(e) => return e,
         };
 
         let state_snap = match self.sockets.get(&socket_id) {
-            Some(s) if s.listening => (s.domain, s.sock_type, s.nonblock, s.accepted_once),
+            Some(s) if s.listening => (
+                s.domain,
+                s.sock_type,
+                s.nonblock,
+                s.accepted_once,
+                s.tcp_handle,
+            ),
             Some(s) if !s.listening => return EINVAL,
             _ => return EINVAL,
         };
-        let (domain, sock_type, nonblock, accepted_once) = state_snap;
+        let (domain, sock_type, nonblock, accepted_once, parent_tcp_handle) = state_snap;
 
-        // Non-blocking sockets return EAGAIN after the first accept to
-        // prevent infinite accept loops in always-ready epoll stubs.
-        if nonblock && accepted_once {
-            return EAGAIN;
-        }
-
-        // Zero the sockaddr if caller provided one.
-        self.zero_sockaddr(addr, addrlen_ptr);
-
-        // Create new socket state.
-        let new_socket_id = self.next_socket_id;
-        self.next_socket_id += 1;
-        // Mark parent as having accepted once (for EAGAIN on non-blocking).
-        if let Some(parent) = self.sockets.get_mut(&socket_id) {
-            parent.accepted_once = true;
-        }
-
-        self.sockets.insert(
-            new_socket_id,
-            SocketState {
-                domain,
-                sock_type,
-                listening: false,
-                nonblock: flags & SOCK_NONBLOCK != 0,
-                accepted_once: false,
-            },
-        );
-
-        let new_fd = self.alloc_fd();
-        const SOCK_CLOEXEC: i32 = 0o2000000;
-        const SOCK_NONBLOCK: i32 = 0o4000;
-        let fd_flags = if flags & SOCK_CLOEXEC != 0 {
-            FD_CLOEXEC
+        if let Some(h) = parent_tcp_handle {
+            // Real TCP path: try to accept a connection.
+            match self.tcp.tcp_accept(h) {
+                Ok(Some(accepted_handle)) => {
+                    let new_socket_id = self.next_socket_id;
+                    self.next_socket_id += 1;
+                    // Per Linux accept4 semantics, the accepted socket's blocking
+                    // mode is determined solely by flags, not inherited from the listener.
+                    let new_nonblock = flags & SOCK_NONBLOCK != 0;
+                    self.sockets.insert(
+                        new_socket_id,
+                        SocketState {
+                            domain,
+                            sock_type,
+                            listening: false,
+                            nonblock: new_nonblock,
+                            accepted_once: false,
+                            tcp_handle: Some(accepted_handle),
+                            bound_port: 0,
+                        },
+                    );
+                    let new_fd = self.alloc_fd();
+                    let fd_flags = if flags & SOCK_CLOEXEC != 0 {
+                        FD_CLOEXEC
+                    } else {
+                        0
+                    };
+                    self.fd_table.insert(
+                        new_fd,
+                        FdEntry {
+                            kind: FdKind::Socket {
+                                socket_id: new_socket_id,
+                            },
+                            flags: fd_flags,
+                        },
+                    );
+                    if addr != 0 {
+                        self.zero_sockaddr(addr, addrlen_ptr);
+                    }
+                    new_fd as i64
+                }
+                Ok(None) => EAGAIN, // No pending connection
+                Err(e) => net_error_to_errno(e),
+            }
         } else {
-            0
-        };
-        self.fd_table.insert(
-            new_fd,
-            FdEntry {
-                kind: FdKind::Socket {
-                    socket_id: new_socket_id,
+            // Stub path (no TCP provider or non-AF_INET socket).
+            // Non-blocking sockets return EAGAIN after the first accept to
+            // prevent infinite accept loops in always-ready epoll stubs.
+            if nonblock && accepted_once {
+                return EAGAIN;
+            }
+
+            // Zero the sockaddr if caller provided one.
+            self.zero_sockaddr(addr, addrlen_ptr);
+
+            // Create new socket state.
+            let new_socket_id = self.next_socket_id;
+            self.next_socket_id += 1;
+            // Mark parent as having accepted once (for EAGAIN on non-blocking).
+            if let Some(parent) = self.sockets.get_mut(&socket_id) {
+                parent.accepted_once = true;
+            }
+
+            self.sockets.insert(
+                new_socket_id,
+                SocketState {
+                    domain,
+                    sock_type,
+                    listening: false,
+                    nonblock: flags & SOCK_NONBLOCK != 0,
+                    accepted_once: false,
+                    tcp_handle: None,
+                    bound_port: 0,
                 },
-                flags: fd_flags,
-            },
-        );
-        new_fd as i64
+            );
+
+            let new_fd = self.alloc_fd();
+            let fd_flags = if flags & SOCK_CLOEXEC != 0 {
+                FD_CLOEXEC
+            } else {
+                0
+            };
+            self.fd_table.insert(
+                new_fd,
+                FdEntry {
+                    kind: FdKind::Socket {
+                        socket_id: new_socket_id,
+                    },
+                    flags: fd_flags,
+                },
+            );
+            new_fd as i64
+        }
     }
 
-    /// Linux connect(2): stub — no-op.
-    fn sys_connect(&self, fd: i32, _addr: u64, _addrlen: u32) -> i64 {
-        match self.require_socket(fd) {
-            Ok(_) => 0,
-            Err(e) => e,
+    /// Linux connect(2): connect socket to a remote address.
+    fn sys_connect(&mut self, fd: i32, addr: u64, addrlen: u32) -> i64 {
+        let socket_id = match self.require_socket(fd) {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+        let (tcp_handle, _nonblock) = match self.sockets.get(&socket_id) {
+            Some(s) => (s.tcp_handle, s.nonblock),
+            None => return EBADF,
+        };
+        if let Some(h) = tcp_handle {
+            // sockaddr_in needs at least 8 bytes (family + port + addr).
+            if addr == 0 || addrlen < 8 {
+                return EINVAL;
+            }
+            let ptr = addr as *const u8;
+            let port = u16::from_be_bytes(unsafe { [*ptr.add(2), *ptr.add(3)] });
+            let ip = harmony_netstack::smoltcp::wire::Ipv4Address::new(
+                unsafe { *ptr.add(4) },
+                unsafe { *ptr.add(5) },
+                unsafe { *ptr.add(6) },
+                unsafe { *ptr.add(7) },
+            );
+            match self.tcp.tcp_connect(h, ip, port) {
+                // v1: always return EINPROGRESS since tcp_connect only
+                // queues the SYN. True blocking connect (wait for handshake)
+                // requires yield/coroutine (harmony-os-cqy).
+                Ok(()) => EINPROGRESS,
+                Err(e) => net_error_to_errno(e),
+            }
+        } else {
+            0 // stub no-op
         }
     }
 
@@ -3931,38 +4205,88 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
     }
 
-    /// Linux sendto(2): stub — pretend all bytes sent.
+    /// Linux sendto(2): send data on a socket.
     fn sys_sendto(
-        &self,
+        &mut self,
         fd: i32,
-        _buf: u64,
+        buf: u64,
         len: u64,
         _flags: i32,
         _addr: u64,
         _addrlen: u32,
     ) -> i64 {
-        match self.require_socket(fd) {
-            Ok(_) => len.min(i64::MAX as u64) as i64,
-            Err(e) => e,
+        let socket_id = match self.require_socket(fd) {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+        let (tcp_handle, _nonblock) = match self.sockets.get(&socket_id) {
+            Some(s) => (s.tcp_handle, s.nonblock),
+            None => return EBADF,
+        };
+        if let Some(h) = tcp_handle {
+            let count = len as usize;
+            if count == 0 {
+                return 0;
+            }
+            if buf == 0 {
+                return EFAULT;
+            }
+            let data = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
+            match self.tcp.tcp_send(h, data) {
+                Ok(n) => n as i64,
+                Err(NetError::WouldBlock) => {
+                    // v1: always return EAGAIN. True blocking requires
+                    // a yield/coroutine mechanism (harmony-os-cqy).
+                    EAGAIN
+                }
+                Err(_) => EPIPE,
+            }
+        } else {
+            // Stub: pretend all bytes sent.
+            len.min(i64::MAX as u64) as i64
         }
     }
 
-    /// Linux recvfrom(2): stub — return EOF (no data).
+    /// Linux recvfrom(2): receive data from a socket.
     fn sys_recvfrom(
-        &self,
+        &mut self,
         fd: i32,
-        _buf: u64,
-        _len: u64,
+        buf: u64,
+        len: u64,
         _flags: i32,
         src: u64,
         addrlen: u64,
     ) -> i64 {
-        match self.require_socket(fd) {
-            Ok(_) => {
-                self.zero_sockaddr(src, addrlen);
-                0
+        let socket_id = match self.require_socket(fd) {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+        let (tcp_handle, _nonblock) = match self.sockets.get(&socket_id) {
+            Some(s) => (s.tcp_handle, s.nonblock),
+            None => return EBADF,
+        };
+        if let Some(h) = tcp_handle {
+            let count = len as usize;
+            if count == 0 {
+                return 0;
             }
-            Err(e) => e,
+            if buf == 0 {
+                return EFAULT;
+            }
+            let data = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, count) };
+            match self.tcp.tcp_recv(h, data) {
+                Ok(n) => n as i64,
+                Err(NetError::WouldBlock) => {
+                    // v1: always return EAGAIN. True blocking requires
+                    // a yield/coroutine mechanism (harmony-os-cqy).
+                    EAGAIN
+                }
+                Err(e) => net_error_to_errno(e),
+            }
+        } else {
+            // Stub: return EOF.
+            self.zero_sockaddr(src, addrlen);
+            0
         }
     }
 
@@ -4248,8 +4572,12 @@ impl<B: SyscallBackend> Linuxulator<B> {
         }
     }
 
-    /// Linux epoll_wait(2): return all registered fds as ready.
-    fn sys_epoll_wait(&self, epfd: i32, events_ptr: u64, maxevents: i32, _timeout: i32) -> i64 {
+    /// Linux epoll_wait(2): return ready fds.
+    ///
+    /// For TCP sockets the real readiness state is checked via the
+    /// [`TcpProvider`]; all other fds are always reported as ready
+    /// (existing stub behaviour).
+    fn sys_epoll_wait(&mut self, epfd: i32, events_ptr: u64, maxevents: i32, _timeout: i32) -> i64 {
         let epoll_id = match self.require_epoll(epfd) {
             Ok(id) => id,
             Err(e) => return e,
@@ -4263,20 +4591,97 @@ impl<B: SyscallBackend> Linuxulator<B> {
             return EFAULT;
         }
 
-        let state = match self.epolls.get(&epoll_id) {
-            Some(s) => s,
+        // Drive the network stack so TCP state is fresh.
+        // monotonic_ns is in nanoseconds; tcp_poll expects milliseconds.
+        let now_ms = (self.monotonic_ns / 1_000_000) as i64;
+        self.tcp.tcp_poll(now_ms);
+
+        // Collect the interest list snapshot to avoid borrow conflicts when
+        // looking up socket / tcp state later.
+        let interests: Vec<(i32, u32, u64)> = match self.epolls.get(&epoll_id) {
+            Some(s) => s
+                .interests
+                .iter()
+                .map(|(&fd, &(m, d))| (fd, m, d))
+                .collect(),
             None => return EINVAL,
         };
 
+        const EPOLLIN: u32 = 0x001;
+        const EPOLLOUT: u32 = 0x004;
+        const EPOLLHUP: u32 = 0x010;
+
         let event_size = self.epoll_event_size();
         let mut written = 0i64;
-        for (&_fd, &(mask, data)) in state.interests.iter() {
+
+        for (fd, mask, data) in interests {
             if written >= maxevents as i64 {
                 break;
             }
-            let offset = (written as usize) * event_size;
-            self.write_epoll_event(events_ptr + offset as u64, mask, data);
-            written += 1;
+
+            // Check if this fd maps to a TCP-backed socket.
+            let tcp_handle = self.fd_table.get(&fd).and_then(|entry| {
+                if let FdKind::Socket { socket_id } = &entry.kind {
+                    self.sockets.get(socket_id).and_then(|s| s.tcp_handle)
+                } else {
+                    None
+                }
+            });
+
+            // Also look up if this socket is a listener (for accept readiness).
+            let is_listener = self
+                .fd_table
+                .get(&fd)
+                .and_then(|entry| {
+                    if let FdKind::Socket { socket_id } = &entry.kind {
+                        self.sockets.get(socket_id).map(|s| s.listening)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(false);
+
+            let ready_events: u32 = if let Some(h) = tcp_handle {
+                let state = self.tcp.tcp_state(h);
+                let mut ev = 0u32;
+
+                // EPOLLIN: data available, accepted connection ready, or EOF.
+                if mask & EPOLLIN != 0 {
+                    if self.tcp.tcp_can_recv(h) || state == TcpSocketState::CloseWait {
+                        ev |= EPOLLIN;
+                    }
+                    // A listening socket that transitioned to Established means
+                    // a connection is ready to accept.
+                    if is_listener && state == TcpSocketState::Established {
+                        ev |= EPOLLIN;
+                    }
+                }
+
+                // EPOLLOUT: writable when established (not listening) and send buffer available.
+                if mask & EPOLLOUT != 0
+                    && !is_listener
+                    && self.tcp.tcp_can_send(h)
+                    && state == TcpSocketState::Established
+                {
+                    ev |= EPOLLOUT;
+                }
+
+                // EPOLLHUP: connection fully closed.
+                if state == TcpSocketState::Closed || state == TcpSocketState::Closing {
+                    ev |= EPOLLHUP;
+                }
+
+                ev
+            } else {
+                // Non-TCP fd: always ready (existing stub behaviour).
+                mask
+            };
+
+            if ready_events != 0 {
+                let offset = (written as usize) * event_size;
+                self.write_epoll_event(events_ptr + offset as u64, ready_events, data);
+                written += 1;
+            }
         }
         written
     }
@@ -4556,10 +4961,35 @@ impl<B: SyscallBackend> Linuxulator<B> {
     // ── Process management ────────────────────────────────────────
 
     /// Create a child Linuxulator with cloned state for fork.
-    fn create_child(&mut self, child_pid: i32) -> Option<Linuxulator<B>> {
+    ///
+    /// Returns `None` if the backend or TCP provider does not support fork.
+    fn create_child(&mut self, child_pid: i32) -> Option<Linuxulator<B, T>> {
         let child_backend = self.backend.fork_backend()?;
+        let child_tcp = self.tcp.tcp_fork()?;
+        // Child socket state: sockets with tcp_handle are not forked (TCP
+        // handles are not duplicable). Clone the socket map but clear
+        // tcp_handles so child sockets become stubs.
+        let child_sockets = self
+            .sockets
+            .iter()
+            .map(|(&id, s)| {
+                (
+                    id,
+                    SocketState {
+                        domain: s.domain,
+                        sock_type: s.sock_type,
+                        listening: s.listening,
+                        nonblock: s.nonblock,
+                        accepted_once: s.accepted_once,
+                        tcp_handle: None,
+                        bound_port: s.bound_port,
+                    },
+                )
+            })
+            .collect();
         let mut child = Linuxulator {
             backend: child_backend,
+            tcp: child_tcp,
             fd_table: self.fd_table.clone(),
             next_fid: self.next_fid,
             exit_code: None,
@@ -4577,7 +5007,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
             next_pipe_id: self.next_pipe_id,
             eventfds: BTreeMap::new(),
             next_eventfd_id: self.next_eventfd_id,
-            sockets: self.sockets.clone(),
+            sockets: child_sockets,
             next_socket_id: self.next_socket_id,
             epolls: self.epolls.clone(),
             next_epoll_id: self.next_epoll_id,
@@ -5961,6 +6391,7 @@ impl<B: SyscallBackend> Linuxulator<B> {
         };
 
         // Both ends share a single SocketState (same socket_id).
+        // socketpair is AF_UNIX only; no TCP handle needed.
         let socket_id = self.next_socket_id;
         self.next_socket_id += 1;
         self.sockets.insert(
@@ -5971,6 +6402,8 @@ impl<B: SyscallBackend> Linuxulator<B> {
                 listening: false,
                 nonblock: flags & SOCK_NONBLOCK != 0,
                 accepted_once: false,
+                tcp_handle: None,
+                bound_port: 0,
             },
         );
 
