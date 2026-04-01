@@ -15,6 +15,7 @@ pub mod config_applicator;
 pub mod disk_book_store;
 pub mod elf;
 pub mod elf_loader;
+pub mod embedded_fs;
 pub mod linuxulator;
 #[cfg(feature = "std")]
 pub mod mesh_nar_source;
