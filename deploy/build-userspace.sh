@@ -21,10 +21,10 @@ set -euo pipefail
 # with libtommath/libtomcrypt that occur when invoking make directly.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-NIX="nix --extra-experimental-features nix-command\ flakes"
+NIX=(nix --extra-experimental-features "nix-command flakes")
 
 echo "=== Building static dropbear (aarch64-linux-musl) ==="
-DROPBEAR_PATH=$($NIX build --impure --expr '
+DROPBEAR_PATH=$("${NIX[@]}" build --impure --expr '
   let pkgs = import (builtins.getFlake "nixpkgs") {
     system = builtins.currentSystem;
     crossSystem = { config = "aarch64-unknown-linux-musl"; useLLVM = false; };
@@ -35,7 +35,7 @@ cp -f "$DROPBEAR_PATH/bin/dropbear" "$SCRIPT_DIR/dropbear-aarch64"
 echo "  → dropbear-aarch64 ($(wc -c < "$SCRIPT_DIR/dropbear-aarch64" | tr -d ' ') bytes)"
 
 echo "=== Building static busybox (aarch64-linux-musl) ==="
-BUSYBOX_PATH=$($NIX build --impure --expr '
+BUSYBOX_PATH=$("${NIX[@]}" build --impure --expr '
   let pkgs = import (builtins.getFlake "nixpkgs") {
     system = builtins.currentSystem;
     crossSystem = { config = "aarch64-unknown-linux-musl"; useLLVM = false; };

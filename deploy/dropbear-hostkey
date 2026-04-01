@@ -1,9 +1,0 @@
-This is a PLACEHOLDER file, not a real SSH host key.
-
-The actual host key is generated at build time by deploy/build-userspace.sh
-and should NEVER be committed to git. Real keys are gitignored.
-
-For QEMU testing, dropbear will generate a temporary key with the -R flag
-(generate key on first connection) if no valid key file is provided.
-
-For production nodes, provision unique host keys on first boot.
