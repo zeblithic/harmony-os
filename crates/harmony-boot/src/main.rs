@@ -216,85 +216,6 @@ fn qemu_debug_exit(value: u32) {
 // RefCell-based TCP provider for shared NetStack access
 // ---------------------------------------------------------------------------
 
-/// Wraps a `&RefCell<NetStack>` and implements `TcpProvider` by borrowing
-/// on each call. Provided for future use when a scoped (non-static) Linuxulator
-/// is constructed in the event loop path.
-#[allow(dead_code)]
-struct RefCellTcpProvider<'a>(&'a core::cell::RefCell<harmony_netstack::NetStack>);
-
-impl<'a> harmony_netstack::TcpProvider for RefCellTcpProvider<'a> {
-    fn tcp_create(&mut self) -> Result<harmony_netstack::TcpHandle, harmony_netstack::NetError> {
-        self.0.borrow_mut().tcp_create()
-    }
-    fn tcp_bind(
-        &mut self,
-        h: harmony_netstack::TcpHandle,
-        port: u16,
-    ) -> Result<(), harmony_netstack::NetError> {
-        self.0.borrow_mut().tcp_bind(h, port)
-    }
-    fn tcp_listen(
-        &mut self,
-        h: harmony_netstack::TcpHandle,
-        backlog: usize,
-    ) -> Result<(), harmony_netstack::NetError> {
-        self.0.borrow_mut().tcp_listen(h, backlog)
-    }
-    fn tcp_accept(
-        &mut self,
-        h: harmony_netstack::TcpHandle,
-    ) -> Result<Option<harmony_netstack::TcpHandle>, harmony_netstack::NetError> {
-        self.0.borrow_mut().tcp_accept(h)
-    }
-    fn tcp_connect(
-        &mut self,
-        h: harmony_netstack::TcpHandle,
-        addr: smoltcp::wire::Ipv4Address,
-        port: u16,
-    ) -> Result<(), harmony_netstack::NetError> {
-        self.0.borrow_mut().tcp_connect(h, addr, port)
-    }
-    fn tcp_send(
-        &mut self,
-        h: harmony_netstack::TcpHandle,
-        data: &[u8],
-    ) -> Result<usize, harmony_netstack::NetError> {
-        self.0.borrow_mut().tcp_send(h, data)
-    }
-    fn tcp_recv(
-        &mut self,
-        h: harmony_netstack::TcpHandle,
-        buf: &mut [u8],
-    ) -> Result<usize, harmony_netstack::NetError> {
-        self.0.borrow_mut().tcp_recv(h, buf)
-    }
-    fn tcp_close(
-        &mut self,
-        h: harmony_netstack::TcpHandle,
-    ) -> Result<(), harmony_netstack::NetError> {
-        self.0.borrow_mut().tcp_close(h)
-    }
-    fn tcp_state(&self, h: harmony_netstack::TcpHandle) -> harmony_netstack::TcpSocketState {
-        self.0.borrow().tcp_state(h)
-    }
-    fn tcp_can_recv(&self, h: harmony_netstack::TcpHandle) -> bool {
-        self.0.borrow().tcp_can_recv(h)
-    }
-    fn tcp_can_send(&self, h: harmony_netstack::TcpHandle) -> bool {
-        self.0.borrow().tcp_can_send(h)
-    }
-    fn tcp_poll(&mut self, now_ms: i64) {
-        self.0.borrow_mut().tcp_poll(now_ms)
-    }
-    fn tcp_fork(&self) -> Option<Self>
-    where
-        Self: Sized,
-    {
-        // RefCell wrapper holds a reference — cannot be forked.
-        None
-    }
-}
-
 /// Wraps a raw `*mut NetStack` and implements `TcpProvider`.
 ///
 /// Used only in the ring3 `static mut LINUXULATOR` where a `'static` bound
@@ -302,11 +223,21 @@ impl<'a> harmony_netstack::TcpProvider for RefCellTcpProvider<'a> {
 /// pointer is valid for the entire boot lifetime because `netstack` is a
 /// local variable in `kernel_continue` which never returns.
 ///
-/// # Safety invariant
-/// The caller must ensure the pointer remains valid and no aliasing mutable
-/// borrows coexist with calls to this type. In practice this is guaranteed
-/// because the ring3 path exits via `jmp` (noreturn) before the event loop
-/// that also touches the netstack, so the two code paths never interleave.
+/// # Safety invariants
+///
+/// 1. **Lifetime:** The pointer remains valid because `kernel_continue` never
+///    returns — the `jmp {entry}` is marked `options(noreturn)`.
+///
+/// 2. **No aliasing:** The ring3 `jmp` exits before the event loop that also
+///    borrows the netstack, so the two code paths never interleave.
+///
+/// 3. **Exception safety:** After the `jmp`, the CPU runs on the ELF's own
+///    64 KiB stack. x86 hardware exceptions (page fault, GPF) use the current
+///    RSP for the exception frame — they do NOT switch back to the old kernel
+///    stack where `netstack` lives. The IDT entries do not use IST (no TSS
+///    IST pointer is configured to the old stack), so exceptions cannot
+///    corrupt the abandoned `kernel_continue` frame. A double-fault triggers
+///    a triple-fault (reset), not a stack write into the old frame.
 #[cfg(feature = "ring3")]
 struct RawPtrTcpProvider(*mut harmony_netstack::NetStack);
 
@@ -621,7 +552,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     };
     let netstack = core::cell::RefCell::new(netstack);
 
-    serial.log("NETSTACK", "udp0 DHCP (fallback 10.0.2.15/24), port 4242, tcp_max_sockets=16");
+    serial.log("NETSTACK", "udp0 DHCP (fallback 10.0.2.15/24 after 5s), port 4242, tcp_max_sockets=16");
 
     // 5. Event loop
     let persistence = MemoryState::new();
