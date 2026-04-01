@@ -29,6 +29,17 @@ use harmony_identity::PrivateIdentity;
 use harmony_unikernel::serial::{hex_encode, SerialWriter};
 use harmony_unikernel::{KernelEntropy, MemoryState, RuntimeAction, UnikernelRuntime};
 
+// ---------------------------------------------------------------------------
+// Embedded SSH userspace binaries (ring3 only)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "ring3")]
+static DROPBEAR_BIN: &[u8] = include_bytes!("../../../deploy/dropbear-aarch64");
+#[cfg(feature = "ring3")]
+static BUSYBOX_BIN: &[u8] = include_bytes!("../../../deploy/busybox-aarch64");
+#[cfg(feature = "ring3")]
+static DROPBEAR_HOSTKEY: &[u8] = include_bytes!("../../../deploy/dropbear-hostkey");
+
 use virtio::net::ETH_HEADER_LEN;
 
 // ---------------------------------------------------------------------------
@@ -812,7 +823,38 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                 .expect("init_stdio failed");
         }
 
-        // 5. Install dispatch function
+        // 5. Build embedded filesystem for dropbear + busybox
+        {
+            let mut efs = harmony_os::embedded_fs::EmbeddedFs::new();
+
+            // Binaries
+            efs.add_file("/bin/dropbear", DROPBEAR_BIN, true);
+            efs.add_file("/bin/busybox", BUSYBOX_BIN, true);
+            efs.add_file("/bin/sh", BUSYBOX_BIN, true);
+            efs.add_file("/bin/ash", BUSYBOX_BIN, true);
+
+            // Config files
+            efs.add_file("/etc/passwd", b"root::0:0:root:/root:/bin/sh\n", false);
+            efs.add_file("/etc/shells", b"/bin/sh\n", false);
+            efs.add_file(
+                "/etc/dropbear/dropbear_ed25519_host_key",
+                DROPBEAR_HOSTKEY,
+                false,
+            );
+
+            // Minimal /etc/group for busybox id/whoami
+            efs.add_file("/etc/group", b"root:x:0:\n", false);
+
+            // Register with the Linuxulator
+            unsafe {
+                if let Some(ref mut lx) = LINUXULATOR {
+                    lx.set_embedded_fs(efs);
+                }
+            }
+        }
+        serial.log("USERSPACE", "embedded dropbear + busybox registered in EmbeddedFs");
+
+        // 7. Install dispatch function
         fn dispatch(nr: u64, args: [u64; 6]) -> syscall::SyscallResult {
             let lx = unsafe { LINUXULATOR.as_mut().unwrap() };
             let retval = lx.handle_syscall(nr, args);
@@ -833,7 +875,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             syscall::set_dispatch_fn(dispatch);
         }
 
-        // 6. Set up MSRs
+        // 8. Set up MSRs
         // kernel_cs = 0x08 (standard GDT kernel code segment from bootloader)
         // user_cs_base = 0x00 (unused in flat Ring 0 MVP — we use jmp instead of sysretq)
         unsafe {
@@ -842,7 +884,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
 
         serial.log("LINUX", "jumping to ELF entry point");
 
-        // 7. Jump to the binary
+        // 9. Jump to the binary
         // Set RSP to stack_top and jump to entry. When the binary calls
         // `syscall`, the CPU will vector to syscall_entry via LSTAR.
         // After exit_group, we check the flag and continue.
