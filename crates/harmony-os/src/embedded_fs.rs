@@ -24,6 +24,7 @@ pub struct EmbeddedFile {
 /// `/usr/bin/dropbear`. Directory existence is derived automatically: any
 /// path component that is a prefix of a registered file is considered an
 /// existing directory.
+#[derive(Clone)]
 pub struct EmbeddedFs {
     files: BTreeMap<String, EmbeddedFile>,
 }

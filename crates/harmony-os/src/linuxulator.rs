@@ -5101,8 +5101,8 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             alt_stack_flags: self.alt_stack_flags,
             on_alt_stack: false,
             pending_signal_return: None,
-            // EmbeddedFs is shared by reference — children see the same overlay.
-            embedded_fs: None,
+            // EmbeddedFs contains only &'static references — clone is cheap.
+            embedded_fs: self.embedded_fs.clone(),
         };
         // Move shared pipe/eventfd state to child
         core::mem::swap(&mut self.pipes, &mut child.pipes);
@@ -5575,6 +5575,11 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             .as_ref()
             .is_some_and(|efs| efs.get(&path).is_some());
         if efs_hit {
+            // Embedded files are read-only — reject write access upfront.
+            if flags & 0x03 != 0 {
+                // O_WRONLY (1) or O_RDWR (2)
+                return EROFS;
+            }
             let fd_flags = if flags & O_CLOEXEC != 0 {
                 FD_CLOEXEC
             } else {

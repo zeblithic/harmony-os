@@ -834,7 +834,18 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             efs.add_file("/bin/ash", BUSYBOX_BIN, true);
 
             // Config files
-            efs.add_file("/etc/passwd", b"root::0:0:root:/root:/bin/sh\n", false);
+            efs.add_file(
+                "/etc/passwd",
+                b"root:x:0:0:root:/root:/bin/sh\n",
+                false,
+            );
+            // SHA-512 hash of "harmony" — dropbear checks /etc/shadow when
+            // /etc/passwd has "x" in the password field.
+            efs.add_file(
+                "/etc/shadow",
+                b"root:$6$3dBTlFcq3TUeP.1b$MMabSOewt9dUQg.duy11rBOtOcIgjMwLWGTcuxkdIeeXaYTzQbn2R2HKwQs4p.GXuQr/RHx7FAxwzR6FpJT2y1:19814:0:99999:7:::\n",
+                false,
+            );
             efs.add_file("/etc/shells", b"/bin/sh\n", false);
             efs.add_file(
                 "/etc/dropbear/dropbear_ed25519_host_key",
