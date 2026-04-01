@@ -3433,7 +3433,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 let n = if let Some(ref efs) = self.embedded_fs {
                     if let Some(file) = efs.get(&path_clone) {
                         let start = (file_offset as usize).min(file.data.len());
-                        let end = (start + count).min(file.data.len());
+                        let end = start.saturating_add(count).min(file.data.len());
                         let n = end - start;
                         if n > 0 {
                             // Safety: buf_ptr points to valid writable user memory of at least
@@ -5674,22 +5674,24 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         let envp = read_string_array(envp_ptr, 256);
 
         // Fetch ELF bytes — prefer EmbeddedFs, fall back to 9P.
-        let elf_bytes: Vec<u8> = if let Some(ref efs) = self.embedded_fs {
+        let embedded_elf: Option<Vec<u8>> = if let Some(ref efs) = self.embedded_fs {
             if let Some(file) = efs.get(&path) {
                 if !file.executable {
                     return EACCES;
                 }
-                file.data.to_vec()
+                if file.data.is_empty() {
+                    return ENOEXEC;
+                }
+                Some(file.data.to_vec())
             } else {
-                // Not in EmbeddedFs — fall through to 9P below.
-                alloc::vec![]
+                None // Not in EmbeddedFs — fall through to 9P
             }
         } else {
-            alloc::vec![]
+            None
         };
 
-        let elf_bytes: Vec<u8> = if !elf_bytes.is_empty() {
-            elf_bytes
+        let elf_bytes: Vec<u8> = if let Some(bytes) = embedded_elf {
+            bytes
         } else {
             // Read ELF binary from 9P filesystem.
             let fid = self.alloc_fid();
