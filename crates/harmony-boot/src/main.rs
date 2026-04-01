@@ -335,6 +335,167 @@ unsafe fn map_elf_at_linked_addresses(
     mapped
 }
 
+/// Map a virtual address range to a contiguous heap allocation.
+///
+/// Creates page-table entries so that `vaddr_start..vaddr_end` resolves to
+/// the heap buffer at `heap_base_virt`. Used by `DirectBackend::vm_mmap`
+/// when loading an ELF for execve.
+///
+/// # Safety
+/// Same requirements as `map_elf_at_linked_addresses`.
+#[cfg(feature = "ring3")]
+unsafe fn map_range_to_heap(phys_offset: u64, heap_base_virt: usize, vaddr_start: u64, vaddr_end: u64) {
+    const PRESENT: u64 = 1;
+    const WRITABLE: u64 = 1 << 1;
+    const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+    const PAGE_SIZE: u64 = 0x1000;
+
+    let cr3: u64;
+    core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+    let pml4_phys = cr3 & ADDR_MASK;
+    let pml4 = (pml4_phys + phys_offset) as *mut u64;
+
+    let mut alloc_pt_page = || -> (usize, u64) {
+        let layout = core::alloc::Layout::from_size_align(PAGE_SIZE as usize, PAGE_SIZE as usize)
+            .expect("page table layout");
+        let ptr = alloc::alloc::alloc_zeroed(layout);
+        assert!(!ptr.is_null(), "page table allocation failed");
+        let virt = ptr as usize;
+        let phys = virt as u64 - phys_offset;
+        (virt, phys)
+    };
+
+    let ensure_table = |entry: *mut u64, alloc: &mut dyn FnMut() -> (usize, u64)| -> *mut u64 {
+        let val = core::ptr::read_volatile(entry);
+        if val & PRESENT != 0 {
+            ((val & ADDR_MASK) + phys_offset) as *mut u64
+        } else {
+            let (virt, phys) = alloc();
+            core::ptr::write_volatile(entry, phys | PRESENT | WRITABLE);
+            virt as *mut u64
+        }
+    };
+
+    let mut vaddr = vaddr_start & !(PAGE_SIZE - 1);
+    while vaddr < vaddr_end {
+        let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+        let pml3_idx = ((vaddr >> 30) & 0x1FF) as usize;
+        let pml2_idx = ((vaddr >> 21) & 0x1FF) as usize;
+        let pml1_idx = ((vaddr >> 12) & 0x1FF) as usize;
+
+        let pml3 = ensure_table(pml4.add(pml4_idx), &mut alloc_pt_page);
+        let pml2 = ensure_table(pml3.add(pml3_idx), &mut alloc_pt_page);
+        let pml1 = ensure_table(pml2.add(pml2_idx), &mut alloc_pt_page);
+
+        let heap_offset = (vaddr - vaddr_start) as usize;
+        let heap_virt_for_page = heap_base_virt + heap_offset;
+        let phys_addr = heap_virt_for_page as u64 - phys_offset;
+
+        // RW, no NX — we don't know which pages are code vs data at this level.
+        core::ptr::write_volatile(pml1.add(pml1_idx), phys_addr | PRESENT | WRITABLE);
+        vaddr += PAGE_SIZE;
+    }
+
+    // Flush TLB
+    core::arch::asm!("mov {0}, cr3", "mov cr3, {0}", out(reg) _, options(nostack));
+}
+
+/// Save all PTE values for a virtual address range.
+///
+/// Returns a Vec of (vaddr, pte_value) pairs. Used to preserve the
+/// parent binary's page table entries before a child exec overwrites them.
+#[cfg(feature = "ring3")]
+unsafe fn save_pte_range(phys_offset: u64, vaddr_start: u64, vaddr_end: u64) -> alloc::vec::Vec<(u64, u64)> {
+    const PRESENT: u64 = 1;
+    const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+    const PAGE_SIZE: u64 = 0x1000;
+
+    let cr3: u64;
+    core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+    let pml4_phys = cr3 & ADDR_MASK;
+    let pml4 = (pml4_phys + phys_offset) as *const u64;
+
+    let mut saved = alloc::vec::Vec::new();
+    let mut vaddr = vaddr_start & !(PAGE_SIZE - 1);
+    while vaddr < vaddr_end {
+        let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+        let pml3_idx = ((vaddr >> 30) & 0x1FF) as usize;
+        let pml2_idx = ((vaddr >> 21) & 0x1FF) as usize;
+        let pml1_idx = ((vaddr >> 12) & 0x1FF) as usize;
+
+        let pml4_val = core::ptr::read_volatile(pml4.add(pml4_idx));
+        if pml4_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        let pml3 = ((pml4_val & ADDR_MASK) + phys_offset) as *const u64;
+
+        let pml3_val = core::ptr::read_volatile(pml3.add(pml3_idx));
+        if pml3_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        let pml2 = ((pml3_val & ADDR_MASK) + phys_offset) as *const u64;
+
+        let pml2_val = core::ptr::read_volatile(pml2.add(pml2_idx));
+        if pml2_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        let pml1 = ((pml2_val & ADDR_MASK) + phys_offset) as *const u64;
+
+        let pte = core::ptr::read_volatile(pml1.add(pml1_idx));
+        saved.push((vaddr, pte));
+        vaddr += PAGE_SIZE;
+    }
+    saved
+}
+
+/// Restore PTE values saved by `save_pte_range` and clear any PTEs in the
+/// range that were NOT in the saved set (i.e., pages added by the child's exec).
+#[cfg(feature = "ring3")]
+unsafe fn restore_pte_range(phys_offset: u64, saved: &[(u64, u64)], vaddr_start: u64, vaddr_end: u64) {
+    const PRESENT: u64 = 1;
+    const WRITABLE: u64 = 1 << 1;
+    const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+    const PAGE_SIZE: u64 = 0x1000;
+
+    let cr3: u64;
+    core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+    let pml4_phys = cr3 & ADDR_MASK;
+    let pml4 = (pml4_phys + phys_offset) as *mut u64;
+
+    // Build a map of saved vaddr → pte for fast lookup.
+    let mut saved_map = alloc::collections::BTreeMap::new();
+    for &(va, pte) in saved {
+        saved_map.insert(va, pte);
+    }
+
+    let mut vaddr = vaddr_start & !(PAGE_SIZE - 1);
+    while vaddr < vaddr_end {
+        let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+        let pml3_idx = ((vaddr >> 30) & 0x1FF) as usize;
+        let pml2_idx = ((vaddr >> 21) & 0x1FF) as usize;
+        let pml1_idx = ((vaddr >> 12) & 0x1FF) as usize;
+
+        // Walk to PML1 — skip if intermediate tables don't exist.
+        let pml4_val = core::ptr::read_volatile(pml4.add(pml4_idx) as *const u64);
+        if pml4_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        let pml3 = ((pml4_val & ADDR_MASK) + phys_offset) as *mut u64;
+
+        let pml3_val = core::ptr::read_volatile(pml3.add(pml3_idx) as *const u64);
+        if pml3_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        let pml2 = ((pml3_val & ADDR_MASK) + phys_offset) as *mut u64;
+
+        let pml2_val = core::ptr::read_volatile(pml2.add(pml2_idx) as *const u64);
+        if pml2_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        let pml1 = ((pml2_val & ADDR_MASK) + phys_offset) as *mut u64;
+
+        if let Some(&pte) = saved_map.get(&vaddr) {
+            // Restore original PTE.
+            core::ptr::write_volatile(pml1.add(pml1_idx), pte);
+        } else {
+            // Page added by child — clear it.
+            core::ptr::write_volatile(pml1.add(pml1_idx), 0);
+        }
+        vaddr += PAGE_SIZE;
+    }
+
+    // Flush TLB
+    core::arch::asm!("mov {0}, cr3", "mov cr3, {0}", out(reg) _, options(nostack));
+}
+
 // ---------------------------------------------------------------------------
 // QEMU debug exit
 // ---------------------------------------------------------------------------
@@ -449,8 +610,9 @@ impl harmony_netstack::TcpProvider for RawPtrTcpProvider {
     where
         Self: Sized,
     {
-        // Raw pointer wrapper cannot be forked safely.
-        None
+        // Child shares the same NetStack pointer — safe because the
+        // sequential fork model runs only one process at a time.
+        Some(RawPtrTcpProvider(self.0))
     }
 }
 
@@ -596,7 +758,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // 3. Heap init — find first usable region >= 4 MiB
     //    (2MB kernel stack + 2MB runtime allocations)
-    const MIN_HEAP_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+    const MIN_HEAP_SIZE: usize = 16 * 1024 * 1024; // 16 MiB minimum
+    const MAX_HEAP_SIZE: usize = 32 * 1024 * 1024; // 32 MiB cap — fork needs room for child arena
     let mut heap_start: Option<u64> = None;
     let mut heap_size: usize = 0;
 
@@ -605,11 +768,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let size = (region.end - region.start) as usize;
             if size >= MIN_HEAP_SIZE {
                 heap_start = Some(region.start);
-                heap_size = if size > 16 * 1024 * 1024 {
-                    16 * 1024 * 1024
-                } else {
-                    size
-                };
+                heap_size = size.min(MAX_HEAP_SIZE);
                 break;
             }
         }
@@ -830,19 +989,33 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     #[cfg(feature = "ring3")]
     {
         use harmony_microkernel::serial_server::SerialServer as KernelSerialServer;
+        use harmony_microkernel::vm::{FrameClassification, PageFlags, VmError};
         use harmony_microkernel::FileServer;
         use harmony_os::elf::parse_elf;
         use harmony_os::linuxulator::{Linuxulator, SyscallBackend};
 
         serial.log("KERN", "Ring 3 Linuxulator mode");
 
+        // Store phys_offset for DirectBackend's vm_mmap page-table creation.
+        unsafe {
+            PHYS_OFFSET = phys_offset;
+        }
+
         // ── DirectBackend: wraps SerialServer directly ──────────────
         // The Kernel requires `std` (identity stores), so on bare metal
         // we bypass it and call SerialServer methods directly. Still
         // exercises the FileServer trait — just skips capability checks.
+        //
+        // Also provides vm_mmap for ELF loading during execve: allocates
+        // page-aligned heap memory and creates identity-mapped page table
+        // entries so the new binary can run at its linked addresses.
         struct DirectBackend {
             server: KernelSerialServer,
         }
+
+        /// Physical-memory offset from the bootloader. Set once, used by
+        /// DirectBackend::vm_mmap to create page table entries.
+        static mut PHYS_OFFSET: u64 = 0;
 
         impl DirectBackend {
             fn new() -> Self {
@@ -901,6 +1074,52 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                 fid: harmony_microkernel::Fid,
             ) -> Result<harmony_microkernel::FileStat, harmony_microkernel::IpcError> {
                 self.server.stat(fid)
+            }
+
+            fn vm_mmap(
+                &mut self,
+                vaddr: u64,
+                len: usize,
+                _flags: PageFlags,
+                _classification: FrameClassification,
+            ) -> Result<u64, VmError> {
+                // Allocate page-aligned heap memory and create page-table
+                // entries mapping vaddr → heap frames. The binary's code
+                // uses absolute addresses, so the page table must resolve
+                // them to the heap allocation.
+                const PAGE_SIZE: usize = 0x1000;
+                let aligned_len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                if aligned_len == 0 {
+                    return Ok(vaddr);
+                }
+                let layout = core::alloc::Layout::from_size_align(aligned_len, PAGE_SIZE)
+                    .map_err(|_| VmError::OutOfMemory)?;
+                let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
+                if ptr.is_null() {
+                    return Err(VmError::OutOfMemory);
+                }
+                // Create page table entries: vaddr → heap physical frames.
+                let phys_offset = unsafe { PHYS_OFFSET };
+                let page_start = vaddr & !(PAGE_SIZE as u64 - 1);
+                let page_end = page_start + aligned_len as u64;
+                unsafe {
+                    map_range_to_heap(phys_offset, ptr as usize, page_start, page_end);
+                }
+                Ok(vaddr)
+            }
+
+            fn vm_mprotect(
+                &mut self,
+                _vaddr: u64,
+                _len: usize,
+                _flags: PageFlags,
+            ) -> Result<(), VmError> {
+                // Unikernel: no per-page protection enforcement.
+                Ok(())
+            }
+
+            fn fork_backend(&self) -> Option<Self> {
+                Some(DirectBackend::new())
             }
         }
 
@@ -1101,16 +1320,170 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         }
 
         // 7. Install dispatch function
+        //
+        // Fork strategy:
+        //   Fork #1 (accept loop): fake fork — return 0 so the binary takes
+        //     the child path. One connection per boot.
+        //   Fork #2+ (shell spawn): real Linuxulator fork with context switching.
+        //     The assembly trampoline saves the parent's register frame, returns
+        //     0 to the child. When the child exits, the trampoline restores the
+        //     parent's frame with the child_pid return value. The parent resumes
+        //     its relay loop and reads the child's pipe output.
+
+        /// Number of fork() calls seen. First fork is fake (accept loop);
+        /// subsequent forks use real Linuxulator fork + context switching.
+        static mut FORK_COUNT: u32 = 0;
+
+        /// Saved page-table entries for the ELF address range. Saved before
+        /// the child's execve overwrites them, restored when the child exits.
+        static mut SAVED_PTES: Option<alloc::vec::Vec<(u64, u64)>> = None;
+
+        /// Saved FS_BASE MSR (TLS pointer) from the parent context.
+        static mut SAVED_FS_BASE: u64 = 0;
+
+        /// Saved .data/.bss segment from the parent binary.
+        /// The child modifies dropbear's global variables before exec.
+        /// Range: 0x4a2000..0x4b0000 (56 KiB, page-aligned around the rw- segment).
+        const DATA_SEG_START: u64 = 0x4a2000;
+        const DATA_SEG_SIZE: usize = 56 * 1024; // 56 KiB covers 0x4a2000..0x4b0000
+        static mut SAVED_DATA_SEG: [u8; DATA_SEG_SIZE] = [0; DATA_SEG_SIZE];
+
+        /// Saved brk area (heap) from the parent. The child modifies
+        /// malloc metadata in the brk area between fork and exec.
+        static mut SAVED_BRK: Option<alloc::vec::Vec<u8>> = None;
+        static mut SAVED_BRK_BASE: usize = 0;
+
+        /// Virtual address range of the parent ELF (set once during initial load).
+        static mut ELF_VADDR_MIN: u64 = 0;
+        static mut ELF_VADDR_MAX: u64 = 0;
+
         fn dispatch(nr: u64, args: [u64; 6]) -> syscall::SyscallResult {
-            // Unikernel fork: return 0 ("you are the child") so the binary
-            // takes the child code path. There is only one thread of
-            // execution — we cannot duplicate processes. This makes
-            // fork-per-connection servers (dropbear) handle exactly one
-            // session, which is the right behavior for a unikernel.
             const SYS_CLONE: u64 = 56;
             const SYS_FORK: u64 = 57;
             const SYS_VFORK: u64 = 58;
-            if nr == SYS_FORK || nr == SYS_VFORK || nr == SYS_CLONE {
+
+            let is_fork = nr == SYS_FORK || nr == SYS_VFORK || nr == SYS_CLONE;
+
+            // First fork: fake fork (accept loop). Return 0 so the binary
+            // takes the child path and handles exactly one connection.
+            if is_fork {
+                let count = unsafe { FORK_COUNT };
+                if count == 0 {
+                    unsafe { FORK_COUNT = 1; }
+                    return syscall::SyscallResult {
+                        retval: 0,
+                        exited: false,
+                        exit_code: 0,
+                    };
+                }
+            }
+
+            // Poll the network stack on every syscall entry.
+            unsafe { poll_network(); }
+
+            let lx = unsafe { LINUXULATOR.as_mut().unwrap() };
+
+            // Route to the active process (child if one is running).
+            let active = lx.active_process();
+            let retval = active.handle_syscall(nr, args);
+
+            // Trace unimplemented syscalls for gap-filling.
+            // if retval == -38 {
+            //     serial_write_str(b"[SYS] ENOSYS nr=");
+            //     serial_write_hex(nr);
+            //     serial_write_str(b"\n");
+            // }
+
+            // Poll again after the syscall.
+            unsafe { poll_network(); }
+
+            // ── Fork child creation ─────────────────────────────────
+            // If fork just created a child, save the parent's page table
+            // entries and signal the trampoline to save the register frame.
+            if is_fork && lx.pending_fork_child().is_some() {
+                serial_write_str(b"[FORK] real fork - saving parent context\n");
+                unsafe {
+                    FORK_COUNT += 1;
+                    // Save dropbear's PTEs before the child's exec overwrites them.
+                    if SAVED_PTES.is_none() {
+                        let phys = PHYS_OFFSET;
+                        SAVED_PTES = Some(save_pte_range(phys, 0x400000, 0x600000));
+                    }
+                    // Save dropbear's writable data segment — the child's code
+                    // modifies global variables before exec.
+                    core::ptr::copy_nonoverlapping(
+                        DATA_SEG_START as *const u8,
+                        SAVED_DATA_SEG.as_mut_ptr(),
+                        DATA_SEG_SIZE,
+                    );
+                    // Save entire arena (brk + mmap regions). The child's
+                    // code modifies malloc metadata and heap objects.
+                    let arena_base = lx.arena_base();
+                    let arena_size = 4 * 1024 * 1024; // match the 4 MiB arena
+                    let mut buf = alloc::vec![0u8; arena_size];
+                    core::ptr::copy_nonoverlapping(
+                        arena_base as *const u8,
+                        buf.as_mut_ptr(),
+                        arena_size,
+                    );
+                    SAVED_BRK_BASE = arena_base;
+                    SAVED_BRK = Some(buf);
+                    // Save parent's FS_BASE (TLS pointer).
+                    SAVED_FS_BASE = syscall::read_fs_base();
+                    syscall::fork_save_context();
+                }
+                // retval = child_pid, but the trampoline saves it and returns 0.
+                return syscall::SyscallResult {
+                    retval,
+                    exited: false,
+                    exit_code: 0,
+                };
+            }
+
+            // ── Fork child exit detection ───────────────────────────
+            // If we're in a fork and the active child just exited,
+            // restore the parent's PTEs and signal the trampoline.
+            if syscall::fork_depth() > 0 && lx.pending_fork_child().is_none() {
+                serial_write_str(b"[FORK] child exited - restoring parent context\n");
+                // Call active_process() to trigger recover_child_state().
+                let _ = lx.active_process();
+                // Re-create any pipe buffers removed by the child's close().
+                lx.heal_pipes();
+                // Extract pipe data BEFORE arena restore (which clobbers Vec buffers).
+                let pipe_snapshot = lx.snapshot_pipes();
+
+                unsafe {
+                    // Restore page table entries — dropbear's code is back.
+                    if let Some(ref saved) = SAVED_PTES {
+                        restore_pte_range(PHYS_OFFSET, saved, 0x400000, 0x600000);
+                    }
+                    SAVED_PTES = None;
+                    // Restore dropbear's writable data segment (globals).
+                    core::ptr::copy_nonoverlapping(
+                        SAVED_DATA_SEG.as_ptr(),
+                        DATA_SEG_START as *mut u8,
+                        DATA_SEG_SIZE,
+                    );
+                    // Restore brk area (heap / malloc metadata).
+                    if let Some(ref buf) = SAVED_BRK {
+                        core::ptr::copy_nonoverlapping(
+                            buf.as_ptr(),
+                            SAVED_BRK_BASE as *mut u8,
+                            buf.len(),
+                        );
+                    }
+                    SAVED_BRK = None;
+                }
+                // Restore pipe data that arena restore may have clobbered.
+                lx.restore_pipes(&pipe_snapshot);
+                unsafe {
+                    // Restore parent's user stack content (corrupted by child).
+                    syscall::fork_restore_stack();
+                    // Restore parent's FS_BASE (TLS pointer).
+                    syscall::write_fs_base(SAVED_FS_BASE);
+                    syscall::fork_restore_context();
+                }
+                // retval doesn't matter — trampoline overwrites RAX.
                 return syscall::SyscallResult {
                     retval: 0,
                     exited: false,
@@ -1118,31 +1491,9 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                 };
             }
 
-            // Poll the network stack on every syscall entry so smoltcp
-            // can process TCP handshakes while userspace runs.
-            unsafe {
-                poll_network();
-            }
-
-            let lx = unsafe { LINUXULATOR.as_mut().unwrap() };
-            let retval = lx.handle_syscall(nr, args);
-
-            // Uncomment for gap-filling: trace unimplemented syscalls.
-            // if retval == -38 {
-            //     serial_write_str(b"[SYS] ENOSYS nr=");
-            //     serial_write_hex(nr);
-            //     serial_write_str(b"\n");
-            // }
-
-            // Poll again after the syscall — flushes any outbound frames
-            // generated by the syscall (e.g. TCP ACK after read/write).
-            unsafe {
-                poll_network();
-            }
-
-            // Handle execve: if the Linuxulator parsed a new ELF and set up a
-            // new stack, tell the syscall trampoline to jump there.
-            if let Some(exec) = lx.pending_execve() {
+            // ── Execve handling ─────────────────────────────────────
+            let active = lx.active_process();
+            if let Some(exec) = active.pending_execve() {
                 unsafe {
                     syscall::set_execve_target(exec.entry_point, exec.stack_pointer);
                 }

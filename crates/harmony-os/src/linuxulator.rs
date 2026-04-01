@@ -2900,10 +2900,68 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         })
     }
 
-    /// Base address of the memory arena (for testing).
-    #[cfg(test)]
+    /// Base address of the memory arena.
     pub fn arena_base(&self) -> usize {
         self.arena.base
+    }
+
+    /// Current end of the brk area (base + brk_offset).
+    pub fn arena_brk_end(&self) -> usize {
+        self.arena.base + self.arena.brk_offset
+    }
+
+    /// Return the set of pipe_ids that exist in the pipes map.
+    pub fn pipe_ids(&self) -> alloc::vec::Vec<usize> {
+        self.pipes.keys().copied().collect()
+    }
+
+    /// Return pipe_ids referenced in the fd_table (both read and write ends).
+    pub fn fd_pipe_ids(&self) -> alloc::vec::Vec<(i32, usize)> {
+        self.fd_table
+            .iter()
+            .filter_map(|(&fd, e)| match &e.kind {
+                FdKind::PipeRead { pipe_id } | FdKind::PipeWrite { pipe_id } => {
+                    Some((fd, *pipe_id))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Snapshot all pipe buffers (clone). Used before arena restore which
+    /// might clobber heap-allocated Vec buffers.
+    pub fn snapshot_pipes(&self) -> alloc::collections::BTreeMap<usize, alloc::vec::Vec<u8>> {
+        self.pipes.clone()
+    }
+
+    /// Restore pipe buffers from a snapshot.
+    pub fn restore_pipes(
+        &mut self,
+        snapshot: &alloc::collections::BTreeMap<usize, alloc::vec::Vec<u8>>,
+    ) {
+        self.pipes = snapshot.clone();
+    }
+
+    /// Ensure every pipe_id referenced by the fd_table has an entry in the
+    /// pipes map. Inserts an empty buffer for any missing pipe. This is
+    /// needed after fork recovery when the child closed pipe fds and the
+    /// close handler removed the pipe buffer.
+    pub fn heal_pipes(&mut self) {
+        let missing: alloc::vec::Vec<usize> = self
+            .fd_table
+            .values()
+            .filter_map(|e| match &e.kind {
+                FdKind::PipeRead { pipe_id } | FdKind::PipeWrite { pipe_id }
+                    if !self.pipes.contains_key(pipe_id) =>
+                {
+                    Some(*pipe_id)
+                }
+                _ => None,
+            })
+            .collect();
+        for pid in missing {
+            self.pipes.insert(pid, alloc::vec::Vec::new());
+        }
     }
 
     /// Handle a syscall identified by x86_64 syscall number.
@@ -3222,10 +3280,19 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                     .fd_table
                     .values()
                     .any(|e| matches!(&e.kind, FdKind::PipeRead { pipe_id: id } if *id == pipe_id));
+                // In a forked child (parent_pid != 0), the reader might be in
+                // the parent process. Allow writes if the pipe buffer exists
+                // (shared via fork swap) so the parent can read after recovery.
                 if !has_reader {
-                    return EPIPE;
+                    let is_child = self.parent_pid != 0;
+                    if !is_child || !self.pipes.contains_key(&pipe_id) {
+                        return EPIPE;
+                    }
                 }
-                let pipe_buf = self.pipes.get_mut(&pipe_id).unwrap();
+                let pipe_buf = match self.pipes.get_mut(&pipe_id) {
+                    Some(b) => b,
+                    None => return EPIPE, // pipe buffer removed (e.g. after fork recovery)
+                };
                 let avail = PIPE_BUF_CAP.saturating_sub(pipe_buf.len());
                 if avail == 0 {
                     return EAGAIN;
@@ -3372,7 +3439,10 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 if count == 0 {
                     return 0;
                 }
-                let buf = self.pipes.get_mut(&pipe_id).unwrap();
+                let buf = match self.pipes.get_mut(&pipe_id) {
+                    Some(b) => b,
+                    None => return 0, // EOF — pipe buffer was removed (e.g. after fork recovery)
+                };
                 if buf.is_empty() {
                     // Check if any writer still exists.
                     let has_writer = self.fd_table.values().any(
