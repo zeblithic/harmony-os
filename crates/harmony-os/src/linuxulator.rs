@@ -3179,6 +3179,9 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                     if count == 0 {
                         return 0;
                     }
+                    if buf_ptr == 0 {
+                        return EFAULT;
+                    }
                     let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
                     match self.tcp.tcp_send(h, data) {
                         Ok(n) => n as i64,
@@ -3303,6 +3306,9 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 if let Some(h) = tcp_handle {
                     if count == 0 {
                         return 0;
+                    }
+                    if buf_ptr == 0 {
+                        return EFAULT;
                     }
                     let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, count) };
                     match self.tcp.tcp_recv(h, buf) {
