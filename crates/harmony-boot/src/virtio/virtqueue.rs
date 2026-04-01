@@ -284,10 +284,7 @@ impl Virtqueue {
         let (raw_id, len) = unsafe {
             let ring_idx = (self.last_used_idx % self.queue_size) as usize;
             let elem = &(*self.used).ring[ring_idx];
-            (
-                ptr::read_volatile(&elem.id),
-                ptr::read_volatile(&elem.len),
-            )
+            (ptr::read_volatile(&elem.id), ptr::read_volatile(&elem.len))
         };
 
         self.last_used_idx = self.last_used_idx.wrapping_add(1);

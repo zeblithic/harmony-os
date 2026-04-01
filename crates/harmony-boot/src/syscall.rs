@@ -61,6 +61,19 @@ static mut DISPATCH_FN: Option<SyscallDispatchFn> = None;
 static mut PROCESS_EXITED: bool = false;
 static mut EXIT_CODE: i32 = 0;
 
+/// Execve target: when set, the syscall handler jumps here instead of returning.
+static mut EXECVE_ENTRY: u64 = 0;
+static mut EXECVE_RSP: u64 = 0;
+
+/// Set the execve target. The next syscall return will jump to `entry` with `rsp`.
+///
+/// # Safety
+/// Must be called from the dispatch function during an execve syscall.
+pub unsafe fn set_execve_target(entry: u64, rsp: u64) {
+    EXECVE_ENTRY = entry;
+    EXECVE_RSP = rsp;
+}
+
 /// Install the syscall dispatch function.
 ///
 /// # Safety
@@ -95,11 +108,23 @@ unsafe extern "C" fn rust_syscall_handler(
         if result.exited {
             PROCESS_EXITED = true;
             EXIT_CODE = result.exit_code;
-            // Halt — do not return to the binary after exit_group.
-            // sysretq would jump to an undefined address.
             loop {
                 core::arch::asm!("hlt");
             }
+        }
+        // Check for pending execve — jump to the new binary.
+        if EXECVE_ENTRY != 0 {
+            let entry = EXECVE_ENTRY;
+            let rsp = EXECVE_RSP;
+            EXECVE_ENTRY = 0;
+            EXECVE_RSP = 0;
+            core::arch::asm!(
+                "mov rsp, {rsp}",
+                "jmp {entry}",
+                rsp = in(reg) rsp,
+                entry = in(reg) entry,
+                options(noreturn),
+            );
         }
         result.retval
     } else {
@@ -131,8 +156,8 @@ extern "C" fn syscall_entry() {
         //
         // We save RCX/R11 for sysretq, and all caller-saved argument
         // registers because rust_syscall_handler (SysV) will clobber them.
-        "push rcx",          // return RIP (saved by syscall hw)
-        "push r11",          // return RFLAGS (saved by syscall hw)
+        "push rcx", // return RIP (saved by syscall hw)
+        "push r11", // return RFLAGS (saved by syscall hw)
         "push rbx",
         "push rbp",
         "push r12",
@@ -140,41 +165,35 @@ extern "C" fn syscall_entry() {
         "push r14",
         "push r15",
         // Argument registers — must survive the Rust call
-        "push rdi",          // a1
-        "push rsi",          // a2
-        "push rdx",          // a3
-        "push r10",          // a4
-        "push r8",           // a5
-        "push r9",           // a6
-
+        "push rdi", // a1
+        "push rsi", // a2
+        "push rdx", // a3
+        "push r10", // a4
+        "push r8",  // a5
+        "push r9",  // a6
         // Force 16-byte stack alignment for SysV ABI.
         // 14 pushes (14*8 = 112 bytes) = even, so if RSP was 16-aligned
         // before the first push, it's still 16-aligned now.
         // But user RSP may not be aligned, so force it.
-        "mov rbp, rsp",      // save frame pointer
-        "and rsp, -16",      // force 16-byte alignment
-
+        "mov rbp, rsp", // save frame pointer
+        "and rsp, -16", // force 16-byte alignment
         // Set up arguments for rust_syscall_handler(nr, a1, a2, a3, a4, a5, a6)
         // SysV calling convention: rdi, rsi, rdx, rcx, r8, r9, [stack]
         //
         // Current:  RAX=nr, RDI=a1, RSI=a2, RDX=a3, R10=a4, R8=a5, R9=a6
         // Need:     RDI=nr, RSI=a1, RDX=a2, RCX=a3, R8=a4, R9=a5, [stack]=a6
-        "sub rsp, 8",        // alignment padding
-        "push r9",           // a6 as 7th stack arg
-
+        "sub rsp, 8", // alignment padding
+        "push r9",    // a6 as 7th stack arg
         // Shuffle registers: Linux ABI → SysV calling convention
-        "mov r9, r8",        // r9 = a5
-        "mov r8, r10",       // r8 = a4
-        "mov rcx, rdx",      // rcx = a3
-        "mov rdx, rsi",      // rdx = a2
-        "mov rsi, rdi",      // rsi = a1
-        "mov rdi, rax",      // rdi = nr
-
+        "mov r9, r8",   // r9 = a5
+        "mov r8, r10",  // r8 = a4
+        "mov rcx, rdx", // rcx = a3
+        "mov rdx, rsi", // rdx = a2
+        "mov rsi, rdi", // rsi = a1
+        "mov rdi, rax", // rdi = nr
         "call rust_syscall_handler",
-
         // Return value is in RAX. Restore frame pointer / stack.
         "mov rsp, rbp",
-
         // ── Restore ALL saved registers ──
         // Argument registers (in reverse push order)
         "pop r9",
@@ -190,12 +209,10 @@ extern "C" fn syscall_entry() {
         "pop r12",
         "pop rbp",
         "pop rbx",
-        "pop r11",           // return RFLAGS
-        "pop rcx",           // return RIP
-
+        "pop r11", // return RFLAGS
+        "pop rcx", // return RIP
         // Keep IF disabled (no IDT for hardware interrupts).
         "cli",
-
         // jmp back to caller
         "jmp rcx",
     );

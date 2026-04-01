@@ -332,6 +332,11 @@ pub enum LinuxSyscall {
     Getpid,
     Getppid,
     Gettid,
+    Setsid,
+    /// Stub uid/gid syscalls — always succeed in a unikernel.
+    SetuidStub,
+    /// fsync/fdatasync — no-op (no persistent storage in unikernel).
+    FsyncStub,
     Getuid,
     Geteuid,
     Getgid,
@@ -886,11 +891,21 @@ impl LinuxSyscall {
                 resource: args[0] as i32,
                 rlim: args[1],
             },
+            74 => LinuxSyscall::FsyncStub, // fsync
+            75 => LinuxSyscall::FsyncStub, // fdatasync
             102 => LinuxSyscall::Getuid,
             104 => LinuxSyscall::Getgid,
+            105 => LinuxSyscall::SetuidStub, // setuid
+            106 => LinuxSyscall::SetuidStub, // setgid
             107 => LinuxSyscall::Geteuid,
             108 => LinuxSyscall::Getegid,
             110 => LinuxSyscall::Getppid,
+            112 => LinuxSyscall::Setsid,
+            113 => LinuxSyscall::SetuidStub, // setreuid
+            114 => LinuxSyscall::SetuidStub, // setregid
+            116 => LinuxSyscall::SetuidStub, // setgroups
+            117 => LinuxSyscall::SetuidStub, // setresuid
+            119 => LinuxSyscall::SetuidStub, // setresgid
             131 => LinuxSyscall::Sigaltstack {
                 ss: args[0],
                 old_ss: args[1],
@@ -2123,6 +2138,11 @@ enum FdKind {
     DevNull,
     /// /dev/urandom — reads return random bytes.
     DevUrandom,
+    /// A writable scratch file in the EmbeddedFs overlay.
+    ScratchFile {
+        path: alloc::string::String,
+        offset: u64,
+    },
 }
 
 /// Shared state for an eventfd instance.
@@ -2998,6 +3018,9 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             LinuxSyscall::Getpid => self.sys_getpid(),
             LinuxSyscall::Getppid => self.sys_getppid(),
             LinuxSyscall::Gettid => self.sys_gettid(),
+            LinuxSyscall::Setsid => self.sys_getpid(), // unikernel: return PID as session ID
+            LinuxSyscall::SetuidStub => 0,             // always root in unikernel
+            LinuxSyscall::FsyncStub => 0,              // no persistent storage
             LinuxSyscall::Getuid => self.sys_getuid(),
             LinuxSyscall::Geteuid => self.sys_geteuid(),
             LinuxSyscall::Getgid => self.sys_getgid(),
@@ -3164,7 +3187,12 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                     self.sys_ftruncate(fd)
                 }
             }
-            LinuxSyscall::Renameat { .. } => self.sys_renameat(),
+            LinuxSyscall::Renameat {
+                olddirfd,
+                oldpath,
+                newdirfd,
+                newpath,
+            } => self.sys_renameat(olddirfd, oldpath, newdirfd, newpath),
             LinuxSyscall::RtSigreturn { rsp } => self.sys_rt_sigreturn(rsp),
             LinuxSyscall::Sigaltstack { ss, old_ss } => self.sys_sigaltstack(ss, old_ss),
             LinuxSyscall::Unknown { .. } => ENOSYS,
@@ -3299,6 +3327,35 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             FdKind::EmbeddedFile { .. } => EROFS,
             FdKind::DevNull => count as i64, // discard, report success
             FdKind::DevUrandom => count as i64, // discard, report success
+            FdKind::ScratchFile {
+                ref path,
+                ref offset,
+            } => {
+                let path_clone = path.clone();
+                let cur_offset = *offset as usize;
+                let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
+                if let Some(ref mut efs) = self.embedded_fs {
+                    let file_data = efs
+                        .scratch
+                        .entry(path_clone)
+                        .or_insert_with(alloc::vec::Vec::new);
+                    // Extend file if write goes past current end.
+                    let end = cur_offset + count;
+                    if end > file_data.len() {
+                        file_data.resize(end, 0);
+                    }
+                    file_data[cur_offset..end].copy_from_slice(data);
+                }
+                // Advance offset.
+                if let Some(FdEntry {
+                    kind: FdKind::ScratchFile { ref mut offset, .. },
+                    ..
+                }) = self.fd_table.get_mut(&fd)
+                {
+                    *offset += count as u64;
+                }
+                count as i64
+            }
         }
     }
 
@@ -3541,6 +3598,45 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 }
                 n as i64
             }
+            FdKind::ScratchFile {
+                ref path,
+                ref offset,
+            } => {
+                if count == 0 {
+                    return 0;
+                }
+                let path_clone = path.clone();
+                let file_offset = *offset as usize;
+                let n = if let Some(ref efs) = self.embedded_fs {
+                    if let Some(data) = efs.scratch.get(&path_clone) {
+                        let start = file_offset.min(data.len());
+                        let end = start.saturating_add(count).min(data.len());
+                        let n = end - start;
+                        if n > 0 {
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    data[start..end].as_ptr(),
+                                    buf_ptr as *mut u8,
+                                    n,
+                                );
+                            }
+                        }
+                        n
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+                if let Some(FdEntry {
+                    kind: FdKind::ScratchFile { ref mut offset, .. },
+                    ..
+                }) = self.fd_table.get_mut(&fd)
+                {
+                    *offset += n as u64;
+                }
+                n as i64
+            }
             FdKind::DevNull => 0, // EOF
             FdKind::DevUrandom => {
                 // Fill buffer with random bytes from LCG-based PRNG.
@@ -3627,8 +3723,8 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                     self.timerfds.remove(&timerfd_id);
                 }
             }
-            // EmbeddedFile data is static — nothing to release on close.
-            FdKind::EmbeddedFile { .. } => {}
+            // EmbeddedFile/ScratchFile data lives in memory — nothing to release on close.
+            FdKind::EmbeddedFile { .. } | FdKind::ScratchFile { .. } => {}
             // Device files have no resources to release.
             FdKind::DevNull | FdKind::DevUrandom => {}
         }
@@ -4351,7 +4447,15 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 Err(e) => net_error_to_errno(e),
             }
         } else {
-            0 // stub no-op
+            // AF_UNIX connect: no daemon is running → ECONNREFUSED.
+            // This forces musl's nscd client to fall back to file-based lookup.
+            let domain = self.sockets.get(&socket_id).map(|s| s.domain).unwrap_or(0);
+            if domain == 1 {
+                // AF_UNIX
+                -111 // ECONNREFUSED
+            } else {
+                0 // stub for other non-TCP sockets
+            }
         }
     }
 
@@ -5677,6 +5781,22 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 }
                 ENOENT
             }
+            FdKind::ScratchFile { ref path, .. } => {
+                let path_clone = path.clone();
+                let size = self
+                    .embedded_fs
+                    .as_ref()
+                    .and_then(|efs| efs.scratch.get(&path_clone))
+                    .map_or(0, |d| d.len() as u64);
+                let stat = FileStat {
+                    qpath: 0,
+                    name: alloc::sync::Arc::from(path_clone.as_str()),
+                    size,
+                    file_type: FileType::Regular,
+                };
+                write_linux_stat_with_mode(statbuf_ptr, &stat, Some(0o100644));
+                0
+            }
             FdKind::DevNull | FdKind::DevUrandom => {
                 // S_IFCHR | 0o666 — character device, rw for all
                 let stat = FileStat {
@@ -5711,16 +5831,21 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             return EBADF;
         };
 
-        // Check EmbeddedFs first — if the path is a registered embedded file,
-        // open it as an EmbeddedFile fd (no 9P round-trip needed).
-        let efs_hit = self
-            .embedded_fs
-            .as_ref()
-            .is_some_and(|efs| efs.get(&path).is_some());
-        if efs_hit {
-            // Embedded files are read-only — reject write access upfront.
+        // Check EmbeddedFs first — if the path is a registered embedded file
+        // (static or scratch), open it without a 9P round-trip.
+        const O_CREAT: i32 = 0o100;
+        const O_TRUNC: i32 = 0o1000;
+        let (is_static, is_scratch, efs_present) = match self.embedded_fs {
+            Some(ref efs) => (
+                efs.get(&path).is_some(),
+                efs.scratch.contains_key(&path),
+                true,
+            ),
+            None => (false, false, false),
+        };
+        if is_static && !is_scratch {
+            // Static embedded files are read-only.
             if flags & 0x03 != 0 {
-                // O_WRONLY (1) or O_RDWR (2)
                 return EROFS;
             }
             let fd_flags = if flags & O_CLOEXEC != 0 {
@@ -5733,6 +5858,28 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 fd,
                 FdEntry {
                     kind: FdKind::EmbeddedFile { path, offset: 0 },
+                    flags: fd_flags,
+                },
+            );
+            return fd as i64;
+        }
+        if is_scratch {
+            // Scratch file — writable.
+            if flags & O_TRUNC != 0 {
+                if let Some(ref mut efs) = self.embedded_fs {
+                    efs.write_scratch(&path, alloc::vec::Vec::new());
+                }
+            }
+            let fd_flags = if flags & O_CLOEXEC != 0 {
+                FD_CLOEXEC
+            } else {
+                0
+            };
+            let fd = self.alloc_fd();
+            self.fd_table.insert(
+                fd,
+                FdEntry {
+                    kind: FdKind::ScratchFile { path, offset: 0 },
                     flags: fd_flags,
                 },
             );
@@ -5777,9 +5924,39 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         }
 
         // When EmbeddedFs is configured, it IS the root filesystem.
+        // O_CREAT: create a new scratch file if the parent directory exists.
+        if efs_present && flags & O_CREAT != 0 {
+            // Verify parent directory exists in the filesystem.
+            let parent = path.rfind('/').map(|i| &path[..i]).unwrap_or("");
+            let parent_exists = parent.is_empty()
+                || parent == "/"
+                || self
+                    .embedded_fs
+                    .as_ref()
+                    .is_some_and(|efs| efs.exists(parent));
+            if parent_exists {
+                if let Some(ref mut efs) = self.embedded_fs {
+                    efs.write_scratch(&path, alloc::vec::Vec::new());
+                }
+                let fd_flags = if flags & O_CLOEXEC != 0 {
+                    FD_CLOEXEC
+                } else {
+                    0
+                };
+                let fd = self.alloc_fd();
+                self.fd_table.insert(
+                    fd,
+                    FdEntry {
+                        kind: FdKind::ScratchFile { path, offset: 0 },
+                        flags: fd_flags,
+                    },
+                );
+                return fd as i64;
+            }
+        }
         // Paths not found in EmbeddedFs or device table → ENOENT.
         // Only fall through to the 9P backend when no EmbeddedFs is set.
-        if self.embedded_fs.is_some() {
+        if efs_present {
             return ENOENT;
         }
 
@@ -6822,8 +6999,28 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
 
     /// Linux renameat(2): rename a file relative to directory fds.
     ///
-    /// Returns EROFS — the Linuxulator filesystem is read-only.
-    fn sys_renameat(&self) -> i64 {
+    /// Supports renaming scratch files in the EmbeddedFs overlay.
+    /// Returns EROFS for static embedded files.
+    fn sys_renameat(
+        &mut self,
+        _olddirfd: i32,
+        oldpath_ptr: u64,
+        _newdirfd: i32,
+        newpath_ptr: u64,
+    ) -> i64 {
+        if oldpath_ptr == 0 || newpath_ptr == 0 {
+            return EFAULT;
+        }
+        let old_raw = unsafe { read_c_string(oldpath_ptr as usize) };
+        let new_raw = unsafe { read_c_string(newpath_ptr as usize) };
+        let old_path = self.resolve_path(&old_raw);
+        let new_path = self.resolve_path(&new_raw);
+
+        if let Some(ref mut efs) = self.embedded_fs {
+            if efs.rename_scratch(&old_path, &new_path) {
+                return 0;
+            }
+        }
         EROFS
     }
 
@@ -6873,6 +7070,52 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             if let Some(FdEntry {
                 kind:
                     FdKind::EmbeddedFile {
+                        offset: ref mut off,
+                        ..
+                    },
+                ..
+            }) = self.fd_table.get_mut(&fd)
+            {
+                *off = new_offset as u64;
+            }
+            return new_offset;
+        }
+
+        // Handle ScratchFile lseek.
+        if let Some(FdEntry {
+            kind:
+                FdKind::ScratchFile {
+                    ref path,
+                    offset: cur_offset,
+                },
+            ..
+        }) = self.fd_table.get(&fd)
+        {
+            let file_size = self
+                .embedded_fs
+                .as_ref()
+                .and_then(|efs| efs.scratch.get(path))
+                .map(|d| d.len() as i64)
+                .unwrap_or(0);
+            let cur = *cur_offset as i64;
+            let new_offset = match whence {
+                SEEK_SET => offset,
+                SEEK_CUR => match cur.checked_add(offset) {
+                    Some(v) => v,
+                    None => return EOVERFLOW,
+                },
+                SEEK_END => match file_size.checked_add(offset) {
+                    Some(v) => v,
+                    None => return EOVERFLOW,
+                },
+                _ => return EINVAL,
+            };
+            if new_offset < 0 {
+                return EINVAL;
+            }
+            if let Some(FdEntry {
+                kind:
+                    FdKind::ScratchFile {
                         offset: ref mut off,
                         ..
                     },
@@ -7074,6 +7317,17 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
 
         // Check EmbeddedFs before issuing a 9P walk.
         if let Some(ref efs) = self.embedded_fs {
+            // Check scratch files first (may shadow static files).
+            if let Some(data) = efs.scratch.get(&resolved) {
+                let stat = FileStat {
+                    qpath: 0,
+                    name: alloc::sync::Arc::from(resolved.as_str()),
+                    size: data.len() as u64,
+                    file_type: FileType::Regular,
+                };
+                write_linux_stat_with_mode(statbuf_ptr, &stat, Some(0o100644));
+                return 0;
+            }
             if let Some(file) = efs.get(&resolved) {
                 let mode: u32 = if file.executable { 0o100755 } else { 0o100644 };
                 let size = file.data.len() as u64;
@@ -7266,6 +7520,19 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             return ENOENT;
         }
         let resolved = self.resolve_path(&path);
+
+        // Check EmbeddedFs for the directory before falling through to 9P.
+        if let Some(ref efs) = self.embedded_fs {
+            if efs.exists(&resolved) && efs.get(&resolved).is_none() {
+                // Path exists as a directory (not a file) in EmbeddedFs.
+                self.cwd = resolved;
+                return 0;
+            }
+            if efs.get(&resolved).is_some() {
+                return -20; // ENOTDIR
+            }
+            // Not in EmbeddedFs at all — still try 9P below.
+        }
 
         let fid = self.alloc_fid();
         if let Err(e) = self.backend.walk(&resolved, fid) {
@@ -11930,13 +12197,13 @@ mod integration_tests {
         assert_ne!(client_fd, fd);
         assert!(lx.has_fd(client_fd as i32));
 
-        // connect — no-op stub
+        // connect — AF_UNIX returns ECONNREFUSED (no daemon running)
         let r = lx.dispatch_syscall(LinuxSyscall::Connect {
             fd: client_fd as i32,
             addr: 0,
             addrlen: 0,
         });
-        assert_eq!(r, 0);
+        assert_eq!(r, -111); // ECONNREFUSED
 
         // shutdown — no-op stub
         let r = lx.dispatch_syscall(LinuxSyscall::Shutdown {

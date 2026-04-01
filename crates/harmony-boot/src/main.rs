@@ -261,8 +261,8 @@ unsafe fn map_elf_at_linked_addresses(
     // entry — if the physical address isn't page-aligned, the hardware
     // truncates the low bits and reads the wrong memory.
     let mut alloc_pt_page = || -> (usize, u64) {
-        let layout = core::alloc::Layout::from_size_align(PAGE_SIZE, PAGE_SIZE)
-            .expect("page table layout");
+        let layout =
+            core::alloc::Layout::from_size_align(PAGE_SIZE, PAGE_SIZE).expect("page table layout");
         let ptr = alloc::alloc::alloc_zeroed(layout);
         assert!(!ptr.is_null(), "page table allocation failed");
         let virt = ptr as usize;
@@ -272,19 +272,18 @@ unsafe fn map_elf_at_linked_addresses(
 
     // Helper: ensure an entry at the given page-table level exists and
     // points to a sub-table. Returns the virtual address of the sub-table.
-    let ensure_table =
-        |entry: *mut u64, alloc: &mut dyn FnMut() -> (usize, u64)| -> *mut u64 {
-            let val = core::ptr::read_volatile(entry);
-            if val & PRESENT != 0 {
-                // Entry exists — return pointer to sub-table
-                ((val & ADDR_MASK) + phys_offset) as *mut u64
-            } else {
-                // Allocate new sub-table
-                let (virt, phys) = alloc();
-                core::ptr::write_volatile(entry, phys | PRESENT | WRITABLE);
-                virt as *mut u64
-            }
-        };
+    let ensure_table = |entry: *mut u64, alloc: &mut dyn FnMut() -> (usize, u64)| -> *mut u64 {
+        let val = core::ptr::read_volatile(entry);
+        if val & PRESENT != 0 {
+            // Entry exists — return pointer to sub-table
+            ((val & ADDR_MASK) + phys_offset) as *mut u64
+        } else {
+            // Allocate new sub-table
+            let (virt, phys) = alloc();
+            core::ptr::write_volatile(entry, phys | PRESENT | WRITABLE);
+            virt as *mut u64
+        }
+    };
 
     let mut mapped = 0usize;
     let start_page = vaddr_min & !(PAGE_SIZE as u64 - 1);
@@ -310,7 +309,7 @@ unsafe fn map_elf_at_linked_addresses(
 
         // Determine flags from segment permissions
         let mut flags = PRESENT | WRITABLE; // default RW
-        // Check if any executable segment covers this page
+                                            // Check if any executable segment covers this page
         let page_end = vaddr + PAGE_SIZE as u64;
         let mut is_exec = false;
         for seg in segments {
@@ -456,6 +455,63 @@ impl harmony_netstack::TcpProvider for RawPtrTcpProvider {
 }
 
 // ---------------------------------------------------------------------------
+// Ring 3 network polling
+// ---------------------------------------------------------------------------
+
+/// Raw pointers to the network stack and VirtIO device, set once in
+/// `kernel_continue` before the `jmp` to userspace. The dispatch function
+/// calls `poll_network()` on every syscall to drive smoltcp while the
+/// main event loop is unreachable.
+#[cfg(feature = "ring3")]
+static mut NETSTACK_PTR: *mut core::cell::RefCell<harmony_netstack::NetStack> =
+    core::ptr::null_mut();
+#[cfg(feature = "ring3")]
+static mut VIRTIO_NET_PTR: *mut Option<virtio::net::VirtioNet> = core::ptr::null_mut();
+#[cfg(feature = "ring3")]
+static mut PIT_PTR: *mut pit::PitTimer = core::ptr::null_mut();
+
+/// Poll the VirtIO NIC → smoltcp → TX path. Called from the syscall
+/// dispatch function so the network stack advances while userspace runs.
+///
+/// # Safety
+/// Must only be called after the statics are initialized and before the
+/// program exits (the pointers reference stack locals in `kernel_continue`
+/// which never returns).
+#[cfg(feature = "ring3")]
+unsafe fn poll_network() {
+    let netstack = &mut *NETSTACK_PTR;
+    let virtio_net = &mut *VIRTIO_NET_PTR;
+    let pit = &mut *PIT_PTR;
+
+    let now_ms = pit.now_ms();
+    let smoltcp_now = smoltcp::time::Instant::from_millis(now_ms as i64);
+
+    // RX: pull frames from VirtIO NIC into smoltcp
+    if let Some(ref mut net) = virtio_net {
+        while let Some(frame) = net.receive_raw() {
+            match virtio::net::ethertype(&frame) {
+                0x0800 | 0x0806 => {
+                    // IP or ARP — feed to netstack
+                    netstack.borrow_mut().ingest(frame);
+                }
+                _ => {} // Drop non-IP (Harmony raw frames not relevant here)
+            }
+        }
+    }
+
+    // Process IP stack
+    netstack.borrow_mut().poll(smoltcp_now);
+
+    // TX: flush outbound frames
+    if let Some(ref mut net) = virtio_net {
+        let frames: alloc::vec::Vec<_> = netstack.borrow_mut().drain_tx().collect();
+        for frame in frames {
+            let _ = net.send_raw(&frame);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RuntimeAction dispatch
 // ---------------------------------------------------------------------------
 
@@ -470,22 +526,21 @@ fn dispatch_actions(
 
     for action in actions {
         match action {
-            RuntimeAction::SendOnInterface { interface_name, raw } => {
-                match interface_name.as_ref() {
-                    "eth0" | "virtio0" => {
-                        if let Some(ref mut net) = virtio_net {
-                            let _ = harmony_platform::NetworkInterface::send(net, raw);
-                        }
+            RuntimeAction::SendOnInterface {
+                interface_name,
+                raw,
+            } => match interface_name.as_ref() {
+                "eth0" | "virtio0" => {
+                    if let Some(ref mut net) = virtio_net {
+                        let _ = harmony_platform::NetworkInterface::send(net, raw);
                     }
-                    "udp0" => {
-                        let _ = harmony_platform::NetworkInterface::send(
-                            &mut *netstack.borrow_mut(),
-                            raw,
-                        );
-                    }
-                    _ => {}
                 }
-            }
+                "udp0" => {
+                    let _ =
+                        harmony_platform::NetworkInterface::send(&mut *netstack.borrow_mut(), raw);
+                }
+                _ => {}
+            },
             RuntimeAction::PeerDiscovered { address_hash, hops } => {
                 let mut hex = [0u8; 32];
                 hex_encode(address_hash, &mut hex);
@@ -498,13 +553,19 @@ fn dispatch_actions(
                 let s = core::str::from_utf8(&hex).unwrap_or("?");
                 let _ = writeln!(serial, "[PEER-] {}", s);
             }
-            RuntimeAction::HeartbeatReceived { address_hash, uptime_ms } => {
+            RuntimeAction::HeartbeatReceived {
+                address_hash,
+                uptime_ms,
+            } => {
                 let mut hex = [0u8; 32];
                 hex_encode(address_hash, &mut hex);
                 let s = core::str::from_utf8(&hex).unwrap_or("?");
                 let _ = writeln!(serial, "[HBT] {} uptime={}ms", s, uptime_ms);
             }
-            RuntimeAction::DeliverLocally { destination_hash, payload } => {
+            RuntimeAction::DeliverLocally {
+                destination_hash,
+                payload,
+            } => {
                 let mut hex = [0u8; 32];
                 hex_encode(destination_hash, &mut hex);
                 let s = core::str::from_utf8(&hex).unwrap_or("?");
@@ -524,7 +585,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let mut serial = serial_writer();
     serial.log("BOOT", "Harmony unikernel v0.1.0");
 
-    let pit = pit::PitTimer::init();
+    let mut pit = pit::PitTimer::init();
     serial.log("PIT", "timer initialized");
 
     // 2. Get the physical memory offset so we can convert physical -> virtual
@@ -613,7 +674,11 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     let stack_canary_addr = state.stack_canary_addr;
 
     let mut serial = serial_writer();
-    let _ = writeln!(serial, "[STACK] switched to {}KB heap stack", KERNEL_STACK_SIZE / 1024);
+    let _ = writeln!(
+        serial,
+        "[STACK] switched to {}KB heap stack",
+        KERNEL_STACK_SIZE / 1024
+    );
 
     // 1. RDRAND entropy
     if !rdrand_available() {
@@ -689,7 +754,10 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     };
     let netstack = core::cell::RefCell::new(netstack);
 
-    serial.log("NETSTACK", "udp0 DHCP (fallback 10.0.2.15/24 after 5s), port 4242, tcp_max_sockets=16");
+    serial.log(
+        "NETSTACK",
+        "udp0 DHCP (fallback 10.0.2.15/24 after 5s), port 4242, tcp_max_sockets=16",
+    );
 
     // 5. Event loop
     let persistence = MemoryState::new();
@@ -704,8 +772,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     //   once Ring 2 boot path exists. Requires persistent storage for hw key.
     if let Some(pq_addr) = runtime.generate_pq_identity() {
         hex_encode(&pq_addr, &mut hex_buf);
-        let hex_str =
-            core::str::from_utf8(&hex_buf).unwrap_or("????????????????????????????????");
+        let hex_str = core::str::from_utf8(&hex_buf).unwrap_or("????????????????????????????????");
         serial.log("PQ_IDENTITY", hex_str);
     }
 
@@ -750,7 +817,8 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         // Walk to echo, write, read back
         echo.walk(0, 2, "echo").expect("ring2: walk echo");
         echo.open(2, OpenMode::ReadWrite).expect("ring2: open echo");
-        echo.write(2, 0, b"Harmony Ring 2!").expect("ring2: write echo");
+        echo.write(2, 0, b"Harmony Ring 2!")
+            .expect("ring2: write echo");
         let data = echo.read(2, 0, 256).expect("ring2: read echo");
         let msg = core::str::from_utf8(&data).unwrap_or("(non-utf8)");
         let _ = writeln!(serial, "[IPC]  echo: \"{}\"", msg);
@@ -863,18 +931,10 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         }
 
         // Find the overall virtual address range across all segments
-        let vaddr_min = parsed
-            .segments
-            .iter()
-            .map(|s| s.vaddr)
-            .min()
-            .unwrap();
-        let vaddr_max = match parsed
-            .segments
-            .iter()
-            .try_fold(0u64, |acc, s| {
-                s.vaddr.checked_add(s.memsz).map(|end| acc.max(end))
-            }) {
+        let vaddr_min = parsed.segments.iter().map(|s| s.vaddr).min().unwrap();
+        let vaddr_max = match parsed.segments.iter().try_fold(0u64, |acc, s| {
+            s.vaddr.checked_add(s.memsz).map(|end| acc.max(end))
+        }) {
             Some(max) => max,
             None => {
                 let _ = writeln!(serial, "[LINUX] segment vaddr+memsz overflow");
@@ -901,12 +961,18 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         // (e.g. 0x400000, page offset 0x000) and the heap allocation.
         // A non-page-aligned allocation would shift the within-page
         // offsets, causing reads to hit wrong bytes.
-        let mem_layout = core::alloc::Layout::from_size_align(total_size, 0x1000)
-            .expect("ELF mem layout");
+        let mem_layout =
+            core::alloc::Layout::from_size_align(total_size, 0x1000).expect("ELF mem layout");
         let mem_ptr = unsafe { alloc::alloc::alloc_zeroed(mem_layout) };
         if mem_ptr.is_null() {
-            let _ = writeln!(serial, "[LINUX] failed to allocate {} bytes (page-aligned)", total_size);
-            loop { x86_64::instructions::hlt(); }
+            let _ = writeln!(
+                serial,
+                "[LINUX] failed to allocate {} bytes (page-aligned)",
+                total_size
+            );
+            loop {
+                x86_64::instructions::hlt();
+            }
         }
         let mut mem = unsafe { core::slice::from_raw_parts_mut(mem_ptr, total_size) };
 
@@ -995,11 +1061,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             efs.add_file("/bin/ash", BUSYBOX_BIN, true);
 
             // Config files
-            efs.add_file(
-                "/etc/passwd",
-                b"root:x:0:0:root:/root:/bin/sh\n",
-                false,
-            );
+            efs.add_file("/etc/passwd", b"root:x:0:0:root:/root:/bin/sh\n", false);
             // SHA-512 hash of "harmony" — dropbear checks /etc/shadow when
             // /etc/passwd has "x" in the password field.
             efs.add_file(
@@ -1012,6 +1074,10 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
 
             // Minimal /etc/group for busybox id/whoami
             efs.add_file("/etc/group", b"root:x:0:\n", false);
+            // Empty marker so dropbear can create host keys via scratch layer
+            efs.add_file("/etc/dropbear/.keep", b"", false);
+            // Home directory marker for root user (dropbear chdir's here)
+            efs.add_file("/root/.keep", b"", false);
 
             // Register with the Linuxulator
             unsafe {
@@ -1020,18 +1086,74 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                 }
             }
         }
-        serial.log("USERSPACE", "embedded dropbear + busybox registered in EmbeddedFs");
+        serial.log(
+            "USERSPACE",
+            "embedded dropbear + busybox registered in EmbeddedFs",
+        );
+
+        // 6b. Store raw pointers for network polling from syscall dispatch.
+        // These point to stack locals in kernel_continue which never returns.
+        unsafe {
+            NETSTACK_PTR = &netstack as *const core::cell::RefCell<harmony_netstack::NetStack>
+                as *mut core::cell::RefCell<harmony_netstack::NetStack>;
+            VIRTIO_NET_PTR = &mut virtio_net as *mut Option<virtio::net::VirtioNet>;
+            PIT_PTR = &pit as *const pit::PitTimer as *mut pit::PitTimer;
+        }
 
         // 7. Install dispatch function
         fn dispatch(nr: u64, args: [u64; 6]) -> syscall::SyscallResult {
+            // Unikernel fork: return 0 ("you are the child") so the binary
+            // takes the child code path. There is only one thread of
+            // execution — we cannot duplicate processes. This makes
+            // fork-per-connection servers (dropbear) handle exactly one
+            // session, which is the right behavior for a unikernel.
+            const SYS_CLONE: u64 = 56;
+            const SYS_FORK: u64 = 57;
+            const SYS_VFORK: u64 = 58;
+            if nr == SYS_FORK || nr == SYS_VFORK || nr == SYS_CLONE {
+                return syscall::SyscallResult {
+                    retval: 0,
+                    exited: false,
+                    exit_code: 0,
+                };
+            }
+
+            // Poll the network stack on every syscall entry so smoltcp
+            // can process TCP handshakes while userspace runs.
+            unsafe {
+                poll_network();
+            }
+
             let lx = unsafe { LINUXULATOR.as_mut().unwrap() };
             let retval = lx.handle_syscall(nr, args);
+
+            // Uncomment for gap-filling: trace unimplemented syscalls.
+            // if retval == -38 {
+            //     serial_write_str(b"[SYS] ENOSYS nr=");
+            //     serial_write_hex(nr);
+            //     serial_write_str(b"\n");
+            // }
+
+            // Poll again after the syscall — flushes any outbound frames
+            // generated by the syscall (e.g. TCP ACK after read/write).
+            unsafe {
+                poll_network();
+            }
+
+            // Handle execve: if the Linuxulator parsed a new ELF and set up a
+            // new stack, tell the syscall trampoline to jump there.
+            if let Some(exec) = lx.pending_execve() {
+                unsafe {
+                    syscall::set_execve_target(exec.entry_point, exec.stack_pointer);
+                }
+            }
+
             // Write FS base MSR only after handle_syscall confirms success.
-            // If arch_prctl ever adds validation (e.g. range check), an
-            // unconditional MSR write would leave the CPU in a bad state
-            // even though the syscall nominally failed.
-            if nr == 158 /* SYS_arch_prctl */ && args[0] == 0x1002 /* ARCH_SET_FS */ && retval == 0 {
-                unsafe { syscall::write_fs_base(args[1]); }
+            if nr == 158 /* SYS_arch_prctl */ && args[0] == 0x1002 /* ARCH_SET_FS */ && retval == 0
+            {
+                unsafe {
+                    syscall::write_fs_base(args[1]);
+                }
             }
             syscall::SyscallResult {
                 retval,
@@ -1067,14 +1189,15 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         //
         // The argv strings are placed below the pointer table on the stack.
         // dropbear flags: -R (ephemeral host key), -F (foreground), -E (log
-        // to stderr), -p 2222 (listen port).
+        // to stderr), -p 0.0.0.0:2222 (listen on IPv4 only — our netstack
+        // only supports IPv4, so force AF_INET to get a real TCP handle).
         let argv_strings: &[&[u8]] = &[
             b"/bin/dropbear\0",
             b"-R\0",
             b"-F\0",
             b"-E\0",
             b"-p\0",
-            b"2222\0",
+            b"0.0.0.0:2222\0",
         ];
         let argc = argv_strings.len();
 
@@ -1124,22 +1247,33 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             // page size, and entry point. Without AT_PHDR/AT_PHNUM, musl
             // cannot find PT_TLS and computes garbage TLS sizes.
             // AT_PHDR (3) — address of program header table
-            *p = 3; p = p.add(1);
-            *p = vaddr_min + parsed.phdr_offset; p = p.add(1);
+            *p = 3;
+            p = p.add(1);
+            *p = vaddr_min + parsed.phdr_offset;
+            p = p.add(1);
             // AT_PHENT (4) — size of one program header entry
-            *p = 4; p = p.add(1);
-            *p = parsed.phdr_entry_size as u64; p = p.add(1);
+            *p = 4;
+            p = p.add(1);
+            *p = parsed.phdr_entry_size as u64;
+            p = p.add(1);
             // AT_PHNUM (5) — number of program headers
-            *p = 5; p = p.add(1);
-            *p = parsed.phdr_count as u64; p = p.add(1);
+            *p = 5;
+            p = p.add(1);
+            *p = parsed.phdr_count as u64;
+            p = p.add(1);
             // AT_PAGESZ (6)
-            *p = 6; p = p.add(1);
-            *p = 4096; p = p.add(1);
+            *p = 6;
+            p = p.add(1);
+            *p = 4096;
+            p = p.add(1);
             // AT_ENTRY (9) — original entry point
-            *p = 9; p = p.add(1);
-            *p = parsed.entry_point; p = p.add(1);
+            *p = 9;
+            p = p.add(1);
+            *p = parsed.entry_point;
+            p = p.add(1);
             // AT_NULL (0) — terminator
-            *p = 0; p = p.add(1);
+            *p = 0;
+            p = p.add(1);
             *p = 0;
         }
 
@@ -1268,8 +1402,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         // Collect packets first to avoid holding borrow across dispatch_actions.
         let udp_packets: alloc::vec::Vec<_> = {
             let mut ns = netstack.borrow_mut();
-            core::iter::from_fn(|| harmony_platform::NetworkInterface::receive(&mut *ns))
-                .collect()
+            core::iter::from_fn(|| harmony_platform::NetworkInterface::receive(&mut *ns)).collect()
         };
         for pkt in udp_packets {
             let actions = runtime.handle_packet("udp0", pkt, now);
@@ -1308,18 +1441,22 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
 /// Write a hex value to serial (COM1) using direct port I/O.
 /// Safe to call from exception handlers where normal logging may not work.
 fn serial_write_hex(val: u64) {
-    let write_byte = |b: u8| {
-        unsafe {
-            while Port::<u8>::new(0x3F8 + 5).read() & 0x20 == 0 {
-                core::hint::spin_loop();
-            }
-            Port::new(0x3F8).write(b);
+    let write_byte = |b: u8| unsafe {
+        while Port::<u8>::new(0x3F8 + 5).read() & 0x20 == 0 {
+            core::hint::spin_loop();
         }
+        Port::new(0x3F8).write(b);
     };
-    for &b in b"0x" { write_byte(b); }
+    for &b in b"0x" {
+        write_byte(b);
+    }
     for shift in (0..16).rev() {
         let nibble = ((val >> (shift * 4)) & 0xF) as u8;
-        write_byte(if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 });
+        write_byte(if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + nibble - 10
+        });
     }
 }
 
@@ -1349,19 +1486,20 @@ extern "x86-interrupt" fn page_fault_handler(
     serial_write_str(b" rip=");
     serial_write_hex(stack_frame.instruction_pointer.as_u64());
     serial_write_str(b"\n");
-    loop { x86_64::instructions::hlt(); }
+    loop {
+        x86_64::instructions::hlt();
+    }
 }
 
-extern "x86-interrupt" fn gpf_handler(
-    stack_frame: InterruptStackFrame,
-    error_code: u64,
-) {
+extern "x86-interrupt" fn gpf_handler(stack_frame: InterruptStackFrame, error_code: u64) {
     serial_write_str(b"\n[#GP] code=");
     serial_write_hex(error_code);
     serial_write_str(b" rip=");
     serial_write_hex(stack_frame.instruction_pointer.as_u64());
     serial_write_str(b"\n");
-    loop { x86_64::instructions::hlt(); }
+    loop {
+        x86_64::instructions::hlt();
+    }
 }
 
 extern "x86-interrupt" fn double_fault_handler(
@@ -1371,7 +1509,9 @@ extern "x86-interrupt" fn double_fault_handler(
     serial_write_str(b"\n[#DF] rip=");
     serial_write_hex(stack_frame.instruction_pointer.as_u64());
     serial_write_str(b"\n");
-    loop { x86_64::instructions::hlt(); }
+    loop {
+        x86_64::instructions::hlt();
+    }
 }
 
 // ---------------------------------------------------------------------------
