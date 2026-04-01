@@ -500,6 +500,7 @@ name = "harmony-os"
 version = "0.1.0"
 dependencies = [
  "harmony-microkernel",
+ "harmony-netstack",
 ]
 
 [[package]]
