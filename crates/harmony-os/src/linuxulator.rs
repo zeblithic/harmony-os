@@ -2237,7 +2237,6 @@ struct SocketState {
     domain: i32,
     sock_type: i32,
     listening: bool,
-    nonblock: bool,
     /// Track whether accept4 has already returned a stub fd. Non-blocking
     /// sockets return EAGAIN on subsequent calls to prevent infinite accept
     /// loops in event-driven callers (epoll always reports ready).
@@ -2379,6 +2378,10 @@ struct FdEntry {
     kind: FdKind,
     /// File descriptor flags (e.g. FD_CLOEXEC). Default 0.
     flags: u32,
+    /// Whether this fd is in non-blocking mode. Set by O_NONBLOCK/SOCK_NONBLOCK
+    /// at creation time, updated by fcntl(F_SETFL). Applies to all fd kinds
+    /// (sockets, pipes, eventfds, etc.).
+    nonblock: bool,
 }
 
 /// Linux syscall-to-9P translation engine.
@@ -2686,6 +2689,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     file_type: FileType::CharDev,
                 },
                 flags: 0,
+                nonblock: false,
             },
         );
         self.fid_refcount.insert(stdin_fid, 1);
@@ -2704,6 +2708,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     file_type: FileType::CharDev,
                 },
                 flags: 0,
+                nonblock: false,
             },
         );
         self.fid_refcount.insert(stdout_fid, 1);
@@ -2722,6 +2727,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     file_type: FileType::CharDev,
                 },
                 flags: 0,
+                nonblock: false,
             },
         );
         self.fid_refcount.insert(stderr_fid, 1);
@@ -3514,8 +3520,8 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 }
             }
             FdKind::Socket { socket_id } => {
-                let (tcp_handle, _nonblock) = match self.sockets.get(&socket_id) {
-                    Some(s) => (s.tcp_handle, s.nonblock),
+                let tcp_handle = match self.sockets.get(&socket_id) {
+                    Some(s) => s.tcp_handle,
                     None => return EBADF,
                 };
                 if let Some(h) = tcp_handle {
@@ -3678,8 +3684,8 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 }
             }
             FdKind::Socket { socket_id } => {
-                let (tcp_handle, _nonblock) = match self.sockets.get(&socket_id) {
-                    Some(s) => (s.tcp_handle, s.nonblock),
+                let tcp_handle = match self.sockets.get(&socket_id) {
+                    Some(s) => s.tcp_handle,
                     None => return EBADF,
                 };
                 if let Some(h) = tcp_handle {
@@ -4212,6 +4218,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     fn dup_fd_to(&mut self, oldfd: i32, newfd: i32, fd_flags: u32) {
         let entry = self.fd_table.get(&oldfd).unwrap();
         let new_kind = entry.kind.clone();
+        let src_nonblock = entry.nonblock;
         if let FdKind::File { fid, .. } = &new_kind {
             *self.fid_refcount.get_mut(fid).expect("refcount missing") += 1;
         }
@@ -4220,6 +4227,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             FdEntry {
                 kind: new_kind,
                 flags: fd_flags,
+                nonblock: src_nonblock,
             },
         );
     }
@@ -4317,6 +4325,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         } else {
             0
         };
+        let is_nonblock = flags & O_NONBLOCK != 0;
 
         // Allocate pipe buffer.
         let pipe_id = self.next_pipe_id;
@@ -4330,6 +4339,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             FdEntry {
                 kind: FdKind::PipeRead { pipe_id },
                 flags: fd_flags,
+                nonblock: is_nonblock,
             },
         );
 
@@ -4339,6 +4349,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             FdEntry {
                 kind: FdKind::PipeWrite { pipe_id },
                 flags: fd_flags,
+                nonblock: is_nonblock,
             },
         );
 
@@ -4387,6 +4398,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             FdEntry {
                 kind: FdKind::EventFd { eventfd_id },
                 flags: fd_flags,
+                nonblock: false,
             },
         );
         fd as i64
@@ -4435,7 +4447,6 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 domain,
                 sock_type: base_type,
                 listening: false,
-                nonblock: flags & SOCK_NONBLOCK != 0,
                 accepted_once: false,
                 tcp_handle,
                 udp_handle,
@@ -4454,6 +4465,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             FdEntry {
                 kind: FdKind::Socket { socket_id },
                 flags: fd_flags,
+                nonblock: flags & SOCK_NONBLOCK != 0,
             },
         );
         fd as i64
@@ -4563,17 +4575,17 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         };
 
         let state_snap = match self.sockets.get(&socket_id) {
-            Some(s) if s.listening => (
-                s.domain,
-                s.sock_type,
-                s.nonblock,
-                s.accepted_once,
-                s.tcp_handle,
-            ),
+            Some(s) if s.listening => (s.domain, s.sock_type, s.accepted_once, s.tcp_handle),
             Some(s) if !s.listening => return EINVAL,
             _ => return EINVAL,
         };
-        let (domain, sock_type, nonblock, accepted_once, parent_tcp_handle) = state_snap;
+        let (domain, sock_type, accepted_once, parent_tcp_handle) = state_snap;
+
+        // For the stub path EAGAIN check, read nonblock from the parent FdEntry.
+        let parent_nonblock = match self.fd_table.get(&fd) {
+            Some(entry) => entry.nonblock,
+            None => false,
+        };
 
         if let Some(h) = parent_tcp_handle {
             // Real TCP path: try to accept a connection.
@@ -4583,14 +4595,12 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     self.next_socket_id += 1;
                     // Per Linux accept4 semantics, the accepted socket's blocking
                     // mode is determined solely by flags, not inherited from the listener.
-                    let new_nonblock = flags & SOCK_NONBLOCK != 0;
                     self.sockets.insert(
                         new_socket_id,
                         SocketState {
                             domain,
                             sock_type,
                             listening: false,
-                            nonblock: new_nonblock,
                             accepted_once: false,
                             tcp_handle: Some(accepted_handle),
                             udp_handle: None,
@@ -4610,6 +4620,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                                 socket_id: new_socket_id,
                             },
                             flags: fd_flags,
+                            nonblock: flags & SOCK_NONBLOCK != 0,
                         },
                     );
                     if addr != 0 {
@@ -4624,7 +4635,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             // Stub path (no TCP provider or non-AF_INET socket).
             // Non-blocking sockets return EAGAIN after the first accept to
             // prevent infinite accept loops in always-ready epoll stubs.
-            if nonblock && accepted_once {
+            if parent_nonblock && accepted_once {
                 return EAGAIN;
             }
 
@@ -4645,7 +4656,6 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     domain,
                     sock_type,
                     listening: false,
-                    nonblock: flags & SOCK_NONBLOCK != 0,
                     accepted_once: false,
                     tcp_handle: None,
                     udp_handle: None,
@@ -4666,6 +4676,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                         socket_id: new_socket_id,
                     },
                     flags: fd_flags,
+                    nonblock: flags & SOCK_NONBLOCK != 0,
                 },
             );
             new_fd as i64
@@ -4678,8 +4689,8 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             Ok(id) => id,
             Err(e) => return e,
         };
-        let (tcp_handle, _nonblock) = match self.sockets.get(&socket_id) {
-            Some(s) => (s.tcp_handle, s.nonblock),
+        let tcp_handle = match self.sockets.get(&socket_id) {
+            Some(s) => s.tcp_handle,
             None => return EBADF,
         };
         if let Some(h) = tcp_handle {
@@ -4747,8 +4758,8 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             Ok(id) => id,
             Err(e) => return e,
         };
-        let (tcp_handle, _nonblock) = match self.sockets.get(&socket_id) {
-            Some(s) => (s.tcp_handle, s.nonblock),
+        let tcp_handle = match self.sockets.get(&socket_id) {
+            Some(s) => s.tcp_handle,
             None => return EBADF,
         };
         if let Some(h) = tcp_handle {
@@ -4825,8 +4836,8 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             Ok(id) => id,
             Err(e) => return e,
         };
-        let (tcp_handle, _nonblock) = match self.sockets.get(&socket_id) {
-            Some(s) => (s.tcp_handle, s.nonblock),
+        let tcp_handle = match self.sockets.get(&socket_id) {
+            Some(s) => s.tcp_handle,
             None => return EBADF,
         };
         if let Some(h) = tcp_handle {
@@ -5121,6 +5132,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             FdEntry {
                 kind: FdKind::Epoll { epoll_id },
                 flags: fd_flags,
+                nonblock: false,
             },
         );
         fd as i64
@@ -5430,6 +5442,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 FdEntry {
                     kind: FdKind::SignalFd { signalfd_id },
                     flags: fd_flags,
+                    nonblock: false,
                 },
             );
             new_fd as i64
@@ -5518,6 +5531,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             FdEntry {
                 kind: FdKind::TimerFd { timerfd_id },
                 flags: fd_flags,
+                nonblock: false,
             },
         );
         fd as i64
@@ -5682,7 +5696,6 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                         domain: s.domain,
                         sock_type: s.sock_type,
                         listening: s.listening,
-                        nonblock: s.nonblock,
                         accepted_once: s.accepted_once,
                         tcp_handle: None,
                         udp_handle: None,
@@ -6262,6 +6275,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 FdEntry {
                     kind: FdKind::EmbeddedFile { path, offset: 0 },
                     flags: fd_flags,
+                    nonblock: false,
                 },
             );
             return fd as i64;
@@ -6284,6 +6298,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 FdEntry {
                     kind: FdKind::ScratchFile { path, offset: 0 },
                     flags: fd_flags,
+                    nonblock: false,
                 },
             );
             return fd as i64;
@@ -6303,6 +6318,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     FdEntry {
                         kind: FdKind::DevNull,
                         flags: fd_flags,
+                        nonblock: false,
                     },
                 );
                 return fd as i64;
@@ -6319,6 +6335,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     FdEntry {
                         kind: FdKind::DevUrandom,
                         flags: fd_flags,
+                        nonblock: false,
                     },
                 );
                 return fd as i64;
@@ -6352,6 +6369,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     FdEntry {
                         kind: FdKind::ScratchFile { path, offset: 0 },
                         flags: fd_flags,
+                        nonblock: false,
                     },
                 );
                 return fd as i64;
@@ -6396,6 +6414,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     file_type,
                 },
                 flags: fd_flags,
+                nonblock: false,
             },
         );
         self.fid_refcount.insert(fid, 1);
@@ -7302,13 +7321,13 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         // socketpair is AF_UNIX only; no TCP handle needed.
         let socket_id = self.next_socket_id;
         self.next_socket_id += 1;
+        let is_nonblock = flags & SOCK_NONBLOCK != 0;
         self.sockets.insert(
             socket_id,
             SocketState {
                 domain,
                 sock_type: base_type,
                 listening: false,
-                nonblock: flags & SOCK_NONBLOCK != 0,
                 accepted_once: false,
                 tcp_handle: None,
                 udp_handle: None,
@@ -7322,6 +7341,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             FdEntry {
                 kind: FdKind::Socket { socket_id },
                 flags: fd_flags,
+                nonblock: is_nonblock,
             },
         );
         let fd1 = self.alloc_fd();
@@ -7330,6 +7350,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             FdEntry {
                 kind: FdKind::Socket { socket_id },
                 flags: fd_flags,
+                nonblock: is_nonblock,
             },
         );
 
@@ -10846,6 +10867,7 @@ mod integration_tests {
                     file_type: FileType::Directory,
                 },
                 flags: 0,
+                nonblock: false,
             },
         );
 
@@ -10893,6 +10915,7 @@ mod integration_tests {
                     file_type: FileType::Directory,
                 },
                 flags: 0,
+                nonblock: false,
             },
         );
 
@@ -13108,6 +13131,46 @@ mod integration_tests {
             addrlen: 0,
         });
         assert_eq!(a2, EAGAIN);
+    }
+
+    #[test]
+    fn fd_entry_nonblock_from_sock_nonblock() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        // SOCK_NONBLOCK = 0o4000 = 2048
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,           // AF_INET
+            sock_type: 1 | 2048, // SOCK_STREAM | SOCK_NONBLOCK
+            protocol: 0,
+        });
+        assert!(fd >= 0);
+        let entry = lx.fd_table.get(&(fd as i32)).unwrap();
+        assert!(entry.nonblock);
+    }
+
+    #[test]
+    fn fd_entry_nonblock_default_false() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,    // AF_INET
+            sock_type: 1, // SOCK_STREAM (no NONBLOCK)
+            protocol: 0,
+        });
+        assert!(fd >= 0);
+        let entry = lx.fd_table.get(&(fd as i32)).unwrap();
+        assert!(!entry.nonblock);
+    }
+
+    #[test]
+    fn fd_entry_nonblock_from_pipe2() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        let mut fds = [0i32; 2];
+        let result = lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0o4000, // O_NONBLOCK
+        });
+        assert_eq!(result, 0);
+        assert!(lx.fd_table.get(&fds[0]).unwrap().nonblock);
+        assert!(lx.fd_table.get(&fds[1]).unwrap().nonblock);
     }
 
     #[test]
