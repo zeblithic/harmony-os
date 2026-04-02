@@ -2400,6 +2400,10 @@ pub struct Linuxulator<B: SyscallBackend, T: TcpProvider = NoTcp> {
     pending_signal_return: Option<SignalReturn>,
     /// Optional in-memory filesystem for embedded binaries and config files.
     embedded_fs: Option<EmbeddedFs>,
+    /// Network poll callback for blocking operations (select/poll).
+    /// Drives VirtIO RX/TX + smoltcp processing and returns current
+    /// time in milliseconds. Set by the kernel at init.
+    poll_fn: Option<fn() -> u64>,
 }
 
 impl<B: SyscallBackend> Linuxulator<B, NoTcp> {
@@ -2469,6 +2473,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             on_alt_stack: false,
             pending_signal_return: None,
             embedded_fs: None,
+            poll_fn: None,
         }
     }
 
@@ -2479,6 +2484,12 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
     /// the requested path is not found here.
     pub fn set_embedded_fs(&mut self, fs: EmbeddedFs) {
         self.embedded_fs = Some(fs);
+    }
+
+    /// Set the network poll callback. Called during blocking select/poll
+    /// to drive the network stack and read the PIT timer.
+    pub fn set_poll_fn(&mut self, f: fn() -> u64) {
+        self.poll_fn = Some(f);
     }
 
     /// Allocate the next fid for a backend call.
@@ -5428,6 +5439,8 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             pending_signal_return: None,
             // EmbeddedFs contains only &'static references — clone is cheap.
             embedded_fs: self.embedded_fs.clone(),
+            // Function pointer — copy to child so blocking ops work in forked processes.
+            poll_fn: self.poll_fn,
         };
         // Move shared pipe/eventfd state to child
         core::mem::swap(&mut self.pipes, &mut child.pipes);
@@ -7869,6 +7882,72 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             }
         }
         ready
+    }
+
+    /// Check if an fd is ready for reading (has data or EOF).
+    fn is_fd_readable(&self, fd: i32) -> bool {
+        let entry = match self.fd_table.get(&fd) {
+            Some(e) => e,
+            None => return false,
+        };
+        match &entry.kind {
+            FdKind::PipeRead { pipe_id } => {
+                let buf_nonempty = self
+                    .pipes
+                    .get(pipe_id)
+                    .map(|b| !b.is_empty())
+                    .unwrap_or(false);
+                if buf_nonempty {
+                    return true;
+                }
+                // EOF: write end is closed (no PipeWrite fd references this pipe_id).
+                !self.fd_table.values().any(|e| {
+                    matches!(&e.kind, FdKind::PipeWrite { pipe_id: pid } if *pid == *pipe_id)
+                })
+            }
+            FdKind::Socket { socket_id } => {
+                if let Some(state) = self.sockets.get(socket_id) {
+                    if let Some(h) = state.tcp_handle {
+                        let tcp_state = self.tcp.tcp_state(h);
+                        // Listener: readable if a connection is ready to accept.
+                        if state.listening {
+                            return tcp_state == TcpSocketState::Established;
+                        }
+                        // Data socket: readable if recv buffer has data or EOF.
+                        return self.tcp.tcp_can_recv(h)
+                            || tcp_state == TcpSocketState::CloseWait
+                            || tcp_state == TcpSocketState::Closed;
+                    }
+                }
+                false
+            }
+            // Serial/stdout/stderr, eventfd, timerfd, signalfd, files: always readable.
+            _ => true,
+        }
+    }
+
+    /// Check if an fd is ready for writing (buffer space available).
+    fn is_fd_writable(&self, fd: i32) -> bool {
+        let entry = match self.fd_table.get(&fd) {
+            Some(e) => e,
+            None => return false,
+        };
+        match &entry.kind {
+            FdKind::PipeWrite { .. } => true, // unbounded buffer
+            FdKind::Socket { socket_id } => {
+                if let Some(state) = self.sockets.get(socket_id) {
+                    if let Some(h) = state.tcp_handle {
+                        let tcp_state = self.tcp.tcp_state(h);
+                        return !state.listening
+                            && self.tcp.tcp_can_send(h)
+                            && tcp_state == TcpSocketState::Established;
+                    }
+                }
+                false
+            }
+            // Everything else: always writable.
+            _ => true,
+        }
     }
 
     /// Linux sched_getaffinity(2): get CPU affinity mask.
