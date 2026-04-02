@@ -291,6 +291,13 @@ unsafe fn map_elf_at_linked_addresses(
 
     let mut vaddr = start_page;
     while vaddr < end_page {
+        // Guard against page-unaligned vaddr_min: if start_page < vaddr_min,
+        // the subtraction below would underflow. Skip head-padding pages.
+        if vaddr < vaddr_min {
+            vaddr += PAGE_SIZE as u64;
+            continue;
+        }
+
         let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
         let pml3_idx = ((vaddr >> 30) & 0x1FF) as usize;
         let pml2_idx = ((vaddr >> 21) & 0x1FF) as usize;
@@ -1516,7 +1523,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                     // Save entire arena (brk + mmap regions). The child's
                     // code modifies malloc metadata and heap objects.
                     let arena_base = lx.arena_base();
-                    let arena_size = 4 * 1024 * 1024; // match the 4 MiB arena
+                    let arena_size = lx.arena_size();
                     let mut buf = alloc::vec![0u8; arena_size];
                     core::ptr::copy_nonoverlapping(
                         arena_base as *const u8,

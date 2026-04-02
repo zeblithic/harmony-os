@@ -2910,6 +2910,11 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         self.arena.base + self.arena.brk_offset
     }
 
+    /// Total size of the memory arena in bytes.
+    pub fn arena_size(&self) -> usize {
+        self.arena_size
+    }
+
     /// Return the set of pipe_ids that exist in the pipes map.
     pub fn pipe_ids(&self) -> alloc::vec::Vec<usize> {
         self.pipes.keys().copied().collect()
@@ -7807,7 +7812,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         exceptfds: u64,
         _timeout: u64,
     ) -> i64 {
-        if nfds < 0 || nfds > 1024 {
+        if !(0..=1024).contains(&nfds) {
             return EINVAL;
         }
         // Count how many fds are "ready" (i.e., exist in our fd_table).
@@ -7818,7 +7823,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 return 0;
             }
             let mut count = 0i64;
-            let bytes = (nfds as usize + 7) / 8;
+            let bytes = (nfds as usize).div_ceil(8);
             let set = unsafe { core::slice::from_raw_parts_mut(fdset_ptr as *mut u8, bytes) };
             for fd in 0..nfds {
                 let byte_idx = fd as usize / 8;
@@ -7837,7 +7842,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         ready += check_fdset(writefds, nfds);
         // Clear exceptfds — we never report exceptional conditions.
         if exceptfds != 0 {
-            let bytes = (nfds as usize + 7) / 8;
+            let bytes = (nfds as usize).div_ceil(8);
             unsafe {
                 core::ptr::write_bytes(exceptfds as *mut u8, 0, bytes);
             }
