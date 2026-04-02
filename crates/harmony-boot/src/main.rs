@@ -733,6 +733,15 @@ unsafe fn poll_network() {
     }
 }
 
+/// Network poll + PIT read, callable from Linuxulator during blocking ops.
+#[cfg(feature = "ring3")]
+fn kernel_poll_and_time() -> u64 {
+    unsafe {
+        poll_network();
+        (*PIT_PTR).now_ms()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RuntimeAction dispatch
 // ---------------------------------------------------------------------------
@@ -1430,6 +1439,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             unsafe {
                 if let Some(ref mut lx) = LINUXULATOR {
                     lx.set_embedded_fs(efs);
+                    lx.set_poll_fn(kernel_poll_and_time);
                 }
             }
         }
