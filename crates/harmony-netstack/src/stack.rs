@@ -14,6 +14,7 @@ use crate::device::FrameBuffer;
 use crate::dhcp::DhcpClient;
 use crate::peers::PeerTable;
 use crate::tcp::{NetError, TcpHandle, TcpProvider, TcpSocketState};
+use crate::udp::UdpHandle;
 
 /// Configuration for DHCP-based address acquisition with a static fallback.
 pub struct DhcpConfig {
@@ -46,6 +47,12 @@ pub struct NetStack {
     /// Handles that userspace has called tcp_close() on. Only these are
     /// eligible for reaping once smoltcp reaches Closed/TimeWait.
     tcp_user_closed: alloc::collections::BTreeSet<TcpHandle>,
+    // UDP userspace sockets
+    udp_handles: Vec<Option<SocketHandle>>,
+    udp_bound_ports: BTreeMap<UdpHandle, u16>,
+    udp_connected: BTreeMap<UdpHandle, (Ipv4Address, u16)>,
+    /// Next ephemeral port for outbound UDP.
+    udp_next_ephemeral: u16,
     // DHCP
     dhcp: Option<DhcpClient>,
 }
@@ -60,6 +67,7 @@ impl NetStack {
         broadcast: bool,
         peers: &[(Ipv4Address, u16)],
         tcp_max_sockets: usize,
+        udp_max_sockets: usize,
         dhcp_config: Option<DhcpConfig>,
         now: Instant,
     ) -> Self {
@@ -82,7 +90,7 @@ impl NetStack {
         }
 
         // Build socket storage with room for UDP + TCP slots + DHCP + spare.
-        let socket_capacity = tcp_max_sockets + 3;
+        let socket_capacity = tcp_max_sockets + udp_max_sockets + 3;
         let mut storage = Vec::with_capacity(socket_capacity);
         for _ in 0..socket_capacity {
             storage.push(smoltcp::iface::SocketStorage::EMPTY);
@@ -113,6 +121,7 @@ impl NetStack {
         });
 
         let tcp_handles = vec![None; tcp_max_sockets];
+        let udp_handles = vec![None; udp_max_sockets];
 
         Self {
             device,
@@ -126,6 +135,11 @@ impl NetStack {
             tcp_listen_ports: BTreeMap::new(),
             tcp_next_ephemeral: 49152,
             tcp_user_closed: alloc::collections::BTreeSet::new(),
+            // UDP userspace sockets
+            udp_handles,
+            udp_bound_ports: BTreeMap::new(),
+            udp_connected: BTreeMap::new(),
+            udp_next_ephemeral: 49152,
             dhcp,
         }
     }
