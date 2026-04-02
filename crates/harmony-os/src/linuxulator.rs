@@ -4700,12 +4700,15 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 sa[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
                 sa[2..4].copy_from_slice(&0u16.to_be_bytes()); // port 0
                 sa[4..8].copy_from_slice(&[127, 0, 0, 1]); // 127.0.0.1
+                                                           // Write min(buf_len, 16) bytes, but set *addrlen to the
+                                                           // actual struct size (16) per Linux convention so callers
+                                                           // can detect truncation.
                 let n = buf_len.min(16);
                 let buf = unsafe { core::slice::from_raw_parts_mut(addr as usize as *mut u8, n) };
                 buf.copy_from_slice(&sa[..n]);
                 let out =
                     unsafe { core::slice::from_raw_parts_mut(addrlen_ptr as usize as *mut u8, 4) };
-                out.copy_from_slice(&(n as u32).to_ne_bytes());
+                out.copy_from_slice(&16u32.to_ne_bytes());
             }
             10 => {
                 // AF_INET6: sockaddr_in6 (28 bytes)
@@ -4720,7 +4723,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 buf.copy_from_slice(&sa[..n]);
                 let out =
                     unsafe { core::slice::from_raw_parts_mut(addrlen_ptr as usize as *mut u8, 4) };
-                out.copy_from_slice(&(n as u32).to_ne_bytes());
+                out.copy_from_slice(&28u32.to_ne_bytes());
             }
             _ => {
                 // Unknown domain — just zero it
