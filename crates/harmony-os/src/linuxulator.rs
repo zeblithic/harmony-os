@@ -4622,7 +4622,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             }
         } else {
             // Stub: return EOF.
-            self.zero_sockaddr(src, addrlen);
+            self.write_stub_sockaddr(src, addrlen, 2);
             0
         }
     }
@@ -4679,11 +4679,6 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             }
             Err(e) => e,
         }
-    }
-
-    /// Helper: zero a sockaddr buffer and set *addrlen to 0.
-    fn zero_sockaddr(&self, addr: u64, addrlen_ptr: u64) {
-        self.write_stub_sockaddr(addr, addrlen_ptr, 2); // AF_INET default
     }
 
     /// Write a stub sockaddr with the correct address family.
