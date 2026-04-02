@@ -4776,7 +4776,62 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     }
                     new_fd as i64
                 }
-                Ok(None) => EAGAIN, // No pending connection
+                Ok(None) => {
+                    let parent_nonblock =
+                        self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
+                    if !parent_nonblock {
+                        if let Some(pf) = self.poll_fn {
+                            match self.block_until(pf, Self::is_fd_readable, fd) {
+                                BlockResult::Ready => {
+                                    match self.tcp.tcp_accept(h) {
+                                        Ok(Some(accepted_handle)) => {
+                                            // Create new socket + fd (same logic as the Ok(Some(...)) arm above)
+                                            let new_socket_id = self.next_socket_id;
+                                            self.next_socket_id += 1;
+                                            let new_nonblock = flags & SOCK_NONBLOCK != 0;
+                                            self.sockets.insert(
+                                                new_socket_id,
+                                                SocketState {
+                                                    domain,
+                                                    sock_type,
+                                                    listening: false,
+                                                    accepted_once: false,
+                                                    tcp_handle: Some(accepted_handle),
+                                                    udp_handle: None,
+                                                    bound_port: 0,
+                                                },
+                                            );
+                                            let new_fd = self.alloc_fd();
+                                            let fd_flags = if flags & SOCK_CLOEXEC != 0 {
+                                                FD_CLOEXEC
+                                            } else {
+                                                0
+                                            };
+                                            self.fd_table.insert(
+                                                new_fd,
+                                                FdEntry {
+                                                    kind: FdKind::Socket {
+                                                        socket_id: new_socket_id,
+                                                    },
+                                                    flags: fd_flags,
+                                                    nonblock: new_nonblock,
+                                                },
+                                            );
+                                            if addr != 0 {
+                                                self.write_stub_sockaddr(addr, addrlen_ptr, domain);
+                                            }
+                                            return new_fd as i64;
+                                        }
+                                        Ok(None) => return EAGAIN,
+                                        Err(e) => return net_error_to_errno(e),
+                                    }
+                                }
+                                BlockResult::Interrupted => return EINTR,
+                            }
+                        }
+                    }
+                    EAGAIN
+                }
                 Err(e) => net_error_to_errno(e),
             }
         } else {
@@ -17303,6 +17358,77 @@ mod integration_tests {
 
         // Keep rfd alive so pipe isn't broken.
         let _ = rfd;
+    }
+
+    #[test]
+    fn blocking_accept4_stub_returns_fd() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.set_poll_fn(timeout_poll_fn);
+
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 1,    // AF_UNIX
+            sock_type: 1, // SOCK_STREAM (blocking)
+            protocol: 0,
+        });
+        assert!(fd >= 0);
+        lx.dispatch_syscall(LinuxSyscall::Listen {
+            fd: fd as i32,
+            backlog: 128,
+        });
+
+        let c1 = lx.dispatch_syscall(LinuxSyscall::Accept4 {
+            fd: fd as i32,
+            addr: 0,
+            addrlen: 0,
+            flags: 0,
+        });
+        assert!(c1 >= 0);
+
+        // Second blocking accept on stub — stub sockets are always "ready"
+        // per is_fd_readable, so block_until returns Ready immediately.
+        // Blocking mode prevents the accepted_once EAGAIN guard.
+        let c2 = lx.dispatch_syscall(LinuxSyscall::Accept4 {
+            fd: fd as i32,
+            addr: 0,
+            addrlen: 0,
+            flags: 0,
+        });
+        assert!(c2 >= 0);
+        assert_ne!(c2, c1);
+    }
+
+    #[test]
+    fn nonblocking_accept4_returns_eagain() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.set_poll_fn(timeout_poll_fn);
+
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 1,           // AF_UNIX
+            sock_type: 1 | 2048, // SOCK_STREAM | SOCK_NONBLOCK
+            protocol: 0,
+        });
+        assert!(fd >= 0);
+        lx.dispatch_syscall(LinuxSyscall::Listen {
+            fd: fd as i32,
+            backlog: 128,
+        });
+
+        let c1 = lx.dispatch_syscall(LinuxSyscall::Accept4 {
+            fd: fd as i32,
+            addr: 0,
+            addrlen: 0,
+            flags: 0,
+        });
+        assert!(c1 >= 0);
+
+        // Second nonblocking accept → EAGAIN (accepted_once guard).
+        let c2 = lx.dispatch_syscall(LinuxSyscall::Accept4 {
+            fd: fd as i32,
+            addr: 0,
+            addrlen: 0,
+            flags: 0,
+        });
+        assert_eq!(c2, EAGAIN);
     }
 
     #[test]
