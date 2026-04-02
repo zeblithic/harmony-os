@@ -1171,6 +1171,12 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                         .push((ptr, layout));
                 }
                 // Create page table entries: vaddr → heap physical frames.
+                // NOTE: map_range_to_heap may allocate intermediate page table
+                // pages (PML3/PML2/PML1) via alloc_pt_page. These are NOT tracked
+                // for deallocation because ensure_table reuses existing entries
+                // (dropbear's initial load already created them for the 0x400000
+                // range). If a future binary loads at a novel address requiring
+                // new intermediate tables, those pages will leak (~4 KiB each).
                 let phys_offset = unsafe { PHYS_OFFSET };
                 unsafe {
                     map_range_to_heap(phys_offset, ptr as usize, page_start, page_end);

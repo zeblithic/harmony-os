@@ -3717,7 +3717,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 // Fill buffer with random bytes from LCG-based PRNG.
                 let n = count.min(256); // cap at 256 bytes per read
                 let mut tmp = alloc::vec![0u8; n];
-                self.fill_random(&mut tmp);
+                self.fill_random(&mut tmp, buf_ptr as u64);
                 unsafe {
                     core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf_ptr as *mut u8, n);
                 }
@@ -7260,11 +7260,15 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
     /// produce distinct output.  This is sufficient for ld-musl stack
     /// canaries and ASLR seeds in the Linuxulator environment (no real
     /// security boundary).
-    /// Fill a buffer with pseudo-random bytes (LCG-based, same as getrandom).
-    fn fill_random(&mut self, buf: &mut [u8]) {
+    /// Fill a buffer with pseudo-random bytes (LCG-based).
+    ///
+    /// `extra_seed` is mixed into the initial state for caller-specific
+    /// diversity (e.g. the destination buffer address for getrandom).
+    fn fill_random(&mut self, buf: &mut [u8], extra_seed: u64) {
         let counter = self.getrandom_counter;
         self.getrandom_counter = counter.wrapping_add(1);
         let mut state = counter
+            .wrapping_add(extra_seed)
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         for byte in buf.iter_mut() {
@@ -7295,7 +7299,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         while written < buflen {
             let n = CHUNK.min(buflen - written);
             let mut chunk = [0u8; CHUNK];
-            self.fill_random(&mut chunk[..n]);
+            self.fill_random(&mut chunk[..n], buf_ptr as u64);
             self.backend
                 .vm_write_bytes(buf_ptr as u64 + written as u64, &chunk[..n]);
             written += n;
