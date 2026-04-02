@@ -2612,44 +2612,56 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     /// space is available for the write (respecting POSIX atomic semantics
     /// for writes <= PIPE_BUF), then performs the write and returns the
     /// byte count.  Returns EINTR on timeout, EPIPE on broken pipe.
+    ///
+    /// Uses a single deadline for the entire wait — retries after
+    /// insufficient-space wakeups share the same 30-second cap rather
+    /// than resetting it.
     fn pipe_write_blocking(
         &mut self,
         poll_fn: fn() -> u64,
-        fd: i32,
         pipe_id: usize,
         buf_ptr: usize,
         count: usize,
     ) -> i64 {
         const PIPE_BUF_CAP: usize = 65536;
         const PIPE_BUF: usize = 4096;
+        const MAX_BLOCK_MS: u64 = 30_000;
+
+        let start_ms = poll_fn();
+        let deadline = start_ms.saturating_add(MAX_BLOCK_MS);
+
         loop {
-            match self.block_until(poll_fn, Self::is_fd_writable, fd) {
-                BlockResult::Ready => {
-                    let has_reader = self.fd_table.values().any(
-                        |e| matches!(&e.kind, FdKind::PipeRead { pipe_id: id } if *id == pipe_id),
-                    );
-                    if !has_reader {
-                        let is_child = self.parent_pid != 0;
-                        if !is_child || !self.pipes.contains_key(&pipe_id) {
-                            return EPIPE;
-                        }
-                    }
-                    let pipe_buf = match self.pipes.get_mut(&pipe_id) {
-                        Some(b) => b,
-                        None => return EPIPE,
-                    };
-                    let avail = PIPE_BUF_CAP.saturating_sub(pipe_buf.len());
-                    if avail == 0 || (count <= PIPE_BUF && avail < count) {
-                        continue; // Not enough space yet, keep waiting
-                    }
-                    let to_write = count.min(avail);
-                    let data =
-                        unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, to_write) };
-                    pipe_buf.extend_from_slice(data);
-                    return to_write as i64;
+            let now = poll_fn();
+
+            // Check if enough space is available.
+            let has_reader = self
+                .fd_table
+                .values()
+                .any(|e| matches!(&e.kind, FdKind::PipeRead { pipe_id: id } if *id == pipe_id));
+            if !has_reader {
+                let is_child = self.parent_pid != 0;
+                if !is_child || !self.pipes.contains_key(&pipe_id) {
+                    return EPIPE;
                 }
-                BlockResult::Interrupted => return EINTR,
             }
+            let pipe_buf = match self.pipes.get_mut(&pipe_id) {
+                Some(b) => b,
+                None => return EPIPE,
+            };
+            let avail = PIPE_BUF_CAP.saturating_sub(pipe_buf.len());
+            if avail > 0 && (count > PIPE_BUF || avail >= count) {
+                // Enough space — perform the write.
+                let to_write = count.min(avail);
+                let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, to_write) };
+                pipe_buf.extend_from_slice(data);
+                return to_write as i64;
+            }
+
+            // Not enough space — check timeout before spinning.
+            if now >= deadline {
+                return EINTR;
+            }
+            core::hint::spin_loop();
         }
     }
 
@@ -3507,7 +3519,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                     if !nonblock {
                         if let Some(pf) = self.poll_fn {
-                            return self.pipe_write_blocking(pf, fd, pipe_id, buf_ptr, count);
+                            return self.pipe_write_blocking(pf, pipe_id, buf_ptr, count);
                         }
                     }
                     return EAGAIN;
@@ -4685,6 +4697,58 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         }
     }
 
+    /// Create the accepted socket state and fd entry for a successful
+    /// `tcp_accept`.  Shared by the immediate and blocking-retry paths
+    /// in [`sys_accept4`] to avoid code duplication.
+    fn finish_tcp_accept(
+        &mut self,
+        accepted_handle: TcpHandle,
+        domain: i32,
+        sock_type: i32,
+        flags: i32,
+        addr: u64,
+        addrlen_ptr: u64,
+    ) -> i64 {
+        const SOCK_CLOEXEC: i32 = 0o2000000;
+        const SOCK_NONBLOCK: i32 = 0o4000;
+        let new_socket_id = self.next_socket_id;
+        self.next_socket_id += 1;
+        // Per Linux accept4 semantics, the accepted socket's blocking
+        // mode is determined solely by flags, not inherited from the listener.
+        self.sockets.insert(
+            new_socket_id,
+            SocketState {
+                domain,
+                sock_type,
+                listening: false,
+                accepted_once: false,
+                tcp_handle: Some(accepted_handle),
+                udp_handle: None,
+                bound_port: 0,
+            },
+        );
+        let new_fd = self.alloc_fd();
+        let fd_flags = if flags & SOCK_CLOEXEC != 0 {
+            FD_CLOEXEC
+        } else {
+            0
+        };
+        self.fd_table.insert(
+            new_fd,
+            FdEntry {
+                kind: FdKind::Socket {
+                    socket_id: new_socket_id,
+                },
+                flags: fd_flags,
+                nonblock: flags & SOCK_NONBLOCK != 0,
+            },
+        );
+        if addr != 0 {
+            self.write_stub_sockaddr(addr, addrlen_ptr, domain);
+        }
+        new_fd as i64
+    }
+
     /// Linux accept4(2): create a new socket fd from a listening socket.
     fn sys_accept4(&mut self, fd: i32, addr: u64, addrlen_ptr: u64, flags: i32) -> i64 {
         const SOCK_CLOEXEC: i32 = 0o2000000;
@@ -4711,94 +4775,34 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         if let Some(h) = parent_tcp_handle {
             // Real TCP path: try to accept a connection.
             match self.tcp.tcp_accept(h) {
-                Ok(Some(accepted_handle)) => {
-                    let new_socket_id = self.next_socket_id;
-                    self.next_socket_id += 1;
-                    // Per Linux accept4 semantics, the accepted socket's blocking
-                    // mode is determined solely by flags, not inherited from the listener.
-                    self.sockets.insert(
-                        new_socket_id,
-                        SocketState {
-                            domain,
-                            sock_type,
-                            listening: false,
-                            accepted_once: false,
-                            tcp_handle: Some(accepted_handle),
-                            udp_handle: None,
-                            bound_port: 0,
-                        },
-                    );
-                    let new_fd = self.alloc_fd();
-                    let fd_flags = if flags & SOCK_CLOEXEC != 0 {
-                        FD_CLOEXEC
-                    } else {
-                        0
-                    };
-                    self.fd_table.insert(
-                        new_fd,
-                        FdEntry {
-                            kind: FdKind::Socket {
-                                socket_id: new_socket_id,
-                            },
-                            flags: fd_flags,
-                            nonblock: flags & SOCK_NONBLOCK != 0,
-                        },
-                    );
-                    if addr != 0 {
-                        self.write_stub_sockaddr(addr, addrlen_ptr, domain);
-                    }
-                    new_fd as i64
-                }
+                Ok(Some(accepted_handle)) => self.finish_tcp_accept(
+                    accepted_handle,
+                    domain,
+                    sock_type,
+                    flags,
+                    addr,
+                    addrlen_ptr,
+                ),
                 Ok(None) => {
                     let parent_nonblock =
                         self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                     if !parent_nonblock {
                         if let Some(pf) = self.poll_fn {
                             match self.block_until(pf, Self::is_fd_readable, fd) {
-                                BlockResult::Ready => {
-                                    match self.tcp.tcp_accept(h) {
-                                        Ok(Some(accepted_handle)) => {
-                                            // Create new socket + fd (same logic as the Ok(Some(...)) arm above)
-                                            let new_socket_id = self.next_socket_id;
-                                            self.next_socket_id += 1;
-                                            let new_nonblock = flags & SOCK_NONBLOCK != 0;
-                                            self.sockets.insert(
-                                                new_socket_id,
-                                                SocketState {
-                                                    domain,
-                                                    sock_type,
-                                                    listening: false,
-                                                    accepted_once: false,
-                                                    tcp_handle: Some(accepted_handle),
-                                                    udp_handle: None,
-                                                    bound_port: 0,
-                                                },
-                                            );
-                                            let new_fd = self.alloc_fd();
-                                            let fd_flags = if flags & SOCK_CLOEXEC != 0 {
-                                                FD_CLOEXEC
-                                            } else {
-                                                0
-                                            };
-                                            self.fd_table.insert(
-                                                new_fd,
-                                                FdEntry {
-                                                    kind: FdKind::Socket {
-                                                        socket_id: new_socket_id,
-                                                    },
-                                                    flags: fd_flags,
-                                                    nonblock: new_nonblock,
-                                                },
-                                            );
-                                            if addr != 0 {
-                                                self.write_stub_sockaddr(addr, addrlen_ptr, domain);
-                                            }
-                                            return new_fd as i64;
-                                        }
-                                        Ok(None) => return EAGAIN,
-                                        Err(e) => return net_error_to_errno(e),
+                                BlockResult::Ready => match self.tcp.tcp_accept(h) {
+                                    Ok(Some(accepted_handle)) => {
+                                        return self.finish_tcp_accept(
+                                            accepted_handle,
+                                            domain,
+                                            sock_type,
+                                            flags,
+                                            addr,
+                                            addrlen_ptr,
+                                        );
                                     }
-                                }
+                                    Ok(None) => return EAGAIN,
+                                    Err(e) => return net_error_to_errno(e),
+                                },
                                 BlockResult::Interrupted => return EINTR,
                             }
                         }
