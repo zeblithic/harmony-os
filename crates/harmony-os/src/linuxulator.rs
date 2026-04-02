@@ -177,6 +177,76 @@ impl TcpProvider for NoTcp {
     }
 }
 
+impl harmony_netstack::udp::UdpProvider for NoTcp {
+    fn udp_create(&mut self) -> Result<harmony_netstack::UdpHandle, harmony_netstack::NetError> {
+        Err(harmony_netstack::NetError::SocketLimit)
+    }
+    fn udp_bind(
+        &mut self,
+        _: harmony_netstack::UdpHandle,
+        _: u16,
+    ) -> Result<(), harmony_netstack::NetError> {
+        Err(harmony_netstack::NetError::InvalidHandle)
+    }
+    fn udp_close(
+        &mut self,
+        _: harmony_netstack::UdpHandle,
+    ) -> Result<(), harmony_netstack::NetError> {
+        Err(harmony_netstack::NetError::InvalidHandle)
+    }
+    fn udp_can_recv(&self, _: harmony_netstack::UdpHandle) -> bool {
+        false
+    }
+    fn udp_can_send(&self, _: harmony_netstack::UdpHandle) -> bool {
+        false
+    }
+    fn udp_sendto(
+        &mut self,
+        _: harmony_netstack::UdpHandle,
+        _: &[u8],
+        _: harmony_netstack::smoltcp::wire::Ipv4Address,
+        _: u16,
+    ) -> Result<usize, harmony_netstack::NetError> {
+        Err(harmony_netstack::NetError::InvalidHandle)
+    }
+    fn udp_recvfrom(
+        &mut self,
+        _: harmony_netstack::UdpHandle,
+        _: &mut [u8],
+    ) -> Result<
+        (usize, harmony_netstack::smoltcp::wire::Ipv4Address, u16),
+        harmony_netstack::NetError,
+    > {
+        Err(harmony_netstack::NetError::InvalidHandle)
+    }
+    fn udp_connect(
+        &mut self,
+        _: harmony_netstack::UdpHandle,
+        _: harmony_netstack::smoltcp::wire::Ipv4Address,
+        _: u16,
+    ) -> Result<(), harmony_netstack::NetError> {
+        Err(harmony_netstack::NetError::InvalidHandle)
+    }
+    fn udp_send(
+        &mut self,
+        _: harmony_netstack::UdpHandle,
+        _: &[u8],
+    ) -> Result<usize, harmony_netstack::NetError> {
+        Err(harmony_netstack::NetError::InvalidHandle)
+    }
+    fn udp_recv(
+        &mut self,
+        _: harmony_netstack::UdpHandle,
+        _: &mut [u8],
+    ) -> Result<
+        (usize, harmony_netstack::smoltcp::wire::Ipv4Address, u16),
+        harmony_netstack::NetError,
+    > {
+        Err(harmony_netstack::NetError::InvalidHandle)
+    }
+    fn udp_poll(&mut self, _: i64) {}
+}
+
 /// Directory entry returned by [`SyscallBackend::readdir`].
 #[derive(Debug, Clone)]
 pub struct DirEntry {
@@ -2166,6 +2236,9 @@ struct SocketState {
     /// Handle into the TcpProvider, if the socket was successfully created
     /// via tcp_create. None for stub/AF_UNIX/AF_INET6 sockets.
     tcp_handle: Option<TcpHandle>,
+    /// Handle into the UdpProvider, if socket was created as SOCK_DGRAM
+    /// via udp_create. None for SOCK_STREAM/AF_UNIX/stub sockets.
+    udp_handle: Option<harmony_netstack::UdpHandle>,
     /// Port this socket is bound to (0 = unbound).
     bound_port: u16,
 }
@@ -2279,7 +2352,7 @@ fn default_signal_action(signum: u32) -> DefaultAction {
 }
 
 /// A child process created by fork/clone.
-struct ChildProcess<B: SyscallBackend, T: TcpProvider> {
+struct ChildProcess<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> {
     pid: i32,
     linuxulator: Linuxulator<B, T>,
 }
@@ -2306,7 +2379,10 @@ struct FdEntry {
 ///
 /// The `T` type parameter selects the TCP provider. Use the default
 /// [`NoTcp`] when networking is not required.
-pub struct Linuxulator<B: SyscallBackend, T: TcpProvider = NoTcp> {
+pub struct Linuxulator<
+    B: SyscallBackend,
+    T: TcpProvider + harmony_netstack::udp::UdpProvider = NoTcp,
+> {
     backend: B,
     /// TCP provider for SOCK_STREAM sockets. [`NoTcp`] by default.
     tcp: T,
@@ -2418,7 +2494,7 @@ impl<B: SyscallBackend> Linuxulator<B, NoTcp> {
     }
 }
 
-impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
+impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Linuxulator<B, T> {
     /// Create a Linuxulator with a custom TCP provider and default 1 MiB arena.
     pub fn with_tcp(backend: B, tcp: T) -> Self {
         Self::with_tcp_and_arena(backend, tcp, 1024 * 1024)
@@ -3805,6 +3881,9 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                         if let Some(h) = state.tcp_handle {
                             let _ = self.tcp.tcp_close(h);
                         }
+                        if let Some(h) = state.udp_handle {
+                            let _ = self.tcp.udp_close(h);
+                        }
                     }
                 }
             }
@@ -4295,10 +4374,18 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         let base_type = sock_type & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
 
         const SOCK_STREAM: i32 = 1;
+        const SOCK_DGRAM: i32 = 2;
 
         // Attempt to create a real TCP handle for AF_INET SOCK_STREAM sockets.
         let tcp_handle = if domain == AF_INET && base_type == SOCK_STREAM {
             self.tcp.tcp_create().ok()
+        } else {
+            None
+        };
+
+        // Attempt to create a real UDP handle for AF_INET SOCK_DGRAM sockets.
+        let udp_handle = if domain == AF_INET && base_type == SOCK_DGRAM {
+            self.tcp.udp_create().ok()
         } else {
             None
         };
@@ -4314,6 +4401,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 nonblock: flags & SOCK_NONBLOCK != 0,
                 accepted_once: false,
                 tcp_handle,
+                udp_handle,
                 bound_port: 0,
             },
         );
@@ -4361,7 +4449,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             // Parse port from sockaddr_in (bytes 2-3, big-endian).
             let port_bytes = unsafe { [*(addr as *const u8).add(2), *(addr as *const u8).add(3)] };
             let port = u16::from_be_bytes(port_bytes);
-            match self.tcp.tcp_bind(h, port) {
+            return match self.tcp.tcp_bind(h, port) {
                 Ok(()) => {
                     if let Some(state) = self.sockets.get_mut(&socket_id) {
                         state.bound_port = port;
@@ -4369,10 +4457,29 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                     0
                 }
                 Err(e) => net_error_to_errno(e),
-            }
-        } else {
-            0 // stub no-op
+            };
         }
+
+        // UDP path.
+        let udp_handle = self.sockets.get(&socket_id).and_then(|s| s.udp_handle);
+        if let Some(h) = udp_handle {
+            if addr == 0 || addrlen < 4 {
+                return EINVAL;
+            }
+            let ptr = addr as *const u8;
+            let port = u16::from_be_bytes(unsafe { [*ptr.add(2), *ptr.add(3)] });
+            return match self.tcp.udp_bind(h, port) {
+                Ok(()) => {
+                    if let Some(state) = self.sockets.get_mut(&socket_id) {
+                        state.bound_port = port;
+                    }
+                    0
+                }
+                Err(e) => net_error_to_errno(e),
+            };
+        }
+
+        0 // stub no-op
     }
 
     /// Linux listen(2): mark socket as listening.
@@ -4449,6 +4556,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                             nonblock: new_nonblock,
                             accepted_once: false,
                             tcp_handle: Some(accepted_handle),
+                            udp_handle: None,
                             bound_port: 0,
                         },
                     );
@@ -4503,6 +4611,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                     nonblock: flags & SOCK_NONBLOCK != 0,
                     accepted_once: false,
                     tcp_handle: None,
+                    udp_handle: None,
                     bound_port: 0,
                 },
             );
@@ -4556,6 +4665,16 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 Ok(()) => EINPROGRESS,
                 Err(e) => net_error_to_errno(e),
             }
+        } else if let Some(h) = self.sockets.get(&socket_id).and_then(|s| s.udp_handle) {
+            // UDP connect — stores the remote endpoint, returns immediately.
+            let (ip, port) = match self.parse_sockaddr_in(addr, addrlen) {
+                Some(pair) => pair,
+                None => return EINVAL,
+            };
+            match self.tcp.udp_connect(h, ip, port) {
+                Ok(()) => 0,
+                Err(e) => net_error_to_errno(e),
+            }
         } else {
             // AF_UNIX connect: no daemon is running → ECONNREFUSED.
             // This forces musl's nscd client to fall back to file-based lookup.
@@ -4584,8 +4703,8 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         buf: u64,
         len: u64,
         _flags: i32,
-        _addr: u64,
-        _addrlen: u32,
+        dest_addr: u64,
+        addrlen: u32,
     ) -> i64 {
         let socket_id = match self.require_socket(fd) {
             Ok(id) => id,
@@ -4614,6 +4733,42 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 Err(_) => EPIPE,
             }
         } else {
+            // UDP path.
+            if let Some(h) = self.sockets.get(&socket_id).and_then(|s| s.udp_handle) {
+                let count = len as usize;
+                if count == 0 {
+                    return 0;
+                }
+                if buf == 0 {
+                    return EFAULT;
+                }
+                let data = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
+
+                if dest_addr != 0 {
+                    // Explicit destination — parse and use sendto.
+                    let (ip, port) = match self.parse_sockaddr_in(dest_addr, addrlen) {
+                        Some(pair) => pair,
+                        None => return EINVAL,
+                    };
+                    return match self.tcp.udp_sendto(h, data, ip, port) {
+                        Ok(n) => n as i64,
+                        Err(NetError::WouldBlock) => EAGAIN,
+                        Err(e) => net_error_to_errno(e),
+                    };
+                }
+
+                // No destination (NULL) — must be connected.
+                return match self.tcp.udp_send(h, data) {
+                    Ok(n) => n as i64,
+                    Err(NetError::NotConnected) => {
+                        const EDESTADDRREQ: i64 = -89;
+                        EDESTADDRREQ
+                    }
+                    Err(NetError::WouldBlock) => EAGAIN,
+                    Err(e) => net_error_to_errno(e),
+                };
+            }
+
             // Stub: pretend all bytes sent.
             len.min(i64::MAX as u64) as i64
         }
@@ -4656,6 +4811,34 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 Err(e) => net_error_to_errno(e),
             }
         } else {
+            // UDP path.
+            if let Some(h) = self.sockets.get(&socket_id).and_then(|s| s.udp_handle) {
+                let count = len as usize;
+                if count == 0 {
+                    return 0;
+                }
+                if buf == 0 {
+                    return EFAULT;
+                }
+                let data = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, count) };
+
+                // Try connected recv first; on NotConnected, fall back to recvfrom.
+                let result = match self.tcp.udp_recv(h, data) {
+                    Ok(r) => Ok(r),
+                    Err(NetError::NotConnected) => self.tcp.udp_recvfrom(h, data),
+                    Err(e) => Err(e),
+                };
+
+                return match result {
+                    Ok((n, src_addr, src_port)) => {
+                        self.write_sockaddr_in(src, addrlen, src_addr, src_port);
+                        n as i64
+                    }
+                    Err(NetError::WouldBlock) => EAGAIN,
+                    Err(e) => net_error_to_errno(e),
+                };
+            }
+
             // Stub: return EOF.
             self.write_stub_sockaddr(src, addrlen, 2);
             0
@@ -4788,6 +4971,59 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 out.copy_from_slice(&0u32.to_ne_bytes());
             }
         }
+    }
+
+    /// Parse a `sockaddr_in` from userspace memory.
+    /// Returns `None` if the pointer is null or the buffer is too short
+    /// (needs at least 8 bytes: family + port + addr).
+    fn parse_sockaddr_in(
+        &self,
+        addr: u64,
+        addrlen: u32,
+    ) -> Option<(harmony_netstack::smoltcp::wire::Ipv4Address, u16)> {
+        if addr == 0 || addrlen < 8 {
+            return None;
+        }
+        let ptr = addr as *const u8;
+        let port = u16::from_be_bytes(unsafe { [*ptr.add(2), *ptr.add(3)] });
+        let ip = harmony_netstack::smoltcp::wire::Ipv4Address::new(
+            unsafe { *ptr.add(4) },
+            unsafe { *ptr.add(5) },
+            unsafe { *ptr.add(6) },
+            unsafe { *ptr.add(7) },
+        );
+        Some((ip, port))
+    }
+
+    /// Write a `sockaddr_in` to userspace memory.
+    /// No-op if `addr` or `addrlen_ptr` is null.
+    fn write_sockaddr_in(
+        &self,
+        addr: u64,
+        addrlen_ptr: u64,
+        ip: harmony_netstack::smoltcp::wire::Ipv4Address,
+        port: u16,
+    ) {
+        if addr == 0 || addrlen_ptr == 0 {
+            return;
+        }
+        let addrlen_bytes = unsafe { core::slice::from_raw_parts(addrlen_ptr as *const u8, 4) };
+        let buf_len = u32::from_ne_bytes(addrlen_bytes.try_into().unwrap()) as usize;
+        if buf_len < 8 {
+            return;
+        }
+        let n = buf_len.min(16);
+        let sa = unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, n) };
+        sa[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
+        sa[2..4].copy_from_slice(&port.to_be_bytes());
+        sa[4..8].copy_from_slice(&ip.0);
+        if n > 8 {
+            sa[8..n].fill(0); // sin_zero (partial or full)
+        }
+        // Per Linux recvfrom(2): always write the actual struct size (16)
+        // regardless of buffer size, so callers can detect truncation.
+        let out = unsafe { core::slice::from_raw_parts_mut(addrlen_ptr as *mut u8, 4) };
+        out.copy_from_slice(&16u32.to_ne_bytes());
     }
 
     /// Linux getsockname(2): return sockaddr with correct address family.
@@ -5412,6 +5648,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                         nonblock: s.nonblock,
                         accepted_once: s.accepted_once,
                         tcp_handle: None,
+                        udp_handle: None,
                         bound_port: s.bound_port,
                     },
                 )
@@ -7037,6 +7274,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 nonblock: flags & SOCK_NONBLOCK != 0,
                 accepted_once: false,
                 tcp_handle: None,
+                udp_handle: None,
                 bound_port: 0,
             },
         );
@@ -8150,8 +8388,11 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                             || tcp_state == TcpSocketState::Closing
                             || tcp_state == TcpSocketState::Closed;
                     }
+                    if let Some(h) = state.udp_handle {
+                        return self.tcp.udp_can_recv(h);
+                    }
                 }
-                // Non-TCP sockets (AF_UNIX stubs, socketpair): always ready.
+                // Non-TCP/UDP sockets (AF_UNIX stubs, socketpair): always ready.
                 true
             }
             // Pipe write-end is not readable.
@@ -8180,8 +8421,11 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                             && (tcp_state == TcpSocketState::Established
                                 || tcp_state == TcpSocketState::CloseWait);
                     }
+                    if let Some(h) = state.udp_handle {
+                        return self.tcp.udp_can_send(h);
+                    }
                 }
-                // Non-TCP sockets (AF_UNIX stubs, socketpair): always ready.
+                // Non-TCP/UDP sockets (AF_UNIX stubs, socketpair): always ready.
                 true
             }
             // Everything else: always writable.
@@ -8343,6 +8587,13 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    #[test]
+    fn no_tcp_implements_udp_provider() {
+        use harmony_netstack::udp::UdpProvider;
+        let mut no_tcp = NoTcp;
+        assert!(no_tcp.udp_create().is_err());
+    }
 
     #[test]
     fn mock_backend_records_write() {
@@ -16514,5 +16765,76 @@ mod integration_tests {
             size_out, alt_size,
             "child must inherit parent alt stack size"
         );
+    }
+
+    #[test]
+    fn test_socket_dgram_creates_fd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // AF_INET (2), SOCK_DGRAM (2), protocol 0
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,
+            sock_type: 2,
+            protocol: 0,
+        });
+        assert!(
+            fd >= 0,
+            "socket(AF_INET, SOCK_DGRAM) should return valid fd, got {fd}"
+        );
+        assert!(lx.has_fd(fd as i32));
+    }
+
+    #[test]
+    fn test_udp_readiness_stub() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,    // AF_INET
+            sock_type: 2, // SOCK_DGRAM
+            protocol: 0,
+        }) as i32;
+        assert!(fd >= 0);
+
+        // With NoTcp, udp_create fails → no udp_handle → stub path.
+        assert!(lx.is_fd_readable(fd));
+        assert!(lx.is_fd_writable(fd));
+    }
+
+    #[test]
+    fn test_parse_sockaddr_in() {
+        let mock = MockBackend::new();
+        let lx = Linuxulator::new(mock);
+
+        // Build a valid sockaddr_in: AF_INET=2, port=8080, addr=10.0.0.1
+        let mut sa = [0u8; 16];
+        sa[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
+        sa[2..4].copy_from_slice(&8080u16.to_be_bytes());
+        sa[4..8].copy_from_slice(&[10, 0, 0, 1]);
+
+        let result = lx.parse_sockaddr_in(sa.as_ptr() as u64, 16);
+        assert!(result.is_some());
+        let (ip, port) = result.unwrap();
+        assert_eq!(port, 8080);
+        assert_eq!(
+            ip,
+            harmony_netstack::smoltcp::wire::Ipv4Address::new(10, 0, 0, 1)
+        );
+    }
+
+    #[test]
+    fn test_parse_sockaddr_in_null() {
+        let mock = MockBackend::new();
+        let lx = Linuxulator::new(mock);
+        assert!(lx.parse_sockaddr_in(0, 16).is_none());
+    }
+
+    #[test]
+    fn test_parse_sockaddr_in_too_short() {
+        let mock = MockBackend::new();
+        let lx = Linuxulator::new(mock);
+        let sa = [0u8; 4];
+        assert!(lx.parse_sockaddr_in(sa.as_ptr() as u64, 4).is_none());
     }
 }

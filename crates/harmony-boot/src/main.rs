@@ -676,6 +676,73 @@ impl harmony_netstack::TcpProvider for RawPtrTcpProvider {
     }
 }
 
+#[cfg(feature = "ring3")]
+impl harmony_netstack::udp::UdpProvider for RawPtrTcpProvider {
+    fn udp_create(&mut self) -> Result<harmony_netstack::UdpHandle, harmony_netstack::NetError> {
+        unsafe { (*self.0).udp_create() }
+    }
+    fn udp_bind(
+        &mut self,
+        h: harmony_netstack::UdpHandle,
+        port: u16,
+    ) -> Result<(), harmony_netstack::NetError> {
+        unsafe { (*self.0).udp_bind(h, port) }
+    }
+    fn udp_close(
+        &mut self,
+        h: harmony_netstack::UdpHandle,
+    ) -> Result<(), harmony_netstack::NetError> {
+        unsafe { (*self.0).udp_close(h) }
+    }
+    fn udp_can_recv(&self, h: harmony_netstack::UdpHandle) -> bool {
+        unsafe { (*self.0).udp_can_recv(h) }
+    }
+    fn udp_can_send(&self, h: harmony_netstack::UdpHandle) -> bool {
+        unsafe { (*self.0).udp_can_send(h) }
+    }
+    fn udp_sendto(
+        &mut self,
+        h: harmony_netstack::UdpHandle,
+        data: &[u8],
+        addr: smoltcp::wire::Ipv4Address,
+        port: u16,
+    ) -> Result<usize, harmony_netstack::NetError> {
+        unsafe { (*self.0).udp_sendto(h, data, addr, port) }
+    }
+    fn udp_recvfrom(
+        &mut self,
+        h: harmony_netstack::UdpHandle,
+        buf: &mut [u8],
+    ) -> Result<(usize, smoltcp::wire::Ipv4Address, u16), harmony_netstack::NetError> {
+        unsafe { (*self.0).udp_recvfrom(h, buf) }
+    }
+    fn udp_connect(
+        &mut self,
+        h: harmony_netstack::UdpHandle,
+        addr: smoltcp::wire::Ipv4Address,
+        port: u16,
+    ) -> Result<(), harmony_netstack::NetError> {
+        unsafe { (*self.0).udp_connect(h, addr, port) }
+    }
+    fn udp_send(
+        &mut self,
+        h: harmony_netstack::UdpHandle,
+        data: &[u8],
+    ) -> Result<usize, harmony_netstack::NetError> {
+        unsafe { (*self.0).udp_send(h, data) }
+    }
+    fn udp_recv(
+        &mut self,
+        h: harmony_netstack::UdpHandle,
+        buf: &mut [u8],
+    ) -> Result<(usize, smoltcp::wire::Ipv4Address, u16), harmony_netstack::NetError> {
+        unsafe { (*self.0).udp_recv(h, buf) }
+    }
+    fn udp_poll(&mut self, now_ms: i64) {
+        unsafe { (*self.0).udp_poll(now_ms) }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Ring 3 network polling
 // ---------------------------------------------------------------------------

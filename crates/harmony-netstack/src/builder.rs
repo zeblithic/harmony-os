@@ -25,6 +25,8 @@ pub struct NetStackBuilder {
     fallback_timeout_ms: i64,
     // TCP
     tcp_max_sockets: usize,
+    // UDP
+    udp_max_sockets: usize,
 }
 
 impl NetStackBuilder {
@@ -41,6 +43,7 @@ impl NetStackBuilder {
             fallback_gateway: None,
             fallback_timeout_ms: 5000,
             tcp_max_sockets: 0,
+            udp_max_sockets: 4,
         }
     }
 
@@ -117,6 +120,14 @@ impl NetStackBuilder {
         self
     }
 
+    /// Maximum number of concurrent userspace UDP sockets.
+    ///
+    /// Defaults to 4. Set to 0 to disable userspace UDP support.
+    pub fn udp_max_sockets(mut self, max: usize) -> Self {
+        self.udp_max_sockets = max;
+        self
+    }
+
     pub fn build(self, now: Instant) -> NetStack {
         let dhcp_config = if self.dhcp {
             Some(DhcpConfig {
@@ -147,6 +158,7 @@ impl NetStackBuilder {
             self.broadcast,
             &self.peers,
             self.tcp_max_sockets,
+            self.udp_max_sockets,
             dhcp_config,
             now,
         )
