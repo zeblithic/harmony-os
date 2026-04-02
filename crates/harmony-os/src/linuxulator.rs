@@ -4184,18 +4184,23 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 }
                 None => EBADF,
             },
-            F_GETFL => {
-                if !self.fd_table.contains_key(&fd) {
-                    return EBADF;
+            F_GETFL => match self.fd_table.get(&fd) {
+                Some(entry) => {
+                    if entry.nonblock {
+                        O_NONBLOCK as i64
+                    } else {
+                        0
+                    }
                 }
-                0 // stub — we don't track open mode flags yet
-            }
-            F_SETFL => {
-                if !self.fd_table.contains_key(&fd) {
-                    return EBADF;
+                None => EBADF,
+            },
+            F_SETFL => match self.fd_table.get_mut(&fd) {
+                Some(entry) => {
+                    entry.nonblock = (arg as i32) & O_NONBLOCK != 0;
+                    0
                 }
-                0 // stub — no-op
-            }
+                None => EBADF,
+            },
             _ => EINVAL,
         }
     }
@@ -11879,6 +11884,79 @@ mod integration_tests {
             }),
             EBADF
         );
+    }
+
+    #[test]
+    fn sys_fcntl_getfl_returns_nonblock() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        // Create a nonblocking socket.
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,
+            sock_type: 1 | 2048, // SOCK_STREAM | SOCK_NONBLOCK
+            protocol: 0,
+        });
+        assert!(fd >= 0);
+        let result = lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: fd as i32,
+            cmd: 3, // F_GETFL
+            arg: 0,
+        });
+        assert_eq!(result, 0o4000); // O_NONBLOCK
+    }
+
+    #[test]
+    fn sys_fcntl_setfl_enables_nonblock() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        // Create a blocking socket.
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,
+            sock_type: 1, // SOCK_STREAM (blocking)
+            protocol: 0,
+        });
+        assert!(fd >= 0);
+        // Set O_NONBLOCK via F_SETFL.
+        let r = lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: fd as i32,
+            cmd: 4,      // F_SETFL
+            arg: 0o4000, // O_NONBLOCK
+        });
+        assert_eq!(r, 0);
+        // Verify F_GETFL reflects the change.
+        let result = lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: fd as i32,
+            cmd: 3, // F_GETFL
+            arg: 0,
+        });
+        assert_eq!(result, 0o4000);
+    }
+
+    #[test]
+    fn sys_fcntl_setfl_clears_nonblock() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        // Create a nonblocking socket.
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,
+            sock_type: 1 | 2048, // SOCK_STREAM | SOCK_NONBLOCK
+            protocol: 0,
+        });
+        assert!(fd >= 0);
+        // Clear O_NONBLOCK via F_SETFL.
+        let r = lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: fd as i32,
+            cmd: 4, // F_SETFL
+            arg: 0, // no flags
+        });
+        assert_eq!(r, 0);
+        // Verify F_GETFL is 0.
+        let result = lx.dispatch_syscall(LinuxSyscall::Fcntl {
+            fd: fd as i32,
+            cmd: 3,
+            arg: 0,
+        });
+        assert_eq!(result, 0);
+        // Verify the entry is actually blocking.
+        let entry = lx.fd_table.get(&(fd as i32)).unwrap();
+        assert!(!entry.nonblock);
     }
 
     // ── dup tests ───────────────────────────────────────────────────
