@@ -2232,6 +2232,9 @@ struct SocketState {
     /// Handle into the TcpProvider, if the socket was successfully created
     /// via tcp_create. None for stub/AF_UNIX/AF_INET6 sockets.
     tcp_handle: Option<TcpHandle>,
+    /// Handle into the UdpProvider, if socket was created as SOCK_DGRAM
+    /// via udp_create. None for SOCK_STREAM/AF_UNIX/stub sockets.
+    udp_handle: Option<harmony_netstack::UdpHandle>,
     /// Port this socket is bound to (0 = unbound).
     bound_port: u16,
 }
@@ -2345,7 +2348,7 @@ fn default_signal_action(signum: u32) -> DefaultAction {
 }
 
 /// A child process created by fork/clone.
-struct ChildProcess<B: SyscallBackend, T: TcpProvider> {
+struct ChildProcess<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> {
     pid: i32,
     linuxulator: Linuxulator<B, T>,
 }
@@ -2372,7 +2375,7 @@ struct FdEntry {
 ///
 /// The `T` type parameter selects the TCP provider. Use the default
 /// [`NoTcp`] when networking is not required.
-pub struct Linuxulator<B: SyscallBackend, T: TcpProvider = NoTcp> {
+pub struct Linuxulator<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider = NoTcp> {
     backend: B,
     /// TCP provider for SOCK_STREAM sockets. [`NoTcp`] by default.
     tcp: T,
@@ -2484,7 +2487,7 @@ impl<B: SyscallBackend> Linuxulator<B, NoTcp> {
     }
 }
 
-impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
+impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Linuxulator<B, T> {
     /// Create a Linuxulator with a custom TCP provider and default 1 MiB arena.
     pub fn with_tcp(backend: B, tcp: T) -> Self {
         Self::with_tcp_and_arena(backend, tcp, 1024 * 1024)
@@ -4361,10 +4364,18 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         let base_type = sock_type & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
 
         const SOCK_STREAM: i32 = 1;
+        const SOCK_DGRAM: i32 = 2;
 
         // Attempt to create a real TCP handle for AF_INET SOCK_STREAM sockets.
         let tcp_handle = if domain == AF_INET && base_type == SOCK_STREAM {
             self.tcp.tcp_create().ok()
+        } else {
+            None
+        };
+
+        // Attempt to create a real UDP handle for AF_INET SOCK_DGRAM sockets.
+        let udp_handle = if domain == AF_INET && base_type == SOCK_DGRAM {
+            self.tcp.udp_create().ok()
         } else {
             None
         };
@@ -4380,6 +4391,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 nonblock: flags & SOCK_NONBLOCK != 0,
                 accepted_once: false,
                 tcp_handle,
+                udp_handle,
                 bound_port: 0,
             },
         );
@@ -4515,6 +4527,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                             nonblock: new_nonblock,
                             accepted_once: false,
                             tcp_handle: Some(accepted_handle),
+                            udp_handle: None,
                             bound_port: 0,
                         },
                     );
@@ -4569,6 +4582,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                     nonblock: flags & SOCK_NONBLOCK != 0,
                     accepted_once: false,
                     tcp_handle: None,
+                    udp_handle: None,
                     bound_port: 0,
                 },
             );
@@ -5478,6 +5492,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                         nonblock: s.nonblock,
                         accepted_once: s.accepted_once,
                         tcp_handle: None,
+                        udp_handle: None,
                         bound_port: s.bound_port,
                     },
                 )
@@ -7103,6 +7118,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 nonblock: flags & SOCK_NONBLOCK != 0,
                 accepted_once: false,
                 tcp_handle: None,
+                udp_handle: None,
                 bound_port: 0,
             },
         );
@@ -16587,5 +16603,20 @@ mod integration_tests {
             size_out, alt_size,
             "child must inherit parent alt stack size"
         );
+    }
+
+    #[test]
+    fn test_socket_dgram_creates_fd() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // AF_INET (2), SOCK_DGRAM (2), protocol 0
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,
+            sock_type: 2,
+            protocol: 0,
+        });
+        assert!(fd >= 0, "socket(AF_INET, SOCK_DGRAM) should return valid fd, got {fd}");
+        assert!(lx.has_fd(fd as i32));
     }
 }
