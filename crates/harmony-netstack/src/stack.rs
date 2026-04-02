@@ -520,14 +520,8 @@ impl UdpProvider for NetStack {
             .position(|h| h.is_none())
             .ok_or(NetError::SocketLimit)?;
 
-        let rx_buf = udp::PacketBuffer::new(
-            vec![udp::PacketMetadata::EMPTY; 8],
-            vec![0; 4096],
-        );
-        let tx_buf = udp::PacketBuffer::new(
-            vec![udp::PacketMetadata::EMPTY; 8],
-            vec![0; 4096],
-        );
+        let rx_buf = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0; 4096]);
+        let tx_buf = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0; 4096]);
         let socket = udp::Socket::new(rx_buf, tx_buf);
         let smoltcp_handle = self.sockets.add(socket);
         self.udp_handles[slot] = Some(smoltcp_handle);
@@ -1057,7 +1051,10 @@ mod udp_tests {
         let h = s.udp_create().unwrap();
         s.udp_bind(h, 5353).unwrap();
         let mut buf = [0u8; 512];
-        assert!(matches!(s.udp_recvfrom(h, &mut buf), Err(NetError::WouldBlock)));
+        assert!(matches!(
+            s.udp_recvfrom(h, &mut buf),
+            Err(NetError::WouldBlock)
+        ));
     }
 
     #[test]

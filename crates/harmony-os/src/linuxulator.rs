@@ -213,8 +213,10 @@ impl harmony_netstack::udp::UdpProvider for NoTcp {
         &mut self,
         _: harmony_netstack::UdpHandle,
         _: &mut [u8],
-    ) -> Result<(usize, harmony_netstack::smoltcp::wire::Ipv4Address, u16), harmony_netstack::NetError>
-    {
+    ) -> Result<
+        (usize, harmony_netstack::smoltcp::wire::Ipv4Address, u16),
+        harmony_netstack::NetError,
+    > {
         Err(harmony_netstack::NetError::InvalidHandle)
     }
     fn udp_connect(
@@ -236,8 +238,10 @@ impl harmony_netstack::udp::UdpProvider for NoTcp {
         &mut self,
         _: harmony_netstack::UdpHandle,
         _: &mut [u8],
-    ) -> Result<(usize, harmony_netstack::smoltcp::wire::Ipv4Address, u16), harmony_netstack::NetError>
-    {
+    ) -> Result<
+        (usize, harmony_netstack::smoltcp::wire::Ipv4Address, u16),
+        harmony_netstack::NetError,
+    > {
         Err(harmony_netstack::NetError::InvalidHandle)
     }
     fn udp_poll(&mut self, _: i64) {}
@@ -2375,7 +2379,10 @@ struct FdEntry {
 ///
 /// The `T` type parameter selects the TCP provider. Use the default
 /// [`NoTcp`] when networking is not required.
-pub struct Linuxulator<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider = NoTcp> {
+pub struct Linuxulator<
+    B: SyscallBackend,
+    T: TcpProvider + harmony_netstack::udp::UdpProvider = NoTcp,
+> {
     backend: B,
     /// TCP provider for SOCK_STREAM sockets. [`NoTcp`] by default.
     tcp: T,
@@ -4835,17 +4842,13 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     Ok((n, src_addr, src_port)) => {
                         // Write source address if caller provided a buffer.
                         if src != 0 && addrlen != 0 {
-                            let addrlen_bytes = unsafe {
-                                core::slice::from_raw_parts(addrlen as *const u8, 4)
-                            };
+                            let addrlen_bytes =
+                                unsafe { core::slice::from_raw_parts(addrlen as *const u8, 4) };
                             let buf_len =
                                 u32::from_ne_bytes(addrlen_bytes.try_into().unwrap()) as usize;
                             if buf_len >= 8 {
                                 let sa = unsafe {
-                                    core::slice::from_raw_parts_mut(
-                                        src as *mut u8,
-                                        buf_len.min(16),
-                                    )
+                                    core::slice::from_raw_parts_mut(src as *mut u8, buf_len.min(16))
                                 };
                                 sa[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
                                 sa[2..4].copy_from_slice(&src_port.to_be_bytes());
@@ -5000,6 +5003,60 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 out.copy_from_slice(&0u32.to_ne_bytes());
             }
         }
+    }
+
+    /// Parse a `sockaddr_in` from userspace memory.
+    /// Returns `None` if the pointer is null or the buffer is too short
+    /// (needs at least 8 bytes: family + port + addr).
+    #[allow(dead_code)]
+    fn parse_sockaddr_in(
+        &self,
+        addr: u64,
+        addrlen: u32,
+    ) -> Option<(harmony_netstack::smoltcp::wire::Ipv4Address, u16)> {
+        if addr == 0 || addrlen < 8 {
+            return None;
+        }
+        let ptr = addr as *const u8;
+        let port = u16::from_be_bytes(unsafe { [*ptr.add(2), *ptr.add(3)] });
+        let ip = harmony_netstack::smoltcp::wire::Ipv4Address::new(
+            unsafe { *ptr.add(4) },
+            unsafe { *ptr.add(5) },
+            unsafe { *ptr.add(6) },
+            unsafe { *ptr.add(7) },
+        );
+        Some((ip, port))
+    }
+
+    /// Write a `sockaddr_in` to userspace memory.
+    /// No-op if `addr` or `addrlen_ptr` is null.
+    #[allow(dead_code)]
+    fn write_sockaddr_in(
+        &self,
+        addr: u64,
+        addrlen_ptr: u64,
+        ip: harmony_netstack::smoltcp::wire::Ipv4Address,
+        port: u16,
+    ) {
+        if addr == 0 || addrlen_ptr == 0 {
+            return;
+        }
+        let addrlen_bytes = unsafe { core::slice::from_raw_parts(addrlen_ptr as *const u8, 4) };
+        let buf_len = u32::from_ne_bytes(addrlen_bytes.try_into().unwrap()) as usize;
+        if buf_len < 8 {
+            return;
+        }
+        let n = buf_len.min(16);
+        let sa = unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, n) };
+        sa[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
+        sa[2..4].copy_from_slice(&port.to_be_bytes());
+        sa[4..8].copy_from_slice(&ip.0);
+        if n >= 16 {
+            sa[8..16].fill(0); // sin_zero
+        }
+        let actual = 16u32.min(buf_len as u32);
+        let out = unsafe { core::slice::from_raw_parts_mut(addrlen_ptr as *mut u8, 4) };
+        out.copy_from_slice(&actual.to_ne_bytes());
     }
 
     /// Linux getsockname(2): return sockaddr with correct address family.
@@ -16754,7 +16811,10 @@ mod integration_tests {
             sock_type: 2,
             protocol: 0,
         });
-        assert!(fd >= 0, "socket(AF_INET, SOCK_DGRAM) should return valid fd, got {fd}");
+        assert!(
+            fd >= 0,
+            "socket(AF_INET, SOCK_DGRAM) should return valid fd, got {fd}"
+        );
         assert!(lx.has_fd(fd as i32));
     }
 
@@ -16773,5 +16833,41 @@ mod integration_tests {
         // With NoTcp, udp_create fails → no udp_handle → stub path.
         assert!(lx.is_fd_readable(fd));
         assert!(lx.is_fd_writable(fd));
+    }
+
+    #[test]
+    fn test_parse_sockaddr_in() {
+        let mock = MockBackend::new();
+        let lx = Linuxulator::new(mock);
+
+        // Build a valid sockaddr_in: AF_INET=2, port=8080, addr=10.0.0.1
+        let mut sa = [0u8; 16];
+        sa[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
+        sa[2..4].copy_from_slice(&8080u16.to_be_bytes());
+        sa[4..8].copy_from_slice(&[10, 0, 0, 1]);
+
+        let result = lx.parse_sockaddr_in(sa.as_ptr() as u64, 16);
+        assert!(result.is_some());
+        let (ip, port) = result.unwrap();
+        assert_eq!(port, 8080);
+        assert_eq!(
+            ip,
+            harmony_netstack::smoltcp::wire::Ipv4Address::new(10, 0, 0, 1)
+        );
+    }
+
+    #[test]
+    fn test_parse_sockaddr_in_null() {
+        let mock = MockBackend::new();
+        let lx = Linuxulator::new(mock);
+        assert!(lx.parse_sockaddr_in(0, 16).is_none());
+    }
+
+    #[test]
+    fn test_parse_sockaddr_in_too_short() {
+        let mock = MockBackend::new();
+        let lx = Linuxulator::new(mock);
+        let sa = [0u8; 4];
+        assert!(lx.parse_sockaddr_in(sa.as_ptr() as u64, 4).is_none());
     }
 }
