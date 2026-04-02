@@ -7836,51 +7836,137 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
 
     /// Linux select(2): synchronous I/O multiplexing via fd_set bitmasks.
     ///
-    /// fd_set is a bitmask of 128 bytes (1024 bits). Bit N is set if fd N
-    /// is in the set. We use the same "always ready" stub as sys_poll.
+    /// Spin-waits until at least one fd is ready or the timeout expires.
+    /// Calls poll_fn on each iteration to drive the network stack.
     fn sys_select(
         &self,
         nfds: i32,
         readfds: u64,
         writefds: u64,
         exceptfds: u64,
-        _timeout: u64,
+        timeout_ptr: u64,
     ) -> i64 {
         if !(0..=1024).contains(&nfds) {
             return EINVAL;
         }
-        // Count how many fds are "ready" (i.e., exist in our fd_table).
-        // For each fd_set, zero out bits for fds that don't exist.
-        let mut ready = 0i64;
-        let check_fdset = |fdset_ptr: u64, nfds: i32| -> i64 {
-            if fdset_ptr == 0 {
+
+        // Parse struct timeval { tv_sec: i64, tv_usec: i64 } → deadline.
+        let deadline_ms: u64 = if timeout_ptr == 0 {
+            u64::MAX // NULL → block forever
+        } else {
+            let tv = unsafe { core::slice::from_raw_parts(timeout_ptr as *const u8, 16) };
+            let tv_sec = i64::from_ne_bytes(tv[0..8].try_into().unwrap());
+            let tv_usec = i64::from_ne_bytes(tv[8..16].try_into().unwrap());
+            let timeout_ms = (tv_sec as u64).saturating_mul(1000)
+                .saturating_add((tv_usec as u64) / 1000);
+            if timeout_ms == 0 {
+                // {0,0} → non-blocking: check once and return.
+                return self.select_check_once(nfds, readfds, writefds, exceptfds);
+            }
+            let now = self.poll_fn.map(|f| f()).unwrap_or(0);
+            now.saturating_add(timeout_ms)
+        };
+
+        // Save copies of the input fd_sets (select overwrites them with results).
+        let read_bytes = (nfds as usize).div_ceil(8);
+        let mut saved_readfds = [0u8; 128];
+        let mut saved_writefds = [0u8; 128];
+        if readfds != 0 && read_bytes > 0 {
+            let src = unsafe { core::slice::from_raw_parts(readfds as *const u8, read_bytes) };
+            saved_readfds[..read_bytes].copy_from_slice(src);
+        }
+        if writefds != 0 && read_bytes > 0 {
+            let src = unsafe { core::slice::from_raw_parts(writefds as *const u8, read_bytes) };
+            saved_writefds[..read_bytes].copy_from_slice(src);
+        }
+
+        loop {
+            // Drive the network stack and get current time.
+            let now = self.poll_fn.map(|f| f()).unwrap_or(0);
+
+            // Restore input fd_sets (previous iteration may have cleared bits).
+            if readfds != 0 && read_bytes > 0 {
+                let dst = unsafe { core::slice::from_raw_parts_mut(readfds as *mut u8, read_bytes) };
+                dst.copy_from_slice(&saved_readfds[..read_bytes]);
+            }
+            if writefds != 0 && read_bytes > 0 {
+                let dst = unsafe { core::slice::from_raw_parts_mut(writefds as *mut u8, read_bytes) };
+                dst.copy_from_slice(&saved_writefds[..read_bytes]);
+            }
+
+            let ready = self.select_check_once(nfds, readfds, writefds, exceptfds);
+            if ready > 0 {
+                return ready;
+            }
+
+            // Timeout expired.
+            if now >= deadline_ms {
+                // Clear all fd_sets on timeout (Linux convention).
+                if readfds != 0 {
+                    unsafe { core::ptr::write_bytes(readfds as *mut u8, 0, read_bytes); }
+                }
+                if writefds != 0 {
+                    unsafe { core::ptr::write_bytes(writefds as *mut u8, 0, read_bytes); }
+                }
+                if exceptfds != 0 {
+                    unsafe { core::ptr::write_bytes(exceptfds as *mut u8, 0, read_bytes); }
+                }
                 return 0;
             }
-            let mut count = 0i64;
-            let bytes = (nfds as usize).div_ceil(8);
-            let set = unsafe { core::slice::from_raw_parts_mut(fdset_ptr as *mut u8, bytes) };
+
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Single-pass readiness check for select(). Clears bits for non-ready fds,
+    /// returns count of ready fds.
+    fn select_check_once(
+        &self,
+        nfds: i32,
+        readfds: u64,
+        writefds: u64,
+        exceptfds: u64,
+    ) -> i64 {
+        let mut ready = 0i64;
+        let bytes = (nfds as usize).div_ceil(8);
+
+        // Check readfds: clear bits for fds that are NOT readable.
+        if readfds != 0 {
+            let set = unsafe { core::slice::from_raw_parts_mut(readfds as *mut u8, bytes) };
             for fd in 0..nfds {
                 let byte_idx = fd as usize / 8;
                 let bit_idx = fd as usize % 8;
                 if set[byte_idx] & (1 << bit_idx) != 0 {
-                    if self.fd_table.contains_key(&fd) {
-                        count += 1; // fd exists → "ready"
+                    if self.is_fd_readable(fd) {
+                        ready += 1;
                     } else {
-                        set[byte_idx] &= !(1 << bit_idx); // fd doesn't exist → clear
+                        set[byte_idx] &= !(1 << bit_idx);
                     }
                 }
             }
-            count
-        };
-        ready += check_fdset(readfds, nfds);
-        ready += check_fdset(writefds, nfds);
-        // Clear exceptfds — we never report exceptional conditions.
-        if exceptfds != 0 {
-            let bytes = (nfds as usize).div_ceil(8);
-            unsafe {
-                core::ptr::write_bytes(exceptfds as *mut u8, 0, bytes);
+        }
+
+        // Check writefds: clear bits for fds that are NOT writable.
+        if writefds != 0 {
+            let set = unsafe { core::slice::from_raw_parts_mut(writefds as *mut u8, bytes) };
+            for fd in 0..nfds {
+                let byte_idx = fd as usize / 8;
+                let bit_idx = fd as usize % 8;
+                if set[byte_idx] & (1 << bit_idx) != 0 {
+                    if self.is_fd_writable(fd) {
+                        ready += 1;
+                    } else {
+                        set[byte_idx] &= !(1 << bit_idx);
+                    }
+                }
             }
         }
+
+        // Clear exceptfds — we never report exceptional conditions.
+        if exceptfds != 0 {
+            unsafe { core::ptr::write_bytes(exceptfds as *mut u8, 0, bytes); }
+        }
+
         ready
     }
 
