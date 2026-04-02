@@ -4786,22 +4786,34 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 Ok(None) => {
                     if !parent_nonblock {
                         if let Some(pf) = self.poll_fn {
-                            match self.block_until(pf, Self::is_fd_readable, fd) {
-                                BlockResult::Ready => match self.tcp.tcp_accept(h) {
-                                    Ok(Some(accepted_handle)) => {
-                                        return self.finish_tcp_accept(
-                                            accepted_handle,
-                                            domain,
-                                            sock_type,
-                                            flags,
-                                            addr,
-                                            addrlen_ptr,
-                                        );
+                            // Spin-wait with a single deadline so that spurious
+                            // wakeups (is_fd_readable true but tcp_accept returns
+                            // None) re-enter the wait without resetting the 30s cap.
+                            const MAX_BLOCK_MS: u64 = 30_000;
+                            let start_ms = pf();
+                            let deadline = start_ms.saturating_add(MAX_BLOCK_MS);
+                            loop {
+                                let now = pf();
+                                if Self::is_fd_readable(self, fd) {
+                                    match self.tcp.tcp_accept(h) {
+                                        Ok(Some(accepted_handle)) => {
+                                            return self.finish_tcp_accept(
+                                                accepted_handle,
+                                                domain,
+                                                sock_type,
+                                                flags,
+                                                addr,
+                                                addrlen_ptr,
+                                            );
+                                        }
+                                        Ok(None) => {} // spurious — keep waiting
+                                        Err(e) => return net_error_to_errno(e),
                                     }
-                                    Ok(None) => return EAGAIN,
-                                    Err(e) => return net_error_to_errno(e),
-                                },
-                                BlockResult::Interrupted => return EINTR,
+                                }
+                                if now >= deadline {
+                                    return EINTR;
+                                }
+                                core::hint::spin_loop();
                             }
                         }
                     }
