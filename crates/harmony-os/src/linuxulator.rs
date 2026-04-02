@@ -5017,8 +5017,8 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         sa[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
         sa[2..4].copy_from_slice(&port.to_be_bytes());
         sa[4..8].copy_from_slice(&ip.0);
-        if n >= 16 {
-            sa[8..16].fill(0); // sin_zero
+        if n > 8 {
+            sa[8..n].fill(0); // sin_zero (partial or full)
         }
         // Per Linux recvfrom(2): always write the actual struct size (16)
         // regardless of buffer size, so callers can detect truncation.
