@@ -400,6 +400,50 @@ unsafe fn map_range_to_heap(phys_offset: u64, heap_base_virt: usize, vaddr_start
     core::arch::asm!("mov {0}, cr3", "mov cr3, {0}", out(reg) _, options(nostack));
 }
 
+/// Set the NX (No-Execute) bit on all PTEs in a virtual address range.
+/// Used by `vm_mprotect` to enforce W^X after ELF segment loading.
+#[cfg(feature = "ring3")]
+unsafe fn set_nx_range(phys_offset: u64, vaddr_start: u64, vaddr_end: u64) {
+    const PRESENT: u64 = 1;
+    const NX_BIT: u64 = 1 << 63;
+    const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+    const PAGE_SIZE: u64 = 0x1000;
+
+    let cr3: u64;
+    core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+    let pml4_phys = cr3 & ADDR_MASK;
+    let pml4 = (pml4_phys + phys_offset) as *mut u64;
+
+    let mut vaddr = vaddr_start & !(PAGE_SIZE - 1);
+    while vaddr < vaddr_end {
+        let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+        let pml3_idx = ((vaddr >> 30) & 0x1FF) as usize;
+        let pml2_idx = ((vaddr >> 21) & 0x1FF) as usize;
+        let pml1_idx = ((vaddr >> 12) & 0x1FF) as usize;
+
+        let pml4_val = core::ptr::read_volatile(pml4.add(pml4_idx) as *const u64);
+        if pml4_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        let pml3 = ((pml4_val & ADDR_MASK) + phys_offset) as *mut u64;
+
+        let pml3_val = core::ptr::read_volatile(pml3.add(pml3_idx) as *const u64);
+        if pml3_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        let pml2 = ((pml3_val & ADDR_MASK) + phys_offset) as *mut u64;
+
+        let pml2_val = core::ptr::read_volatile(pml2.add(pml2_idx) as *const u64);
+        if pml2_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        let pml1 = ((pml2_val & ADDR_MASK) + phys_offset) as *mut u64;
+
+        let pte = core::ptr::read_volatile(pml1.add(pml1_idx));
+        if pte & PRESENT != 0 {
+            core::ptr::write_volatile(pml1.add(pml1_idx), pte | NX_BIT);
+        }
+        vaddr += PAGE_SIZE;
+    }
+
+    // Flush TLB
+    core::arch::asm!("mov {0}, cr3", "mov cr3, {0}", out(reg) _, options(nostack));
+}
+
 /// Save all PTE values for a virtual address range.
 ///
 /// Returns a Vec of (vaddr, pte_value) pairs. Used to preserve the
@@ -1009,6 +1053,14 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         // Also provides vm_mmap for ELF loading during execve: allocates
         // page-aligned heap memory and creates identity-mapped page table
         // entries so the new binary can run at its linked addresses.
+        //
+        // NOTE: has_vm_support() intentionally returns false (the default).
+        // If true, sys_execve early-returns ENOSYS (the VM path needs
+        // vm_reset_address_space which isn't implemented). Keeping it false
+        // lets execve proceed via the arena path while vm_mmap creates real
+        // page-table entries for ELF segment loading. Runtime brk/mmap from
+        // the child process correctly uses the MemoryArena, which is a
+        // separate per-process allocation.
         struct DirectBackend {
             server: KernelSerialServer,
         }
@@ -1110,11 +1162,19 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
 
             fn vm_mprotect(
                 &mut self,
-                _vaddr: u64,
-                _len: usize,
-                _flags: PageFlags,
+                vaddr: u64,
+                len: usize,
+                flags: PageFlags,
             ) -> Result<(), VmError> {
-                // Unikernel: no per-page protection enforcement.
+                // Set NX bit on non-executable pages to enforce W^X.
+                if !flags.contains(PageFlags::EXECUTABLE) && len > 0 {
+                    let phys_offset = unsafe { PHYS_OFFSET };
+                    let page_start = vaddr & !0xFFF;
+                    let page_end = (vaddr + len as u64 + 0xFFF) & !0xFFF;
+                    unsafe {
+                        set_nx_range(phys_offset, page_start, page_end);
+                    }
+                }
                 Ok(())
             }
 
@@ -1241,6 +1301,25 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             mapped_pages, vaddr_min, vaddr_max, real_entry
         );
 
+        // 2c. Store ELF address range for fork context switching.
+        // PTE save/restore uses these to scope the page-table snapshot,
+        // and the writable segment range is used for .data/.bss save/restore.
+        unsafe {
+            ELF_VADDR_MIN = vaddr_min;
+            // Include headroom — same range that was mapped above.
+            ELF_VADDR_MAX = vaddr_max + ELF_HEADROOM as u64;
+            // Find the writable (rw-) PT_LOAD segment for .data/.bss save/restore.
+            for seg in &parsed.segments {
+                if seg.flags.write && !seg.flags.execute {
+                    let seg_start = seg.vaddr & !0xFFF; // page-align down
+                    let seg_end = (seg.vaddr + seg.memsz + 0xFFF) & !0xFFF; // page-align up
+                    DATA_SEG_START = seg_start;
+                    DATA_SEG_SIZE = (seg_end - seg_start) as usize;
+                    break; // use the first rw- segment
+                }
+            }
+        }
+
         // 3. Allocate stack
         let stack_size = 64 * 1024; // 64 KiB
         let stack = alloc::vec![0u8; stack_size];
@@ -1281,7 +1360,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
 
             // Config files
             efs.add_file("/etc/passwd", b"root:x:0:0:root:/root:/bin/sh\n", false);
-            // SHA-512 hash of "harmony" — dropbear checks /etc/shadow when
+            // SHA-512 password hash — dropbear checks /etc/shadow when
             // /etc/passwd has "x" in the password field.
             efs.add_file(
                 "/etc/shadow",
@@ -1341,19 +1420,20 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         /// Saved FS_BASE MSR (TLS pointer) from the parent context.
         static mut SAVED_FS_BASE: u64 = 0;
 
-        /// Saved .data/.bss segment from the parent binary.
+        /// Saved writable (.data/.bss) segment from the parent binary.
         /// The child modifies dropbear's global variables before exec.
-        /// Range: 0x4a2000..0x4b0000 (56 KiB, page-aligned around the rw- segment).
-        const DATA_SEG_START: u64 = 0x4a2000;
-        const DATA_SEG_SIZE: usize = 56 * 1024; // 56 KiB covers 0x4a2000..0x4b0000
-        static mut SAVED_DATA_SEG: [u8; DATA_SEG_SIZE] = [0; DATA_SEG_SIZE];
+        /// Range derived dynamically from the rw- PT_LOAD segment.
+        static mut DATA_SEG_START: u64 = 0;
+        static mut DATA_SEG_SIZE: usize = 0;
+        static mut SAVED_DATA_SEG: Option<alloc::vec::Vec<u8>> = None;
 
         /// Saved brk area (heap) from the parent. The child modifies
         /// malloc metadata in the brk area between fork and exec.
         static mut SAVED_BRK: Option<alloc::vec::Vec<u8>> = None;
         static mut SAVED_BRK_BASE: usize = 0;
 
-        /// Virtual address range of the parent ELF (set once during initial load).
+        /// Virtual address range of the parent ELF (set during initial load).
+        /// Used for PTE save/restore scope during fork context switching.
         static mut ELF_VADDR_MIN: u64 = 0;
         static mut ELF_VADDR_MAX: u64 = 0;
 
@@ -1361,8 +1441,17 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             const SYS_CLONE: u64 = 56;
             const SYS_FORK: u64 = 57;
             const SYS_VFORK: u64 = 58;
+            const CLONE_VM: u64 = 0x00000100;
+            const CLONE_THREAD: u64 = 0x00010000;
 
-            let is_fork = nr == SYS_FORK || nr == SYS_VFORK || nr == SYS_CLONE;
+            // Classify fork-like syscalls. clone(2) with threading flags
+            // (CLONE_VM, CLONE_THREAD) is NOT a fork — it must go through
+            // the Linuxulator which will return ENOSYS for threads.
+            let is_fork = match nr {
+                SYS_FORK | SYS_VFORK => true,
+                SYS_CLONE => args[0] & (CLONE_VM | CLONE_THREAD) == 0,
+                _ => false,
+            };
 
             // First fork: fake fork (accept loop). Return 0 so the binary
             // takes the child path and handles exactly one connection.
@@ -1405,17 +1494,25 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                 unsafe {
                     FORK_COUNT += 1;
                     // Save dropbear's PTEs before the child's exec overwrites them.
+                    // Range derived from the parsed ELF's linked addresses.
                     if SAVED_PTES.is_none() {
                         let phys = PHYS_OFFSET;
-                        SAVED_PTES = Some(save_pte_range(phys, 0x400000, 0x600000));
+                        // Save a generous range: ELF min to max + 1 MiB headroom
+                        // (busybox may extend beyond dropbear's vaddr_max).
+                        let save_end = ELF_VADDR_MAX.max(ELF_VADDR_MIN + 0x200000);
+                        SAVED_PTES = Some(save_pte_range(phys, ELF_VADDR_MIN, save_end));
                     }
                     // Save dropbear's writable data segment — the child's code
                     // modifies global variables before exec.
-                    core::ptr::copy_nonoverlapping(
-                        DATA_SEG_START as *const u8,
-                        SAVED_DATA_SEG.as_mut_ptr(),
-                        DATA_SEG_SIZE,
-                    );
+                    if DATA_SEG_SIZE > 0 {
+                        let mut seg_buf = alloc::vec![0u8; DATA_SEG_SIZE];
+                        core::ptr::copy_nonoverlapping(
+                            DATA_SEG_START as *const u8,
+                            seg_buf.as_mut_ptr(),
+                            DATA_SEG_SIZE,
+                        );
+                        SAVED_DATA_SEG = Some(seg_buf);
+                    }
                     // Save entire arena (brk + mmap regions). The child's
                     // code modifies malloc metadata and heap objects.
                     let arena_base = lx.arena_base();
@@ -1455,15 +1552,19 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                 unsafe {
                     // Restore page table entries — dropbear's code is back.
                     if let Some(ref saved) = SAVED_PTES {
-                        restore_pte_range(PHYS_OFFSET, saved, 0x400000, 0x600000);
+                        let restore_end = ELF_VADDR_MAX.max(ELF_VADDR_MIN + 0x200000);
+                        restore_pte_range(PHYS_OFFSET, saved, ELF_VADDR_MIN, restore_end);
                     }
                     SAVED_PTES = None;
                     // Restore dropbear's writable data segment (globals).
-                    core::ptr::copy_nonoverlapping(
-                        SAVED_DATA_SEG.as_ptr(),
-                        DATA_SEG_START as *mut u8,
-                        DATA_SEG_SIZE,
-                    );
+                    if let Some(ref seg_buf) = SAVED_DATA_SEG {
+                        core::ptr::copy_nonoverlapping(
+                            seg_buf.as_ptr(),
+                            DATA_SEG_START as *mut u8,
+                            seg_buf.len(),
+                        );
+                    }
+                    SAVED_DATA_SEG = None;
                     // Restore brk area (heap / malloc metadata).
                     if let Some(ref buf) = SAVED_BRK {
                         core::ptr::copy_nonoverlapping(
