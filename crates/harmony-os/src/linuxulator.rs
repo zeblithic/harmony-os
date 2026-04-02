@@ -4459,9 +4459,8 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         if fds_ptr == 0 {
             return EFAULT;
         }
-        // NOTE: O_NONBLOCK is accepted to avoid EINVAL for callers that set it,
-        // but this synchronous emulator always returns EAGAIN when no data is
-        // available (true blocking is not yet supported).
+        // O_NONBLOCK controls whether pipe reads/writes block (spin-wait)
+        // or return EAGAIN immediately when no data is available.
         // Only O_CLOEXEC and O_NONBLOCK are valid flags.
         let valid_flags = O_CLOEXEC | O_NONBLOCK;
         if flags & !valid_flags != 0 {
@@ -4910,10 +4909,19 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 unsafe { *ptr.add(7) },
             );
             match self.tcp.tcp_connect(h, ip, port) {
-                // v1: always return EINPROGRESS since tcp_connect only
-                // queues the SYN. True blocking connect (wait for handshake)
-                // requires yield/coroutine (harmony-os-cqy).
-                Ok(()) => EINPROGRESS,
+                Ok(()) => {
+                    let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
+                    if nonblock {
+                        EINPROGRESS
+                    } else if let Some(pf) = self.poll_fn {
+                        match self.block_until(pf, Self::is_fd_writable, fd) {
+                            BlockResult::Ready => 0,
+                            BlockResult::Interrupted => EINTR,
+                        }
+                    } else {
+                        EINPROGRESS
+                    }
+                }
                 Err(e) => net_error_to_errno(e),
             }
         } else if let Some(h) = self.sockets.get(&socket_id).and_then(|s| s.udp_handle) {
@@ -4977,8 +4985,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             match self.tcp.tcp_send(h, data) {
                 Ok(n) => n as i64,
                 Err(NetError::WouldBlock) => {
-                    let nonblock =
-                        self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
+                    let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                     if !nonblock {
                         if let Some(pf) = self.poll_fn {
                             match self.block_until(pf, Self::is_fd_writable, fd) {
@@ -5027,10 +5034,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                                     match self.block_until(pf, Self::is_fd_writable, fd) {
                                         BlockResult::Ready => {
                                             let data = unsafe {
-                                                core::slice::from_raw_parts(
-                                                    buf as *const u8,
-                                                    count,
-                                                )
+                                                core::slice::from_raw_parts(buf as *const u8, count)
                                             };
                                             match self.tcp.udp_sendto(h, data, ip, port) {
                                                 Ok(n) => return n as i64,
@@ -5055,8 +5059,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                         EDESTADDRREQ
                     }
                     Err(NetError::WouldBlock) => {
-                        let nonblock =
-                            self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
+                        let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                         if !nonblock {
                             if let Some(pf) = self.poll_fn {
                                 match self.block_until(pf, Self::is_fd_writable, fd) {
@@ -5114,8 +5117,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             match self.tcp.tcp_recv(h, data) {
                 Ok(n) => n as i64,
                 Err(NetError::WouldBlock) => {
-                    let nonblock =
-                        self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
+                    let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                     if !nonblock {
                         if let Some(pf) = self.poll_fn {
                             match self.block_until(pf, Self::is_fd_readable, fd) {
@@ -5161,18 +5163,14 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                         n as i64
                     }
                     Err(NetError::WouldBlock) => {
-                        let nonblock =
-                            self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
+                        let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                         if !nonblock {
                             if let Some(pf) = self.poll_fn {
                                 match self.block_until(pf, Self::is_fd_readable, fd) {
                                     BlockResult::Ready => {
                                         // Retry the full UDP recv logic.
                                         let data = unsafe {
-                                            core::slice::from_raw_parts_mut(
-                                                buf as *mut u8,
-                                                count,
-                                            )
+                                            core::slice::from_raw_parts_mut(buf as *mut u8, count)
                                         };
                                         let retry = match self.tcp.udp_recv(h, data) {
                                             Ok(r) => Ok(r),
