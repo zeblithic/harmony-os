@@ -3475,11 +3475,11 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                                     };
                                     let avail = PIPE_BUF_CAP.saturating_sub(pipe_buf.len());
                                     if avail == 0 {
-                                        return EAGAIN;
+                                        return EINTR;
                                     }
                                     const PIPE_BUF: usize = 4096;
                                     if count <= PIPE_BUF && avail < count {
-                                        return EAGAIN;
+                                        return EINTR;
                                     }
                                     let to_write = count.min(avail);
                                     let data = unsafe {
@@ -3520,10 +3520,10 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                                     };
                                     let avail = PIPE_BUF_CAP.saturating_sub(pipe_buf.len());
                                     if avail == 0 {
-                                        return EAGAIN;
+                                        return EINTR;
                                     }
                                     if count <= PIPE_BUF && avail < count {
-                                        return EAGAIN;
+                                        return EINTR;
                                     }
                                     let to_write = count.min(avail);
                                     let data = unsafe {
@@ -17598,6 +17598,33 @@ mod integration_tests {
             src_addr: 0,
             addrlen: 0,
         });
+        assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn blocking_tcp_connect_stub_returns_zero() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.set_poll_fn(timeout_poll_fn);
+
+        // Create a blocking TCP socket. With NoTcp, tcp_handle is None,
+        // so connect falls to the stub path (returns 0 for non-AF_UNIX).
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,    // AF_INET
+            sock_type: 1, // SOCK_STREAM (blocking)
+            protocol: 0,
+        });
+        assert!(fd >= 0);
+
+        let mut sa = [0u8; 16];
+        sa[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
+        sa[2..4].copy_from_slice(&80u16.to_be_bytes()); // port 80
+        sa[4..8].copy_from_slice(&[10, 0, 0, 1]); // 10.0.0.1
+        let r = lx.dispatch_syscall(LinuxSyscall::Connect {
+            fd: fd as i32,
+            addr: sa.as_ptr() as u64,
+            addrlen: 16,
+        });
+        // NoTcp → tcp_handle is None → stub returns 0.
         assert_eq!(r, 0);
     }
 }
