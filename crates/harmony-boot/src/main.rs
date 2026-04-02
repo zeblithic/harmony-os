@@ -1659,6 +1659,10 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             // by the Linuxulator's active_process() → recover_child_state().
             if syscall::fork_depth() == 1 && lx.pending_fork_child().is_none() {
                 serial_write_str(b"[FORK] child exited - restoring parent context\n");
+                // Reset watchdog — session ended, parent returns to accept loop.
+                // Without this, the watchdog would fire during the idle accept
+                // wait and brick the unikernel.
+                unsafe { LAST_TCP_IO_MS = 0; }
                 // Call active_process() to trigger recover_child_state().
                 let _ = lx.active_process();
                 // Re-create any pipe buffers removed by the child's close().

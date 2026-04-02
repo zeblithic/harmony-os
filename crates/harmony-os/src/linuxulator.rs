@@ -7959,9 +7959,10 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             let tv = unsafe { core::slice::from_raw_parts(timeout_ptr as *const u8, 16) };
             let tv_sec = i64::from_ne_bytes(tv[0..8].try_into().unwrap());
             let tv_usec = i64::from_ne_bytes(tv[8..16].try_into().unwrap());
-            if tv_sec < 0 || !(0..1_000_000).contains(&tv_usec) {
+            if tv_sec < 0 || tv_usec < 0 {
                 return EINVAL;
             }
+            // Linux normalizes out-of-range tv_usec (e.g. 2_500_000 = 2.5s extra).
             (tv_sec as u64)
                 .saturating_mul(1000)
                 .saturating_add((tv_usec as u64).div_ceil(1000))
