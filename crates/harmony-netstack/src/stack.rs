@@ -226,6 +226,25 @@ impl NetStack {
             .and_then(|h| *h)
             .ok_or(NetError::InvalidHandle)
     }
+
+    /// Auto-bind a UDP socket to an ephemeral port if not already bound.
+    /// Retries up to the number of UDP slots on port collision.
+    fn udp_auto_bind(&mut self, handle: UdpHandle) -> Result<(), NetError> {
+        if self.udp_bound_ports.contains_key(&handle) {
+            return Ok(());
+        }
+        let max_attempts = self.udp_handles.len().max(1);
+        for _ in 0..max_attempts {
+            let ep_port = self.udp_next_ephemeral;
+            self.udp_next_ephemeral = if ep_port == 65535 { 49152 } else { ep_port + 1 };
+            match self.udp_bind(handle, ep_port) {
+                Ok(()) => return Ok(()),
+                Err(NetError::AddrInUse) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(NetError::AddrInUse)
+    }
 }
 
 impl HarmonyNetworkInterface for NetStack {
@@ -572,12 +591,7 @@ impl UdpProvider for NetStack {
         addr: Ipv4Address,
         port: u16,
     ) -> Result<usize, NetError> {
-        // Auto-bind to ephemeral port if not yet bound.
-        if !self.udp_bound_ports.contains_key(&handle) {
-            let ep_port = self.udp_next_ephemeral;
-            self.udp_next_ephemeral = if ep_port == 65535 { 49152 } else { ep_port + 1 };
-            self.udp_bind(handle, ep_port)?;
-        }
+        self.udp_auto_bind(handle)?;
         let smoltcp_handle = self.resolve_udp(handle)?;
         let dest = (IpAddress::Ipv4(addr), port);
         let socket = self.sockets.get_mut::<udp::Socket>(smoltcp_handle);
@@ -620,12 +634,7 @@ impl UdpProvider for NetStack {
         port: u16,
     ) -> Result<(), NetError> {
         let _ = self.resolve_udp(handle)?;
-        // Auto-bind to ephemeral port if not yet bound.
-        if !self.udp_bound_ports.contains_key(&handle) {
-            let ep_port = self.udp_next_ephemeral;
-            self.udp_next_ephemeral = if ep_port == 65535 { 49152 } else { ep_port + 1 };
-            self.udp_bind(handle, ep_port)?;
-        }
+        self.udp_auto_bind(handle)?;
         self.udp_connected.insert(handle, (addr, port));
         Ok(())
     }

@@ -4468,13 +4468,15 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             }
             let ptr = addr as *const u8;
             let port = u16::from_be_bytes(unsafe { [*ptr.add(2), *ptr.add(3)] });
-            if let Some(state) = self.sockets.get_mut(&socket_id) {
-                state.bound_port = port;
-            }
-            match self.tcp.udp_bind(h, port) {
-                Ok(()) => return 0,
-                Err(e) => return net_error_to_errno(e),
-            }
+            return match self.tcp.udp_bind(h, port) {
+                Ok(()) => {
+                    if let Some(state) = self.sockets.get_mut(&socket_id) {
+                        state.bound_port = port;
+                    }
+                    0
+                }
+                Err(e) => net_error_to_errno(e),
+            };
         }
 
         0 // stub no-op
@@ -4665,17 +4667,10 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             }
         } else if let Some(h) = self.sockets.get(&socket_id).and_then(|s| s.udp_handle) {
             // UDP connect — stores the remote endpoint, returns immediately.
-            if addr == 0 || addrlen < 8 {
-                return EINVAL;
-            }
-            let ptr = addr as *const u8;
-            let port = u16::from_be_bytes(unsafe { [*ptr.add(2), *ptr.add(3)] });
-            let ip = harmony_netstack::smoltcp::wire::Ipv4Address::new(
-                unsafe { *ptr.add(4) },
-                unsafe { *ptr.add(5) },
-                unsafe { *ptr.add(6) },
-                unsafe { *ptr.add(7) },
-            );
+            let (ip, port) = match self.parse_sockaddr_in(addr, addrlen) {
+                Some(pair) => pair,
+                None => return EINVAL,
+            };
             match self.tcp.udp_connect(h, ip, port) {
                 Ok(()) => 0,
                 Err(e) => net_error_to_errno(e),
@@ -4749,16 +4744,8 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 }
                 let data = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
 
-                if dest_addr != 0 && addrlen >= 8 {
+                if let Some((ip, port)) = self.parse_sockaddr_in(dest_addr, addrlen) {
                     // Explicit destination — use sendto.
-                    let ptr = dest_addr as *const u8;
-                    let port = u16::from_be_bytes(unsafe { [*ptr.add(2), *ptr.add(3)] });
-                    let ip = harmony_netstack::smoltcp::wire::Ipv4Address::new(
-                        unsafe { *ptr.add(4) },
-                        unsafe { *ptr.add(5) },
-                        unsafe { *ptr.add(6) },
-                        unsafe { *ptr.add(7) },
-                    );
                     return match self.tcp.udp_sendto(h, data, ip, port) {
                         Ok(n) => n as i64,
                         Err(NetError::WouldBlock) => EAGAIN,
@@ -4840,30 +4827,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
                 return match result {
                     Ok((n, src_addr, src_port)) => {
-                        // Write source address if caller provided a buffer.
-                        if src != 0 && addrlen != 0 {
-                            let addrlen_bytes =
-                                unsafe { core::slice::from_raw_parts(addrlen as *const u8, 4) };
-                            let buf_len =
-                                u32::from_ne_bytes(addrlen_bytes.try_into().unwrap()) as usize;
-                            if buf_len >= 8 {
-                                let sa = unsafe {
-                                    core::slice::from_raw_parts_mut(src as *mut u8, buf_len.min(16))
-                                };
-                                sa[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
-                                sa[2..4].copy_from_slice(&src_port.to_be_bytes());
-                                sa[4..8].copy_from_slice(&src_addr.0);
-                                if buf_len >= 16 {
-                                    sa[8..16].fill(0); // sin_zero
-                                }
-                                // Update addrlen to actual size written.
-                                let actual_len = 16u32.min(buf_len as u32);
-                                let out = unsafe {
-                                    core::slice::from_raw_parts_mut(addrlen as *mut u8, 4)
-                                };
-                                out.copy_from_slice(&actual_len.to_ne_bytes());
-                            }
-                        }
+                        self.write_sockaddr_in(src, addrlen, src_addr, src_port);
                         n as i64
                     }
                     Err(NetError::WouldBlock) => EAGAIN,
@@ -5008,7 +4972,6 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     /// Parse a `sockaddr_in` from userspace memory.
     /// Returns `None` if the pointer is null or the buffer is too short
     /// (needs at least 8 bytes: family + port + addr).
-    #[allow(dead_code)]
     fn parse_sockaddr_in(
         &self,
         addr: u64,
@@ -5030,7 +4993,6 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
     /// Write a `sockaddr_in` to userspace memory.
     /// No-op if `addr` or `addrlen_ptr` is null.
-    #[allow(dead_code)]
     fn write_sockaddr_in(
         &self,
         addr: u64,
