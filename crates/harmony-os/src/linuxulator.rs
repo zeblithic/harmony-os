@@ -4744,8 +4744,12 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 }
                 let data = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
 
-                if let Some((ip, port)) = self.parse_sockaddr_in(dest_addr, addrlen) {
-                    // Explicit destination — use sendto.
+                if dest_addr != 0 {
+                    // Explicit destination — parse and use sendto.
+                    let (ip, port) = match self.parse_sockaddr_in(dest_addr, addrlen) {
+                        Some(pair) => pair,
+                        None => return EINVAL,
+                    };
                     return match self.tcp.udp_sendto(h, data, ip, port) {
                         Ok(n) => n as i64,
                         Err(NetError::WouldBlock) => EAGAIN,
@@ -4753,7 +4757,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     };
                 }
 
-                // No destination — must be connected.
+                // No destination (NULL) — must be connected.
                 return match self.tcp.udp_send(h, data) {
                     Ok(n) => n as i64,
                     Err(NetError::NotConnected) => {
@@ -5016,9 +5020,10 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         if n >= 16 {
             sa[8..16].fill(0); // sin_zero
         }
-        let actual = 16u32.min(buf_len as u32);
+        // Per Linux recvfrom(2): always write the actual struct size (16)
+        // regardless of buffer size, so callers can detect truncation.
         let out = unsafe { core::slice::from_raw_parts_mut(addrlen_ptr as *mut u8, 4) };
-        out.copy_from_slice(&actual.to_ne_bytes());
+        out.copy_from_slice(&16u32.to_ne_bytes());
     }
 
     /// Linux getsockname(2): return sockaddr with correct address family.
