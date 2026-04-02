@@ -4679,7 +4679,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         const SOL_SOCKET: i32 = 1;
         const SO_KEEPALIVE: i32 = 9;
 
-        if level == SOL_SOCKET && optname == SO_KEEPALIVE && optlen >= 4 {
+        if level == SOL_SOCKET && optname == SO_KEEPALIVE && optlen >= 4 && optval != 0 {
             let val_bytes = unsafe { core::slice::from_raw_parts(optval as usize as *const u8, 4) };
             let val = i32::from_ne_bytes(val_bytes.try_into().unwrap());
             if let Some(h) = self.sockets.get(&socket_id).and_then(|s| s.tcp_handle) {
@@ -7929,7 +7929,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             }
             let ms = tv_sec
                 .saturating_mul(1000)
-                .saturating_add(tv_nsec / 1_000_000);
+                .saturating_add((tv_nsec + 999_999) / 1_000_000);
             ms.min(i32::MAX as i64) as i32
         };
         self.sys_poll(fds_ptr, nfds, timeout_ms)
@@ -7959,12 +7959,12 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             let tv = unsafe { core::slice::from_raw_parts(timeout_ptr as *const u8, 16) };
             let tv_sec = i64::from_ne_bytes(tv[0..8].try_into().unwrap());
             let tv_usec = i64::from_ne_bytes(tv[8..16].try_into().unwrap());
-            if tv_sec < 0 || tv_usec < 0 {
+            if tv_sec < 0 || !(0..1_000_000).contains(&tv_usec) {
                 return EINVAL;
             }
             (tv_sec as u64)
                 .saturating_mul(1000)
-                .saturating_add((tv_usec as u64) / 1000)
+                .saturating_add((tv_usec as u64).div_ceil(1000))
         };
 
         // {0,0} → non-blocking: check once and return.
