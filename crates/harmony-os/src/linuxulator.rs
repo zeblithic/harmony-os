@@ -4628,19 +4628,34 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         }
     }
 
-    /// Linux setsockopt(2): stub — no-op.
+    /// Linux setsockopt(2): handles SO_KEEPALIVE; all other options are silent no-ops.
     fn sys_setsockopt(
-        &self,
+        &mut self,
         fd: i32,
-        _level: i32,
-        _optname: i32,
-        _optval: u64,
-        _optlen: u32,
+        level: i32,
+        optname: i32,
+        optval: u64,
+        optlen: u32,
     ) -> i64 {
-        match self.require_socket(fd) {
-            Ok(_) => 0,
-            Err(e) => e,
+        let socket_id = match self.require_socket(fd) {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+
+        const SOL_SOCKET: i32 = 1;
+        const SO_KEEPALIVE: i32 = 9;
+
+        if level == SOL_SOCKET && optname == SO_KEEPALIVE && optlen >= 4 {
+            let val_bytes =
+                unsafe { core::slice::from_raw_parts(optval as usize as *const u8, 4) };
+            let val = i32::from_ne_bytes(val_bytes.try_into().unwrap());
+            if let Some(h) = self.sockets.get(&socket_id).and_then(|s| s.tcp_handle) {
+                let interval = if val != 0 { Some(60_000u64) } else { None };
+                self.tcp.tcp_set_keepalive(h, interval);
+            }
         }
+        // All other options: silent success (existing behavior).
+        0
     }
 
     /// Linux getsockopt(2): stub — write zeros to optval.
