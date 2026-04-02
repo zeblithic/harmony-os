@@ -3454,6 +3454,44 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 };
                 let avail = PIPE_BUF_CAP.saturating_sub(pipe_buf.len());
                 if avail == 0 {
+                    let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
+                    if !nonblock {
+                        if let Some(pf) = self.poll_fn {
+                            match self.block_until(pf, Self::is_fd_writable, fd) {
+                                BlockResult::Ready => {
+                                    // Retry: re-check reader and buffer
+                                    let has_reader = self.fd_table.values().any(
+                                        |e| matches!(&e.kind, FdKind::PipeRead { pipe_id: id } if *id == pipe_id),
+                                    );
+                                    if !has_reader {
+                                        let is_child = self.parent_pid != 0;
+                                        if !is_child || !self.pipes.contains_key(&pipe_id) {
+                                            return EPIPE;
+                                        }
+                                    }
+                                    let pipe_buf = match self.pipes.get_mut(&pipe_id) {
+                                        Some(b) => b,
+                                        None => return EPIPE,
+                                    };
+                                    let avail = PIPE_BUF_CAP.saturating_sub(pipe_buf.len());
+                                    if avail == 0 {
+                                        return EAGAIN;
+                                    }
+                                    const PIPE_BUF: usize = 4096;
+                                    if count <= PIPE_BUF && avail < count {
+                                        return EAGAIN;
+                                    }
+                                    let to_write = count.min(avail);
+                                    let data = unsafe {
+                                        core::slice::from_raw_parts(buf_ptr as *const u8, to_write)
+                                    };
+                                    pipe_buf.extend_from_slice(data);
+                                    return to_write as i64;
+                                }
+                                BlockResult::Interrupted => return EINTR,
+                            }
+                        }
+                    }
                     return EAGAIN;
                 }
                 // POSIX: writes <= PIPE_BUF bytes must be atomic — either
@@ -3461,6 +3499,43 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 // may be partial.
                 const PIPE_BUF: usize = 4096;
                 if count <= PIPE_BUF && avail < count {
+                    let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
+                    if !nonblock {
+                        if let Some(pf) = self.poll_fn {
+                            match self.block_until(pf, Self::is_fd_writable, fd) {
+                                BlockResult::Ready => {
+                                    // Retry: re-check reader and buffer
+                                    let has_reader = self.fd_table.values().any(
+                                        |e| matches!(&e.kind, FdKind::PipeRead { pipe_id: id } if *id == pipe_id),
+                                    );
+                                    if !has_reader {
+                                        let is_child = self.parent_pid != 0;
+                                        if !is_child || !self.pipes.contains_key(&pipe_id) {
+                                            return EPIPE;
+                                        }
+                                    }
+                                    let pipe_buf = match self.pipes.get_mut(&pipe_id) {
+                                        Some(b) => b,
+                                        None => return EPIPE,
+                                    };
+                                    let avail = PIPE_BUF_CAP.saturating_sub(pipe_buf.len());
+                                    if avail == 0 {
+                                        return EAGAIN;
+                                    }
+                                    if count <= PIPE_BUF && avail < count {
+                                        return EAGAIN;
+                                    }
+                                    let to_write = count.min(avail);
+                                    let data = unsafe {
+                                        core::slice::from_raw_parts(buf_ptr as *const u8, to_write)
+                                    };
+                                    pipe_buf.extend_from_slice(data);
+                                    return to_write as i64;
+                                }
+                                BlockResult::Interrupted => return EINTR,
+                            }
+                        }
+                    }
                     return EAGAIN;
                 }
                 let to_write = count.min(avail);
@@ -3535,8 +3610,27 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     match self.tcp.tcp_send(h, data) {
                         Ok(n) => n as i64,
                         Err(NetError::WouldBlock) => {
-                            // v1: always return EAGAIN. True blocking requires
-                            // a yield/coroutine mechanism (harmony-os-cqy).
+                            let nonblock =
+                                self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
+                            if !nonblock {
+                                if let Some(pf) = self.poll_fn {
+                                    match self.block_until(pf, Self::is_fd_writable, fd) {
+                                        BlockResult::Ready => {
+                                            let data = unsafe {
+                                                core::slice::from_raw_parts(
+                                                    buf_ptr as *const u8,
+                                                    count,
+                                                )
+                                            };
+                                            match self.tcp.tcp_send(h, data) {
+                                                Ok(n) => return n as i64,
+                                                Err(e) => return net_error_to_errno(e),
+                                            }
+                                        }
+                                        BlockResult::Interrupted => return EINTR,
+                                    }
+                                }
+                            }
                             EAGAIN
                         }
                         Err(_) => EPIPE,
@@ -8521,7 +8615,19 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             None => return false,
         };
         match &entry.kind {
-            FdKind::PipeWrite { .. } => true, // unbounded buffer
+            FdKind::PipeWrite { pipe_id } => {
+                let has_reader = self.fd_table.values().any(
+                    |e| matches!(&e.kind, FdKind::PipeRead { pipe_id: id } if *id == *pipe_id),
+                );
+                if !has_reader {
+                    return true; // unblock → write returns EPIPE
+                }
+                const PIPE_BUF_CAP: usize = 65536;
+                self.pipes
+                    .get(pipe_id)
+                    .map(|b| b.len() < PIPE_BUF_CAP)
+                    .unwrap_or(true)
+            }
             // Pipe read-end is not writable.
             FdKind::PipeRead { .. } => false,
             FdKind::Socket { socket_id } => {
@@ -17148,6 +17254,82 @@ mod integration_tests {
             fd: fds[0],
             buf: buf.as_mut_ptr() as u64,
             count: buf.len() as u64,
+        });
+        assert_eq!(r, EAGAIN);
+    }
+
+    #[test]
+    fn blocking_pipe_write_broken_pipe_returns_epipe() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.set_poll_fn(timeout_poll_fn);
+        let (rfd, wfd) = create_pipe(&mut lx);
+
+        // Close read end.
+        lx.dispatch_syscall(LinuxSyscall::Close { fd: rfd });
+
+        // Blocking write to pipe with no reader → EPIPE.
+        let data = b"hello";
+        let r = lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: wfd,
+            buf: data.as_ptr() as u64,
+            count: data.len() as u64,
+        });
+        assert_eq!(r, EPIPE);
+    }
+
+    #[test]
+    fn blocking_pipe_write_full_returns_eintr() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.set_poll_fn(timeout_poll_fn);
+        let (rfd, wfd) = create_pipe(&mut lx);
+
+        // Fill the pipe buffer (65536 bytes).
+        let big = [0u8; 65536];
+        let w = lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: wfd,
+            buf: big.as_ptr() as u64,
+            count: big.len() as u64,
+        });
+        assert_eq!(w, 65536);
+
+        // Blocking write to full pipe — times out → EINTR.
+        let data = b"overflow";
+        let r = lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: wfd,
+            buf: data.as_ptr() as u64,
+            count: data.len() as u64,
+        });
+        assert_eq!(r, EINTR);
+
+        // Keep rfd alive so pipe isn't broken.
+        let _ = rfd;
+    }
+
+    #[test]
+    fn nonblocking_pipe_write_full_returns_eagain() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        let mut fds = [0i32; 2];
+        let result = lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0o4000, // O_NONBLOCK
+        });
+        assert_eq!(result, 0);
+
+        // Fill the pipe buffer.
+        let big = [0u8; 65536];
+        let w = lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: fds[1],
+            buf: big.as_ptr() as u64,
+            count: big.len() as u64,
+        });
+        assert_eq!(w, 65536);
+
+        // Nonblocking write to full pipe → EAGAIN.
+        let data = b"overflow";
+        let r = lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: fds[1],
+            buf: data.as_ptr() as u64,
+            count: data.len() as u64,
         });
         assert_eq!(r, EAGAIN);
     }
