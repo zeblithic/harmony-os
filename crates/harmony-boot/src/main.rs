@@ -1594,6 +1594,14 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                 let pipe_snapshot = lx.snapshot_pipes();
 
                 unsafe {
+                    // Free child's ELF heap allocations BEFORE restoring PTEs.
+                    // The child's PTEs still point to these frames, so freeing
+                    // them first ensures no stale PTE can alias a reused frame.
+                    if let Some(allocs) = CHILD_MMAP_ALLOCS.take() {
+                        for (ptr, layout) in allocs {
+                            alloc::alloc::dealloc(ptr, layout);
+                        }
+                    }
                     // Restore page table entries — dropbear's code is back.
                     if let Some(ref saved) = SAVED_PTES {
                         let restore_end = ELF_VADDR_MAX.max(ELF_VADDR_MIN + 0x200000);
@@ -1609,12 +1617,6 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                         );
                     }
                     SAVED_DATA_SEG = None;
-                    // Free child's ELF heap allocations (from vm_mmap).
-                    if let Some(allocs) = CHILD_MMAP_ALLOCS.take() {
-                        for (ptr, layout) in allocs {
-                            alloc::alloc::dealloc(ptr, layout);
-                        }
-                    }
                     // Restore brk area (heap / malloc metadata).
                     if let Some(ref buf) = SAVED_BRK {
                         core::ptr::copy_nonoverlapping(
