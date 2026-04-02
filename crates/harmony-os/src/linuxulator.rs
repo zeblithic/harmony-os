@@ -8149,6 +8149,8 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 }
                 false
             }
+            // Pipe write-end is not readable.
+            FdKind::PipeWrite { .. } => false,
             // Serial/stdout/stderr, eventfd, timerfd, signalfd, files: always readable.
             _ => true,
         }
@@ -8162,6 +8164,8 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         };
         match &entry.kind {
             FdKind::PipeWrite { .. } => true, // unbounded buffer
+            // Pipe read-end is not writable.
+            FdKind::PipeRead { .. } => false,
             FdKind::Socket { socket_id } => {
                 if let Some(state) = self.sockets.get(socket_id) {
                     if let Some(h) = state.tcp_handle {
