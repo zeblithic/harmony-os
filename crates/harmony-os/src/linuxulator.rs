@@ -45,6 +45,7 @@ const ECONNRESET: i64 = -104;
 const EINPROGRESS: i64 = -115;
 const ENFILE: i64 = -23;
 const ENOTCONN: i64 = -107;
+const EINTR: i64 = -4;
 
 // Clock IDs (shared by clock_gettime and clock_getres)
 const CLOCK_REALTIME: i32 = 0;
@@ -76,6 +77,14 @@ const SA_RESETHAND: u64 = 0x80000000;
 const SS_ONSTACK: i32 = 1;
 const SS_DISABLE: i32 = 2;
 const MINSIGSTKSZ: u64 = 2048;
+
+/// Result of a `block_until` spin-wait.
+enum BlockResult {
+    /// The readiness check returned true — caller should retry the operation.
+    Ready,
+    /// The 30-second watchdog cap expired — caller should return EINTR.
+    Interrupted,
+}
 
 fn ipc_err_to_errno(e: IpcError) -> i64 {
     match e {
@@ -2566,6 +2575,34 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     /// to drive the network stack and read the PIT timer.
     pub fn set_poll_fn(&mut self, f: fn() -> u64) {
         self.poll_fn = Some(f);
+    }
+
+    /// Spin-wait until `ready_check(self, fd)` returns true, or 30 seconds
+    /// elapse.  Calls `poll_fn` on every iteration to drive the network
+    /// stack and read the current time.
+    ///
+    /// Returns [`BlockResult::Ready`] when the fd becomes ready, or
+    /// [`BlockResult::Interrupted`] on timeout (caller returns EINTR).
+    fn block_until(
+        &mut self,
+        poll_fn: fn() -> u64,
+        ready_check: fn(&Self, i32) -> bool,
+        fd: i32,
+    ) -> BlockResult {
+        const MAX_BLOCK_MS: u64 = 30_000;
+        let start_ms = poll_fn();
+        let deadline = start_ms.saturating_add(MAX_BLOCK_MS);
+
+        loop {
+            let now = poll_fn();
+            if ready_check(self, fd) {
+                return BlockResult::Ready;
+            }
+            if now >= deadline {
+                return BlockResult::Interrupted;
+            }
+            core::hint::spin_loop();
+        }
     }
 
     /// Allocate the next fid for a backend call.
