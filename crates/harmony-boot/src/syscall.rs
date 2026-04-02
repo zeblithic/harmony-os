@@ -106,13 +106,29 @@ static mut FORK_PARENT_RETVAL: u64 = 0;
 static mut FORK_SAVED_FRAME: [u64; 15] = [0; 15];
 
 /// Saved user stack content. The child reuses the parent's stack before
-/// exec and corrupts local variables. We save 16 KiB from user_rsp upward
-/// and restore it when the child exits.
-const FORK_STACK_SAVE_SIZE: usize = 16 * 1024;
+/// exec and corrupts local variables. We save from user_rsp upward,
+/// clamped to the actual stack bounds to avoid reading past the allocation.
+const FORK_STACK_SAVE_MAX: usize = 16 * 1024;
 #[no_mangle]
-static mut FORK_SAVED_STACK: [u8; FORK_STACK_SAVE_SIZE] = [0; FORK_STACK_SAVE_SIZE];
+static mut FORK_SAVED_STACK: [u8; FORK_STACK_SAVE_MAX] = [0; FORK_STACK_SAVE_MAX];
+
+/// Actual number of bytes saved (clamped to stack bounds).
+/// Set by Rust before the trampoline reads it; used by both save and restore.
+#[no_mangle]
+static mut FORK_STACK_SAVE_ACTUAL: u64 = 0;
+
+/// Top of the user stack allocation. Set once during boot.
+static mut USER_STACK_TOP: u64 = 0;
 
 static mut FORK_DEPTH: usize = 0;
+
+/// Set the user stack top address. Called once during boot.
+///
+/// # Safety
+/// Must be called before any fork context switching.
+pub unsafe fn set_user_stack_top(top: u64) {
+    USER_STACK_TOP = top;
+}
 
 /// Signal the trampoline to save the parent context and return 0.
 ///
@@ -143,11 +159,12 @@ pub unsafe fn fork_restore_context() {
 /// is still active (the trampoline will switch RSP during restore).
 pub unsafe fn fork_restore_stack() {
     let user_rsp = FORK_SAVED_FRAME[14];
-    if user_rsp != 0 {
+    let actual = FORK_STACK_SAVE_ACTUAL as usize;
+    if user_rsp != 0 && actual > 0 {
         core::ptr::copy_nonoverlapping(
             FORK_SAVED_STACK.as_ptr(),
             user_rsp as *mut u8,
-            FORK_STACK_SAVE_SIZE,
+            actual,
         );
     }
 }
@@ -297,12 +314,21 @@ extern "C" fn syscall_entry() {
         "lea rcx, [rbp + 112]",
         "lea rdi, [rip + {saved_frame}]",
         "mov [rdi + 112], rcx",
-        // Save 16 KiB of user stack from user_rsp upward.
-        // The child reuses this stack before exec and corrupts it.
+        // Save user stack from user_rsp upward, clamped to stack bounds.
+        // user_rsp = rbp + 112. Save min(16384, stack_top - user_rsp) bytes.
         "cld",
-        "lea rsi, [rbp + 112]",          // source: user RSP
-        "lea rdi, [rip + {saved_stack}]", // dest: static buffer
-        "mov rcx, 16384",                // 16 KiB
+        "lea rsi, [rbp + 112]",               // rsi = user_rsp
+        "lea rdi, [rip + {user_stack_top}]",
+        "mov rdi, [rdi]",                     // rdi = stack_top
+        "sub rdi, rsi",                       // rdi = stack_top - user_rsp
+        "mov rcx, 16384",
+        "cmp rdi, rcx",
+        "cmovb rcx, rdi",                    // rcx = min(16384, available)
+        // Store actual size for restore.
+        "lea rdi, [rip + {stack_save_actual}]",
+        "mov [rdi], rcx",
+        // Do the copy.
+        "lea rdi, [rip + {saved_stack}]",      // dest: static buffer
         "rep movsb",
         // Save return value (child_pid).
         "lea rcx, [rip + {parent_retval}]",
@@ -373,6 +399,8 @@ extern "C" fn syscall_entry() {
         parent_retval = sym FORK_PARENT_RETVAL,
         saved_frame = sym FORK_SAVED_FRAME,
         saved_stack = sym FORK_SAVED_STACK,
+        stack_save_actual = sym FORK_STACK_SAVE_ACTUAL,
+        user_stack_top = sym USER_STACK_TOP,
     );
 }
 

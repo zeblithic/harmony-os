@@ -1157,6 +1157,12 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                 if ptr.is_null() {
                     return Err(VmError::OutOfMemory);
                 }
+                // Track the allocation so it can be freed on child exit.
+                unsafe {
+                    CHILD_MMAP_ALLOCS
+                        .get_or_insert_with(alloc::vec::Vec::new)
+                        .push((ptr, layout));
+                }
                 // Create page table entries: vaddr → heap physical frames.
                 let phys_offset = unsafe { PHYS_OFFSET };
                 let page_start = vaddr & !(PAGE_SIZE as u64 - 1);
@@ -1332,6 +1338,9 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         let stack = alloc::vec![0u8; stack_size];
         let stack_top = (stack.as_ptr() as usize + stack_size) & !0xF;
         let _ = writeln!(serial, "[LINUX] stack_top=0x{:x}", stack_top);
+        unsafe {
+            syscall::set_user_stack_top(stack_top as u64);
+        }
 
         // 4. Create Linuxulator with global storage
         // We store it in a static to make it accessible from the syscall handler.
@@ -1443,6 +1452,12 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         /// Used for PTE save/restore scope during fork context switching.
         static mut ELF_VADDR_MIN: u64 = 0;
         static mut ELF_VADDR_MAX: u64 = 0;
+
+        /// Heap allocations made by vm_mmap during child exec. Freed on
+        /// child exit to prevent leaking the child's ELF frames.
+        static mut CHILD_MMAP_ALLOCS: Option<
+            alloc::vec::Vec<(*mut u8, core::alloc::Layout)>,
+        > = None;
 
         fn dispatch(nr: u64, args: [u64; 6]) -> syscall::SyscallResult {
             const SYS_CLONE: u64 = 56;
@@ -1572,6 +1587,12 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                         );
                     }
                     SAVED_DATA_SEG = None;
+                    // Free child's ELF heap allocations (from vm_mmap).
+                    if let Some(allocs) = CHILD_MMAP_ALLOCS.take() {
+                        for (ptr, layout) in allocs {
+                            alloc::alloc::dealloc(ptr, layout);
+                        }
+                    }
                     // Restore brk area (heap / malloc metadata).
                     if let Some(ref buf) = SAVED_BRK {
                         core::ptr::copy_nonoverlapping(
