@@ -4896,11 +4896,14 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                         match self.block_until(pf, Self::is_fd_connect_done, fd) {
                             BlockResult::Ready => {
                                 // Check whether the connect succeeded or failed.
+                                // CloseWait/Closing imply the connection WAS established
+                                // (peer accepted then immediately closed) — still success.
+                                // Only Closed (without having been Established) means refused.
                                 let tcp_state = self.tcp.tcp_state(h);
-                                if tcp_state == TcpSocketState::Established {
-                                    0
-                                } else {
+                                if tcp_state == TcpSocketState::Closed {
                                     ECONNREFUSED
+                                } else {
+                                    0
                                 }
                             }
                             BlockResult::Interrupted => EINTR,
@@ -6556,6 +6559,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         // (static or scratch), open it without a 9P round-trip.
         const O_CREAT: i32 = 0o100;
         const O_TRUNC: i32 = 0o1000;
+        let is_nonblock = flags & O_NONBLOCK != 0;
         let (is_static, is_scratch, efs_present) = match self.embedded_fs {
             Some(ref efs) => (
                 efs.get(&path).is_some(),
@@ -6580,7 +6584,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 FdEntry {
                     kind: FdKind::EmbeddedFile { path, offset: 0 },
                     flags: fd_flags,
-                    nonblock: false,
+                    nonblock: is_nonblock,
                 },
             );
             return fd as i64;
@@ -6603,7 +6607,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 FdEntry {
                     kind: FdKind::ScratchFile { path, offset: 0 },
                     flags: fd_flags,
-                    nonblock: false,
+                    nonblock: is_nonblock,
                 },
             );
             return fd as i64;
@@ -6623,7 +6627,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     FdEntry {
                         kind: FdKind::DevNull,
                         flags: fd_flags,
-                        nonblock: false,
+                        nonblock: is_nonblock,
                     },
                 );
                 return fd as i64;
@@ -6640,7 +6644,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     FdEntry {
                         kind: FdKind::DevUrandom,
                         flags: fd_flags,
-                        nonblock: false,
+                        nonblock: is_nonblock,
                     },
                 );
                 return fd as i64;
@@ -6719,7 +6723,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     file_type,
                 },
                 flags: fd_flags,
-                nonblock: false,
+                nonblock: is_nonblock,
             },
         );
         self.fid_refcount.insert(fid, 1);
