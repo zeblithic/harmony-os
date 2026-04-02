@@ -48,6 +48,9 @@ pub trait TcpProvider {
     fn tcp_state(&self, handle: TcpHandle) -> TcpSocketState;
     fn tcp_can_recv(&self, handle: TcpHandle) -> bool;
     fn tcp_can_send(&self, handle: TcpHandle) -> bool;
+    /// Configure TCP keepalive. `Some(ms)` enables with the given interval;
+    /// `None` disables. No-op for invalid handles.
+    fn tcp_set_keepalive(&mut self, handle: TcpHandle, interval_ms: Option<u64>);
     /// Drive the underlying network stack. Must be called periodically.
     fn tcp_poll(&mut self, now_ms: i64);
     /// Create a forked copy of this provider for a child process.

@@ -660,6 +660,9 @@ impl harmony_netstack::TcpProvider for RawPtrTcpProvider {
     fn tcp_can_send(&self, h: harmony_netstack::TcpHandle) -> bool {
         unsafe { (*self.0).tcp_can_send(h) }
     }
+    fn tcp_set_keepalive(&mut self, h: harmony_netstack::TcpHandle, interval_ms: Option<u64>) {
+        unsafe { (*self.0).tcp_set_keepalive(h, interval_ms) }
+    }
     fn tcp_poll(&mut self, now_ms: i64) {
         unsafe { (*self.0).tcp_poll(now_ms) }
     }
@@ -727,6 +730,15 @@ unsafe fn poll_network() {
         for frame in frames {
             let _ = net.send_raw(&frame);
         }
+    }
+}
+
+/// Network poll + PIT read, callable from Linuxulator during blocking ops.
+#[cfg(feature = "ring3")]
+fn kernel_poll_and_time() -> u64 {
+    unsafe {
+        poll_network();
+        (*PIT_PTR).now_ms()
     }
 }
 
@@ -1427,6 +1439,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             unsafe {
                 if let Some(ref mut lx) = LINUXULATOR {
                     lx.set_embedded_fs(efs);
+                    lx.set_poll_fn(kernel_poll_and_time);
                 }
             }
         }
@@ -1458,6 +1471,11 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         /// Number of fork() calls seen. First fork is fake (accept loop);
         /// subsequent forks use real Linuxulator fork + context switching.
         static mut FORK_COUNT: u32 = 0;
+
+        /// Last time a TCP read/write returned real data (ms). 0 = no session yet.
+        static mut LAST_TCP_IO_MS: u64 = 0;
+        /// Idle kill threshold: 5 minutes with no TCP I/O → force exit.
+        const IDLE_KILL_THRESHOLD_MS: u64 = 300_000;
 
         /// Saved page-table entries for the ELF address range. Saved before
         /// the child's execve overwrites them, restored when the child exits.
@@ -1508,6 +1526,24 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             // Poll the network stack on every syscall entry.
             unsafe { poll_network(); }
 
+            // ── Idle watchdog ──────────────────────────────────────────
+            // If no TCP I/O has occurred for IDLE_KILL_THRESHOLD_MS,
+            // force-terminate the session. Prevents bricked unikernel
+            // when SSH clients hang.
+            unsafe {
+                if LAST_TCP_IO_MS != 0 {
+                    let now = (*PIT_PTR).now_ms();
+                    if now.saturating_sub(LAST_TCP_IO_MS) > IDLE_KILL_THRESHOLD_MS {
+                        serial_write_str(b"[WATCHDOG] idle timeout - killing session\n");
+                        return syscall::SyscallResult {
+                            retval: -1,
+                            exited: true,
+                            exit_code: 62,
+                        };
+                    }
+                }
+            }
+
             // First fork: fake fork (accept loop). Return 0 so the binary
             // takes the child path and handles exactly one connection.
             if is_fork {
@@ -1534,6 +1570,29 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             //     serial_write_hex(nr);
             //     serial_write_str(b"\n");
             // }
+
+            // Track TCP I/O for watchdog.
+            const SYS_READ: u64 = 0;
+            const SYS_WRITE: u64 = 1;
+            const SYS_READV: u64 = 19;
+            const SYS_WRITEV: u64 = 20;
+            const SYS_ACCEPT: u64 = 43;
+            const SYS_ACCEPT4: u64 = 288;
+            unsafe {
+                match nr {
+                    SYS_ACCEPT | SYS_ACCEPT4 if retval >= 0 => {
+                        LAST_TCP_IO_MS = (*PIT_PTR).now_ms();
+                    }
+                    SYS_READ | SYS_WRITE | SYS_READV | SYS_WRITEV if retval > 0 => {
+                        // Only count if the fd is a TCP socket.
+                        let fd = args[0] as i32;
+                        if lx.active_process().fd_is_tcp_socket(fd) {
+                            LAST_TCP_IO_MS = (*PIT_PTR).now_ms();
+                        }
+                    }
+                    _ => {}
+                }
+            }
 
             // Poll again after the syscall.
             unsafe { poll_network(); }
@@ -1600,6 +1659,10 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             // by the Linuxulator's active_process() → recover_child_state().
             if syscall::fork_depth() == 1 && lx.pending_fork_child().is_none() {
                 serial_write_str(b"[FORK] child exited - restoring parent context\n");
+                // Reset watchdog — session ended, parent returns to accept loop.
+                // Without this, the watchdog would fire during the idle accept
+                // wait and brick the unikernel.
+                unsafe { LAST_TCP_IO_MS = 0; }
                 // Call active_process() to trigger recover_child_state().
                 let _ = lx.active_process();
                 // Re-create any pipe buffers removed by the child's close().

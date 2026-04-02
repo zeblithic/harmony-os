@@ -170,6 +170,7 @@ impl TcpProvider for NoTcp {
     fn tcp_can_send(&self, _: TcpHandle) -> bool {
         false
     }
+    fn tcp_set_keepalive(&mut self, _: TcpHandle, _: Option<u64>) {}
     fn tcp_poll(&mut self, _: i64) {}
     fn tcp_fork(&self) -> Option<NoTcp> {
         Some(NoTcp)
@@ -2399,6 +2400,10 @@ pub struct Linuxulator<B: SyscallBackend, T: TcpProvider = NoTcp> {
     pending_signal_return: Option<SignalReturn>,
     /// Optional in-memory filesystem for embedded binaries and config files.
     embedded_fs: Option<EmbeddedFs>,
+    /// Network poll callback for blocking operations (select/poll).
+    /// Drives VirtIO RX/TX + smoltcp processing and returns current
+    /// time in milliseconds. Set by the kernel at init.
+    poll_fn: Option<fn() -> u64>,
 }
 
 impl<B: SyscallBackend> Linuxulator<B, NoTcp> {
@@ -2468,6 +2473,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             on_alt_stack: false,
             pending_signal_return: None,
             embedded_fs: None,
+            poll_fn: None,
         }
     }
 
@@ -2478,6 +2484,12 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
     /// the requested path is not found here.
     pub fn set_embedded_fs(&mut self, fs: EmbeddedFs) {
         self.embedded_fs = Some(fs);
+    }
+
+    /// Set the network poll callback. Called during blocking select/poll
+    /// to drive the network stack and read the PIT timer.
+    pub fn set_poll_fn(&mut self, f: fn() -> u64) {
+        self.poll_fn = Some(f);
     }
 
     /// Allocate the next fid for a backend call.
@@ -2915,6 +2927,23 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         self.arena_size
     }
 
+    /// Check if an fd is a TCP socket (for watchdog tracking).
+    pub fn fd_is_tcp_socket(&self, fd: i32) -> bool {
+        self.fd_table
+            .get(&fd)
+            .map(|e| {
+                if let FdKind::Socket { socket_id } = &e.kind {
+                    self.sockets
+                        .get(socket_id)
+                        .map(|s| s.tcp_handle.is_some())
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false)
+    }
+
     /// Return the set of pipe_ids that exist in the pipes map.
     pub fn pipe_ids(&self) -> alloc::vec::Vec<usize> {
         self.pipes.keys().copied().collect()
@@ -3229,8 +3258,14 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             LinuxSyscall::TimerfdGettime { fd, curr_value } => {
                 self.sys_timerfd_gettime(fd, curr_value)
             }
-            LinuxSyscall::Poll { fds, nfds, .. } => self.sys_poll(fds, nfds),
-            LinuxSyscall::Ppoll { fds, nfds, .. } => self.sys_poll(fds, nfds),
+            LinuxSyscall::Poll { fds, nfds, timeout } => self.sys_poll(fds, nfds, timeout),
+            LinuxSyscall::Ppoll {
+                fds,
+                nfds,
+                tmo_ptr,
+                sigmask,
+                ..
+            } => self.sys_ppoll(fds, nfds, tmo_ptr, sigmask),
             LinuxSyscall::Readv { fd, iov, iovcnt } => self.sys_readv(fd, iov as usize, iovcnt),
             LinuxSyscall::Socketpair {
                 domain,
@@ -4627,19 +4662,33 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         }
     }
 
-    /// Linux setsockopt(2): stub — no-op.
+    /// Linux setsockopt(2): handles SO_KEEPALIVE; all other options are silent no-ops.
     fn sys_setsockopt(
-        &self,
+        &mut self,
         fd: i32,
-        _level: i32,
-        _optname: i32,
-        _optval: u64,
-        _optlen: u32,
+        level: i32,
+        optname: i32,
+        optval: u64,
+        optlen: u32,
     ) -> i64 {
-        match self.require_socket(fd) {
-            Ok(_) => 0,
-            Err(e) => e,
+        let socket_id = match self.require_socket(fd) {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+
+        const SOL_SOCKET: i32 = 1;
+        const SO_KEEPALIVE: i32 = 9;
+
+        if level == SOL_SOCKET && optname == SO_KEEPALIVE && optlen >= 4 && optval != 0 {
+            let val_bytes = unsafe { core::slice::from_raw_parts(optval as usize as *const u8, 4) };
+            let val = i32::from_ne_bytes(val_bytes.try_into().unwrap());
+            if let Some(h) = self.sockets.get(&socket_id).and_then(|s| s.tcp_handle) {
+                let interval = if val != 0 { Some(60_000u64) } else { None };
+                self.tcp.tcp_set_keepalive(h, interval);
+            }
         }
+        // All other options: silent success (existing behavior).
+        0
     }
 
     /// Linux getsockopt(2): stub — write zeros to optval.
@@ -5021,9 +5070,13 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 let state = self.tcp.tcp_state(h);
                 let mut ev = 0u32;
 
-                // EPOLLIN: data available, accepted connection ready, or EOF.
+                // EPOLLIN: data available, accepted connection ready, or EOF/shutdown.
                 if mask & EPOLLIN != 0 {
-                    if self.tcp.tcp_can_recv(h) || state == TcpSocketState::CloseWait {
+                    if self.tcp.tcp_can_recv(h)
+                        || state == TcpSocketState::CloseWait
+                        || state == TcpSocketState::Closing
+                        || state == TcpSocketState::Closed
+                    {
                         ev |= EPOLLIN;
                     }
                     // A listening socket that transitioned to Established means
@@ -5033,11 +5086,12 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                     }
                 }
 
-                // EPOLLOUT: writable when established (not listening) and send buffer available.
+                // EPOLLOUT: writable when connected (not listening) and send buffer available.
+                // CloseWait: remote sent FIN but local send path is still open.
                 if mask & EPOLLOUT != 0
                     && !is_listener
                     && self.tcp.tcp_can_send(h)
-                    && state == TcpSocketState::Established
+                    && (state == TcpSocketState::Established || state == TcpSocketState::CloseWait)
                 {
                     ev |= EPOLLOUT;
                 }
@@ -5412,6 +5466,8 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             pending_signal_return: None,
             // EmbeddedFs contains only &'static references — clone is cheap.
             embedded_fs: self.embedded_fs.clone(),
+            // Function pointer — copy to child so blocking ops work in forked processes.
+            poll_fn: self.poll_fn,
         };
         // Move shared pipe/eventfd state to child
         core::mem::swap(&mut self.pipes, &mut child.pipes);
@@ -7765,23 +7821,70 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         }
     }
 
-    /// Linux poll(2) / ppoll(2): wait for events on file descriptors.
+    /// Linux poll(2): synchronous I/O multiplexing via pollfd array.
     ///
-    /// Always-ready model (same as epoll): for each valid fd in the
-    /// pollfd array, set revents to the requested events. Invalid fds
-    /// get POLLNVAL. Returns the number of fds with non-zero revents.
-    fn sys_poll(&self, fds_ptr: u64, nfds: u64) -> i64 {
-        const POLL_MAX_FDS: u64 = 1 << 20; // cap to prevent DoS / overflow
+    /// Spin-waits until at least one fd is ready or the timeout expires.
+    fn sys_poll(&self, fds_ptr: u64, nfds: u64, timeout_ms: i32) -> i64 {
+        const POLL_MAX_FDS: u64 = 1 << 20;
         if nfds > POLL_MAX_FDS {
             return EINVAL;
         }
         if fds_ptr == 0 && nfds > 0 {
             return EFAULT;
         }
+
+        // Non-blocking: check once.
+        if timeout_ms == 0 {
+            return self.poll_check_once(fds_ptr, nfds);
+        }
+
+        // Blocking requires poll_fn to drive the network stack and read time.
+        let poll_fn = match self.poll_fn {
+            Some(f) => f,
+            None => return self.poll_check_once(fds_ptr, nfds),
+        };
+
+        // Cap blocking duration so control returns to dispatch() periodically,
+        // allowing the idle watchdog to fire. Without this cap, a NULL-timeout
+        // select/poll would spin forever inside a single dispatch() call,
+        // bypassing the watchdog entirely.
+        const MAX_BLOCK_MS: u64 = 30_000; // 30 seconds
+
+        let deadline_ms: u64 = {
+            let now = poll_fn();
+            if timeout_ms < 0 {
+                now.saturating_add(MAX_BLOCK_MS)
+            } else {
+                let requested = now.saturating_add(timeout_ms as u64);
+                requested.min(now.saturating_add(MAX_BLOCK_MS))
+            }
+        };
+
+        loop {
+            let now = poll_fn();
+
+            let ready = self.poll_check_once(fds_ptr, nfds);
+            if ready > 0 {
+                return ready;
+            }
+
+            if now >= deadline_ms {
+                return 0;
+            }
+
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Single-pass readiness check for poll(). Writes revents and returns ready count.
+    fn poll_check_once(&self, fds_ptr: u64, nfds: u64) -> i64 {
+        const POLLIN: i16 = 0x01;
+        const POLLOUT: i16 = 0x04;
+        const POLLHUP: i16 = 0x10;
         const POLLNVAL: i16 = 0x20;
+
         let mut ready_count = 0i64;
         for i in 0..nfds {
-            // struct pollfd = { fd: i32, events: i16, revents: i16 } = 8 bytes
             let base = fds_ptr as usize + (i as usize) * 8;
             let fd_bytes = unsafe { core::slice::from_raw_parts(base as *const u8, 4) };
             let fd = i32::from_ne_bytes(fd_bytes.try_into().unwrap());
@@ -7789,11 +7892,33 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             let events = i16::from_ne_bytes(events_bytes.try_into().unwrap());
 
             let revents = if fd < 0 {
-                0i16 // negative fd → ignored (revents=0)
-            } else if self.fd_table.contains_key(&fd) {
-                events // all requested events are "ready"
+                0i16
+            } else if !self.fd_table.contains_key(&fd) {
+                POLLNVAL
             } else {
-                POLLNVAL // fd doesn't exist
+                let mut r = 0i16;
+                if events & POLLIN != 0 && self.is_fd_readable(fd) {
+                    r |= POLLIN;
+                }
+                if events & POLLOUT != 0 && self.is_fd_writable(fd) {
+                    r |= POLLOUT;
+                }
+                // Check for HUP on sockets (connection closed).
+                if let Some(entry) = self.fd_table.get(&fd) {
+                    if let FdKind::Socket { socket_id } = &entry.kind {
+                        if let Some(state) = self.sockets.get(socket_id) {
+                            if let Some(h) = state.tcp_handle {
+                                let tcp_state = self.tcp.tcp_state(h);
+                                if tcp_state == TcpSocketState::Closed
+                                    || tcp_state == TcpSocketState::Closing
+                                {
+                                    r |= POLLHUP;
+                                }
+                            }
+                        }
+                    }
+                }
+                r
             };
 
             if revents != 0 {
@@ -7805,54 +7930,263 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         ready_count
     }
 
+    /// Linux ppoll(2): like poll but with timespec and signal mask.
+    fn sys_ppoll(&self, fds_ptr: u64, nfds: u64, timeout_ptr: u64, _sigmask: u64) -> i64 {
+        let timeout_ms: i32 = if timeout_ptr == 0 {
+            -1 // NULL → block forever
+        } else {
+            let ts = unsafe { core::slice::from_raw_parts(timeout_ptr as *const u8, 16) };
+            let tv_sec = i64::from_ne_bytes(ts[0..8].try_into().unwrap());
+            let tv_nsec = i64::from_ne_bytes(ts[8..16].try_into().unwrap());
+            if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
+                return EINVAL;
+            }
+            let ms = tv_sec
+                .saturating_mul(1000)
+                .saturating_add((tv_nsec + 999_999) / 1_000_000);
+            ms.min(i32::MAX as i64) as i32
+        };
+        self.sys_poll(fds_ptr, nfds, timeout_ms)
+    }
+
     /// Linux select(2): synchronous I/O multiplexing via fd_set bitmasks.
     ///
-    /// fd_set is a bitmask of 128 bytes (1024 bits). Bit N is set if fd N
-    /// is in the set. We use the same "always ready" stub as sys_poll.
+    /// Spin-waits until at least one fd is ready or the timeout expires.
+    /// Calls poll_fn on each iteration to drive the network stack.
     fn sys_select(
         &self,
         nfds: i32,
         readfds: u64,
         writefds: u64,
         exceptfds: u64,
-        _timeout: u64,
+        timeout_ptr: u64,
     ) -> i64 {
         if !(0..=1024).contains(&nfds) {
             return EINVAL;
         }
-        // Count how many fds are "ready" (i.e., exist in our fd_table).
-        // For each fd_set, zero out bits for fds that don't exist.
-        let mut ready = 0i64;
-        let check_fdset = |fdset_ptr: u64, nfds: i32| -> i64 {
-            if fdset_ptr == 0 {
+
+        // Parse struct timeval { tv_sec: i64, tv_usec: i64 }.
+        // Parse once, then handle non-blocking / blocking paths.
+        let timeout_ms: u64 = if timeout_ptr == 0 {
+            u64::MAX // NULL → block forever (sentinel)
+        } else {
+            let tv = unsafe { core::slice::from_raw_parts(timeout_ptr as *const u8, 16) };
+            let tv_sec = i64::from_ne_bytes(tv[0..8].try_into().unwrap());
+            let tv_usec = i64::from_ne_bytes(tv[8..16].try_into().unwrap());
+            if tv_sec < 0 || tv_usec < 0 {
+                return EINVAL;
+            }
+            // Linux normalizes out-of-range tv_usec (e.g. 2_500_000 = 2.5s extra).
+            (tv_sec as u64)
+                .saturating_mul(1000)
+                .saturating_add((tv_usec as u64).div_ceil(1000))
+        };
+
+        // {0,0} → non-blocking: check once and return.
+        if timeout_ms == 0 {
+            return self.select_check_once(nfds, readfds, writefds, exceptfds);
+        }
+
+        // Blocking requires poll_fn to drive the network stack and read time.
+        let poll_fn = match self.poll_fn {
+            Some(f) => f,
+            None => return self.select_check_once(nfds, readfds, writefds, exceptfds),
+        };
+
+        // Cap blocking duration so control returns to dispatch() periodically,
+        // allowing the idle watchdog to fire.
+        const MAX_BLOCK_MS: u64 = 30_000; // 30 seconds
+
+        let deadline_ms: u64 = {
+            let now = poll_fn();
+            if timeout_ms == u64::MAX {
+                now.saturating_add(MAX_BLOCK_MS)
+            } else {
+                let requested = now.saturating_add(timeout_ms);
+                requested.min(now.saturating_add(MAX_BLOCK_MS))
+            }
+        };
+
+        // Save copies of the input fd_sets (select overwrites them with results).
+        let read_bytes = (nfds as usize).div_ceil(8);
+        let mut saved_readfds = [0u8; 128];
+        let mut saved_writefds = [0u8; 128];
+        if readfds != 0 && read_bytes > 0 {
+            let src = unsafe { core::slice::from_raw_parts(readfds as *const u8, read_bytes) };
+            saved_readfds[..read_bytes].copy_from_slice(src);
+        }
+        if writefds != 0 && read_bytes > 0 {
+            let src = unsafe { core::slice::from_raw_parts(writefds as *const u8, read_bytes) };
+            saved_writefds[..read_bytes].copy_from_slice(src);
+        }
+
+        loop {
+            // Drive the network stack and get current time.
+            let now = poll_fn();
+
+            // Restore input fd_sets (previous iteration may have cleared bits).
+            if readfds != 0 && read_bytes > 0 {
+                let dst =
+                    unsafe { core::slice::from_raw_parts_mut(readfds as *mut u8, read_bytes) };
+                dst.copy_from_slice(&saved_readfds[..read_bytes]);
+            }
+            if writefds != 0 && read_bytes > 0 {
+                let dst =
+                    unsafe { core::slice::from_raw_parts_mut(writefds as *mut u8, read_bytes) };
+                dst.copy_from_slice(&saved_writefds[..read_bytes]);
+            }
+
+            let ready = self.select_check_once(nfds, readfds, writefds, exceptfds);
+            if ready > 0 {
+                return ready;
+            }
+
+            // Timeout expired.
+            if now >= deadline_ms {
+                // Clear all fd_sets on timeout (Linux convention).
+                if readfds != 0 {
+                    unsafe {
+                        core::ptr::write_bytes(readfds as *mut u8, 0, read_bytes);
+                    }
+                }
+                if writefds != 0 {
+                    unsafe {
+                        core::ptr::write_bytes(writefds as *mut u8, 0, read_bytes);
+                    }
+                }
+                if exceptfds != 0 {
+                    unsafe {
+                        core::ptr::write_bytes(exceptfds as *mut u8, 0, read_bytes);
+                    }
+                }
                 return 0;
             }
-            let mut count = 0i64;
-            let bytes = (nfds as usize).div_ceil(8);
-            let set = unsafe { core::slice::from_raw_parts_mut(fdset_ptr as *mut u8, bytes) };
+
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Single-pass readiness check for select(). Clears bits for non-ready fds,
+    /// returns count of ready fds.
+    fn select_check_once(&self, nfds: i32, readfds: u64, writefds: u64, exceptfds: u64) -> i64 {
+        let mut ready = 0i64;
+        let bytes = (nfds as usize).div_ceil(8);
+
+        // Check readfds: clear bits for fds that are NOT readable.
+        if readfds != 0 {
+            let set = unsafe { core::slice::from_raw_parts_mut(readfds as *mut u8, bytes) };
             for fd in 0..nfds {
                 let byte_idx = fd as usize / 8;
                 let bit_idx = fd as usize % 8;
                 if set[byte_idx] & (1 << bit_idx) != 0 {
-                    if self.fd_table.contains_key(&fd) {
-                        count += 1; // fd exists → "ready"
+                    if self.is_fd_readable(fd) {
+                        ready += 1;
                     } else {
-                        set[byte_idx] &= !(1 << bit_idx); // fd doesn't exist → clear
+                        set[byte_idx] &= !(1 << bit_idx);
                     }
                 }
             }
-            count
-        };
-        ready += check_fdset(readfds, nfds);
-        ready += check_fdset(writefds, nfds);
+        }
+
+        // Check writefds: clear bits for fds that are NOT writable.
+        if writefds != 0 {
+            let set = unsafe { core::slice::from_raw_parts_mut(writefds as *mut u8, bytes) };
+            for fd in 0..nfds {
+                let byte_idx = fd as usize / 8;
+                let bit_idx = fd as usize % 8;
+                if set[byte_idx] & (1 << bit_idx) != 0 {
+                    if self.is_fd_writable(fd) {
+                        ready += 1;
+                    } else {
+                        set[byte_idx] &= !(1 << bit_idx);
+                    }
+                }
+            }
+        }
+
         // Clear exceptfds — we never report exceptional conditions.
         if exceptfds != 0 {
-            let bytes = (nfds as usize).div_ceil(8);
             unsafe {
                 core::ptr::write_bytes(exceptfds as *mut u8, 0, bytes);
             }
         }
+
         ready
+    }
+
+    /// Check if an fd is ready for reading (has data or EOF).
+    fn is_fd_readable(&self, fd: i32) -> bool {
+        let entry = match self.fd_table.get(&fd) {
+            Some(e) => e,
+            None => return false,
+        };
+        match &entry.kind {
+            FdKind::PipeRead { pipe_id } => {
+                let buf_nonempty = self
+                    .pipes
+                    .get(pipe_id)
+                    .map(|b| !b.is_empty())
+                    .unwrap_or(false);
+                if buf_nonempty {
+                    return true;
+                }
+                // EOF: write end is closed (no PipeWrite fd references this pipe_id).
+                !self.fd_table.values().any(
+                    |e| matches!(&e.kind, FdKind::PipeWrite { pipe_id: pid } if *pid == *pipe_id),
+                )
+            }
+            FdKind::Socket { socket_id } => {
+                if let Some(state) = self.sockets.get(socket_id) {
+                    if let Some(h) = state.tcp_handle {
+                        let tcp_state = self.tcp.tcp_state(h);
+                        // Listener: readable if a connection is ready to accept.
+                        if state.listening {
+                            return tcp_state == TcpSocketState::Established;
+                        }
+                        // Data socket: readable if recv buffer has data or
+                        // connection is shutting down (CloseWait/Closing/Closed).
+                        return self.tcp.tcp_can_recv(h)
+                            || tcp_state == TcpSocketState::CloseWait
+                            || tcp_state == TcpSocketState::Closing
+                            || tcp_state == TcpSocketState::Closed;
+                    }
+                }
+                // Non-TCP sockets (AF_UNIX stubs, socketpair): always ready.
+                true
+            }
+            // Pipe write-end is not readable.
+            FdKind::PipeWrite { .. } => false,
+            // Serial/stdout/stderr, eventfd, timerfd, signalfd, files: always readable.
+            _ => true,
+        }
+    }
+
+    /// Check if an fd is ready for writing (buffer space available).
+    fn is_fd_writable(&self, fd: i32) -> bool {
+        let entry = match self.fd_table.get(&fd) {
+            Some(e) => e,
+            None => return false,
+        };
+        match &entry.kind {
+            FdKind::PipeWrite { .. } => true, // unbounded buffer
+            // Pipe read-end is not writable.
+            FdKind::PipeRead { .. } => false,
+            FdKind::Socket { socket_id } => {
+                if let Some(state) = self.sockets.get(socket_id) {
+                    if let Some(h) = state.tcp_handle {
+                        let tcp_state = self.tcp.tcp_state(h);
+                        return !state.listening
+                            && self.tcp.tcp_can_send(h)
+                            && (tcp_state == TcpSocketState::Established
+                                || tcp_state == TcpSocketState::CloseWait);
+                    }
+                }
+                // Non-TCP sockets (AF_UNIX stubs, socketpair): always ready.
+                true
+            }
+            // Everything else: always writable.
+            _ => true,
+        }
     }
 
     /// Linux sched_getaffinity(2): get CPU affinity mask.

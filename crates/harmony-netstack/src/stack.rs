@@ -358,6 +358,12 @@ impl TcpProvider for NetStack {
         // accepted (established) connection, not a listener.
         self.tcp_bound_ports.remove(&new_listener);
 
+        // Enable TCP keepalive on accepted connections (60s interval).
+        // Detects dead peers when the remote host disappears without FIN.
+        self.sockets
+            .get_mut::<tcp::Socket>(smoltcp_handle)
+            .set_keep_alive(Some(smoltcp::time::Duration::from_millis(60_000)));
+
         Ok(Some(new_listener))
     }
 
@@ -468,6 +474,15 @@ impl TcpProvider for NetStack {
             .ok()
             .map(|h| self.sockets.get::<tcp::Socket>(h).can_send())
             .unwrap_or(false)
+    }
+
+    fn tcp_set_keepalive(&mut self, handle: TcpHandle, interval_ms: Option<u64>) {
+        if let Ok(h) = self.resolve_tcp(handle) {
+            let duration = interval_ms.map(smoltcp::time::Duration::from_millis);
+            self.sockets
+                .get_mut::<tcp::Socket>(h)
+                .set_keep_alive(duration);
+        }
     }
 
     fn tcp_poll(&mut self, now_ms: i64) {
