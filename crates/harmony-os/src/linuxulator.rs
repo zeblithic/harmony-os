@@ -3241,8 +3241,10 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             LinuxSyscall::TimerfdGettime { fd, curr_value } => {
                 self.sys_timerfd_gettime(fd, curr_value)
             }
-            LinuxSyscall::Poll { fds, nfds, .. } => self.sys_poll(fds, nfds),
-            LinuxSyscall::Ppoll { fds, nfds, .. } => self.sys_poll(fds, nfds),
+            LinuxSyscall::Poll { fds, nfds, timeout } => self.sys_poll(fds, nfds, timeout),
+            LinuxSyscall::Ppoll { fds, nfds, tmo_ptr, sigmask, .. } => {
+                self.sys_ppoll(fds, nfds, tmo_ptr, sigmask)
+            }
             LinuxSyscall::Readv { fd, iov, iovcnt } => self.sys_readv(fd, iov as usize, iovcnt),
             LinuxSyscall::Socketpair {
                 domain,
@@ -7794,23 +7796,63 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         }
     }
 
-    /// Linux poll(2) / ppoll(2): wait for events on file descriptors.
+    /// Linux poll(2): synchronous I/O multiplexing via pollfd array.
     ///
-    /// Always-ready model (same as epoll): for each valid fd in the
-    /// pollfd array, set revents to the requested events. Invalid fds
-    /// get POLLNVAL. Returns the number of fds with non-zero revents.
-    fn sys_poll(&self, fds_ptr: u64, nfds: u64) -> i64 {
-        const POLL_MAX_FDS: u64 = 1 << 20; // cap to prevent DoS / overflow
+    /// Spin-waits until at least one fd is ready or the timeout expires.
+    fn sys_poll(&self, fds_ptr: u64, nfds: u64, timeout_ms: i32) -> i64 {
+        const POLL_MAX_FDS: u64 = 1 << 20;
         if nfds > POLL_MAX_FDS {
             return EINVAL;
         }
         if fds_ptr == 0 && nfds > 0 {
             return EFAULT;
         }
+
+        const POLLIN: i16 = 0x01;
+        const POLLOUT: i16 = 0x04;
+        const POLLHUP: i16 = 0x10;
         const POLLNVAL: i16 = 0x20;
+
+        // Non-blocking: check once.
+        if timeout_ms == 0 {
+            return self.poll_check_once(fds_ptr, nfds, POLLIN, POLLOUT, POLLHUP, POLLNVAL);
+        }
+
+        let deadline_ms: u64 = if timeout_ms < 0 {
+            u64::MAX // negative → block forever
+        } else {
+            let now = self.poll_fn.map(|f| f()).unwrap_or(0);
+            now.saturating_add(timeout_ms as u64)
+        };
+
+        loop {
+            let now = self.poll_fn.map(|f| f()).unwrap_or(0);
+
+            let ready = self.poll_check_once(fds_ptr, nfds, POLLIN, POLLOUT, POLLHUP, POLLNVAL);
+            if ready > 0 {
+                return ready;
+            }
+
+            if now >= deadline_ms {
+                return 0;
+            }
+
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Single-pass readiness check for poll(). Writes revents and returns ready count.
+    fn poll_check_once(
+        &self,
+        fds_ptr: u64,
+        nfds: u64,
+        pollin: i16,
+        pollout: i16,
+        pollhup: i16,
+        pollnval: i16,
+    ) -> i64 {
         let mut ready_count = 0i64;
         for i in 0..nfds {
-            // struct pollfd = { fd: i32, events: i16, revents: i16 } = 8 bytes
             let base = fds_ptr as usize + (i as usize) * 8;
             let fd_bytes = unsafe { core::slice::from_raw_parts(base as *const u8, 4) };
             let fd = i32::from_ne_bytes(fd_bytes.try_into().unwrap());
@@ -7818,11 +7860,33 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             let events = i16::from_ne_bytes(events_bytes.try_into().unwrap());
 
             let revents = if fd < 0 {
-                0i16 // negative fd → ignored (revents=0)
-            } else if self.fd_table.contains_key(&fd) {
-                events // all requested events are "ready"
+                0i16
+            } else if !self.fd_table.contains_key(&fd) {
+                pollnval
             } else {
-                POLLNVAL // fd doesn't exist
+                let mut r = 0i16;
+                if events & pollin != 0 && self.is_fd_readable(fd) {
+                    r |= pollin;
+                }
+                if events & pollout != 0 && self.is_fd_writable(fd) {
+                    r |= pollout;
+                }
+                // Check for HUP on sockets (connection closed).
+                if let Some(entry) = self.fd_table.get(&fd) {
+                    if let FdKind::Socket { socket_id } = &entry.kind {
+                        if let Some(state) = self.sockets.get(socket_id) {
+                            if let Some(h) = state.tcp_handle {
+                                let tcp_state = self.tcp.tcp_state(h);
+                                if tcp_state == TcpSocketState::Closed
+                                    || tcp_state == TcpSocketState::Closing
+                                {
+                                    r |= pollhup;
+                                }
+                            }
+                        }
+                    }
+                }
+                r
             };
 
             if revents != 0 {
@@ -7832,6 +7896,22 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             revents_out.copy_from_slice(&revents.to_ne_bytes());
         }
         ready_count
+    }
+
+    /// Linux ppoll(2): like poll but with timespec and signal mask.
+    fn sys_ppoll(&self, fds_ptr: u64, nfds: u64, timeout_ptr: u64, _sigmask: u64) -> i64 {
+        let timeout_ms: i32 = if timeout_ptr == 0 {
+            -1 // NULL → block forever
+        } else {
+            let ts = unsafe { core::slice::from_raw_parts(timeout_ptr as *const u8, 16) };
+            let tv_sec = i64::from_ne_bytes(ts[0..8].try_into().unwrap());
+            let tv_nsec = i64::from_ne_bytes(ts[8..16].try_into().unwrap());
+            let ms = (tv_sec as i64)
+                .saturating_mul(1000)
+                .saturating_add(tv_nsec / 1_000_000);
+            ms.min(i32::MAX as i64) as i32
+        };
+        self.sys_poll(fds_ptr, nfds, timeout_ms)
     }
 
     /// Linux select(2): synchronous I/O multiplexing via fd_set bitmasks.
