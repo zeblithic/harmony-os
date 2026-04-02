@@ -3457,38 +3457,43 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                     if !nonblock {
                         if let Some(pf) = self.poll_fn {
-                            match self.block_until(pf, Self::is_fd_writable, fd) {
-                                BlockResult::Ready => {
-                                    // Retry: re-check reader and buffer
-                                    let has_reader = self.fd_table.values().any(
-                                        |e| matches!(&e.kind, FdKind::PipeRead { pipe_id: id } if *id == pipe_id),
-                                    );
-                                    if !has_reader {
-                                        let is_child = self.parent_pid != 0;
-                                        if !is_child || !self.pipes.contains_key(&pipe_id) {
-                                            return EPIPE;
+                            loop {
+                                match self.block_until(pf, Self::is_fd_writable, fd) {
+                                    BlockResult::Ready => {
+                                        // Retry: re-check reader and buffer
+                                        let has_reader = self.fd_table.values().any(
+                                            |e| matches!(&e.kind, FdKind::PipeRead { pipe_id: id } if *id == pipe_id),
+                                        );
+                                        if !has_reader {
+                                            let is_child = self.parent_pid != 0;
+                                            if !is_child || !self.pipes.contains_key(&pipe_id) {
+                                                return EPIPE;
+                                            }
                                         }
+                                        let pipe_buf = match self.pipes.get_mut(&pipe_id) {
+                                            Some(b) => b,
+                                            None => return EPIPE,
+                                        };
+                                        let avail = PIPE_BUF_CAP.saturating_sub(pipe_buf.len());
+                                        if avail == 0 {
+                                            continue; // Still full, keep waiting
+                                        }
+                                        const PIPE_BUF: usize = 4096;
+                                        if count <= PIPE_BUF && avail < count {
+                                            continue; // Not enough for atomic write, keep waiting
+                                        }
+                                        let to_write = count.min(avail);
+                                        let data = unsafe {
+                                            core::slice::from_raw_parts(
+                                                buf_ptr as *const u8,
+                                                to_write,
+                                            )
+                                        };
+                                        pipe_buf.extend_from_slice(data);
+                                        return to_write as i64;
                                     }
-                                    let pipe_buf = match self.pipes.get_mut(&pipe_id) {
-                                        Some(b) => b,
-                                        None => return EPIPE,
-                                    };
-                                    let avail = PIPE_BUF_CAP.saturating_sub(pipe_buf.len());
-                                    if avail == 0 {
-                                        return EINTR;
-                                    }
-                                    const PIPE_BUF: usize = 4096;
-                                    if count <= PIPE_BUF && avail < count {
-                                        return EINTR;
-                                    }
-                                    let to_write = count.min(avail);
-                                    let data = unsafe {
-                                        core::slice::from_raw_parts(buf_ptr as *const u8, to_write)
-                                    };
-                                    pipe_buf.extend_from_slice(data);
-                                    return to_write as i64;
+                                    BlockResult::Interrupted => return EINTR,
                                 }
-                                BlockResult::Interrupted => return EINTR,
                             }
                         }
                     }
@@ -3502,37 +3507,42 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                     if !nonblock {
                         if let Some(pf) = self.poll_fn {
-                            match self.block_until(pf, Self::is_fd_writable, fd) {
-                                BlockResult::Ready => {
-                                    // Retry: re-check reader and buffer
-                                    let has_reader = self.fd_table.values().any(
-                                        |e| matches!(&e.kind, FdKind::PipeRead { pipe_id: id } if *id == pipe_id),
-                                    );
-                                    if !has_reader {
-                                        let is_child = self.parent_pid != 0;
-                                        if !is_child || !self.pipes.contains_key(&pipe_id) {
-                                            return EPIPE;
+                            loop {
+                                match self.block_until(pf, Self::is_fd_writable, fd) {
+                                    BlockResult::Ready => {
+                                        // Retry: re-check reader and buffer
+                                        let has_reader = self.fd_table.values().any(
+                                            |e| matches!(&e.kind, FdKind::PipeRead { pipe_id: id } if *id == pipe_id),
+                                        );
+                                        if !has_reader {
+                                            let is_child = self.parent_pid != 0;
+                                            if !is_child || !self.pipes.contains_key(&pipe_id) {
+                                                return EPIPE;
+                                            }
                                         }
+                                        let pipe_buf = match self.pipes.get_mut(&pipe_id) {
+                                            Some(b) => b,
+                                            None => return EPIPE,
+                                        };
+                                        let avail = PIPE_BUF_CAP.saturating_sub(pipe_buf.len());
+                                        if avail == 0 {
+                                            continue; // Still full, keep waiting
+                                        }
+                                        if count <= PIPE_BUF && avail < count {
+                                            continue; // Not enough for atomic write, keep waiting
+                                        }
+                                        let to_write = count.min(avail);
+                                        let data = unsafe {
+                                            core::slice::from_raw_parts(
+                                                buf_ptr as *const u8,
+                                                to_write,
+                                            )
+                                        };
+                                        pipe_buf.extend_from_slice(data);
+                                        return to_write as i64;
                                     }
-                                    let pipe_buf = match self.pipes.get_mut(&pipe_id) {
-                                        Some(b) => b,
-                                        None => return EPIPE,
-                                    };
-                                    let avail = PIPE_BUF_CAP.saturating_sub(pipe_buf.len());
-                                    if avail == 0 {
-                                        return EINTR;
-                                    }
-                                    if count <= PIPE_BUF && avail < count {
-                                        return EINTR;
-                                    }
-                                    let to_write = count.min(avail);
-                                    let data = unsafe {
-                                        core::slice::from_raw_parts(buf_ptr as *const u8, to_write)
-                                    };
-                                    pipe_buf.extend_from_slice(data);
-                                    return to_write as i64;
+                                    BlockResult::Interrupted => return EINTR,
                                 }
-                                BlockResult::Interrupted => return EINTR,
                             }
                         }
                     }
@@ -4545,7 +4555,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             FdEntry {
                 kind: FdKind::EventFd { eventfd_id },
                 flags: fd_flags,
-                nonblock: false,
+                nonblock: flags & O_NONBLOCK != 0,
             },
         );
         fd as i64
@@ -5760,7 +5770,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 FdEntry {
                     kind: FdKind::SignalFd { signalfd_id },
                     flags: fd_flags,
-                    nonblock: false,
+                    nonblock: flags & SFD_NONBLOCK != 0,
                 },
             );
             new_fd as i64
@@ -5849,7 +5859,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             FdEntry {
                 kind: FdKind::TimerFd { timerfd_id },
                 flags: fd_flags,
-                nonblock: false,
+                nonblock: flags & TFD_NONBLOCK != 0,
             },
         );
         fd as i64
