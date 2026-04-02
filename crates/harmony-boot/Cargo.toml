@@ -17,7 +17,7 @@ harmony-netstack = { path = "../harmony-netstack", default-features = false }
 smoltcp = { version = "0.11", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-udp", "alloc"] }
 bootloader_api = "0.11"
 linked_list_allocator = "0.10"
-x86_64 = { version = "0.15", default-features = false, features = ["instructions"] }
+x86_64 = { version = "0.15", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
 
 # Ring 2 microkernel (optional — only with `ring2` feature)
 harmony-microkernel = { path = "../harmony-microkernel", default-features = false, optional = true }
@@ -42,4 +42,8 @@ qemu-test = []
 # Ring 2 microkernel IPC demo on boot.
 ring2 = ["dep:harmony-microkernel"]
 # Ring 3 Linuxulator — run Linux binaries via syscall translation.
-ring3 = ["ring2", "dep:harmony-os"]
+ring3 = ["ring2", "dep:harmony-os", "qemu-dev"]
+# Include QEMU-only dev credentials (known SSH password hash).
+# Automatically enabled by ring3 for local development. Production
+# builds should use ring3 without this: ring3 = ["ring2", "dep:harmony-os"]
+qemu-dev = []

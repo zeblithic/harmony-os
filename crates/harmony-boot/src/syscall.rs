@@ -61,6 +61,121 @@ static mut DISPATCH_FN: Option<SyscallDispatchFn> = None;
 static mut PROCESS_EXITED: bool = false;
 static mut EXIT_CODE: i32 = 0;
 
+/// Execve target: when set, the syscall handler jumps here instead of returning.
+static mut EXECVE_ENTRY: u64 = 0;
+static mut EXECVE_RSP: u64 = 0;
+
+/// Set the execve target. The next syscall return will jump to `entry` with `rsp`.
+///
+/// # Safety
+/// Must be called from the dispatch function during an execve syscall.
+pub unsafe fn set_execve_target(entry: u64, rsp: u64) {
+    EXECVE_ENTRY = entry;
+    EXECVE_RSP = rsp;
+}
+
+// ── Fork context switching ─────────────────────────────────────────
+//
+// When fork creates a child, the assembly trampoline copies the parent's
+// full register frame (14 registers + user RSP) to a static buffer and
+// returns 0 so the code takes the child path.  When the child exits, the
+// trampoline restores all registers and RSP from the buffer, sets RAX to
+// the saved child_pid, and jumps to the parent's return RIP.
+//
+// The frame MUST be copied to a static buffer because the child reuses
+// the parent's stack before exec and will overwrite the on-stack frame.
+
+/// When set to 1, the trampoline copies the frame to the static buffer.
+#[no_mangle]
+static mut FORK_SAVE_PARENT: u64 = 0;
+
+/// When set to 1, the trampoline restores from the static buffer.
+#[no_mangle]
+static mut FORK_RESTORE_PARENT: u64 = 0;
+
+/// Saved return value (child_pid) to deliver to the parent on restore.
+#[no_mangle]
+static mut FORK_PARENT_RETVAL: u64 = 0;
+
+/// Saved register frame for the parent context.
+/// Layout matches syscall_entry push order:
+///   [0]=r9  [1]=r8  [2]=r10 [3]=rdx [4]=rsi [5]=rdi
+///   [6]=r15 [7]=r14 [8]=r13 [9]=r12 [10]=rbp [11]=rbx
+///   [12]=r11 [13]=rcx(RIP) [14]=user_rsp
+#[no_mangle]
+static mut FORK_SAVED_FRAME: [u64; 15] = [0; 15];
+
+/// Saved user stack content. The child reuses the parent's stack before
+/// exec and corrupts local variables. We save from user_rsp upward,
+/// clamped to the actual stack bounds to avoid reading past the allocation.
+/// Sized to match the full 64 KiB user stack so even deep call chains
+/// (dropbear accept → session → fork) are fully covered.
+const FORK_STACK_SAVE_MAX: usize = 64 * 1024;
+#[no_mangle]
+static mut FORK_SAVED_STACK: [u8; FORK_STACK_SAVE_MAX] = [0; FORK_STACK_SAVE_MAX];
+
+/// Actual number of bytes saved (clamped to stack bounds).
+/// Set by Rust before the trampoline reads it; used by both save and restore.
+#[no_mangle]
+static mut FORK_STACK_SAVE_ACTUAL: u64 = 0;
+
+/// Top of the user stack allocation. Set once during boot.
+static mut USER_STACK_TOP: u64 = 0;
+
+static mut FORK_DEPTH: usize = 0;
+
+/// Set the user stack top address. Called once during boot.
+///
+/// # Safety
+/// Must be called before any fork context switching.
+pub unsafe fn set_user_stack_top(top: u64) {
+    USER_STACK_TOP = top;
+}
+
+/// Signal the trampoline to save the parent context and return 0.
+///
+/// # Safety
+/// Must be called from the dispatch function when a fork just created a child.
+pub unsafe fn fork_save_context() {
+    let d = FORK_DEPTH;
+    assert!(d < 2, "only one level of fork nesting supported");
+    FORK_DEPTH = d + 1;
+    FORK_SAVE_PARENT = 1;
+}
+
+/// Signal the trampoline to restore the parent context.
+///
+/// # Safety
+/// Must be called from the dispatch function when a fork child has exited.
+pub unsafe fn fork_restore_context() {
+    let d = FORK_DEPTH;
+    assert!(d > 0, "fork_restore with no saved context");
+    FORK_DEPTH = d - 1;
+    FORK_RESTORE_PARENT = 1;
+}
+
+/// Restore the parent's user stack from the saved buffer.
+///
+/// # Safety
+/// Must be called before `fork_restore_context` while the child's stack
+/// is still active (the trampoline will switch RSP during restore).
+pub unsafe fn fork_restore_stack() {
+    let user_rsp = FORK_SAVED_FRAME[14];
+    let actual = FORK_STACK_SAVE_ACTUAL as usize;
+    if user_rsp != 0 && actual > 0 {
+        core::ptr::copy_nonoverlapping(
+            FORK_SAVED_STACK.as_ptr(),
+            user_rsp as *mut u8,
+            actual,
+        );
+    }
+}
+
+/// Current fork nesting depth.
+pub fn fork_depth() -> usize {
+    unsafe { FORK_DEPTH }
+}
+
 /// Install the syscall dispatch function.
 ///
 /// # Safety
@@ -95,11 +210,23 @@ unsafe extern "C" fn rust_syscall_handler(
         if result.exited {
             PROCESS_EXITED = true;
             EXIT_CODE = result.exit_code;
-            // Halt — do not return to the binary after exit_group.
-            // sysretq would jump to an undefined address.
             loop {
                 core::arch::asm!("hlt");
             }
+        }
+        // Check for pending execve — jump to the new binary.
+        if EXECVE_ENTRY != 0 {
+            let entry = EXECVE_ENTRY;
+            let rsp = EXECVE_RSP;
+            EXECVE_ENTRY = 0;
+            EXECVE_RSP = 0;
+            core::arch::asm!(
+                "mov rsp, {rsp}",
+                "jmp {entry}",
+                rsp = in(reg) rsp,
+                entry = in(reg) entry,
+                options(noreturn),
+            );
         }
         result.retval
     } else {
@@ -121,63 +248,169 @@ unsafe extern "C" fn rust_syscall_handler(
 #[no_mangle]
 extern "C" fn syscall_entry() {
     naked_asm!(
-        // Save registers that sysretq needs and callee-saved regs
-        "push rcx",          // return RIP
-        "push r11",          // return RFLAGS
+        // ── Save ALL registers preserved by the Linux syscall ABI ──
+        //
+        // The `syscall` instruction only clobbers RAX (return value),
+        // RCX (saved RIP), and R11 (saved RFLAGS). The kernel must
+        // preserve everything else: RBX, RBP, RSP, R12-R15 (callee-saved)
+        // AND RDI, RSI, RDX, R8, R9, R10 (argument registers that
+        // userspace expects to survive the syscall).
+        //
+        // We save RCX/R11 for sysretq, and all caller-saved argument
+        // registers because rust_syscall_handler (SysV) will clobber them.
+        "push rcx", // return RIP (saved by syscall hw)
+        "push r11", // return RFLAGS (saved by syscall hw)
         "push rbx",
         "push rbp",
         "push r12",
         "push r13",
         "push r14",
         "push r15",
-
+        // Argument registers — must survive the Rust call
+        "push rdi", // a1
+        "push rsi", // a2
+        "push rdx", // a3
+        "push r10", // a4
+        "push r8",  // a5
+        "push r9",  // a6
         // Force 16-byte stack alignment for SysV ABI.
-        // User RSP may not be aligned when syscall fires.
-        // Save original RSP, align, and restore after the call.
-        "mov rbp, rsp",      // save original RSP in rbp (already saved above)
-        "and rsp, -16",      // force 16-byte alignment
-
+        // 14 pushes (14*8 = 112 bytes) = even, so if RSP was 16-aligned
+        // before the first push, it's still 16-aligned now.
+        // But user RSP may not be aligned, so force it.
+        "mov rbp, rsp", // save frame pointer
+        "and rsp, -16", // force 16-byte alignment
         // Set up arguments for rust_syscall_handler(nr, a1, a2, a3, a4, a5, a6)
         // SysV calling convention: rdi, rsi, rdx, rcx, r8, r9, [stack]
         //
         // Current:  RAX=nr, RDI=a1, RSI=a2, RDX=a3, R10=a4, R8=a5, R9=a6
         // Need:     RDI=nr, RSI=a1, RDX=a2, RCX=a3, R8=a4, R9=a5, [stack]=a6
-        "sub rsp, 8",        // alignment: aligned - 8 - 8(a6) = aligned - 16, then call pushes 8 → -24 mod 16 = 8...
-        "push r9",           // a6 as 7th stack arg at [rsp]
-
+        "sub rsp, 8", // alignment padding
+        "push r9",    // a6 as 7th stack arg
         // Shuffle registers: Linux ABI → SysV calling convention
-        "mov r9, r8",        // r9 = a5
-        "mov r8, r10",       // r8 = a4
-        "mov rcx, rdx",      // rcx = a3
-        "mov rdx, rsi",      // rdx = a2
-        "mov rsi, rdi",      // rsi = a1
-        "mov rdi, rax",      // rdi = nr
-
+        "mov r9, r8",   // r9 = a5
+        "mov r8, r10",  // r8 = a4
+        "mov rcx, rdx", // rcx = a3
+        "mov rdx, rsi", // rdx = a2
+        "mov rsi, rdi", // rsi = a1
+        "mov rdi, rax", // rdi = nr
         "call rust_syscall_handler",
-
-        // Return value is in RAX. Restore original RSP.
+        // Return value is in RAX.
+        //
+        // ── Fork context switching ──
+        // All symbol references use RIP-relative lea to avoid R_X86_64_32S
+        // relocations that fail on x86_64-unknown-none.
+        //
+        // FORK_SAVE: copy 14 registers from the stack frame (at rbp) to
+        // a static buffer, plus the user RSP. Save child_pid, return 0.
+        "lea rcx, [rip + {fork_save}]",
+        "cmp qword ptr [rcx], 1",
+        "jne 2f",
+        "mov qword ptr [rcx], 0",
+        // Copy 14 registers (112 bytes) from frame at rbp to static buffer.
+        "cld",
+        "mov rcx, 112",
+        "lea rsi, [rbp]",
+        "lea rdi, [rip + {saved_frame}]",
+        "rep movsb",
+        // Save user RSP = rbp + 112 (stack position before first push).
+        "lea rcx, [rbp + 112]",
+        "lea rdi, [rip + {saved_frame}]",
+        "mov [rdi + 112], rcx",
+        // Save user stack from user_rsp upward, clamped to stack bounds.
+        // user_rsp = rbp + 112. Save min(65536, stack_top - user_rsp) bytes.
+        // stack_top > user_rsp always holds (stack grows down), but we
+        // guard with jbe to avoid reading garbage if invariants break.
+        "cld",
+        "lea rsi, [rbp + 112]",               // rsi = user_rsp
+        "lea rdi, [rip + {user_stack_top}]",
+        "mov rdi, [rdi]",                     // rdi = stack_top
+        "cmp rdi, rsi",
+        "jbe 5f",                             // skip save if stack_top <= user_rsp
+        "sub rdi, rsi",                       // rdi = stack_top - user_rsp (positive)
+        "mov rcx, 65536",
+        "cmp rdi, rcx",
+        "cmovb rcx, rdi",                    // rcx = min(65536, available)
+        "jmp 6f",
+        "5:",
+        "xor ecx, ecx",                      // 0 bytes to save
+        "6:",
+        // Store actual size for restore.
+        "lea rdi, [rip + {stack_save_actual}]",
+        "mov [rdi], rcx",
+        // Do the copy (rcx may be 0 = no-op).
+        "lea rdi, [rip + {saved_stack}]",      // dest: static buffer
+        "rep movsb",
+        // Save return value (child_pid).
+        "lea rcx, [rip + {parent_retval}]",
+        "mov [rcx], rax",
+        // Return 0 to child path.
+        "xor eax, eax",
+        "jmp 3f",
+        "2:",
+        // FORK_RESTORE: load all registers from the static buffer,
+        // restore RSP, set RAX=child_pid, jump to parent's RIP.
+        // This path does NOT fall through to the normal pop sequence.
+        "lea rcx, [rip + {fork_restore}]",
+        "cmp qword ptr [rcx], 1",
+        "jne 3f",
+        "mov qword ptr [rcx], 0",
+        // Use rcx as base pointer into the saved frame.
+        "lea rcx, [rip + {saved_frame}]",
+        "mov r9,  [rcx +  0]",
+        "mov r8,  [rcx +  8]",
+        "mov r10, [rcx + 16]",
+        "mov rdx, [rcx + 24]",
+        "mov rsi, [rcx + 32]",
+        "mov rdi, [rcx + 40]",
+        "mov r15, [rcx + 48]",
+        "mov r14, [rcx + 56]",
+        "mov r13, [rcx + 64]",
+        "mov r12, [rcx + 72]",
+        "mov rbp, [rcx + 80]",
+        "mov rbx, [rcx + 88]",
+        "mov r11, [rcx + 96]",
+        // Load user RSP into rax (temp), return RIP into rcx.
+        "mov rax, [rcx + 112]",  // rax = user RSP
+        "mov rcx, [rcx + 104]",  // rcx = return RIP (clobbers base)
+        // Switch to parent's stack.
+        "mov rsp, rax",
+        // Load return value (child_pid).
+        "lea rax, [rip + {parent_retval}]",
+        "mov rax, [rax]",
+        // Jump to parent's return RIP.
+        "cli",
+        "jmp rcx",
+        "3:",
+        // ── Normal path: restore from stack frame ──
         "mov rsp, rbp",
-
-        // Restore callee-saved registers
+        // Argument registers (in reverse push order)
+        "pop r9",
+        "pop r8",
+        "pop r10",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        // Callee-saved registers
         "pop r15",
         "pop r14",
         "pop r13",
         "pop r12",
         "pop rbp",
         "pop rbx",
-        "pop r11",           // return RFLAGS
-        "pop rcx",           // return RIP
-
-        // Restore RFLAGS from R11 (syscall saved original RFLAGS there,
-        // and FMASK cleared IF on entry — must re-enable interrupts).
-        "push r11",
-        "popfq",
-
-        // In our flat Ring 0 MVP (no privilege separation), we use jmp
-        // instead of sysretq. sysretq forces RPL=3 on CS which requires
-        // valid Ring 3 GDT entries and user-accessible page mappings.
-        // Since everything runs in Ring 0, a simple jmp is correct.
+        "pop r11", // return RFLAGS
+        "pop rcx", // return RIP
+        // Keep IF disabled (no IDT for hardware interrupts).
+        "cli",
+        // jmp back to caller
         "jmp rcx",
+        // ── Symbol operands for fork statics ──
+        fork_save = sym FORK_SAVE_PARENT,
+        fork_restore = sym FORK_RESTORE_PARENT,
+        parent_retval = sym FORK_PARENT_RETVAL,
+        saved_frame = sym FORK_SAVED_FRAME,
+        saved_stack = sym FORK_SAVED_STACK,
+        stack_save_actual = sym FORK_STACK_SAVE_ACTUAL,
+        user_stack_top = sym USER_STACK_TOP,
     );
 }
 

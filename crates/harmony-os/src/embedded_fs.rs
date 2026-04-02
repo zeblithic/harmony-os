@@ -18,15 +18,20 @@ pub struct EmbeddedFile {
     pub executable: bool,
 }
 
-/// Read-only in-memory filesystem.
+/// In-memory filesystem with static files and a writable scratch layer.
 ///
 /// Files are registered at construction time with absolute paths like
 /// `/usr/bin/dropbear`. Directory existence is derived automatically: any
 /// path component that is a prefix of a registered file is considered an
 /// existing directory.
+///
+/// The scratch layer supports runtime file creation (e.g. dropbear host
+/// key generation). Scratch files are heap-allocated and lost on reboot.
 #[derive(Clone)]
 pub struct EmbeddedFs {
     files: BTreeMap<String, EmbeddedFile>,
+    /// Runtime-created files (writable scratch layer).
+    pub scratch: BTreeMap<String, Vec<u8>>,
 }
 
 impl EmbeddedFs {
@@ -34,6 +39,7 @@ impl EmbeddedFs {
     pub fn new() -> Self {
         Self {
             files: BTreeMap::new(),
+            scratch: BTreeMap::new(),
         }
     }
 
@@ -45,16 +51,39 @@ impl EmbeddedFs {
             .insert(path.to_string(), EmbeddedFile { data, executable });
     }
 
-    /// Look up a file by exact path. Returns `None` for directories or
-    /// paths that were never registered.
+    /// Look up a static file by exact path. Returns `None` for directories,
+    /// scratch files, or paths that were never registered.
     pub fn get(&self, path: &str) -> Option<&EmbeddedFile> {
         self.files.get(path)
     }
 
-    /// Return `true` if `path` names a registered file **or** a directory
-    /// that is a prefix of at least one registered file.
+    /// Read a file's contents — checks scratch layer first, then static.
+    pub fn read_data(&self, path: &str) -> Option<&[u8]> {
+        if let Some(data) = self.scratch.get(path) {
+            return Some(data);
+        }
+        self.files.get(path).map(|f| f.data)
+    }
+
+    /// Create or overwrite a file in the scratch layer.
+    pub fn write_scratch(&mut self, path: &str, data: Vec<u8>) {
+        self.scratch.insert(path.to_string(), data);
+    }
+
+    /// Rename a scratch file. Returns false if `old` doesn't exist in scratch.
+    pub fn rename_scratch(&mut self, old: &str, new: &str) -> bool {
+        if let Some(data) = self.scratch.remove(old) {
+            self.scratch.insert(new.to_string(), data);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Return `true` if `path` names a registered file (static or scratch)
+    /// **or** a directory that is a prefix of at least one registered file.
     pub fn exists(&self, path: &str) -> bool {
-        if self.files.contains_key(path) {
+        if self.files.contains_key(path) || self.scratch.contains_key(path) {
             return true;
         }
         // A path is a directory if any registered path starts with
@@ -67,6 +96,7 @@ impl EmbeddedFs {
             p
         };
         self.files.keys().any(|k| k.starts_with(&dir_prefix))
+            || self.scratch.keys().any(|k| k.starts_with(&dir_prefix))
     }
 
     /// List the immediate children of the directory at `path`.
