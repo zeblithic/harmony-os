@@ -177,6 +177,72 @@ impl TcpProvider for NoTcp {
     }
 }
 
+impl harmony_netstack::udp::UdpProvider for NoTcp {
+    fn udp_create(&mut self) -> Result<harmony_netstack::UdpHandle, harmony_netstack::NetError> {
+        Err(harmony_netstack::NetError::SocketLimit)
+    }
+    fn udp_bind(
+        &mut self,
+        _: harmony_netstack::UdpHandle,
+        _: u16,
+    ) -> Result<(), harmony_netstack::NetError> {
+        Err(harmony_netstack::NetError::InvalidHandle)
+    }
+    fn udp_close(
+        &mut self,
+        _: harmony_netstack::UdpHandle,
+    ) -> Result<(), harmony_netstack::NetError> {
+        Err(harmony_netstack::NetError::InvalidHandle)
+    }
+    fn udp_can_recv(&self, _: harmony_netstack::UdpHandle) -> bool {
+        false
+    }
+    fn udp_can_send(&self, _: harmony_netstack::UdpHandle) -> bool {
+        false
+    }
+    fn udp_sendto(
+        &mut self,
+        _: harmony_netstack::UdpHandle,
+        _: &[u8],
+        _: harmony_netstack::smoltcp::wire::Ipv4Address,
+        _: u16,
+    ) -> Result<usize, harmony_netstack::NetError> {
+        Err(harmony_netstack::NetError::InvalidHandle)
+    }
+    fn udp_recvfrom(
+        &mut self,
+        _: harmony_netstack::UdpHandle,
+        _: &mut [u8],
+    ) -> Result<(usize, harmony_netstack::smoltcp::wire::Ipv4Address, u16), harmony_netstack::NetError>
+    {
+        Err(harmony_netstack::NetError::InvalidHandle)
+    }
+    fn udp_connect(
+        &mut self,
+        _: harmony_netstack::UdpHandle,
+        _: harmony_netstack::smoltcp::wire::Ipv4Address,
+        _: u16,
+    ) -> Result<(), harmony_netstack::NetError> {
+        Err(harmony_netstack::NetError::InvalidHandle)
+    }
+    fn udp_send(
+        &mut self,
+        _: harmony_netstack::UdpHandle,
+        _: &[u8],
+    ) -> Result<usize, harmony_netstack::NetError> {
+        Err(harmony_netstack::NetError::InvalidHandle)
+    }
+    fn udp_recv(
+        &mut self,
+        _: harmony_netstack::UdpHandle,
+        _: &mut [u8],
+    ) -> Result<(usize, harmony_netstack::smoltcp::wire::Ipv4Address, u16), harmony_netstack::NetError>
+    {
+        Err(harmony_netstack::NetError::InvalidHandle)
+    }
+    fn udp_poll(&mut self, _: i64) {}
+}
+
 /// Directory entry returned by [`SyscallBackend::readdir`].
 #[derive(Debug, Clone)]
 pub struct DirEntry {
@@ -8343,6 +8409,13 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    #[test]
+    fn no_tcp_implements_udp_provider() {
+        use harmony_netstack::udp::UdpProvider;
+        let mut no_tcp = NoTcp;
+        assert!(no_tcp.udp_create().is_err());
+    }
 
     #[test]
     fn mock_backend_records_write() {
