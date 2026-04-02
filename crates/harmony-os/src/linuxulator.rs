@@ -4784,8 +4784,6 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     addrlen_ptr,
                 ),
                 Ok(None) => {
-                    let parent_nonblock =
-                        self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                     if !parent_nonblock {
                         if let Some(pf) = self.poll_fn {
                             match self.block_until(pf, Self::is_fd_readable, fd) {
@@ -4892,8 +4890,19 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     if nonblock {
                         EINPROGRESS
                     } else if let Some(pf) = self.poll_fn {
-                        match self.block_until(pf, Self::is_fd_writable, fd) {
-                            BlockResult::Ready => 0,
+                        // Spin-wait until the handshake completes or fails.
+                        // Uses is_fd_connect_done (not is_fd_writable) so that
+                        // connection failures (RST → Closed) also unblock.
+                        match self.block_until(pf, Self::is_fd_connect_done, fd) {
+                            BlockResult::Ready => {
+                                // Check whether the connect succeeded or failed.
+                                let tcp_state = self.tcp.tcp_state(h);
+                                if tcp_state == TcpSocketState::Established {
+                                    0
+                                } else {
+                                    ECONNREFUSED
+                                }
+                            }
                             BlockResult::Interrupted => EINTR,
                         }
                     } else {
@@ -8797,6 +8806,30 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             // Everything else: always writable.
             _ => true,
         }
+    }
+
+    /// Check if a TCP connect has reached a terminal state (success or
+    /// failure).  Returns true when the socket is `Established` (handshake
+    /// done) or in any closing/closed state (connection refused, RST, etc.).
+    /// Used by blocking `sys_connect` so that a failed connection returns
+    /// an error immediately instead of spinning for the full 30-second cap.
+    fn is_fd_connect_done(&self, fd: i32) -> bool {
+        let entry = match self.fd_table.get(&fd) {
+            Some(e) => e,
+            None => return false,
+        };
+        if let FdKind::Socket { socket_id } = &entry.kind {
+            if let Some(state) = self.sockets.get(socket_id) {
+                if let Some(h) = state.tcp_handle {
+                    let tcp_state = self.tcp.tcp_state(h);
+                    return tcp_state == TcpSocketState::Established
+                        || tcp_state == TcpSocketState::CloseWait
+                        || tcp_state == TcpSocketState::Closing
+                        || tcp_state == TcpSocketState::Closed;
+                }
+            }
+        }
+        false
     }
 
     /// Linux sched_getaffinity(2): get CPU affinity mask.
