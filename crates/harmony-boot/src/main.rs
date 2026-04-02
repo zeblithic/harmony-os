@@ -1510,9 +1510,13 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             unsafe { poll_network(); }
 
             // ── Fork child creation ─────────────────────────────────
-            // If fork just created a child, save the parent's page table
-            // entries and signal the trampoline to save the register frame.
-            if is_fork && lx.pending_fork_child().is_some() {
+            // If a fork syscall just created a NEW child at the root level,
+            // save the parent's state. Guard with fork_depth to avoid
+            // re-triggering when a nested fork (from the child) creates a
+            // grandchild — those are handled by the Linuxulator's internal
+            // active_process() routing.
+            if is_fork && retval > 0 && syscall::fork_depth() == 0 && lx.pending_fork_child().is_some()
+            {
                 serial_write_str(b"[FORK] real fork - saving parent context\n");
                 unsafe {
                     FORK_COUNT += 1;
@@ -1561,9 +1565,11 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             }
 
             // ── Fork child exit detection ───────────────────────────
-            // If we're in a fork and the active child just exited,
-            // restore the parent's PTEs and signal the trampoline.
-            if syscall::fork_depth() > 0 && lx.pending_fork_child().is_none() {
+            // Restore when OUR context-switched child (fork_depth == 1) has
+            // exited. pending_fork_child() returns None when the root's last
+            // child has exit_code set. Nested grandchild exits are handled
+            // by the Linuxulator's active_process() → recover_child_state().
+            if syscall::fork_depth() == 1 && lx.pending_fork_child().is_none() {
                 serial_write_str(b"[FORK] child exited - restoring parent context\n");
                 // Call active_process() to trigger recover_child_state().
                 let _ = lx.active_process();
