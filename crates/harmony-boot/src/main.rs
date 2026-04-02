@@ -1327,15 +1327,22 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             ELF_VADDR_MIN = vaddr_min;
             // Include headroom — same range that was mapped above.
             ELF_VADDR_MAX = vaddr_max + ELF_HEADROOM as u64;
-            // Find the writable (rw-) PT_LOAD segment for .data/.bss save/restore.
+            // Compute the merged range of ALL writable (rw-) PT_LOAD segments
+            // for .data/.bss save/restore. Multiple rw- segments are possible
+            // (e.g. separate .data and .bss with different alignments).
+            let mut rw_min: u64 = u64::MAX;
+            let mut rw_max: u64 = 0;
             for seg in &parsed.segments {
                 if seg.flags.write && !seg.flags.execute {
-                    let seg_start = seg.vaddr & !0xFFF; // page-align down
-                    let seg_end = (seg.vaddr + seg.memsz + 0xFFF) & !0xFFF; // page-align up
-                    DATA_SEG_START = seg_start;
-                    DATA_SEG_SIZE = (seg_end - seg_start) as usize;
-                    break; // use the first rw- segment
+                    let seg_start = seg.vaddr & !0xFFF;
+                    let seg_end = (seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
+                    rw_min = rw_min.min(seg_start);
+                    rw_max = rw_max.max(seg_end);
                 }
+            }
+            if rw_min < rw_max {
+                DATA_SEG_START = rw_min;
+                DATA_SEG_SIZE = (rw_max - rw_min) as usize;
             }
         }
 
