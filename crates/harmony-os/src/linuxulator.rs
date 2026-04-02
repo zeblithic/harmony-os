@@ -8364,8 +8364,11 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                             || tcp_state == TcpSocketState::Closing
                             || tcp_state == TcpSocketState::Closed;
                     }
+                    if let Some(h) = state.udp_handle {
+                        return self.tcp.udp_can_recv(h);
+                    }
                 }
-                // Non-TCP sockets (AF_UNIX stubs, socketpair): always ready.
+                // Non-TCP/UDP sockets (AF_UNIX stubs, socketpair): always ready.
                 true
             }
             // Pipe write-end is not readable.
@@ -8394,8 +8397,11 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                             && (tcp_state == TcpSocketState::Established
                                 || tcp_state == TcpSocketState::CloseWait);
                     }
+                    if let Some(h) = state.udp_handle {
+                        return self.tcp.udp_can_send(h);
+                    }
                 }
-                // Non-TCP sockets (AF_UNIX stubs, socketpair): always ready.
+                // Non-TCP/UDP sockets (AF_UNIX stubs, socketpair): always ready.
                 true
             }
             // Everything else: always writable.
@@ -16750,5 +16756,22 @@ mod integration_tests {
         });
         assert!(fd >= 0, "socket(AF_INET, SOCK_DGRAM) should return valid fd, got {fd}");
         assert!(lx.has_fd(fd as i32));
+    }
+
+    #[test]
+    fn test_udp_readiness_stub() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,    // AF_INET
+            sock_type: 2, // SOCK_DGRAM
+            protocol: 0,
+        }) as i32;
+        assert!(fd >= 0);
+
+        // With NoTcp, udp_create fails → no udp_handle → stub path.
+        assert!(lx.is_fd_readable(fd));
+        assert!(lx.is_fd_writable(fd));
     }
 }
