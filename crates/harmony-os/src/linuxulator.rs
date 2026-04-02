@@ -7292,14 +7292,25 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         if buflen > GETRANDOM_MAX {
             return EINVAL;
         }
-        // Generate in page-sized chunks to bound transient allocation
-        // (buflen can be up to ~32 MiB), using the shared fill_random LCG.
+        // Seed once, then maintain a single continuous LCG state across
+        // all chunks (reseeding per chunk would produce correlated output).
+        let counter = self.getrandom_counter;
+        self.getrandom_counter = counter.wrapping_add(1);
+        let mut state = (buf_ptr as u64)
+            .wrapping_add(counter)
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         const CHUNK: usize = 4096;
         let mut written = 0usize;
         while written < buflen {
             let n = CHUNK.min(buflen - written);
             let mut chunk = [0u8; CHUNK];
-            self.fill_random(&mut chunk[..n], buf_ptr as u64);
+            for byte in chunk[..n].iter_mut() {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *byte = (state >> 33) as u8;
+            }
             self.backend
                 .vm_write_bytes(buf_ptr as u64 + written as u64, &chunk[..n]);
             written += n;

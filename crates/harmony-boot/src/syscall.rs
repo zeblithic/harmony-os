@@ -318,19 +318,26 @@ extern "C" fn syscall_entry() {
         "mov [rdi + 112], rcx",
         // Save user stack from user_rsp upward, clamped to stack bounds.
         // user_rsp = rbp + 112. Save min(65536, stack_top - user_rsp) bytes.
-        // 65536 matches FORK_STACK_SAVE_MAX (= user stack size).
+        // stack_top > user_rsp always holds (stack grows down), but we
+        // guard with jbe to avoid reading garbage if invariants break.
         "cld",
         "lea rsi, [rbp + 112]",               // rsi = user_rsp
         "lea rdi, [rip + {user_stack_top}]",
         "mov rdi, [rdi]",                     // rdi = stack_top
-        "sub rdi, rsi",                       // rdi = stack_top - user_rsp
+        "cmp rdi, rsi",
+        "jbe 5f",                             // skip save if stack_top <= user_rsp
+        "sub rdi, rsi",                       // rdi = stack_top - user_rsp (positive)
         "mov rcx, 65536",
         "cmp rdi, rcx",
         "cmovb rcx, rdi",                    // rcx = min(65536, available)
+        "jmp 6f",
+        "5:",
+        "xor ecx, ecx",                      // 0 bytes to save
+        "6:",
         // Store actual size for restore.
         "lea rdi, [rip + {stack_save_actual}]",
         "mov [rdi], rcx",
-        // Do the copy.
+        // Do the copy (rcx may be 0 = no-op).
         "lea rdi, [rip + {saved_stack}]",      // dest: static buffer
         "rep movsb",
         // Save return value (child_pid).
