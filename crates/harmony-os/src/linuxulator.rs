@@ -3874,6 +3874,9 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                         if let Some(h) = state.tcp_handle {
                             let _ = self.tcp.tcp_close(h);
                         }
+                        if let Some(h) = state.udp_handle {
+                            let _ = self.tcp.udp_close(h);
+                        }
                     }
                 }
             }
@@ -4439,7 +4442,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             // Parse port from sockaddr_in (bytes 2-3, big-endian).
             let port_bytes = unsafe { [*(addr as *const u8).add(2), *(addr as *const u8).add(3)] };
             let port = u16::from_be_bytes(port_bytes);
-            match self.tcp.tcp_bind(h, port) {
+            return match self.tcp.tcp_bind(h, port) {
                 Ok(()) => {
                     if let Some(state) = self.sockets.get_mut(&socket_id) {
                         state.bound_port = port;
@@ -4447,10 +4450,27 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     0
                 }
                 Err(e) => net_error_to_errno(e),
-            }
-        } else {
-            0 // stub no-op
+            };
         }
+
+        // UDP path.
+        let udp_handle = self.sockets.get(&socket_id).and_then(|s| s.udp_handle);
+        if let Some(h) = udp_handle {
+            if addr == 0 || addrlen < 4 {
+                return EINVAL;
+            }
+            let ptr = addr as *const u8;
+            let port = u16::from_be_bytes(unsafe { [*ptr.add(2), *ptr.add(3)] });
+            if let Some(state) = self.sockets.get_mut(&socket_id) {
+                state.bound_port = port;
+            }
+            match self.tcp.udp_bind(h, port) {
+                Ok(()) => return 0,
+                Err(e) => return net_error_to_errno(e),
+            }
+        }
+
+        0 // stub no-op
     }
 
     /// Linux listen(2): mark socket as listening.
@@ -4636,6 +4656,23 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 Ok(()) => EINPROGRESS,
                 Err(e) => net_error_to_errno(e),
             }
+        } else if let Some(h) = self.sockets.get(&socket_id).and_then(|s| s.udp_handle) {
+            // UDP connect — stores the remote endpoint, returns immediately.
+            if addr == 0 || addrlen < 8 {
+                return EINVAL;
+            }
+            let ptr = addr as *const u8;
+            let port = u16::from_be_bytes(unsafe { [*ptr.add(2), *ptr.add(3)] });
+            let ip = harmony_netstack::smoltcp::wire::Ipv4Address::new(
+                unsafe { *ptr.add(4) },
+                unsafe { *ptr.add(5) },
+                unsafe { *ptr.add(6) },
+                unsafe { *ptr.add(7) },
+            );
+            match self.tcp.udp_connect(h, ip, port) {
+                Ok(()) => 0,
+                Err(e) => net_error_to_errno(e),
+            }
         } else {
             // AF_UNIX connect: no daemon is running → ECONNREFUSED.
             // This forces musl's nscd client to fall back to file-based lookup.
@@ -4664,8 +4701,8 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         buf: u64,
         len: u64,
         _flags: i32,
-        _addr: u64,
-        _addrlen: u32,
+        dest_addr: u64,
+        addrlen: u32,
     ) -> i64 {
         let socket_id = match self.require_socket(fd) {
             Ok(id) => id,
@@ -4694,6 +4731,46 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 Err(_) => EPIPE,
             }
         } else {
+            // UDP path.
+            if let Some(h) = self.sockets.get(&socket_id).and_then(|s| s.udp_handle) {
+                let count = len as usize;
+                if count == 0 {
+                    return 0;
+                }
+                if buf == 0 {
+                    return EFAULT;
+                }
+                let data = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
+
+                if dest_addr != 0 && addrlen >= 8 {
+                    // Explicit destination — use sendto.
+                    let ptr = dest_addr as *const u8;
+                    let port = u16::from_be_bytes(unsafe { [*ptr.add(2), *ptr.add(3)] });
+                    let ip = harmony_netstack::smoltcp::wire::Ipv4Address::new(
+                        unsafe { *ptr.add(4) },
+                        unsafe { *ptr.add(5) },
+                        unsafe { *ptr.add(6) },
+                        unsafe { *ptr.add(7) },
+                    );
+                    return match self.tcp.udp_sendto(h, data, ip, port) {
+                        Ok(n) => n as i64,
+                        Err(NetError::WouldBlock) => EAGAIN,
+                        Err(e) => net_error_to_errno(e),
+                    };
+                }
+
+                // No destination — must be connected.
+                return match self.tcp.udp_send(h, data) {
+                    Ok(n) => n as i64,
+                    Err(NetError::NotConnected) => {
+                        const EDESTADDRREQ: i64 = -89;
+                        EDESTADDRREQ
+                    }
+                    Err(NetError::WouldBlock) => EAGAIN,
+                    Err(e) => net_error_to_errno(e),
+                };
+            }
+
             // Stub: pretend all bytes sent.
             len.min(i64::MAX as u64) as i64
         }
@@ -4736,6 +4813,61 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 Err(e) => net_error_to_errno(e),
             }
         } else {
+            // UDP path.
+            if let Some(h) = self.sockets.get(&socket_id).and_then(|s| s.udp_handle) {
+                let count = len as usize;
+                if count == 0 {
+                    return 0;
+                }
+                if buf == 0 {
+                    return EFAULT;
+                }
+                let data = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, count) };
+
+                // Try connected recv first; on NotConnected, fall back to recvfrom.
+                let result = match self.tcp.udp_recv(h, data) {
+                    Ok(r) => Ok(r),
+                    Err(NetError::NotConnected) => self.tcp.udp_recvfrom(h, data),
+                    Err(e) => Err(e),
+                };
+
+                return match result {
+                    Ok((n, src_addr, src_port)) => {
+                        // Write source address if caller provided a buffer.
+                        if src != 0 && addrlen != 0 {
+                            let addrlen_bytes = unsafe {
+                                core::slice::from_raw_parts(addrlen as *const u8, 4)
+                            };
+                            let buf_len =
+                                u32::from_ne_bytes(addrlen_bytes.try_into().unwrap()) as usize;
+                            if buf_len >= 8 {
+                                let sa = unsafe {
+                                    core::slice::from_raw_parts_mut(
+                                        src as *mut u8,
+                                        buf_len.min(16),
+                                    )
+                                };
+                                sa[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
+                                sa[2..4].copy_from_slice(&src_port.to_be_bytes());
+                                sa[4..8].copy_from_slice(&src_addr.0);
+                                if buf_len >= 16 {
+                                    sa[8..16].fill(0); // sin_zero
+                                }
+                                // Update addrlen to actual size written.
+                                let actual_len = 16u32.min(buf_len as u32);
+                                let out = unsafe {
+                                    core::slice::from_raw_parts_mut(addrlen as *mut u8, 4)
+                                };
+                                out.copy_from_slice(&actual_len.to_ne_bytes());
+                            }
+                        }
+                        n as i64
+                    }
+                    Err(NetError::WouldBlock) => EAGAIN,
+                    Err(e) => net_error_to_errno(e),
+                };
+            }
+
             // Stub: return EOF.
             self.write_stub_sockaddr(src, addrlen, 2);
             0
