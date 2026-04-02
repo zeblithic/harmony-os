@@ -478,8 +478,10 @@ impl TcpProvider for NetStack {
 
     fn tcp_set_keepalive(&mut self, handle: TcpHandle, interval_ms: Option<u64>) {
         if let Ok(h) = self.resolve_tcp(handle) {
-            let duration = interval_ms.map(|ms| smoltcp::time::Duration::from_millis(ms));
-            self.sockets.get_mut::<tcp::Socket>(h).set_keep_alive(duration);
+            let duration = interval_ms.map(smoltcp::time::Duration::from_millis);
+            self.sockets
+                .get_mut::<tcp::Socket>(h)
+                .set_keep_alive(duration);
         }
     }
 

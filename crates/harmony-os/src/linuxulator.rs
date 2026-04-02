@@ -3259,9 +3259,13 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 self.sys_timerfd_gettime(fd, curr_value)
             }
             LinuxSyscall::Poll { fds, nfds, timeout } => self.sys_poll(fds, nfds, timeout),
-            LinuxSyscall::Ppoll { fds, nfds, tmo_ptr, sigmask, .. } => {
-                self.sys_ppoll(fds, nfds, tmo_ptr, sigmask)
-            }
+            LinuxSyscall::Ppoll {
+                fds,
+                nfds,
+                tmo_ptr,
+                sigmask,
+                ..
+            } => self.sys_ppoll(fds, nfds, tmo_ptr, sigmask),
             LinuxSyscall::Readv { fd, iov, iovcnt } => self.sys_readv(fd, iov as usize, iovcnt),
             LinuxSyscall::Socketpair {
                 domain,
@@ -4676,8 +4680,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         const SO_KEEPALIVE: i32 = 9;
 
         if level == SOL_SOCKET && optname == SO_KEEPALIVE && optlen >= 4 {
-            let val_bytes =
-                unsafe { core::slice::from_raw_parts(optval as usize as *const u8, 4) };
+            let val_bytes = unsafe { core::slice::from_raw_parts(optval as usize as *const u8, 4) };
             let val = i32::from_ne_bytes(val_bytes.try_into().unwrap());
             if let Some(h) = self.sockets.get(&socket_id).and_then(|s| s.tcp_handle) {
                 let interval = if val != 0 { Some(60_000u64) } else { None };
@@ -7923,7 +7926,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             let ts = unsafe { core::slice::from_raw_parts(timeout_ptr as *const u8, 16) };
             let tv_sec = i64::from_ne_bytes(ts[0..8].try_into().unwrap());
             let tv_nsec = i64::from_ne_bytes(ts[8..16].try_into().unwrap());
-            let ms = (tv_sec as i64)
+            let ms = tv_sec
                 .saturating_mul(1000)
                 .saturating_add(tv_nsec / 1_000_000);
             ms.min(i32::MAX as i64) as i32
@@ -7954,7 +7957,8 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             let tv = unsafe { core::slice::from_raw_parts(timeout_ptr as *const u8, 16) };
             let tv_sec = i64::from_ne_bytes(tv[0..8].try_into().unwrap());
             let tv_usec = i64::from_ne_bytes(tv[8..16].try_into().unwrap());
-            let timeout_ms = (tv_sec as u64).saturating_mul(1000)
+            let timeout_ms = (tv_sec as u64)
+                .saturating_mul(1000)
                 .saturating_add((tv_usec as u64) / 1000);
             if timeout_ms == 0 {
                 // {0,0} → non-blocking: check once and return.
@@ -7983,11 +7987,13 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
 
             // Restore input fd_sets (previous iteration may have cleared bits).
             if readfds != 0 && read_bytes > 0 {
-                let dst = unsafe { core::slice::from_raw_parts_mut(readfds as *mut u8, read_bytes) };
+                let dst =
+                    unsafe { core::slice::from_raw_parts_mut(readfds as *mut u8, read_bytes) };
                 dst.copy_from_slice(&saved_readfds[..read_bytes]);
             }
             if writefds != 0 && read_bytes > 0 {
-                let dst = unsafe { core::slice::from_raw_parts_mut(writefds as *mut u8, read_bytes) };
+                let dst =
+                    unsafe { core::slice::from_raw_parts_mut(writefds as *mut u8, read_bytes) };
                 dst.copy_from_slice(&saved_writefds[..read_bytes]);
             }
 
@@ -8000,13 +8006,19 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             if now >= deadline_ms {
                 // Clear all fd_sets on timeout (Linux convention).
                 if readfds != 0 {
-                    unsafe { core::ptr::write_bytes(readfds as *mut u8, 0, read_bytes); }
+                    unsafe {
+                        core::ptr::write_bytes(readfds as *mut u8, 0, read_bytes);
+                    }
                 }
                 if writefds != 0 {
-                    unsafe { core::ptr::write_bytes(writefds as *mut u8, 0, read_bytes); }
+                    unsafe {
+                        core::ptr::write_bytes(writefds as *mut u8, 0, read_bytes);
+                    }
                 }
                 if exceptfds != 0 {
-                    unsafe { core::ptr::write_bytes(exceptfds as *mut u8, 0, read_bytes); }
+                    unsafe {
+                        core::ptr::write_bytes(exceptfds as *mut u8, 0, read_bytes);
+                    }
                 }
                 return 0;
             }
@@ -8017,13 +8029,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
 
     /// Single-pass readiness check for select(). Clears bits for non-ready fds,
     /// returns count of ready fds.
-    fn select_check_once(
-        &self,
-        nfds: i32,
-        readfds: u64,
-        writefds: u64,
-        exceptfds: u64,
-    ) -> i64 {
+    fn select_check_once(&self, nfds: i32, readfds: u64, writefds: u64, exceptfds: u64) -> i64 {
         let mut ready = 0i64;
         let bytes = (nfds as usize).div_ceil(8);
 
@@ -8061,7 +8067,9 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
 
         // Clear exceptfds — we never report exceptional conditions.
         if exceptfds != 0 {
-            unsafe { core::ptr::write_bytes(exceptfds as *mut u8, 0, bytes); }
+            unsafe {
+                core::ptr::write_bytes(exceptfds as *mut u8, 0, bytes);
+            }
         }
 
         ready
@@ -8084,9 +8092,9 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                     return true;
                 }
                 // EOF: write end is closed (no PipeWrite fd references this pipe_id).
-                !self.fd_table.values().any(|e| {
-                    matches!(&e.kind, FdKind::PipeWrite { pipe_id: pid } if *pid == *pipe_id)
-                })
+                !self.fd_table.values().any(
+                    |e| matches!(&e.kind, FdKind::PipeWrite { pipe_id: pid } if *pid == *pipe_id),
+                )
             }
             FdKind::Socket { socket_id } => {
                 if let Some(state) = self.sockets.get(socket_id) {
