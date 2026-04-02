@@ -1395,7 +1395,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             NETSTACK_PTR = &netstack as *const core::cell::RefCell<harmony_netstack::NetStack>
                 as *mut core::cell::RefCell<harmony_netstack::NetStack>;
             VIRTIO_NET_PTR = &mut virtio_net as *mut Option<virtio::net::VirtioNet>;
-            PIT_PTR = &pit as *const pit::PitTimer as *mut pit::PitTimer;
+            PIT_PTR = &mut pit as *mut pit::PitTimer;
         }
 
         // 7. Install dispatch function
@@ -1453,6 +1453,9 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                 _ => false,
             };
 
+            // Poll the network stack on every syscall entry.
+            unsafe { poll_network(); }
+
             // First fork: fake fork (accept loop). Return 0 so the binary
             // takes the child path and handles exactly one connection.
             if is_fork {
@@ -1466,9 +1469,6 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                     };
                 }
             }
-
-            // Poll the network stack on every syscall entry.
-            unsafe { poll_network(); }
 
             let lx = unsafe { LINUXULATOR.as_mut().unwrap() };
 
