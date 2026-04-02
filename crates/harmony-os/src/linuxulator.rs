@@ -7924,7 +7924,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             let ts = unsafe { core::slice::from_raw_parts(timeout_ptr as *const u8, 16) };
             let tv_sec = i64::from_ne_bytes(ts[0..8].try_into().unwrap());
             let tv_nsec = i64::from_ne_bytes(ts[8..16].try_into().unwrap());
-            if tv_sec < 0 || tv_nsec < 0 {
+            if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
                 return EINVAL;
             }
             let ms = tv_sec
@@ -7952,20 +7952,24 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         }
 
         // Parse struct timeval { tv_sec: i64, tv_usec: i64 }.
-        // Check for non-blocking ({0,0}) before requiring poll_fn.
-        if timeout_ptr != 0 {
+        // Parse once, then handle non-blocking / blocking paths.
+        let timeout_ms: u64 = if timeout_ptr == 0 {
+            u64::MAX // NULL → block forever (sentinel)
+        } else {
             let tv = unsafe { core::slice::from_raw_parts(timeout_ptr as *const u8, 16) };
             let tv_sec = i64::from_ne_bytes(tv[0..8].try_into().unwrap());
             let tv_usec = i64::from_ne_bytes(tv[8..16].try_into().unwrap());
             if tv_sec < 0 || tv_usec < 0 {
                 return EINVAL;
             }
-            let timeout_ms = (tv_sec as u64)
+            (tv_sec as u64)
                 .saturating_mul(1000)
-                .saturating_add((tv_usec as u64) / 1000);
-            if timeout_ms == 0 {
-                return self.select_check_once(nfds, readfds, writefds, exceptfds);
-            }
+                .saturating_add((tv_usec as u64) / 1000)
+        };
+
+        // {0,0} → non-blocking: check once and return.
+        if timeout_ms == 0 {
+            return self.select_check_once(nfds, readfds, writefds, exceptfds);
         }
 
         // Blocking requires poll_fn to drive the network stack and read time.
@@ -7974,16 +7978,10 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             None => return self.select_check_once(nfds, readfds, writefds, exceptfds),
         };
 
-        // Compute deadline (re-parse timeout now that we have poll_fn).
-        let deadline_ms: u64 = if timeout_ptr == 0 {
-            u64::MAX // NULL → block forever
+        // Compute deadline from parsed timeout.
+        let deadline_ms: u64 = if timeout_ms == u64::MAX {
+            u64::MAX
         } else {
-            let tv = unsafe { core::slice::from_raw_parts(timeout_ptr as *const u8, 16) };
-            let tv_sec = i64::from_ne_bytes(tv[0..8].try_into().unwrap());
-            let tv_usec = i64::from_ne_bytes(tv[8..16].try_into().unwrap());
-            let timeout_ms = (tv_sec as u64)
-                .saturating_mul(1000)
-                .saturating_add((tv_usec as u64) / 1000);
             let now = poll_fn();
             now.saturating_add(timeout_ms)
         };
@@ -8151,7 +8149,8 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                         let tcp_state = self.tcp.tcp_state(h);
                         return !state.listening
                             && self.tcp.tcp_can_send(h)
-                            && tcp_state == TcpSocketState::Established;
+                            && (tcp_state == TcpSocketState::Established
+                                || tcp_state == TcpSocketState::CloseWait);
                     }
                 }
                 false

@@ -1574,6 +1574,8 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             // Track TCP I/O for watchdog.
             const SYS_READ: u64 = 0;
             const SYS_WRITE: u64 = 1;
+            const SYS_READV: u64 = 19;
+            const SYS_WRITEV: u64 = 20;
             const SYS_ACCEPT: u64 = 43;
             const SYS_ACCEPT4: u64 = 288;
             unsafe {
@@ -1581,7 +1583,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                     SYS_ACCEPT | SYS_ACCEPT4 if retval >= 0 => {
                         LAST_TCP_IO_MS = (*PIT_PTR).now_ms();
                     }
-                    SYS_READ | SYS_WRITE if retval > 0 => {
+                    SYS_READ | SYS_WRITE | SYS_READV | SYS_WRITEV if retval > 0 => {
                         // Only count if the fd is a TCP socket.
                         let fd = args[0] as i32;
                         if lx.active_process().fd_is_tcp_socket(fd) {
