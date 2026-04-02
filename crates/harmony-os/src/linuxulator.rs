@@ -2608,6 +2608,51 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         }
     }
 
+    /// Blocking pipe write retry loop.  Spin-waits until enough buffer
+    /// space is available for the write (respecting POSIX atomic semantics
+    /// for writes <= PIPE_BUF), then performs the write and returns the
+    /// byte count.  Returns EINTR on timeout, EPIPE on broken pipe.
+    fn pipe_write_blocking(
+        &mut self,
+        poll_fn: fn() -> u64,
+        fd: i32,
+        pipe_id: usize,
+        buf_ptr: usize,
+        count: usize,
+    ) -> i64 {
+        const PIPE_BUF_CAP: usize = 65536;
+        const PIPE_BUF: usize = 4096;
+        loop {
+            match self.block_until(poll_fn, Self::is_fd_writable, fd) {
+                BlockResult::Ready => {
+                    let has_reader = self.fd_table.values().any(
+                        |e| matches!(&e.kind, FdKind::PipeRead { pipe_id: id } if *id == pipe_id),
+                    );
+                    if !has_reader {
+                        let is_child = self.parent_pid != 0;
+                        if !is_child || !self.pipes.contains_key(&pipe_id) {
+                            return EPIPE;
+                        }
+                    }
+                    let pipe_buf = match self.pipes.get_mut(&pipe_id) {
+                        Some(b) => b,
+                        None => return EPIPE,
+                    };
+                    let avail = PIPE_BUF_CAP.saturating_sub(pipe_buf.len());
+                    if avail == 0 || (count <= PIPE_BUF && avail < count) {
+                        continue; // Not enough space yet, keep waiting
+                    }
+                    let to_write = count.min(avail);
+                    let data =
+                        unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, to_write) };
+                    pipe_buf.extend_from_slice(data);
+                    return to_write as i64;
+                }
+                BlockResult::Interrupted => return EINTR,
+            }
+        }
+    }
+
     /// Allocate the next fid for a backend call.
     fn alloc_fid(&mut self) -> Fid {
         let fid = self.next_fid;
@@ -3453,97 +3498,16 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     None => return EPIPE, // pipe buffer removed (e.g. after fork recovery)
                 };
                 let avail = PIPE_BUF_CAP.saturating_sub(pipe_buf.len());
-                if avail == 0 {
-                    let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
-                    if !nonblock {
-                        if let Some(pf) = self.poll_fn {
-                            loop {
-                                match self.block_until(pf, Self::is_fd_writable, fd) {
-                                    BlockResult::Ready => {
-                                        // Retry: re-check reader and buffer
-                                        let has_reader = self.fd_table.values().any(
-                                            |e| matches!(&e.kind, FdKind::PipeRead { pipe_id: id } if *id == pipe_id),
-                                        );
-                                        if !has_reader {
-                                            let is_child = self.parent_pid != 0;
-                                            if !is_child || !self.pipes.contains_key(&pipe_id) {
-                                                return EPIPE;
-                                            }
-                                        }
-                                        let pipe_buf = match self.pipes.get_mut(&pipe_id) {
-                                            Some(b) => b,
-                                            None => return EPIPE,
-                                        };
-                                        let avail = PIPE_BUF_CAP.saturating_sub(pipe_buf.len());
-                                        if avail == 0 {
-                                            continue; // Still full, keep waiting
-                                        }
-                                        const PIPE_BUF: usize = 4096;
-                                        if count <= PIPE_BUF && avail < count {
-                                            continue; // Not enough for atomic write, keep waiting
-                                        }
-                                        let to_write = count.min(avail);
-                                        let data = unsafe {
-                                            core::slice::from_raw_parts(
-                                                buf_ptr as *const u8,
-                                                to_write,
-                                            )
-                                        };
-                                        pipe_buf.extend_from_slice(data);
-                                        return to_write as i64;
-                                    }
-                                    BlockResult::Interrupted => return EINTR,
-                                }
-                            }
-                        }
-                    }
-                    return EAGAIN;
-                }
                 // POSIX: writes <= PIPE_BUF bytes must be atomic — either
                 // all bytes fit or return EAGAIN. Only writes > PIPE_BUF
                 // may be partial.
                 const PIPE_BUF: usize = 4096;
-                if count <= PIPE_BUF && avail < count {
+                let needs_block = avail == 0 || (count <= PIPE_BUF && avail < count);
+                if needs_block {
                     let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                     if !nonblock {
                         if let Some(pf) = self.poll_fn {
-                            loop {
-                                match self.block_until(pf, Self::is_fd_writable, fd) {
-                                    BlockResult::Ready => {
-                                        // Retry: re-check reader and buffer
-                                        let has_reader = self.fd_table.values().any(
-                                            |e| matches!(&e.kind, FdKind::PipeRead { pipe_id: id } if *id == pipe_id),
-                                        );
-                                        if !has_reader {
-                                            let is_child = self.parent_pid != 0;
-                                            if !is_child || !self.pipes.contains_key(&pipe_id) {
-                                                return EPIPE;
-                                            }
-                                        }
-                                        let pipe_buf = match self.pipes.get_mut(&pipe_id) {
-                                            Some(b) => b,
-                                            None => return EPIPE,
-                                        };
-                                        let avail = PIPE_BUF_CAP.saturating_sub(pipe_buf.len());
-                                        if avail == 0 {
-                                            continue; // Still full, keep waiting
-                                        }
-                                        if count <= PIPE_BUF && avail < count {
-                                            continue; // Not enough for atomic write, keep waiting
-                                        }
-                                        let to_write = count.min(avail);
-                                        let data = unsafe {
-                                            core::slice::from_raw_parts(
-                                                buf_ptr as *const u8,
-                                                to_write,
-                                            )
-                                        };
-                                        pipe_buf.extend_from_slice(data);
-                                        return to_write as i64;
-                                    }
-                                    BlockResult::Interrupted => return EINTR,
-                                }
-                            }
+                            return self.pipe_write_blocking(pf, fd, pipe_id, buf_ptr, count);
                         }
                     }
                     return EAGAIN;
