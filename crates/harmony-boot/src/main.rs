@@ -1151,12 +1151,14 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                 // entries mapping vaddr → heap frames. The binary's code
                 // uses absolute addresses, so the page table must resolve
                 // them to the heap allocation.
-                const PAGE_SIZE: usize = 0x1000;
-                let aligned_len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-                if aligned_len == 0 {
+                const PAGE_SIZE: u64 = 0x1000;
+                let page_start = vaddr & !(PAGE_SIZE - 1);
+                let page_end = (vaddr + len as u64 + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                let map_len = (page_end - page_start) as usize;
+                if map_len == 0 {
                     return Ok(vaddr);
                 }
-                let layout = core::alloc::Layout::from_size_align(aligned_len, PAGE_SIZE)
+                let layout = core::alloc::Layout::from_size_align(map_len, PAGE_SIZE as usize)
                     .map_err(|_| VmError::OutOfMemory)?;
                 let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
                 if ptr.is_null() {
@@ -1170,8 +1172,6 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                 }
                 // Create page table entries: vaddr → heap physical frames.
                 let phys_offset = unsafe { PHYS_OFFSET };
-                let page_start = vaddr & !(PAGE_SIZE as u64 - 1);
-                let page_end = page_start + aligned_len as u64;
                 unsafe {
                     map_range_to_heap(phys_offset, ptr as usize, page_start, page_end);
                 }
