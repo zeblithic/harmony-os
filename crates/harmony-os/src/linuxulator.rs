@@ -7828,27 +7828,28 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             return EFAULT;
         }
 
-        const POLLIN: i16 = 0x01;
-        const POLLOUT: i16 = 0x04;
-        const POLLHUP: i16 = 0x10;
-        const POLLNVAL: i16 = 0x20;
-
         // Non-blocking: check once.
         if timeout_ms == 0 {
-            return self.poll_check_once(fds_ptr, nfds, POLLIN, POLLOUT, POLLHUP, POLLNVAL);
+            return self.poll_check_once(fds_ptr, nfds);
         }
+
+        // Blocking requires poll_fn to drive the network stack and read time.
+        let poll_fn = match self.poll_fn {
+            Some(f) => f,
+            None => return self.poll_check_once(fds_ptr, nfds),
+        };
 
         let deadline_ms: u64 = if timeout_ms < 0 {
             u64::MAX // negative → block forever
         } else {
-            let now = self.poll_fn.map(|f| f()).unwrap_or(0);
+            let now = poll_fn();
             now.saturating_add(timeout_ms as u64)
         };
 
         loop {
-            let now = self.poll_fn.map(|f| f()).unwrap_or(0);
+            let now = poll_fn();
 
-            let ready = self.poll_check_once(fds_ptr, nfds, POLLIN, POLLOUT, POLLHUP, POLLNVAL);
+            let ready = self.poll_check_once(fds_ptr, nfds);
             if ready > 0 {
                 return ready;
             }
@@ -7862,15 +7863,12 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
     }
 
     /// Single-pass readiness check for poll(). Writes revents and returns ready count.
-    fn poll_check_once(
-        &self,
-        fds_ptr: u64,
-        nfds: u64,
-        pollin: i16,
-        pollout: i16,
-        pollhup: i16,
-        pollnval: i16,
-    ) -> i64 {
+    fn poll_check_once(&self, fds_ptr: u64, nfds: u64) -> i64 {
+        const POLLIN: i16 = 0x01;
+        const POLLOUT: i16 = 0x04;
+        const POLLHUP: i16 = 0x10;
+        const POLLNVAL: i16 = 0x20;
+
         let mut ready_count = 0i64;
         for i in 0..nfds {
             let base = fds_ptr as usize + (i as usize) * 8;
@@ -7882,14 +7880,14 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             let revents = if fd < 0 {
                 0i16
             } else if !self.fd_table.contains_key(&fd) {
-                pollnval
+                POLLNVAL
             } else {
                 let mut r = 0i16;
-                if events & pollin != 0 && self.is_fd_readable(fd) {
-                    r |= pollin;
+                if events & POLLIN != 0 && self.is_fd_readable(fd) {
+                    r |= POLLIN;
                 }
-                if events & pollout != 0 && self.is_fd_writable(fd) {
-                    r |= pollout;
+                if events & POLLOUT != 0 && self.is_fd_writable(fd) {
+                    r |= POLLOUT;
                 }
                 // Check for HUP on sockets (connection closed).
                 if let Some(entry) = self.fd_table.get(&fd) {
@@ -7900,7 +7898,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                                 if tcp_state == TcpSocketState::Closed
                                     || tcp_state == TcpSocketState::Closing
                                 {
-                                    r |= pollhup;
+                                    r |= POLLHUP;
                                 }
                             }
                         }
@@ -7926,6 +7924,9 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             let ts = unsafe { core::slice::from_raw_parts(timeout_ptr as *const u8, 16) };
             let tv_sec = i64::from_ne_bytes(ts[0..8].try_into().unwrap());
             let tv_nsec = i64::from_ne_bytes(ts[8..16].try_into().unwrap());
+            if tv_sec < 0 || tv_nsec < 0 {
+                return EINVAL;
+            }
             let ms = tv_sec
                 .saturating_mul(1000)
                 .saturating_add(tv_nsec / 1_000_000);
@@ -7950,7 +7951,30 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             return EINVAL;
         }
 
-        // Parse struct timeval { tv_sec: i64, tv_usec: i64 } → deadline.
+        // Parse struct timeval { tv_sec: i64, tv_usec: i64 }.
+        // Check for non-blocking ({0,0}) before requiring poll_fn.
+        if timeout_ptr != 0 {
+            let tv = unsafe { core::slice::from_raw_parts(timeout_ptr as *const u8, 16) };
+            let tv_sec = i64::from_ne_bytes(tv[0..8].try_into().unwrap());
+            let tv_usec = i64::from_ne_bytes(tv[8..16].try_into().unwrap());
+            if tv_sec < 0 || tv_usec < 0 {
+                return EINVAL;
+            }
+            let timeout_ms = (tv_sec as u64)
+                .saturating_mul(1000)
+                .saturating_add((tv_usec as u64) / 1000);
+            if timeout_ms == 0 {
+                return self.select_check_once(nfds, readfds, writefds, exceptfds);
+            }
+        }
+
+        // Blocking requires poll_fn to drive the network stack and read time.
+        let poll_fn = match self.poll_fn {
+            Some(f) => f,
+            None => return self.select_check_once(nfds, readfds, writefds, exceptfds),
+        };
+
+        // Compute deadline (re-parse timeout now that we have poll_fn).
         let deadline_ms: u64 = if timeout_ptr == 0 {
             u64::MAX // NULL → block forever
         } else {
@@ -7960,11 +7984,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             let timeout_ms = (tv_sec as u64)
                 .saturating_mul(1000)
                 .saturating_add((tv_usec as u64) / 1000);
-            if timeout_ms == 0 {
-                // {0,0} → non-blocking: check once and return.
-                return self.select_check_once(nfds, readfds, writefds, exceptfds);
-            }
-            let now = self.poll_fn.map(|f| f()).unwrap_or(0);
+            let now = poll_fn();
             now.saturating_add(timeout_ms)
         };
 
@@ -7983,7 +8003,7 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
 
         loop {
             // Drive the network stack and get current time.
-            let now = self.poll_fn.map(|f| f()).unwrap_or(0);
+            let now = poll_fn();
 
             // Restore input fd_sets (previous iteration may have cleared bits).
             if readfds != 0 && read_bytes > 0 {
