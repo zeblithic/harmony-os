@@ -7415,13 +7415,19 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 return 0;
             } else if efs.exists(&resolved) {
                 // Directory entry derived from embedded files.
+                // .ssh directories need mode 0700 (dropbear rejects group/other access).
+                let dir_mode: u32 = if resolved.ends_with("/.ssh") || resolved == ".ssh" {
+                    0o040700
+                } else {
+                    0o040755
+                };
                 let stat = FileStat {
                     qpath: 0,
                     name: alloc::sync::Arc::from(resolved.as_str()),
                     size: 0,
                     file_type: FileType::Directory,
                 };
-                write_linux_stat_with_mode(statbuf_ptr, &stat, Some(0o040755));
+                write_linux_stat_with_mode(statbuf_ptr, &stat, Some(dir_mode));
                 return 0;
             }
         }
