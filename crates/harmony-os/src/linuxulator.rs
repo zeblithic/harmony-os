@@ -7839,11 +7839,20 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             None => return self.poll_check_once(fds_ptr, nfds),
         };
 
-        let deadline_ms: u64 = if timeout_ms < 0 {
-            u64::MAX // negative → block forever
-        } else {
+        // Cap blocking duration so control returns to dispatch() periodically,
+        // allowing the idle watchdog to fire. Without this cap, a NULL-timeout
+        // select/poll would spin forever inside a single dispatch() call,
+        // bypassing the watchdog entirely.
+        const MAX_BLOCK_MS: u64 = 30_000; // 30 seconds
+
+        let deadline_ms: u64 = {
             let now = poll_fn();
-            now.saturating_add(timeout_ms as u64)
+            if timeout_ms < 0 {
+                now.saturating_add(MAX_BLOCK_MS)
+            } else {
+                let requested = now.saturating_add(timeout_ms as u64);
+                requested.min(now.saturating_add(MAX_BLOCK_MS))
+            }
         };
 
         loop {
@@ -7979,12 +7988,18 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
             None => return self.select_check_once(nfds, readfds, writefds, exceptfds),
         };
 
-        // Compute deadline from parsed timeout.
-        let deadline_ms: u64 = if timeout_ms == u64::MAX {
-            u64::MAX
-        } else {
+        // Cap blocking duration so control returns to dispatch() periodically,
+        // allowing the idle watchdog to fire.
+        const MAX_BLOCK_MS: u64 = 30_000; // 30 seconds
+
+        let deadline_ms: u64 = {
             let now = poll_fn();
-            now.saturating_add(timeout_ms)
+            if timeout_ms == u64::MAX {
+                now.saturating_add(MAX_BLOCK_MS)
+            } else {
+                let requested = now.saturating_add(timeout_ms);
+                requested.min(now.saturating_add(MAX_BLOCK_MS))
+            }
         };
 
         // Save copies of the input fd_sets (select overwrites them with results).
