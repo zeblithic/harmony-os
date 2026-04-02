@@ -5070,9 +5070,13 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                 let state = self.tcp.tcp_state(h);
                 let mut ev = 0u32;
 
-                // EPOLLIN: data available, accepted connection ready, or EOF.
+                // EPOLLIN: data available, accepted connection ready, or EOF/shutdown.
                 if mask & EPOLLIN != 0 {
-                    if self.tcp.tcp_can_recv(h) || state == TcpSocketState::CloseWait {
+                    if self.tcp.tcp_can_recv(h)
+                        || state == TcpSocketState::CloseWait
+                        || state == TcpSocketState::Closing
+                        || state == TcpSocketState::Closed
+                    {
                         ev |= EPOLLIN;
                     }
                     // A listening socket that transitioned to Established means
@@ -8147,7 +8151,8 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                             || tcp_state == TcpSocketState::Closed;
                     }
                 }
-                false
+                // Non-TCP sockets (AF_UNIX stubs, socketpair): always ready.
+                true
             }
             // Pipe write-end is not readable.
             FdKind::PipeWrite { .. } => false,
@@ -8176,7 +8181,8 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                                 || tcp_state == TcpSocketState::CloseWait);
                     }
                 }
-                false
+                // Non-TCP sockets (AF_UNIX stubs, socketpair): always ready.
+                true
             }
             // Everything else: always writable.
             _ => true,
