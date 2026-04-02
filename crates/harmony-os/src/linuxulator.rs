@@ -3608,6 +3608,36 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                         |e| matches!(&e.kind, FdKind::PipeWrite { pipe_id: id } if *id == pipe_id),
                     );
                     if has_writer {
+                        // Writer exists but buffer is empty — would block.
+                        let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
+                        if nonblock {
+                            return EAGAIN;
+                        }
+                        if let Some(pf) = self.poll_fn {
+                            match self.block_until(pf, Self::is_fd_readable, fd) {
+                                BlockResult::Ready => {
+                                    // Re-borrow after block_until releases the borrow.
+                                    let buf = match self.pipes.get_mut(&pipe_id) {
+                                        Some(b) => b,
+                                        None => return 0, // EOF
+                                    };
+                                    if buf.is_empty() {
+                                        return 0; // Write end closed during wait (EOF).
+                                    }
+                                    let n = count.min(buf.len());
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(
+                                            buf.as_ptr(),
+                                            buf_ptr as *mut u8,
+                                            n,
+                                        );
+                                    }
+                                    buf.drain(..n);
+                                    return n as i64;
+                                }
+                                BlockResult::Interrupted => return EINTR,
+                            }
+                        }
                         EAGAIN
                     } else {
                         0 // EOF — write end closed
@@ -3699,8 +3729,27 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     match self.tcp.tcp_recv(h, buf) {
                         Ok(n) => n as i64,
                         Err(NetError::WouldBlock) => {
-                            // v1: always return EAGAIN. True blocking requires
-                            // a yield/coroutine mechanism (harmony-os-cqy).
+                            let nonblock =
+                                self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
+                            if !nonblock {
+                                if let Some(pf) = self.poll_fn {
+                                    match self.block_until(pf, Self::is_fd_readable, fd) {
+                                        BlockResult::Ready => {
+                                            let buf = unsafe {
+                                                core::slice::from_raw_parts_mut(
+                                                    buf_ptr as *mut u8,
+                                                    count,
+                                                )
+                                            };
+                                            match self.tcp.tcp_recv(h, buf) {
+                                                Ok(n) => return n as i64,
+                                                Err(e) => return net_error_to_errno(e),
+                                            }
+                                        }
+                                        BlockResult::Interrupted => return EINTR,
+                                    }
+                                }
+                            }
                             EAGAIN
                         }
                         Err(e) => net_error_to_errno(e),
@@ -17014,5 +17063,92 @@ mod integration_tests {
         let lx = Linuxulator::new(mock);
         let sa = [0u8; 4];
         assert!(lx.parse_sockaddr_in(sa.as_ptr() as u64, 4).is_none());
+    }
+
+    // ── Blocking I/O tests ───────────────────────────────────────────────────
+
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// Poll function for blocking I/O tests. Each call advances time by
+    /// 31 seconds, ensuring `block_until` times out on the second call.
+    fn timeout_poll_fn() -> u64 {
+        static TIME: AtomicU64 = AtomicU64::new(0);
+        TIME.fetch_add(31_000, Ordering::Relaxed)
+    }
+
+    #[test]
+    fn blocking_pipe_read_returns_data() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.set_poll_fn(timeout_poll_fn);
+        let (rfd, wfd) = create_pipe(&mut lx);
+
+        let data = b"hello";
+        let w = lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: wfd,
+            buf: data.as_ptr() as u64,
+            count: data.len() as u64,
+        });
+        assert_eq!(w, 5);
+
+        let mut buf = [0u8; 16];
+        let r = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: rfd,
+            buf: buf.as_mut_ptr() as u64,
+            count: buf.len() as u64,
+        });
+        assert_eq!(r, 5);
+        assert_eq!(&buf[..5], b"hello");
+    }
+
+    #[test]
+    fn blocking_pipe_read_empty_returns_eintr() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.set_poll_fn(timeout_poll_fn);
+        let (rfd, _wfd) = create_pipe(&mut lx);
+
+        let mut buf = [0u8; 16];
+        let r = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: rfd,
+            buf: buf.as_mut_ptr() as u64,
+            count: buf.len() as u64,
+        });
+        assert_eq!(r, EINTR);
+    }
+
+    #[test]
+    fn blocking_pipe_read_eof_returns_zero() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.set_poll_fn(timeout_poll_fn);
+        let (rfd, wfd) = create_pipe(&mut lx);
+
+        lx.dispatch_syscall(LinuxSyscall::Close { fd: wfd });
+
+        let mut buf = [0u8; 16];
+        let r = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: rfd,
+            buf: buf.as_mut_ptr() as u64,
+            count: buf.len() as u64,
+        });
+        assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn nonblocking_pipe_read_empty_returns_eagain() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.set_poll_fn(timeout_poll_fn);
+        let mut fds = [0i32; 2];
+        let result = lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: fds.as_mut_ptr() as u64,
+            flags: 0o4000, // O_NONBLOCK
+        });
+        assert_eq!(result, 0);
+
+        let mut buf = [0u8; 16];
+        let r = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: fds[0],
+            buf: buf.as_mut_ptr() as u64,
+            count: buf.len() as u64,
+        });
+        assert_eq!(r, EAGAIN);
     }
 }
