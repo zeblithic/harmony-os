@@ -108,7 +108,9 @@ static mut FORK_SAVED_FRAME: [u64; 15] = [0; 15];
 /// Saved user stack content. The child reuses the parent's stack before
 /// exec and corrupts local variables. We save from user_rsp upward,
 /// clamped to the actual stack bounds to avoid reading past the allocation.
-const FORK_STACK_SAVE_MAX: usize = 16 * 1024;
+/// Sized to match the full 64 KiB user stack so even deep call chains
+/// (dropbear accept → session → fork) are fully covered.
+const FORK_STACK_SAVE_MAX: usize = 64 * 1024;
 #[no_mangle]
 static mut FORK_SAVED_STACK: [u8; FORK_STACK_SAVE_MAX] = [0; FORK_STACK_SAVE_MAX];
 
@@ -315,15 +317,16 @@ extern "C" fn syscall_entry() {
         "lea rdi, [rip + {saved_frame}]",
         "mov [rdi + 112], rcx",
         // Save user stack from user_rsp upward, clamped to stack bounds.
-        // user_rsp = rbp + 112. Save min(16384, stack_top - user_rsp) bytes.
+        // user_rsp = rbp + 112. Save min(65536, stack_top - user_rsp) bytes.
+        // 65536 matches FORK_STACK_SAVE_MAX (= user stack size).
         "cld",
         "lea rsi, [rbp + 112]",               // rsi = user_rsp
         "lea rdi, [rip + {user_stack_top}]",
         "mov rdi, [rdi]",                     // rdi = stack_top
         "sub rdi, rsi",                       // rdi = stack_top - user_rsp
-        "mov rcx, 16384",
+        "mov rcx, 65536",
         "cmp rdi, rcx",
-        "cmovb rcx, rdi",                    // rcx = min(16384, available)
+        "cmovb rcx, rdi",                    // rcx = min(65536, available)
         // Store actual size for restore.
         "lea rdi, [rip + {stack_save_actual}]",
         "mov [rdi], rcx",

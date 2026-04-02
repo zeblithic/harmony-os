@@ -1239,6 +1239,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         // static TLS struct (struct pthread, ~1-2 KiB) lives at the tail
         // of .bss and may extend beyond the last segment's vaddr+memsz.
         const ELF_HEADROOM: usize = 16 * 1024;
+        const _: () = assert!(ELF_HEADROOM % 0x1000 == 0, "ELF_HEADROOM must be page-aligned");
         let total_size = match vaddr_max.checked_sub(vaddr_min) {
             Some(sz) => sz as usize + ELF_HEADROOM,
             None => {
