@@ -4977,8 +4977,24 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             match self.tcp.tcp_send(h, data) {
                 Ok(n) => n as i64,
                 Err(NetError::WouldBlock) => {
-                    // v1: always return EAGAIN. True blocking requires
-                    // a yield/coroutine mechanism (harmony-os-cqy).
+                    let nonblock =
+                        self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
+                    if !nonblock {
+                        if let Some(pf) = self.poll_fn {
+                            match self.block_until(pf, Self::is_fd_writable, fd) {
+                                BlockResult::Ready => {
+                                    let data = unsafe {
+                                        core::slice::from_raw_parts(buf as *const u8, count)
+                                    };
+                                    match self.tcp.tcp_send(h, data) {
+                                        Ok(n) => return n as i64,
+                                        Err(e) => return net_error_to_errno(e),
+                                    }
+                                }
+                                BlockResult::Interrupted => return EINTR,
+                            }
+                        }
+                    }
                     EAGAIN
                 }
                 Err(_) => EPIPE,
@@ -5003,7 +5019,30 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     };
                     return match self.tcp.udp_sendto(h, data, ip, port) {
                         Ok(n) => n as i64,
-                        Err(NetError::WouldBlock) => EAGAIN,
+                        Err(NetError::WouldBlock) => {
+                            let nonblock =
+                                self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
+                            if !nonblock {
+                                if let Some(pf) = self.poll_fn {
+                                    match self.block_until(pf, Self::is_fd_writable, fd) {
+                                        BlockResult::Ready => {
+                                            let data = unsafe {
+                                                core::slice::from_raw_parts(
+                                                    buf as *const u8,
+                                                    count,
+                                                )
+                                            };
+                                            match self.tcp.udp_sendto(h, data, ip, port) {
+                                                Ok(n) => return n as i64,
+                                                Err(e) => return net_error_to_errno(e),
+                                            }
+                                        }
+                                        BlockResult::Interrupted => return EINTR,
+                                    }
+                                }
+                            }
+                            EAGAIN
+                        }
                         Err(e) => net_error_to_errno(e),
                     };
                 }
@@ -5015,7 +5054,27 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                         const EDESTADDRREQ: i64 = -89;
                         EDESTADDRREQ
                     }
-                    Err(NetError::WouldBlock) => EAGAIN,
+                    Err(NetError::WouldBlock) => {
+                        let nonblock =
+                            self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
+                        if !nonblock {
+                            if let Some(pf) = self.poll_fn {
+                                match self.block_until(pf, Self::is_fd_writable, fd) {
+                                    BlockResult::Ready => {
+                                        let data = unsafe {
+                                            core::slice::from_raw_parts(buf as *const u8, count)
+                                        };
+                                        match self.tcp.udp_send(h, data) {
+                                            Ok(n) => return n as i64,
+                                            Err(e) => return net_error_to_errno(e),
+                                        }
+                                    }
+                                    BlockResult::Interrupted => return EINTR,
+                                }
+                            }
+                        }
+                        EAGAIN
+                    }
                     Err(e) => net_error_to_errno(e),
                 };
             }
@@ -5055,8 +5114,24 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             match self.tcp.tcp_recv(h, data) {
                 Ok(n) => n as i64,
                 Err(NetError::WouldBlock) => {
-                    // v1: always return EAGAIN. True blocking requires
-                    // a yield/coroutine mechanism (harmony-os-cqy).
+                    let nonblock =
+                        self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
+                    if !nonblock {
+                        if let Some(pf) = self.poll_fn {
+                            match self.block_until(pf, Self::is_fd_readable, fd) {
+                                BlockResult::Ready => {
+                                    let data = unsafe {
+                                        core::slice::from_raw_parts_mut(buf as *mut u8, count)
+                                    };
+                                    match self.tcp.tcp_recv(h, data) {
+                                        Ok(n) => return n as i64,
+                                        Err(e) => return net_error_to_errno(e),
+                                    }
+                                }
+                                BlockResult::Interrupted => return EINTR,
+                            }
+                        }
+                    }
                     EAGAIN
                 }
                 Err(e) => net_error_to_errno(e),
@@ -5085,7 +5160,49 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                         self.write_sockaddr_in(src, addrlen, src_addr, src_port);
                         n as i64
                     }
-                    Err(NetError::WouldBlock) => EAGAIN,
+                    Err(NetError::WouldBlock) => {
+                        let nonblock =
+                            self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
+                        if !nonblock {
+                            if let Some(pf) = self.poll_fn {
+                                match self.block_until(pf, Self::is_fd_readable, fd) {
+                                    BlockResult::Ready => {
+                                        // Retry the full UDP recv logic.
+                                        let data = unsafe {
+                                            core::slice::from_raw_parts_mut(
+                                                buf as *mut u8,
+                                                count,
+                                            )
+                                        };
+                                        let retry = match self.tcp.udp_recv(h, data) {
+                                            Ok(r) => Ok(r),
+                                            Err(NetError::NotConnected) => {
+                                                let data = unsafe {
+                                                    core::slice::from_raw_parts_mut(
+                                                        buf as *mut u8,
+                                                        count,
+                                                    )
+                                                };
+                                                self.tcp.udp_recvfrom(h, data)
+                                            }
+                                            Err(e) => Err(e),
+                                        };
+                                        return match retry {
+                                            Ok((n, src_addr, src_port)) => {
+                                                self.write_sockaddr_in(
+                                                    src, addrlen, src_addr, src_port,
+                                                );
+                                                n as i64
+                                            }
+                                            Err(e) => net_error_to_errno(e),
+                                        };
+                                    }
+                                    BlockResult::Interrupted => return EINTR,
+                                }
+                            }
+                        }
+                        EAGAIN
+                    }
                     Err(e) => net_error_to_errno(e),
                 };
             }
@@ -17458,5 +17575,31 @@ mod integration_tests {
             count: data.len() as u64,
         });
         assert_eq!(r, EAGAIN);
+    }
+
+    #[test]
+    fn blocking_udp_stub_recvfrom_returns_eof() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.set_poll_fn(timeout_poll_fn);
+
+        // Create blocking UDP socket (NoTcp → udp_handle is None).
+        let fd = lx.dispatch_syscall(LinuxSyscall::Socket {
+            domain: 2,    // AF_INET
+            sock_type: 2, // SOCK_DGRAM (blocking)
+            protocol: 0,
+        });
+        assert!(fd >= 0);
+
+        // With NoTcp, recvfrom returns 0 (stub EOF).
+        let mut buf = [0u8; 16];
+        let r = lx.dispatch_syscall(LinuxSyscall::Recvfrom {
+            fd: fd as i32,
+            buf: buf.as_mut_ptr() as u64,
+            len: buf.len() as u64,
+            flags: 0,
+            src_addr: 0,
+            addrlen: 0,
+        });
+        assert_eq!(r, 0);
     }
 }
