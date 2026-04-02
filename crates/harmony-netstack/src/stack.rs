@@ -470,6 +470,13 @@ impl TcpProvider for NetStack {
             .unwrap_or(false)
     }
 
+    fn tcp_set_keepalive(&mut self, handle: TcpHandle, interval_ms: Option<u64>) {
+        if let Ok(h) = self.resolve_tcp(handle) {
+            let duration = interval_ms.map(|ms| smoltcp::time::Duration::from_millis(ms));
+            self.sockets.get_mut::<tcp::Socket>(h).set_keep_alive(duration);
+        }
+    }
+
     fn tcp_poll(&mut self, now_ms: i64) {
         self.poll(Instant::from_millis(now_ms));
     }

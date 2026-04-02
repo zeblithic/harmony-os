@@ -170,6 +170,7 @@ impl TcpProvider for NoTcp {
     fn tcp_can_send(&self, _: TcpHandle) -> bool {
         false
     }
+    fn tcp_set_keepalive(&mut self, _: TcpHandle, _: Option<u64>) {}
     fn tcp_poll(&mut self, _: i64) {}
     fn tcp_fork(&self) -> Option<NoTcp> {
         Some(NoTcp)

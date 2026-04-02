@@ -660,6 +660,9 @@ impl harmony_netstack::TcpProvider for RawPtrTcpProvider {
     fn tcp_can_send(&self, h: harmony_netstack::TcpHandle) -> bool {
         unsafe { (*self.0).tcp_can_send(h) }
     }
+    fn tcp_set_keepalive(&mut self, h: harmony_netstack::TcpHandle, interval_ms: Option<u64>) {
+        unsafe { (*self.0).tcp_set_keepalive(h, interval_ms) }
+    }
     fn tcp_poll(&mut self, now_ms: i64) {
         unsafe { (*self.0).tcp_poll(now_ms) }
     }
