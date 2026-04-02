@@ -1411,6 +1411,18 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             // Home directory marker for root user (dropbear chdir's here)
             efs.add_file("/root/.keep", b"", false);
 
+            // SSH public key authentication — QEMU dev only.
+            // Dropbear reads authorized_keys from ~root/.ssh/.
+            // The .ssh directory needs mode 0700 (enforced in sys_newfstatat).
+            // Production builds should provision keys at runtime or build-time,
+            // not embed a personal developer key.
+            #[cfg(feature = "qemu-dev")]
+            efs.add_file(
+                "/root/.ssh/authorized_keys",
+                b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC9fSUat8x5KnIbuqbThWn7fqm3ork11fsvaqxAY/b5F zeblith@gmail.com\n",
+                false,
+            );
+
             // Register with the Linuxulator
             unsafe {
                 if let Some(ref mut lx) = LINUXULATOR {
