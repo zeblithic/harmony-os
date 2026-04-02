@@ -2927,6 +2927,23 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
         self.arena_size
     }
 
+    /// Check if an fd is a TCP socket (for watchdog tracking).
+    pub fn fd_is_tcp_socket(&self, fd: i32) -> bool {
+        self.fd_table
+            .get(&fd)
+            .map(|e| {
+                if let FdKind::Socket { socket_id } = &e.kind {
+                    self.sockets
+                        .get(socket_id)
+                        .map(|s| s.tcp_handle.is_some())
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false)
+    }
+
     /// Return the set of pipe_ids that exist in the pipes map.
     pub fn pipe_ids(&self) -> alloc::vec::Vec<usize> {
         self.pipes.keys().copied().collect()

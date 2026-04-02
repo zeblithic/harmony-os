@@ -1472,6 +1472,11 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         /// subsequent forks use real Linuxulator fork + context switching.
         static mut FORK_COUNT: u32 = 0;
 
+        /// Last time a TCP read/write returned real data (ms). 0 = no session yet.
+        static mut LAST_TCP_IO_MS: u64 = 0;
+        /// Idle kill threshold: 5 minutes with no TCP I/O → force exit.
+        const IDLE_KILL_THRESHOLD_MS: u64 = 300_000;
+
         /// Saved page-table entries for the ELF address range. Saved before
         /// the child's execve overwrites them, restored when the child exits.
         static mut SAVED_PTES: Option<alloc::vec::Vec<(u64, u64)>> = None;
@@ -1521,6 +1526,24 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             // Poll the network stack on every syscall entry.
             unsafe { poll_network(); }
 
+            // ── Idle watchdog ──────────────────────────────────────────
+            // If no TCP I/O has occurred for IDLE_KILL_THRESHOLD_MS,
+            // force-terminate the session. Prevents bricked unikernel
+            // when SSH clients hang.
+            unsafe {
+                if LAST_TCP_IO_MS != 0 {
+                    let now = (*PIT_PTR).now_ms();
+                    if now.saturating_sub(LAST_TCP_IO_MS) > IDLE_KILL_THRESHOLD_MS {
+                        serial_write_str(b"[WATCHDOG] idle timeout - killing session\n");
+                        return syscall::SyscallResult {
+                            retval: -1,
+                            exited: true,
+                            exit_code: 62,
+                        };
+                    }
+                }
+            }
+
             // First fork: fake fork (accept loop). Return 0 so the binary
             // takes the child path and handles exactly one connection.
             if is_fork {
@@ -1547,6 +1570,27 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             //     serial_write_hex(nr);
             //     serial_write_str(b"\n");
             // }
+
+            // Track TCP I/O for watchdog.
+            const SYS_READ: u64 = 0;
+            const SYS_WRITE: u64 = 1;
+            const SYS_ACCEPT: u64 = 43;
+            const SYS_ACCEPT4: u64 = 288;
+            unsafe {
+                match nr {
+                    SYS_ACCEPT | SYS_ACCEPT4 if retval >= 0 => {
+                        LAST_TCP_IO_MS = (*PIT_PTR).now_ms();
+                    }
+                    SYS_READ | SYS_WRITE if retval > 0 => {
+                        // Only count if the fd is a TCP socket.
+                        let fd = args[0] as i32;
+                        if lx.active_process().fd_is_tcp_socket(fd) {
+                            LAST_TCP_IO_MS = (*PIT_PTR).now_ms();
+                        }
+                    }
+                    _ => {}
+                }
+            }
 
             // Poll again after the syscall.
             unsafe { poll_network(); }
