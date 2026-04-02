@@ -47,8 +47,9 @@ static BUSYBOX_BIN: &[u8] = include_bytes!("../../../deploy/busybox-x86_64");
 // dropbear refuses to start. Production key provisioning: harmony-os-g7v.
 
 /// QEMU-only /etc/shadow entry for local development SSH testing.
-/// NOT for production use. Production auth is tracked in harmony-os-g7v.
-#[cfg(feature = "ring3")]
+/// NOT for production use. Gated behind the `qemu-dev` feature flag
+/// (which ring3 enables by default). Production auth: harmony-os-g7v.
+#[cfg(feature = "qemu-dev")]
 static QEMU_DEV_SHADOW: &[u8] = b"root:$6$3dBTlFcq3TUeP.1b$MMabSOewt9dUQg.duy11rBOtOcIgjMwLWGTcuxkdIeeXaYTzQbn2R2HKwQs4p.GXuQr/RHx7FAxwzR6FpJT2y1:19814:0:99999:7:::\n";
 
 use virtio::net::ETH_HEADER_LEN;
@@ -1395,9 +1396,10 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
 
             // Config files
             efs.add_file("/etc/passwd", b"root:x:0:0:root:/root:/bin/sh\n", false);
-            // SAFETY: This is a QEMU-only development image. The password
-            // hash is for local testing and must NOT be used in production.
-            // Production key provisioning is tracked in harmony-os-g7v.
+            // QEMU dev credentials — gated by the `qemu-dev` feature flag.
+            // Production builds without this feature get no /etc/shadow
+            // (password auth disabled; only pubkey auth via harmony-os-g7v).
+            #[cfg(feature = "qemu-dev")]
             efs.add_file("/etc/shadow", QEMU_DEV_SHADOW, false);
             efs.add_file("/etc/shells", b"/bin/sh\n", false);
             // No host key registered — dropbear -R generates one at startup.

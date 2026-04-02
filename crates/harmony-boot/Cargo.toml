@@ -42,4 +42,8 @@ qemu-test = []
 # Ring 2 microkernel IPC demo on boot.
 ring2 = ["dep:harmony-microkernel"]
 # Ring 3 Linuxulator — run Linux binaries via syscall translation.
-ring3 = ["ring2", "dep:harmony-os"]
+ring3 = ["ring2", "dep:harmony-os", "qemu-dev"]
+# Include QEMU-only dev credentials (known SSH password hash).
+# Automatically enabled by ring3 for local development. Production
+# builds should use ring3 without this: ring3 = ["ring2", "dep:harmony-os"]
+qemu-dev = []
