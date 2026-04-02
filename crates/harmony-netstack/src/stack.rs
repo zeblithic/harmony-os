@@ -14,7 +14,7 @@ use crate::device::FrameBuffer;
 use crate::dhcp::DhcpClient;
 use crate::peers::PeerTable;
 use crate::tcp::{NetError, TcpHandle, TcpProvider, TcpSocketState};
-use crate::udp::UdpHandle;
+use crate::udp::{UdpHandle, UdpProvider};
 
 /// Configuration for DHCP-based address acquisition with a static fallback.
 pub struct DhcpConfig {
@@ -217,6 +217,14 @@ impl NetStack {
         self.tcp_bound_ports.remove(&handle);
         self.tcp_user_closed.remove(&handle);
         Ok(())
+    }
+
+    /// Resolve a `UdpHandle` to the underlying smoltcp `SocketHandle`.
+    fn resolve_udp(&self, handle: UdpHandle) -> Result<SocketHandle, NetError> {
+        self.udp_handles
+            .get(handle.0 as usize)
+            .and_then(|h| *h)
+            .ok_or(NetError::InvalidHandle)
     }
 }
 
@@ -501,6 +509,166 @@ impl TcpProvider for NetStack {
 
     fn tcp_poll(&mut self, now_ms: i64) {
         self.poll(Instant::from_millis(now_ms));
+    }
+}
+
+impl UdpProvider for NetStack {
+    fn udp_create(&mut self) -> Result<UdpHandle, NetError> {
+        let slot = self
+            .udp_handles
+            .iter()
+            .position(|h| h.is_none())
+            .ok_or(NetError::SocketLimit)?;
+
+        let rx_buf = udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; 8],
+            vec![0; 4096],
+        );
+        let tx_buf = udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; 8],
+            vec![0; 4096],
+        );
+        let socket = udp::Socket::new(rx_buf, tx_buf);
+        let smoltcp_handle = self.sockets.add(socket);
+        self.udp_handles[slot] = Some(smoltcp_handle);
+        Ok(UdpHandle(slot as u32))
+    }
+
+    fn udp_bind(&mut self, handle: UdpHandle, port: u16) -> Result<(), NetError> {
+        let smoltcp_handle = self.resolve_udp(handle)?;
+        if self.udp_bound_ports.values().any(|&p| p == port) {
+            return Err(NetError::AddrInUse);
+        }
+        self.sockets
+            .get_mut::<udp::Socket>(smoltcp_handle)
+            .bind(port)
+            .map_err(|_| NetError::AddrInUse)?;
+        self.udp_bound_ports.insert(handle, port);
+        Ok(())
+    }
+
+    fn udp_close(&mut self, handle: UdpHandle) -> Result<(), NetError> {
+        let smoltcp_handle = self.resolve_udp(handle)?;
+        self.sockets.get_mut::<udp::Socket>(smoltcp_handle).close();
+        self.sockets.remove(smoltcp_handle);
+        self.udp_handles[handle.0 as usize] = None;
+        self.udp_bound_ports.remove(&handle);
+        self.udp_connected.remove(&handle);
+        Ok(())
+    }
+
+    fn udp_can_recv(&self, handle: UdpHandle) -> bool {
+        self.resolve_udp(handle)
+            .ok()
+            .map(|h| self.sockets.get::<udp::Socket>(h).can_recv())
+            .unwrap_or(false)
+    }
+
+    fn udp_can_send(&self, handle: UdpHandle) -> bool {
+        self.resolve_udp(handle)
+            .ok()
+            .map(|h| self.sockets.get::<udp::Socket>(h).can_send())
+            .unwrap_or(false)
+    }
+
+    fn udp_sendto(
+        &mut self,
+        handle: UdpHandle,
+        data: &[u8],
+        addr: Ipv4Address,
+        port: u16,
+    ) -> Result<usize, NetError> {
+        // Auto-bind to ephemeral port if not yet bound.
+        if !self.udp_bound_ports.contains_key(&handle) {
+            let ep_port = self.udp_next_ephemeral;
+            self.udp_next_ephemeral = if ep_port == 65535 { 49152 } else { ep_port + 1 };
+            self.udp_bind(handle, ep_port)?;
+        }
+        let smoltcp_handle = self.resolve_udp(handle)?;
+        let dest = (IpAddress::Ipv4(addr), port);
+        let socket = self.sockets.get_mut::<udp::Socket>(smoltcp_handle);
+        if !socket.can_send() {
+            return Err(NetError::WouldBlock);
+        }
+        socket
+            .send_slice(data, dest)
+            .map_err(|_| NetError::WouldBlock)?;
+        Ok(data.len())
+    }
+
+    fn udp_recvfrom(
+        &mut self,
+        handle: UdpHandle,
+        buf: &mut [u8],
+    ) -> Result<(usize, Ipv4Address, u16), NetError> {
+        let smoltcp_handle = self.resolve_udp(handle)?;
+        let socket = self.sockets.get_mut::<udp::Socket>(smoltcp_handle);
+        if !socket.can_recv() {
+            return Err(NetError::WouldBlock);
+        }
+        match socket.recv_slice(buf) {
+            Ok((len, endpoint)) => {
+                let src_addr = match endpoint.endpoint.addr {
+                    IpAddress::Ipv4(a) => a,
+                    #[allow(unreachable_patterns)]
+                    _ => Ipv4Address::UNSPECIFIED,
+                };
+                Ok((len, src_addr, endpoint.endpoint.port))
+            }
+            Err(_) => Err(NetError::WouldBlock),
+        }
+    }
+
+    fn udp_connect(
+        &mut self,
+        handle: UdpHandle,
+        addr: Ipv4Address,
+        port: u16,
+    ) -> Result<(), NetError> {
+        let _ = self.resolve_udp(handle)?;
+        // Auto-bind to ephemeral port if not yet bound.
+        if !self.udp_bound_ports.contains_key(&handle) {
+            let ep_port = self.udp_next_ephemeral;
+            self.udp_next_ephemeral = if ep_port == 65535 { 49152 } else { ep_port + 1 };
+            self.udp_bind(handle, ep_port)?;
+        }
+        self.udp_connected.insert(handle, (addr, port));
+        Ok(())
+    }
+
+    fn udp_send(&mut self, handle: UdpHandle, data: &[u8]) -> Result<usize, NetError> {
+        let (addr, port) = self
+            .udp_connected
+            .get(&handle)
+            .copied()
+            .ok_or(NetError::NotConnected)?;
+        self.udp_sendto(handle, data, addr, port)
+    }
+
+    fn udp_recv(
+        &mut self,
+        handle: UdpHandle,
+        buf: &mut [u8],
+    ) -> Result<(usize, Ipv4Address, u16), NetError> {
+        let (peer_addr, peer_port) = self
+            .udp_connected
+            .get(&handle)
+            .copied()
+            .ok_or(NetError::NotConnected)?;
+        // Loop, dropping packets from non-connected sources.
+        loop {
+            let (len, src_addr, src_port) = self.udp_recvfrom(handle, buf)?;
+            if src_addr == peer_addr && src_port == peer_port {
+                return Ok((len, src_addr, src_port));
+            }
+            // Non-matching packet — drop and try again.
+            // udp_recvfrom returns WouldBlock when buffer is empty, breaking the loop.
+        }
+    }
+
+    fn udp_poll(&mut self, now_ms: i64) {
+        // No-op: the shared iface.poll() in poll_network() drives all sockets.
+        let _ = now_ms;
     }
 }
 
@@ -822,5 +990,113 @@ mod tcp_tests {
             .static_ip(Ipv4Cidr::new(Ipv4Address::new(10, 0, 0, 1), 24))
             .build(Instant::from_millis(0));
         assert_eq!(s.name(), "udp0");
+    }
+}
+
+#[cfg(test)]
+mod udp_tests {
+    use super::*;
+    use crate::builder::NetStackBuilder;
+    use crate::udp::UdpProvider;
+    use smoltcp::time::Instant;
+    use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
+
+    fn build_udp_stack() -> NetStack {
+        NetStackBuilder::new()
+            .static_ip(Ipv4Cidr::new(Ipv4Address::new(10, 0, 0, 1), 24))
+            .udp_max_sockets(4)
+            .build(Instant::from_millis(0))
+    }
+
+    #[test]
+    fn udp_create_returns_unique_handles() {
+        let mut s = build_udp_stack();
+        let h1 = s.udp_create().unwrap();
+        let h2 = s.udp_create().unwrap();
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn udp_create_beyond_limit() {
+        let mut s = build_udp_stack();
+        for _ in 0..4 {
+            s.udp_create().unwrap();
+        }
+        assert!(matches!(s.udp_create(), Err(NetError::SocketLimit)));
+    }
+
+    #[test]
+    fn udp_close_frees_slot() {
+        let mut s = build_udp_stack();
+        let h = s.udp_create().unwrap();
+        s.udp_close(h).unwrap();
+        let h2 = s.udp_create().unwrap();
+        assert_eq!(h, h2);
+    }
+
+    #[test]
+    fn udp_bind_and_port_conflict() {
+        let mut s = build_udp_stack();
+        let h1 = s.udp_create().unwrap();
+        let h2 = s.udp_create().unwrap();
+        s.udp_bind(h1, 5353).unwrap();
+        assert!(matches!(s.udp_bind(h2, 5353), Err(NetError::AddrInUse)));
+    }
+
+    #[test]
+    fn udp_can_send_after_bind() {
+        let mut s = build_udp_stack();
+        let h = s.udp_create().unwrap();
+        s.udp_bind(h, 5353).unwrap();
+        assert!(s.udp_can_send(h));
+    }
+
+    #[test]
+    fn udp_recvfrom_empty_returns_wouldblock() {
+        let mut s = build_udp_stack();
+        let h = s.udp_create().unwrap();
+        s.udp_bind(h, 5353).unwrap();
+        let mut buf = [0u8; 512];
+        assert!(matches!(s.udp_recvfrom(h, &mut buf), Err(NetError::WouldBlock)));
+    }
+
+    #[test]
+    fn udp_send_without_connect_returns_not_connected() {
+        let mut s = build_udp_stack();
+        let h = s.udp_create().unwrap();
+        s.udp_bind(h, 5353).unwrap();
+        assert!(matches!(
+            s.udp_send(h, b"hello"),
+            Err(NetError::NotConnected)
+        ));
+    }
+
+    #[test]
+    fn udp_recv_without_connect_returns_not_connected() {
+        let mut s = build_udp_stack();
+        let h = s.udp_create().unwrap();
+        s.udp_bind(h, 5353).unwrap();
+        let mut buf = [0u8; 512];
+        assert!(matches!(
+            s.udp_recv(h, &mut buf),
+            Err(NetError::NotConnected)
+        ));
+    }
+
+    #[test]
+    fn udp_connect_stores_peer() {
+        let mut s = build_udp_stack();
+        let h = s.udp_create().unwrap();
+        s.udp_connect(h, Ipv4Address::new(8, 8, 8, 8), 53).unwrap();
+        let result = s.udp_send(h, b"hello");
+        assert!(!matches!(result, Err(NetError::NotConnected)));
+    }
+
+    #[test]
+    fn udp_sendto_auto_binds() {
+        let mut s = build_udp_stack();
+        let h = s.udp_create().unwrap();
+        let result = s.udp_sendto(h, b"hello", Ipv4Address::new(10, 0, 0, 2), 5353);
+        assert!(!matches!(result, Err(NetError::InvalidHandle)));
     }
 }
