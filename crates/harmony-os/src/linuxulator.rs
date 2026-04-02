@@ -5082,11 +5082,12 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                     }
                 }
 
-                // EPOLLOUT: writable when established (not listening) and send buffer available.
+                // EPOLLOUT: writable when connected (not listening) and send buffer available.
+                // CloseWait: remote sent FIN but local send path is still open.
                 if mask & EPOLLOUT != 0
                     && !is_listener
                     && self.tcp.tcp_can_send(h)
-                    && state == TcpSocketState::Established
+                    && (state == TcpSocketState::Established || state == TcpSocketState::CloseWait)
                 {
                     ev |= EPOLLOUT;
                 }
@@ -8138,9 +8139,11 @@ impl<B: SyscallBackend, T: TcpProvider> Linuxulator<B, T> {
                         if state.listening {
                             return tcp_state == TcpSocketState::Established;
                         }
-                        // Data socket: readable if recv buffer has data or EOF.
+                        // Data socket: readable if recv buffer has data or
+                        // connection is shutting down (CloseWait/Closing/Closed).
                         return self.tcp.tcp_can_recv(h)
                             || tcp_state == TcpSocketState::CloseWait
+                            || tcp_state == TcpSocketState::Closing
                             || tcp_state == TcpSocketState::Closed;
                     }
                 }
