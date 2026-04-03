@@ -2155,6 +2155,44 @@ impl NeighborTable {
         }
         None
     }
+
+    /// Learn a neighbor from an inbound Harmony frame if it's an announce packet.
+    /// Announce packets (packet_type bits 1..0 == 0x01) carry the announcer's
+    /// identity as the destination_hash in a Type1 header (bytes 2..18).
+    fn learn_from_announce(&mut self, payload: &[u8], src_mac: [u8; 6], now_ms: u64) {
+        // Minimum Type1 header: 1 (flags) + 1 (hops) + 16 (dest_hash) + 1 (context) = 19
+        if payload.len() < 19 {
+            return;
+        }
+        // Check packet_type == Announce (bits 1..0 of flags byte)
+        let packet_type = payload[0] & 0x03;
+        if packet_type != 0x01 {
+            return;
+        }
+        let mut identity_hash = [0u8; 16];
+        identity_hash.copy_from_slice(&payload[2..18]);
+        self.learn(identity_hash, src_mac, now_ms);
+    }
+}
+
+/// Extract the destination hash from an outbound Harmony/Reticulum packet.
+/// Returns `None` if the packet is too short to contain a valid header.
+fn extract_dest_hash(raw: &[u8]) -> Option<[u8; 16]> {
+    if raw.len() < 2 {
+        return None;
+    }
+    let header_type2 = (raw[0] & 0x40) != 0;
+    let (offset, min_len) = if header_type2 {
+        (18, 34) // Type2: transport_id at 2..18, dest_hash at 18..34
+    } else {
+        (2, 18) // Type1: dest_hash at 2..18
+    };
+    if raw.len() < min_len {
+        return None;
+    }
+    let mut hash = [0u8; 16];
+    hash.copy_from_slice(&raw[offset..offset + 16]);
+    Some(hash)
 }
 
 #[cfg(test)]
@@ -2227,6 +2265,89 @@ mod neighbor_tests {
             table.lookup(&hash1, 2000),
             Some([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])
         );
+    }
+
+    #[test]
+    fn learn_from_announce_packet() {
+        let mut table = NeighborTable::new();
+        let src_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        // Build a minimal announce packet:
+        // Byte 0: flags — packet_type=Announce (0x01), header_type=Type1 (bit 6=0)
+        // Byte 1: hops
+        // Bytes 2..18: destination_hash (the announcer's identity)
+        // Byte 18: context
+        let mut payload = [0u8; 19];
+        payload[0] = 0x01; // packet_type=Announce (bits 1..0 = 01)
+        payload[1] = 0x00; // hops
+        let identity = [0xAA; 16];
+        payload[2..18].copy_from_slice(&identity);
+
+        table.learn_from_announce(&payload, src_mac, 5000);
+        assert_eq!(table.lookup(&identity, 5000), Some(src_mac));
+    }
+
+    #[test]
+    fn learn_from_non_announce_does_nothing() {
+        let mut table = NeighborTable::new();
+        let src_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+        // Build a data packet (packet_type=Data = 0x00)
+        let mut payload = [0u8; 19];
+        payload[0] = 0x00; // packet_type=Data
+        let identity = [0xBB; 16];
+        payload[2..18].copy_from_slice(&identity);
+
+        table.learn_from_announce(&payload, src_mac, 5000);
+        // Should NOT have learned anything
+        assert_eq!(table.lookup(&identity, 5000), None);
+    }
+
+    #[test]
+    fn learn_from_short_packet_does_nothing() {
+        let mut table = NeighborTable::new();
+        let src_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x03];
+        let short_payload = [0x01; 10]; // Announce flag but too short
+
+        table.learn_from_announce(&short_payload, src_mac, 5000);
+        // Table should be empty — no crash, no entry
+        assert_eq!(table.lookup(&[0x01; 16], 5000), None);
+    }
+
+    #[test]
+    fn extract_dest_hash_type1() {
+        // Type1: bit 6 of flags = 0, dest at bytes 2..18
+        let mut packet = [0u8; 20];
+        packet[0] = 0x00; // Type1 header
+        let dest = [0x11; 16];
+        packet[2..18].copy_from_slice(&dest);
+
+        assert_eq!(extract_dest_hash(&packet), Some(dest));
+    }
+
+    #[test]
+    fn extract_dest_hash_type2() {
+        // Type2: bit 6 of flags = 1, dest at bytes 18..34
+        let mut packet = [0u8; 35];
+        packet[0] = 0x40; // Type2 header (bit 6 set)
+        let dest = [0x22; 16];
+        packet[18..34].copy_from_slice(&dest);
+
+        assert_eq!(extract_dest_hash(&packet), Some(dest));
+    }
+
+    #[test]
+    fn extract_dest_hash_short_packet() {
+        let short = [0u8; 5];
+        assert_eq!(extract_dest_hash(&short), None);
+
+        // Type1 but not enough bytes for dest hash
+        let mut short_type1 = [0u8; 17];
+        short_type1[0] = 0x00;
+        assert_eq!(extract_dest_hash(&short_type1), None);
+
+        // Type2 but not enough bytes for dest hash
+        let mut short_type2 = [0u8; 33];
+        short_type2[0] = 0x40;
+        assert_eq!(extract_dest_hash(&short_type2), None);
     }
 }
 
