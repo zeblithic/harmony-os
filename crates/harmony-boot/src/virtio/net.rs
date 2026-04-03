@@ -426,6 +426,7 @@ impl VirtioNet {
 
         match self.tx_queue.submit_send(&frame[..frame_len]) {
             Some(_) => {
+                // Notify the device that a TX buffer is available.
                 unsafe { mmio_write16(self.tx_notify_addr, 1) };
                 Ok(())
             }
@@ -444,37 +445,7 @@ impl NetworkInterface for VirtioNet {
     }
 
     fn send(&mut self, data: &[u8]) -> Result<(), PlatformError> {
-        // Reclaim completed TX descriptors first.
-        self.reclaim_tx();
-
-        let frame_len = VIRTIO_NET_HDR_LEN + ETH_HEADER_LEN + data.len();
-        if frame_len > BUF_SIZE {
-            return Err(PlatformError::SendFailed);
-        }
-
-        // Build virtio_net_hdr + Ethernet frame on the stack.
-        // TODO(perf): Build frame directly in the DMA buffer to avoid the
-        // 2 KiB stack allocation and the extra copy into submit_send.
-        // Bytes 0..12: virtio_net_hdr (all zeros = no GSO, no checksum offload).
-        let mut frame = [0u8; BUF_SIZE];
-        let h = VIRTIO_NET_HDR_LEN;
-        // Destination: broadcast.
-        frame[h..h + 6].copy_from_slice(&BROADCAST_MAC);
-        // Source: our MAC.
-        frame[h + 6..h + 12].copy_from_slice(&self.mac);
-        // EtherType: Harmony (0x88B5).
-        frame[h + 12..h + 14].copy_from_slice(&ETHERTYPE_HARMONY);
-        // Payload.
-        frame[h + ETH_HEADER_LEN..h + ETH_HEADER_LEN + data.len()].copy_from_slice(data);
-
-        match self.tx_queue.submit_send(&frame[..frame_len]) {
-            Some(_) => {
-                // Notify the device that a TX buffer is available.
-                unsafe { mmio_write16(self.tx_notify_addr, 1) };
-                Ok(())
-            }
-            None => Err(PlatformError::SendFailed),
-        }
+        self.send_to(data, None)
     }
 
     fn receive(&mut self) -> Option<Vec<u8>> {
