@@ -2077,8 +2077,8 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                         // Raw Harmony — learn neighbor from announces, then
                         // strip Ethernet header and feed to runtime.
                         if frame.len() > ETH_HEADER_LEN {
-                            let src_mac: [u8; 6] =
-                                frame[6..12].try_into().unwrap();
+                            let mut src_mac = [0u8; 6];
+                            src_mac.copy_from_slice(&frame[6..12]);
                             let payload = &frame[ETH_HEADER_LEN..];
                             neighbor_table.learn_from_announce(
                                 payload, src_mac, now,
@@ -2421,6 +2421,35 @@ mod neighbor_tests {
         let mut short_type2 = [0u8; 33];
         short_type2[0] = 0x40;
         assert_eq!(extract_dest_hash(&short_type2), None);
+    }
+
+    #[test]
+    fn learn_from_ifac_packet_does_nothing() {
+        let mut table = NeighborTable::new();
+        let src_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x04];
+        let mut payload = [0u8; 19];
+        // IFAC flag set (bit 7) + announce packet_type
+        payload[0] = 0x80 | 0x01;
+        let identity = [0xCC; 16];
+        payload[2..18].copy_from_slice(&identity);
+
+        table.learn_from_announce(&payload, src_mac, 5000);
+        assert_eq!(table.lookup(&identity, 5000), None);
+    }
+
+    #[test]
+    fn learn_from_type2_announce_does_nothing() {
+        let mut table = NeighborTable::new();
+        let src_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x05];
+        let mut payload = [0u8; 35];
+        // Type2 flag set (bit 6) + announce packet_type
+        payload[0] = 0x40 | 0x01;
+        let identity = [0xDD; 16];
+        // bytes 2..18 would be transport_id in Type2, not identity
+        payload[2..18].copy_from_slice(&identity);
+
+        table.learn_from_announce(&payload, src_mac, 5000);
+        assert_eq!(table.lookup(&identity, 5000), None);
     }
 }
 
