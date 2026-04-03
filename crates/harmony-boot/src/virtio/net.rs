@@ -7,7 +7,7 @@
 //! IEEE Local Experimental EtherType (0x88B5).
 
 use alloc::vec::Vec;
-use core::ptr::{read_volatile, write_volatile};
+use core::ptr::{self, read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
 
 use harmony_platform::error::PlatformError;
@@ -388,19 +388,22 @@ impl VirtioNet {
             return Err(PlatformError::SendFailed);
         }
 
-        // Build virtio_net_hdr + raw frame on the stack.
-        // First VIRTIO_NET_HDR_LEN bytes are zeroed (no GSO, no checksum offload).
-        let mut buf = [0u8; BUF_SIZE];
-        buf[VIRTIO_NET_HDR_LEN..total_len].copy_from_slice(frame);
+        let (idx, buf) = self.tx_queue.prepare_send().ok_or(PlatformError::SendFailed)?;
 
-        match self.tx_queue.submit_send(&buf[..total_len]) {
-            Some(_) => {
-                // Notify the device that a TX buffer is available.
-                unsafe { mmio_write16(self.tx_notify_addr, 1) };
-                Ok(())
-            }
-            None => Err(PlatformError::SendFailed),
+        unsafe {
+            // Zero VirtIO net header (no GSO, no checksum offload).
+            ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_LEN);
+            // Copy pre-built Ethernet frame after the VirtIO header.
+            ptr::copy_nonoverlapping(frame.as_ptr(), buf.add(VIRTIO_NET_HDR_LEN), frame.len());
         }
+
+        // SAFETY: idx was returned by prepare_send above; total_len bytes
+        // were written to the DMA buffer (VirtIO header + Ethernet frame).
+        unsafe { self.tx_queue.commit_send(idx, total_len) };
+
+        // Notify the device that a TX buffer is available.
+        unsafe { mmio_write16(self.tx_notify_addr, 1) };
+        Ok(())
     }
 
     /// Send a Harmony raw payload with an explicit destination MAC.
@@ -413,25 +416,34 @@ impl VirtioNet {
             return Err(PlatformError::SendFailed);
         }
 
-        let mut frame = [0u8; BUF_SIZE];
-        let h = VIRTIO_NET_HDR_LEN;
-        // Destination: unicast if known, broadcast otherwise.
-        frame[h..h + 6].copy_from_slice(dst_mac.unwrap_or(&BROADCAST_MAC));
-        // Source: our MAC.
-        frame[h + 6..h + 12].copy_from_slice(&self.mac);
-        // EtherType: Harmony (0x88B5).
-        frame[h + 12..h + 14].copy_from_slice(&ETHERTYPE_HARMONY);
-        // Payload.
-        frame[h + ETH_HEADER_LEN..h + ETH_HEADER_LEN + data.len()].copy_from_slice(data);
+        let (idx, buf) = self.tx_queue.prepare_send().ok_or(PlatformError::SendFailed)?;
 
-        match self.tx_queue.submit_send(&frame[..frame_len]) {
-            Some(_) => {
-                // Notify the device that a TX buffer is available.
-                unsafe { mmio_write16(self.tx_notify_addr, 1) };
-                Ok(())
-            }
-            None => Err(PlatformError::SendFailed),
+        unsafe {
+            let h = VIRTIO_NET_HDR_LEN;
+            // Zero VirtIO net header (no GSO, no checksum offload).
+            // Payload region is fully overwritten, so only the header needs zeroing.
+            ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_LEN);
+            // Destination: unicast if known, broadcast otherwise.
+            ptr::copy_nonoverlapping(
+                dst_mac.unwrap_or(&BROADCAST_MAC).as_ptr(),
+                buf.add(h),
+                6,
+            );
+            // Source: our MAC.
+            ptr::copy_nonoverlapping(self.mac.as_ptr(), buf.add(h + 6), 6);
+            // EtherType: Harmony (0x88B5).
+            ptr::copy_nonoverlapping(ETHERTYPE_HARMONY.as_ptr(), buf.add(h + 12), 2);
+            // Payload.
+            ptr::copy_nonoverlapping(data.as_ptr(), buf.add(h + ETH_HEADER_LEN), data.len());
         }
+
+        // SAFETY: idx was returned by prepare_send above; frame_len bytes
+        // were written to the DMA buffer (VirtIO header + ETH header + payload).
+        unsafe { self.tx_queue.commit_send(idx, frame_len) };
+
+        // Notify the device that a TX buffer is available.
+        unsafe { mmio_write16(self.tx_notify_addr, 1) };
+        Ok(())
     }
 }
 
