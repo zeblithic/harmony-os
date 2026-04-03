@@ -31,7 +31,7 @@ const GICR_ISENABLER0: usize = GICR_SGI_OFFSET + 0x0100;
 const GICR_IPRIORITYR: usize = GICR_SGI_OFFSET + 0x0400;
 
 /// Physical timer PPI (INTID 30).
-const TIMER_INTID: u32 = 30;
+pub const TIMER_INTID: u32 = 30;
 
 /// Spurious interrupt — returned by `ack()` when no valid interrupt is pending.
 pub const SPURIOUS: u32 = 1023;
@@ -55,18 +55,32 @@ pub unsafe fn init(gicd_base: *mut u8, gicr_base: *mut u8) {
     let ctlr = gicd_base.add(GICD_CTLR) as *mut u32;
     write_volatile(ctlr, GICD_CTLR_ARE_NS | GICD_CTLR_ENABLE_GRP1_NS);
     // Wait for register write to propagate.
-    while read_volatile(ctlr) & GICD_CTLR_RWP != 0 {
+    for _ in 0..1_000_000u32 {
+        if read_volatile(ctlr) & GICD_CTLR_RWP == 0 {
+            break;
+        }
         core::hint::spin_loop();
     }
+    assert!(
+        read_volatile(ctlr) & GICD_CTLR_RWP == 0,
+        "GIC: GICD_CTLR.RWP never cleared — wrong GICD base address?"
+    );
 
     // ── 2. Redistributor ────────────────────────────────────────────────
     // Wake the redistributor.
     let waker = gicr_base.add(GICR_WAKER) as *mut u32;
     let w = read_volatile(waker);
     write_volatile(waker, w & !GICR_WAKER_PROCESSOR_SLEEP);
-    while read_volatile(waker) & GICR_WAKER_CHILDREN_ASLEEP != 0 {
+    for _ in 0..1_000_000u32 {
+        if read_volatile(waker) & GICR_WAKER_CHILDREN_ASLEEP == 0 {
+            break;
+        }
         core::hint::spin_loop();
     }
+    assert!(
+        read_volatile(waker) & GICR_WAKER_CHILDREN_ASLEEP == 0,
+        "GIC: GICR_WAKER.ChildrenAsleep never cleared — wrong GICR base address?"
+    );
 
     // Configure PPI 30 in the SGI_base frame.
     // Set to Group 1 NS (bit 30 of IGROUPR0).

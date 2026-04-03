@@ -279,7 +279,7 @@ use crate::timer;
 extern "C" fn irq_dispatch() {
     let intid = gic::ack();
     match intid {
-        30 => timer::on_tick(),
+        gic::TIMER_INTID => timer::on_tick(),
         gic::SPURIOUS => {}
         _ => {
             // Unexpected interrupt — EOI it to prevent the GIC from
