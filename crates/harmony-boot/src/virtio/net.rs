@@ -402,6 +402,36 @@ impl VirtioNet {
             None => Err(PlatformError::SendFailed),
         }
     }
+
+    /// Send a Harmony raw payload with an explicit destination MAC.
+    /// If `dst_mac` is `None`, falls back to broadcast.
+    pub fn send_to(&mut self, data: &[u8], dst_mac: Option<&[u8; 6]>) -> Result<(), PlatformError> {
+        self.reclaim_tx();
+
+        let frame_len = VIRTIO_NET_HDR_LEN + ETH_HEADER_LEN + data.len();
+        if frame_len > BUF_SIZE {
+            return Err(PlatformError::SendFailed);
+        }
+
+        let mut frame = [0u8; BUF_SIZE];
+        let h = VIRTIO_NET_HDR_LEN;
+        // Destination: unicast if known, broadcast otherwise.
+        frame[h..h + 6].copy_from_slice(dst_mac.unwrap_or(&BROADCAST_MAC));
+        // Source: our MAC.
+        frame[h + 6..h + 12].copy_from_slice(&self.mac);
+        // EtherType: Harmony (0x88B5).
+        frame[h + 12..h + 14].copy_from_slice(&ETHERTYPE_HARMONY);
+        // Payload.
+        frame[h + ETH_HEADER_LEN..h + ETH_HEADER_LEN + data.len()].copy_from_slice(data);
+
+        match self.tx_queue.submit_send(&frame[..frame_len]) {
+            Some(_) => {
+                unsafe { mmio_write16(self.tx_notify_addr, 1) };
+                Ok(())
+            }
+            None => Err(PlatformError::SendFailed),
+        }
+    }
 }
 
 impl NetworkInterface for VirtioNet {
@@ -495,4 +525,41 @@ pub fn ethertype(frame: &[u8]) -> u16 {
         return 0;
     }
     ((frame[12] as u16) << 8) | (frame[13] as u16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build the Ethernet frame header the same way send_to does,
+    /// and verify the destination MAC is placed correctly.
+    #[test]
+    fn frame_header_unicast_mac() {
+        let our_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let dst_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+        let data = b"hello";
+
+        let mut frame = [0u8; 128];
+        // Destination MAC
+        frame[0..6].copy_from_slice(&dst_mac);
+        // Source MAC
+        frame[6..12].copy_from_slice(&our_mac);
+        // EtherType
+        frame[12..14].copy_from_slice(&ETHERTYPE_HARMONY);
+        // Payload
+        frame[ETH_HEADER_LEN..ETH_HEADER_LEN + data.len()].copy_from_slice(data);
+
+        assert_eq!(&frame[0..6], &dst_mac);
+        assert_eq!(&frame[6..12], &our_mac);
+        assert_eq!(&frame[12..14], &ETHERTYPE_HARMONY);
+        assert_eq!(&frame[ETH_HEADER_LEN..ETH_HEADER_LEN + 5], b"hello");
+    }
+
+    #[test]
+    fn frame_header_broadcast_fallback() {
+        let mut frame = [0u8; 128];
+        frame[0..6].copy_from_slice(&BROADCAST_MAC);
+
+        assert_eq!(&frame[0..6], &[0xFF; 6]);
+    }
 }

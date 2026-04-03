@@ -359,7 +359,12 @@ unsafe fn map_elf_at_linked_addresses(
 /// # Safety
 /// Same requirements as `map_elf_at_linked_addresses`.
 #[cfg(feature = "ring3")]
-unsafe fn map_range_to_heap(phys_offset: u64, heap_base_virt: usize, vaddr_start: u64, vaddr_end: u64) {
+unsafe fn map_range_to_heap(
+    phys_offset: u64,
+    heap_base_virt: usize,
+    vaddr_start: u64,
+    vaddr_end: u64,
+) {
     const PRESENT: u64 = 1;
     const WRITABLE: u64 = 1 << 1;
     const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -437,15 +442,24 @@ unsafe fn set_nx_range(phys_offset: u64, vaddr_start: u64, vaddr_end: u64) {
         let pml1_idx = ((vaddr >> 12) & 0x1FF) as usize;
 
         let pml4_val = core::ptr::read_volatile(pml4.add(pml4_idx) as *const u64);
-        if pml4_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        if pml4_val & PRESENT == 0 {
+            vaddr += PAGE_SIZE;
+            continue;
+        }
         let pml3 = ((pml4_val & ADDR_MASK) + phys_offset) as *mut u64;
 
         let pml3_val = core::ptr::read_volatile(pml3.add(pml3_idx) as *const u64);
-        if pml3_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        if pml3_val & PRESENT == 0 {
+            vaddr += PAGE_SIZE;
+            continue;
+        }
         let pml2 = ((pml3_val & ADDR_MASK) + phys_offset) as *mut u64;
 
         let pml2_val = core::ptr::read_volatile(pml2.add(pml2_idx) as *const u64);
-        if pml2_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        if pml2_val & PRESENT == 0 {
+            vaddr += PAGE_SIZE;
+            continue;
+        }
         let pml1 = ((pml2_val & ADDR_MASK) + phys_offset) as *mut u64;
 
         let pte = core::ptr::read_volatile(pml1.add(pml1_idx));
@@ -464,7 +478,11 @@ unsafe fn set_nx_range(phys_offset: u64, vaddr_start: u64, vaddr_end: u64) {
 /// Returns a Vec of (vaddr, pte_value) pairs. Used to preserve the
 /// parent binary's page table entries before a child exec overwrites them.
 #[cfg(feature = "ring3")]
-unsafe fn save_pte_range(phys_offset: u64, vaddr_start: u64, vaddr_end: u64) -> alloc::vec::Vec<(u64, u64)> {
+unsafe fn save_pte_range(
+    phys_offset: u64,
+    vaddr_start: u64,
+    vaddr_end: u64,
+) -> alloc::vec::Vec<(u64, u64)> {
     const PRESENT: u64 = 1;
     const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
     const PAGE_SIZE: u64 = 0x1000;
@@ -483,15 +501,24 @@ unsafe fn save_pte_range(phys_offset: u64, vaddr_start: u64, vaddr_end: u64) -> 
         let pml1_idx = ((vaddr >> 12) & 0x1FF) as usize;
 
         let pml4_val = core::ptr::read_volatile(pml4.add(pml4_idx));
-        if pml4_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        if pml4_val & PRESENT == 0 {
+            vaddr += PAGE_SIZE;
+            continue;
+        }
         let pml3 = ((pml4_val & ADDR_MASK) + phys_offset) as *const u64;
 
         let pml3_val = core::ptr::read_volatile(pml3.add(pml3_idx));
-        if pml3_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        if pml3_val & PRESENT == 0 {
+            vaddr += PAGE_SIZE;
+            continue;
+        }
         let pml2 = ((pml3_val & ADDR_MASK) + phys_offset) as *const u64;
 
         let pml2_val = core::ptr::read_volatile(pml2.add(pml2_idx));
-        if pml2_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        if pml2_val & PRESENT == 0 {
+            vaddr += PAGE_SIZE;
+            continue;
+        }
         let pml1 = ((pml2_val & ADDR_MASK) + phys_offset) as *const u64;
 
         let pte = core::ptr::read_volatile(pml1.add(pml1_idx));
@@ -504,7 +531,12 @@ unsafe fn save_pte_range(phys_offset: u64, vaddr_start: u64, vaddr_end: u64) -> 
 /// Restore PTE values saved by `save_pte_range` and clear any PTEs in the
 /// range that were NOT in the saved set (i.e., pages added by the child's exec).
 #[cfg(feature = "ring3")]
-unsafe fn restore_pte_range(phys_offset: u64, saved: &[(u64, u64)], vaddr_start: u64, vaddr_end: u64) {
+unsafe fn restore_pte_range(
+    phys_offset: u64,
+    saved: &[(u64, u64)],
+    vaddr_start: u64,
+    vaddr_end: u64,
+) {
     const PRESENT: u64 = 1;
     const WRITABLE: u64 = 1 << 1;
     const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -530,15 +562,24 @@ unsafe fn restore_pte_range(phys_offset: u64, saved: &[(u64, u64)], vaddr_start:
 
         // Walk to PML1 — skip if intermediate tables don't exist.
         let pml4_val = core::ptr::read_volatile(pml4.add(pml4_idx) as *const u64);
-        if pml4_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        if pml4_val & PRESENT == 0 {
+            vaddr += PAGE_SIZE;
+            continue;
+        }
         let pml3 = ((pml4_val & ADDR_MASK) + phys_offset) as *mut u64;
 
         let pml3_val = core::ptr::read_volatile(pml3.add(pml3_idx) as *const u64);
-        if pml3_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        if pml3_val & PRESENT == 0 {
+            vaddr += PAGE_SIZE;
+            continue;
+        }
         let pml2 = ((pml3_val & ADDR_MASK) + phys_offset) as *mut u64;
 
         let pml2_val = core::ptr::read_volatile(pml2.add(pml2_idx) as *const u64);
-        if pml2_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        if pml2_val & PRESENT == 0 {
+            vaddr += PAGE_SIZE;
+            continue;
+        }
         let pml1 = ((pml2_val & ADDR_MASK) + phys_offset) as *mut u64;
 
         if let Some(&pte) = saved_map.get(&vaddr) {
@@ -1332,7 +1373,10 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         // static TLS struct (struct pthread, ~1-2 KiB) lives at the tail
         // of .bss and may extend beyond the last segment's vaddr+memsz.
         const ELF_HEADROOM: usize = 16 * 1024;
-        const _: () = assert!(ELF_HEADROOM % 0x1000 == 0, "ELF_HEADROOM must be page-aligned");
+        const _: () = assert!(
+            ELF_HEADROOM % 0x1000 == 0,
+            "ELF_HEADROOM must be page-aligned"
+        );
         let total_size = match vaddr_max.checked_sub(vaddr_min) {
             Some(sz) => sz as usize + ELF_HEADROOM,
             None => {
@@ -1572,9 +1616,8 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
 
         /// Heap allocations made by vm_mmap during child exec. Freed on
         /// child exit to prevent leaking the child's ELF frames.
-        static mut CHILD_MMAP_ALLOCS: Option<
-            alloc::vec::Vec<(*mut u8, core::alloc::Layout)>,
-        > = None;
+        static mut CHILD_MMAP_ALLOCS: Option<alloc::vec::Vec<(*mut u8, core::alloc::Layout)>> =
+            None;
 
         fn dispatch(nr: u64, args: [u64; 6]) -> syscall::SyscallResult {
             const SYS_CLONE: u64 = 56;
@@ -1593,7 +1636,9 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             };
 
             // Poll the network stack on every syscall entry.
-            unsafe { poll_network(); }
+            unsafe {
+                poll_network();
+            }
 
             // ── Idle watchdog ──────────────────────────────────────────
             // If no TCP I/O has occurred for IDLE_KILL_THRESHOLD_MS,
@@ -1618,7 +1663,9 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             if is_fork {
                 let count = unsafe { FORK_COUNT };
                 if count == 0 {
-                    unsafe { FORK_COUNT = 1; }
+                    unsafe {
+                        FORK_COUNT = 1;
+                    }
                     return syscall::SyscallResult {
                         retval: 0,
                         exited: false,
@@ -1664,7 +1711,9 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             }
 
             // Poll again after the syscall.
-            unsafe { poll_network(); }
+            unsafe {
+                poll_network();
+            }
 
             // ── Fork child creation ─────────────────────────────────
             // If a fork syscall just created a NEW child at the root level,
@@ -1672,7 +1721,10 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             // re-triggering when a nested fork (from the child) creates a
             // grandchild — those are handled by the Linuxulator's internal
             // active_process() routing.
-            if is_fork && retval > 0 && syscall::fork_depth() == 0 && lx.pending_fork_child().is_some()
+            if is_fork
+                && retval > 0
+                && syscall::fork_depth() == 0
+                && lx.pending_fork_child().is_some()
             {
                 serial_write_str(b"[FORK] real fork - saving parent context\n");
                 unsafe {
@@ -1731,7 +1783,9 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                 // Reset watchdog — session ended, parent returns to accept loop.
                 // Without this, the watchdog would fire during the idle accept
                 // wait and brick the unikernel.
-                unsafe { LAST_TCP_IO_MS = 0; }
+                unsafe {
+                    LAST_TCP_IO_MS = 0;
+                }
                 // Call active_process() to trigger recover_child_state().
                 let _ = lx.active_process();
                 // Re-create any pipe buffers removed by the child's close().
