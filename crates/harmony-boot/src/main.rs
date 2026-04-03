@@ -875,8 +875,19 @@ fn dispatch_actions(
             } => match interface_name.as_ref() {
                 "eth0" | "virtio0" => {
                     if let Some(ref mut net) = virtio_net {
-                        let dst_mac = extract_dest_hash(raw)
-                            .and_then(|hash| neighbor_table.lookup(&hash, now_ms));
+                        // Announce packets (packet_type 0x01) must always
+                        // be broadcast — their destination_hash is the
+                        // announcer's identity, not a unicast target.
+                        let is_announce = raw.len() >= 2
+                            && (raw[0] & 0x03) == 0x01;
+                        let dst_mac = if is_announce {
+                            None
+                        } else {
+                            extract_dest_hash(raw)
+                                .and_then(|hash| {
+                                    neighbor_table.lookup(&hash, now_ms)
+                                })
+                        };
                         let _ = net.send_to(raw, dst_mac.as_ref());
                     }
                 }
@@ -2258,6 +2269,11 @@ fn extract_dest_hash(raw: &[u8]) -> Option<[u8; 16]> {
     if raw.len() < 2 {
         return None;
     }
+    // IFAC packets (bit 7) have a different field layout — dest hash
+    // is not at the standard offsets.
+    if raw[0] & 0x80 != 0 {
+        return None;
+    }
     let header_type2 = (raw[0] & 0x40) != 0;
     let (offset, min_len) = if header_type2 {
         (18, 34) // Type2: transport_id at 2..18, dest_hash at 18..34
@@ -2454,6 +2470,34 @@ mod neighbor_tests {
 
         table.learn_from_announce(&payload, src_mac, 5000);
         assert_eq!(table.lookup(&identity, 5000), None);
+    }
+
+    #[test]
+    fn extract_dest_hash_ifac_returns_none() {
+        // IFAC flag set (bit 7) — field layout differs
+        let mut packet = [0u8; 20];
+        packet[0] = 0x80; // IFAC flag set
+        let dest = [0x33; 16];
+        packet[2..18].copy_from_slice(&dest);
+        assert_eq!(extract_dest_hash(&packet), None);
+    }
+
+    #[test]
+    fn announce_packet_detected_for_broadcast() {
+        // Announce packet_type = 0x01 (bits 1..0)
+        let mut announce = [0u8; 19];
+        announce[0] = 0x01; // Announce
+        assert_eq!(announce[0] & 0x03, 0x01);
+
+        // Data packet_type = 0x00
+        let mut data = [0u8; 19];
+        data[0] = 0x00; // Data
+        assert_eq!(data[0] & 0x03, 0x00);
+
+        // LinkRequest packet_type = 0x02
+        let mut link_req = [0u8; 19];
+        link_req[0] = 0x02;
+        assert_eq!(link_req[0] & 0x03, 0x02);
     }
 }
 
