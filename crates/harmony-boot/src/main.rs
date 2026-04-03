@@ -2060,6 +2060,8 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     #[cfg(feature = "qemu-test")]
     qemu_debug_exit(0x10);
 
+    let mut neighbor_table = NeighborTable::new();
+
     loop {
         let now = pit.now_ms();
         let smoltcp_now = smoltcp::time::Instant::from_millis(now as i64);
@@ -2072,9 +2074,16 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             while let Some(frame) = net.receive_raw() {
                 match virtio::net::ethertype(&frame) {
                     0x88B5 => {
-                        // Raw Harmony — strip Ethernet header, feed to runtime
+                        // Raw Harmony — learn neighbor from announces, then
+                        // strip Ethernet header and feed to runtime.
                         if frame.len() > ETH_HEADER_LEN {
-                            harmony_packets.push(frame[ETH_HEADER_LEN..].to_vec());
+                            let src_mac: [u8; 6] =
+                                frame[6..12].try_into().unwrap();
+                            let payload = &frame[ETH_HEADER_LEN..];
+                            neighbor_table.learn_from_announce(
+                                payload, src_mac, now,
+                            );
+                            harmony_packets.push(payload.to_vec());
                         }
                     }
                     0x0800 | 0x0806 => {
@@ -2216,6 +2225,16 @@ impl NeighborTable {
     fn learn_from_announce(&mut self, payload: &[u8], src_mac: [u8; 6], now_ms: u64) {
         // Minimum Type1 header: 1 (flags) + 1 (hops) + 16 (dest_hash) + 1 (context) = 19
         if payload.len() < 19 {
+            return;
+        }
+        // IFAC packets have a different field layout — skip them.
+        // The raw Harmony path does not currently use IFAC.
+        if payload[0] & 0x80 != 0 {
+            return;
+        }
+        // Announce packets are always Type1. Type2 would mean bytes 2..18
+        // are transport_id, not the announcer's identity hash.
+        if payload[0] & 0x40 != 0 {
             return;
         }
         // Check packet_type == Announce (bits 1..0 of flags byte)
