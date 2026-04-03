@@ -388,19 +388,20 @@ impl VirtioNet {
             return Err(PlatformError::SendFailed);
         }
 
-        // Build virtio_net_hdr + raw frame on the stack.
-        // First VIRTIO_NET_HDR_LEN bytes are zeroed (no GSO, no checksum offload).
-        let mut buf = [0u8; BUF_SIZE];
-        buf[VIRTIO_NET_HDR_LEN..total_len].copy_from_slice(frame);
+        let (idx, buf) = self.tx_queue.prepare_send().ok_or(PlatformError::SendFailed)?;
 
-        match self.tx_queue.submit_send(&buf[..total_len]) {
-            Some(_) => {
-                // Notify the device that a TX buffer is available.
-                unsafe { mmio_write16(self.tx_notify_addr, 1) };
-                Ok(())
-            }
-            None => Err(PlatformError::SendFailed),
+        unsafe {
+            // Zero VirtIO net header (no GSO, no checksum offload).
+            ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_LEN);
+            // Copy pre-built Ethernet frame after the VirtIO header.
+            ptr::copy_nonoverlapping(frame.as_ptr(), buf.add(VIRTIO_NET_HDR_LEN), frame.len());
         }
+
+        self.tx_queue.commit_send(idx, total_len);
+
+        // Notify the device that a TX buffer is available.
+        unsafe { mmio_write16(self.tx_notify_addr, 1) };
+        Ok(())
     }
 
     /// Send a Harmony raw payload with an explicit destination MAC.
