@@ -4,8 +4,8 @@
 //! Initialises serial output, heap, RDRAND entropy, generates PQC + Ed25519
 //! node identities, then enters the unikernel event loop.
 
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
 #![feature(abi_x86_interrupt)]
 
 extern crate alloc;
@@ -58,6 +58,7 @@ use virtio::net::ETH_HEADER_LEN;
 // Bootloader configuration
 // ---------------------------------------------------------------------------
 
+#[cfg(not(test))]
 static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     // Map all physical memory so we can use it for heap allocation.
@@ -65,13 +66,14 @@ static BOOTLOADER_CONFIG: BootloaderConfig = {
     config
 };
 
+#[cfg(not(test))]
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 // ---------------------------------------------------------------------------
 // Global allocator
 // ---------------------------------------------------------------------------
 
-#[global_allocator]
+#[cfg_attr(not(test), global_allocator)]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 // ---------------------------------------------------------------------------
@@ -2083,6 +2085,152 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
 }
 
 // ---------------------------------------------------------------------------
+// Neighbor table: maps Harmony identity hashes to Ethernet MAC addresses.
+// Learned from received announce packets; used for unicast TX.
+// ---------------------------------------------------------------------------
+
+const NEIGHBOR_TABLE_SIZE: usize = 32;
+const NEIGHBOR_TTL_MS: u64 = 300_000; // 5 minutes
+
+#[derive(Clone)]
+struct NeighborEntry {
+    identity_hash: [u8; 16],
+    mac: [u8; 6],
+    last_seen_ms: u64,
+}
+
+struct NeighborTable {
+    entries: [Option<NeighborEntry>; NEIGHBOR_TABLE_SIZE],
+}
+
+impl NeighborTable {
+    fn new() -> Self {
+        Self {
+            entries: [const { None }; NEIGHBOR_TABLE_SIZE],
+        }
+    }
+
+    fn learn(&mut self, identity_hash: [u8; 16], mac: [u8; 6], now_ms: u64) {
+        // Update existing entry if identity_hash matches
+        for entry in self.entries.iter_mut().flatten() {
+            if entry.identity_hash == identity_hash {
+                entry.mac = mac;
+                entry.last_seen_ms = now_ms;
+                return;
+            }
+        }
+        // Find first empty slot
+        for slot in self.entries.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(NeighborEntry {
+                    identity_hash,
+                    mac,
+                    last_seen_ms: now_ms,
+                });
+                return;
+            }
+        }
+        // Table full — evict oldest entry
+        let oldest_idx = self
+            .entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, e)| e.as_ref().map_or(u64::MAX, |e| e.last_seen_ms))
+            .map(|(i, _)| i)
+            .unwrap(); // table is full, so unwrap is safe
+        self.entries[oldest_idx] = Some(NeighborEntry {
+            identity_hash,
+            mac,
+            last_seen_ms: now_ms,
+        });
+    }
+
+    fn lookup(&self, identity_hash: &[u8; 16], now_ms: u64) -> Option<[u8; 6]> {
+        for entry in self.entries.iter().flatten() {
+            if entry.identity_hash == *identity_hash
+                && now_ms.saturating_sub(entry.last_seen_ms) < NEIGHBOR_TTL_MS
+            {
+                return Some(entry.mac);
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod neighbor_tests {
+    use super::*;
+
+    #[test]
+    fn learn_and_lookup() {
+        let mut table = NeighborTable::new();
+        let hash = [0xAA; 16];
+        let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        table.learn(hash, mac, 1000);
+        assert_eq!(table.lookup(&hash, 1000), Some(mac));
+    }
+
+    #[test]
+    fn lookup_unknown_returns_none() {
+        let table = NeighborTable::new();
+        let hash = [0xBB; 16];
+        assert_eq!(table.lookup(&hash, 1000), None);
+    }
+
+    #[test]
+    fn ttl_expiry() {
+        let mut table = NeighborTable::new();
+        let hash = [0xCC; 16];
+        let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+        table.learn(hash, mac, 1000);
+        // Just before expiry: still valid
+        assert_eq!(table.lookup(&hash, 1000 + NEIGHBOR_TTL_MS - 1), Some(mac));
+        // At expiry: stale
+        assert_eq!(table.lookup(&hash, 1000 + NEIGHBOR_TTL_MS), None);
+    }
+
+    #[test]
+    fn update_existing_entry() {
+        let mut table = NeighborTable::new();
+        let hash = [0xDD; 16];
+        let mac1 = [0x02, 0x00, 0x00, 0x00, 0x00, 0x03];
+        let mac2 = [0x02, 0x00, 0x00, 0x00, 0x00, 0x04];
+        table.learn(hash, mac1, 1000);
+        table.learn(hash, mac2, 2000);
+        assert_eq!(table.lookup(&hash, 2000), Some(mac2));
+    }
+
+    #[test]
+    fn eviction_when_full() {
+        let mut table = NeighborTable::new();
+        // Fill all 32 slots
+        for i in 0..NEIGHBOR_TABLE_SIZE {
+            let mut hash = [0u8; 16];
+            hash[0] = i as u8;
+            let mac = [0x02, 0x00, 0x00, 0x00, 0x00, i as u8];
+            table.learn(hash, mac, 1000 + i as u64);
+        }
+        // Add 33rd — should evict slot 0 (oldest, last_seen_ms=1000)
+        let new_hash = [0xFF; 16];
+        let new_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0xFF];
+        table.learn(new_hash, new_mac, 2000);
+
+        // New entry is findable
+        assert_eq!(table.lookup(&new_hash, 2000), Some(new_mac));
+        // Evicted entry is gone
+        let evicted_hash = [0u8; 16]; // slot 0 had hash[0]=0
+        assert_eq!(table.lookup(&evicted_hash, 2000), None);
+        // Other entries still present
+        let mut hash1 = [0u8; 16];
+        hash1[0] = 1;
+        assert_eq!(
+            table.lookup(&hash1, 2000),
+            Some([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Exception handlers (for debugging userspace faults)
 // ---------------------------------------------------------------------------
 
@@ -2166,6 +2314,7 @@ extern "x86-interrupt" fn double_fault_handler(
 // Panic handler
 // ---------------------------------------------------------------------------
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     serial_init();
