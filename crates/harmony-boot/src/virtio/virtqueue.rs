@@ -265,6 +265,54 @@ impl Virtqueue {
         Some(idx)
     }
 
+    /// Allocate a TX descriptor and return a raw pointer to its DMA buffer.
+    ///
+    /// The caller writes frame data directly into the returned buffer, then
+    /// calls [`commit_send`] to finalize. This avoids the intermediate copy
+    /// that [`submit_send`] performs.
+    ///
+    /// Returns `(desc_idx, buffer_ptr)` or `None` if no descriptors are free.
+    ///
+    /// # Safety contract
+    ///
+    /// The caller must:
+    /// - Write at most `BUF_SIZE` bytes through the returned pointer
+    /// - Call `commit_send(idx, len)` exactly once after writing
+    pub fn prepare_send(&mut self) -> Option<(u16, *mut u8)> {
+        let idx = self.alloc_desc()?;
+        Some((idx, self.buffer_ptr(idx)))
+    }
+
+    /// Finalize a TX send started by [`prepare_send`].
+    ///
+    /// Writes the descriptor table entry and adds the descriptor to the
+    /// available ring so the device can consume it.
+    ///
+    /// # Arguments
+    ///
+    /// * `idx` — Descriptor index returned by `prepare_send`.
+    /// * `len` — Number of bytes written into the buffer.
+    pub fn commit_send(&mut self, idx: u16, len: usize) {
+        unsafe {
+            // Volatile writes for descriptor table — device reads via DMA.
+            let desc = self.desc.add(idx as usize);
+            ptr::write_volatile(&raw mut (*desc).addr, self.buffer_phys(idx));
+            ptr::write_volatile(&raw mut (*desc).len, len as u32);
+            ptr::write_volatile(&raw mut (*desc).flags, 0u16);
+            ptr::write_volatile(&raw mut (*desc).next, 0u16);
+
+            // Volatile writes for avail ring — device reads via DMA.
+            let avail_idx = ptr::read_volatile(&(*self.avail).idx);
+            let ring_slot = &mut (*self.avail).ring[(avail_idx % self.queue_size) as usize];
+            ptr::write_volatile(ring_slot, idx);
+
+            // Ensure descriptor + data writes are visible before the device
+            // sees the updated available index.
+            fence(Ordering::Release);
+            ptr::write_volatile(&mut (*self.avail).idx, avail_idx.wrapping_add(1));
+        }
+    }
+
     /// Poll the used ring for completed descriptors.
     ///
     /// Returns `Some((desc_id, bytes_written))` if the device has placed a
@@ -318,5 +366,72 @@ impl Virtqueue {
             ptr::copy_nonoverlapping(src, out.as_mut_ptr(), len);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: create a Virtqueue for testing.
+    /// Uses phys_offset=0 so virtual == physical addresses.
+    fn test_queue() -> Virtqueue {
+        Virtqueue::new(0)
+    }
+
+    #[test]
+    fn prepare_send_returns_valid_index_and_pointer() {
+        let mut vq = test_queue();
+        let (idx, ptr) = vq.prepare_send().expect("should allocate");
+        assert!(idx < QUEUE_SIZE);
+        assert!(!ptr.is_null());
+    }
+
+    #[test]
+    fn prepare_send_exhaustion_returns_none() {
+        let mut vq = test_queue();
+        // Allocate all descriptors.
+        for _ in 0..QUEUE_SIZE {
+            assert!(vq.prepare_send().is_some());
+        }
+        // Next one should fail.
+        assert!(vq.prepare_send().is_none());
+    }
+
+    #[test]
+    fn prepare_commit_sets_descriptor_metadata() {
+        let mut vq = test_queue();
+        let (idx, buf_ptr) = vq.prepare_send().expect("should allocate");
+
+        // Write known bytes into the DMA buffer via the raw pointer.
+        let test_data = b"hello DMA";
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                test_data.as_ptr(),
+                buf_ptr,
+                test_data.len(),
+            );
+        }
+
+        vq.commit_send(idx, test_data.len());
+
+        // Verify the descriptor table entry.
+        unsafe {
+            let desc = vq.desc.add(idx as usize);
+            let addr = core::ptr::read_volatile(&(*desc).addr);
+            let len = core::ptr::read_volatile(&(*desc).len);
+            let flags = core::ptr::read_volatile(&(*desc).flags);
+
+            // With phys_offset=0, buffer_phys == buffer_ptr as u64.
+            assert_eq!(addr, vq.buffer_phys(idx));
+            assert_eq!(len, test_data.len() as u32);
+            assert_eq!(flags, 0); // device-readable (TX)
+        }
+
+        // Verify the available ring was advanced.
+        unsafe {
+            let avail_idx = core::ptr::read_volatile(&(*vq.avail).idx);
+            assert_eq!(avail_idx, 1);
+        }
     }
 }
