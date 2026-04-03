@@ -13,6 +13,7 @@ mod mmu;
 mod pl011;
 mod rndr;
 mod timer;
+mod gic;
 
 mod platform;
 
