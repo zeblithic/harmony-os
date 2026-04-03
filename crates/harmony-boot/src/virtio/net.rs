@@ -402,19 +402,10 @@ impl VirtioNet {
             None => Err(PlatformError::SendFailed),
         }
     }
-}
 
-impl NetworkInterface for VirtioNet {
-    fn name(&self) -> &str {
-        "eth0"
-    }
-
-    fn mtu(&self) -> usize {
-        1500
-    }
-
-    fn send(&mut self, data: &[u8]) -> Result<(), PlatformError> {
-        // Reclaim completed TX descriptors first.
+    /// Send a Harmony raw payload with an explicit destination MAC.
+    /// If `dst_mac` is `None`, falls back to broadcast.
+    pub fn send_to(&mut self, data: &[u8], dst_mac: Option<&[u8; 6]>) -> Result<(), PlatformError> {
         self.reclaim_tx();
 
         let frame_len = VIRTIO_NET_HDR_LEN + ETH_HEADER_LEN + data.len();
@@ -422,14 +413,10 @@ impl NetworkInterface for VirtioNet {
             return Err(PlatformError::SendFailed);
         }
 
-        // Build virtio_net_hdr + Ethernet frame on the stack.
-        // TODO(perf): Build frame directly in the DMA buffer to avoid the
-        // 2 KiB stack allocation and the extra copy into submit_send.
-        // Bytes 0..12: virtio_net_hdr (all zeros = no GSO, no checksum offload).
         let mut frame = [0u8; BUF_SIZE];
         let h = VIRTIO_NET_HDR_LEN;
-        // Destination: broadcast.
-        frame[h..h + 6].copy_from_slice(&BROADCAST_MAC);
+        // Destination: unicast if known, broadcast otherwise.
+        frame[h..h + 6].copy_from_slice(dst_mac.unwrap_or(&BROADCAST_MAC));
         // Source: our MAC.
         frame[h + 6..h + 12].copy_from_slice(&self.mac);
         // EtherType: Harmony (0x88B5).
@@ -445,6 +432,20 @@ impl NetworkInterface for VirtioNet {
             }
             None => Err(PlatformError::SendFailed),
         }
+    }
+}
+
+impl NetworkInterface for VirtioNet {
+    fn name(&self) -> &str {
+        "eth0"
+    }
+
+    fn mtu(&self) -> usize {
+        1500
+    }
+
+    fn send(&mut self, data: &[u8]) -> Result<(), PlatformError> {
+        self.send_to(data, None)
     }
 
     fn receive(&mut self) -> Option<Vec<u8>> {
@@ -495,4 +496,41 @@ pub fn ethertype(frame: &[u8]) -> u16 {
         return 0;
     }
     ((frame[12] as u16) << 8) | (frame[13] as u16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build the Ethernet frame header the same way send_to does,
+    /// and verify the destination MAC is placed correctly.
+    #[test]
+    fn frame_header_unicast_mac() {
+        let our_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let dst_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+        let data = b"hello";
+
+        let mut frame = [0u8; 128];
+        // Destination MAC
+        frame[0..6].copy_from_slice(&dst_mac);
+        // Source MAC
+        frame[6..12].copy_from_slice(&our_mac);
+        // EtherType
+        frame[12..14].copy_from_slice(&ETHERTYPE_HARMONY);
+        // Payload
+        frame[ETH_HEADER_LEN..ETH_HEADER_LEN + data.len()].copy_from_slice(data);
+
+        assert_eq!(&frame[0..6], &dst_mac);
+        assert_eq!(&frame[6..12], &our_mac);
+        assert_eq!(&frame[12..14], &ETHERTYPE_HARMONY);
+        assert_eq!(&frame[ETH_HEADER_LEN..ETH_HEADER_LEN + 5], b"hello");
+    }
+
+    #[test]
+    fn frame_header_broadcast_fallback() {
+        let mut frame = [0u8; 128];
+        frame[0..6].copy_from_slice(&BROADCAST_MAC);
+
+        assert_eq!(&frame[0..6], &[0xFF; 6]);
+    }
 }

@@ -163,11 +163,7 @@ pub unsafe fn fork_restore_stack() {
     let user_rsp = FORK_SAVED_FRAME[14];
     let actual = FORK_STACK_SAVE_ACTUAL as usize;
     if user_rsp != 0 && actual > 0 {
-        core::ptr::copy_nonoverlapping(
-            FORK_SAVED_STACK.as_ptr(),
-            user_rsp as *mut u8,
-            actual,
-        );
+        core::ptr::copy_nonoverlapping(FORK_SAVED_STACK.as_ptr(), user_rsp as *mut u8, actual);
     }
 }
 

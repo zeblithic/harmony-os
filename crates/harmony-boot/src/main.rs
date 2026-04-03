@@ -4,8 +4,8 @@
 //! Initialises serial output, heap, RDRAND entropy, generates PQC + Ed25519
 //! node identities, then enters the unikernel event loop.
 
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
 #![feature(abi_x86_interrupt)]
 
 extern crate alloc;
@@ -58,6 +58,7 @@ use virtio::net::ETH_HEADER_LEN;
 // Bootloader configuration
 // ---------------------------------------------------------------------------
 
+#[cfg(not(test))]
 static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     // Map all physical memory so we can use it for heap allocation.
@@ -65,13 +66,14 @@ static BOOTLOADER_CONFIG: BootloaderConfig = {
     config
 };
 
+#[cfg(not(test))]
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 // ---------------------------------------------------------------------------
 // Global allocator
 // ---------------------------------------------------------------------------
 
-#[global_allocator]
+#[cfg_attr(not(test), global_allocator)]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 // ---------------------------------------------------------------------------
@@ -357,7 +359,12 @@ unsafe fn map_elf_at_linked_addresses(
 /// # Safety
 /// Same requirements as `map_elf_at_linked_addresses`.
 #[cfg(feature = "ring3")]
-unsafe fn map_range_to_heap(phys_offset: u64, heap_base_virt: usize, vaddr_start: u64, vaddr_end: u64) {
+unsafe fn map_range_to_heap(
+    phys_offset: u64,
+    heap_base_virt: usize,
+    vaddr_start: u64,
+    vaddr_end: u64,
+) {
     const PRESENT: u64 = 1;
     const WRITABLE: u64 = 1 << 1;
     const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -435,15 +442,24 @@ unsafe fn set_nx_range(phys_offset: u64, vaddr_start: u64, vaddr_end: u64) {
         let pml1_idx = ((vaddr >> 12) & 0x1FF) as usize;
 
         let pml4_val = core::ptr::read_volatile(pml4.add(pml4_idx) as *const u64);
-        if pml4_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        if pml4_val & PRESENT == 0 {
+            vaddr += PAGE_SIZE;
+            continue;
+        }
         let pml3 = ((pml4_val & ADDR_MASK) + phys_offset) as *mut u64;
 
         let pml3_val = core::ptr::read_volatile(pml3.add(pml3_idx) as *const u64);
-        if pml3_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        if pml3_val & PRESENT == 0 {
+            vaddr += PAGE_SIZE;
+            continue;
+        }
         let pml2 = ((pml3_val & ADDR_MASK) + phys_offset) as *mut u64;
 
         let pml2_val = core::ptr::read_volatile(pml2.add(pml2_idx) as *const u64);
-        if pml2_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        if pml2_val & PRESENT == 0 {
+            vaddr += PAGE_SIZE;
+            continue;
+        }
         let pml1 = ((pml2_val & ADDR_MASK) + phys_offset) as *mut u64;
 
         let pte = core::ptr::read_volatile(pml1.add(pml1_idx));
@@ -462,7 +478,11 @@ unsafe fn set_nx_range(phys_offset: u64, vaddr_start: u64, vaddr_end: u64) {
 /// Returns a Vec of (vaddr, pte_value) pairs. Used to preserve the
 /// parent binary's page table entries before a child exec overwrites them.
 #[cfg(feature = "ring3")]
-unsafe fn save_pte_range(phys_offset: u64, vaddr_start: u64, vaddr_end: u64) -> alloc::vec::Vec<(u64, u64)> {
+unsafe fn save_pte_range(
+    phys_offset: u64,
+    vaddr_start: u64,
+    vaddr_end: u64,
+) -> alloc::vec::Vec<(u64, u64)> {
     const PRESENT: u64 = 1;
     const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
     const PAGE_SIZE: u64 = 0x1000;
@@ -481,15 +501,24 @@ unsafe fn save_pte_range(phys_offset: u64, vaddr_start: u64, vaddr_end: u64) -> 
         let pml1_idx = ((vaddr >> 12) & 0x1FF) as usize;
 
         let pml4_val = core::ptr::read_volatile(pml4.add(pml4_idx));
-        if pml4_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        if pml4_val & PRESENT == 0 {
+            vaddr += PAGE_SIZE;
+            continue;
+        }
         let pml3 = ((pml4_val & ADDR_MASK) + phys_offset) as *const u64;
 
         let pml3_val = core::ptr::read_volatile(pml3.add(pml3_idx));
-        if pml3_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        if pml3_val & PRESENT == 0 {
+            vaddr += PAGE_SIZE;
+            continue;
+        }
         let pml2 = ((pml3_val & ADDR_MASK) + phys_offset) as *const u64;
 
         let pml2_val = core::ptr::read_volatile(pml2.add(pml2_idx));
-        if pml2_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        if pml2_val & PRESENT == 0 {
+            vaddr += PAGE_SIZE;
+            continue;
+        }
         let pml1 = ((pml2_val & ADDR_MASK) + phys_offset) as *const u64;
 
         let pte = core::ptr::read_volatile(pml1.add(pml1_idx));
@@ -502,7 +531,12 @@ unsafe fn save_pte_range(phys_offset: u64, vaddr_start: u64, vaddr_end: u64) -> 
 /// Restore PTE values saved by `save_pte_range` and clear any PTEs in the
 /// range that were NOT in the saved set (i.e., pages added by the child's exec).
 #[cfg(feature = "ring3")]
-unsafe fn restore_pte_range(phys_offset: u64, saved: &[(u64, u64)], vaddr_start: u64, vaddr_end: u64) {
+unsafe fn restore_pte_range(
+    phys_offset: u64,
+    saved: &[(u64, u64)],
+    vaddr_start: u64,
+    vaddr_end: u64,
+) {
     const PRESENT: u64 = 1;
     const WRITABLE: u64 = 1 << 1;
     const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -528,15 +562,24 @@ unsafe fn restore_pte_range(phys_offset: u64, saved: &[(u64, u64)], vaddr_start:
 
         // Walk to PML1 — skip if intermediate tables don't exist.
         let pml4_val = core::ptr::read_volatile(pml4.add(pml4_idx) as *const u64);
-        if pml4_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        if pml4_val & PRESENT == 0 {
+            vaddr += PAGE_SIZE;
+            continue;
+        }
         let pml3 = ((pml4_val & ADDR_MASK) + phys_offset) as *mut u64;
 
         let pml3_val = core::ptr::read_volatile(pml3.add(pml3_idx) as *const u64);
-        if pml3_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        if pml3_val & PRESENT == 0 {
+            vaddr += PAGE_SIZE;
+            continue;
+        }
         let pml2 = ((pml3_val & ADDR_MASK) + phys_offset) as *mut u64;
 
         let pml2_val = core::ptr::read_volatile(pml2.add(pml2_idx) as *const u64);
-        if pml2_val & PRESENT == 0 { vaddr += PAGE_SIZE; continue; }
+        if pml2_val & PRESENT == 0 {
+            vaddr += PAGE_SIZE;
+            continue;
+        }
         let pml1 = ((pml2_val & ADDR_MASK) + phys_offset) as *mut u64;
 
         if let Some(&pte) = saved_map.get(&vaddr) {
@@ -819,6 +862,8 @@ fn dispatch_actions(
     virtio_net: &mut Option<virtio::net::VirtioNet>,
     netstack: &core::cell::RefCell<harmony_netstack::NetStack>,
     serial: &mut SerialWriter<impl FnMut(u8)>,
+    neighbor_table: &NeighborTable,
+    now_ms: u64,
 ) {
     use core::fmt::Write;
 
@@ -830,7 +875,20 @@ fn dispatch_actions(
             } => match interface_name.as_ref() {
                 "eth0" | "virtio0" => {
                     if let Some(ref mut net) = virtio_net {
-                        let _ = harmony_platform::NetworkInterface::send(net, raw);
+                        // Announce packets (packet_type 0x01) must always
+                        // be broadcast — their destination_hash is the
+                        // announcer's identity, not a unicast target.
+                        let is_announce = raw.len() >= 2
+                            && (raw[0] & 0x03) == 0x01;
+                        let dst_mac = if is_announce {
+                            None
+                        } else {
+                            extract_dest_hash(raw)
+                                .and_then(|hash| {
+                                    neighbor_table.lookup(&hash, now_ms)
+                                })
+                        };
+                        let _ = net.send_to(raw, dst_mac.as_ref());
                     }
                 }
                 "udp0" => {
@@ -1330,7 +1388,10 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         // static TLS struct (struct pthread, ~1-2 KiB) lives at the tail
         // of .bss and may extend beyond the last segment's vaddr+memsz.
         const ELF_HEADROOM: usize = 16 * 1024;
-        const _: () = assert!(ELF_HEADROOM % 0x1000 == 0, "ELF_HEADROOM must be page-aligned");
+        const _: () = assert!(
+            ELF_HEADROOM % 0x1000 == 0,
+            "ELF_HEADROOM must be page-aligned"
+        );
         let total_size = match vaddr_max.checked_sub(vaddr_min) {
             Some(sz) => sz as usize + ELF_HEADROOM,
             None => {
@@ -1570,9 +1631,8 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
 
         /// Heap allocations made by vm_mmap during child exec. Freed on
         /// child exit to prevent leaking the child's ELF frames.
-        static mut CHILD_MMAP_ALLOCS: Option<
-            alloc::vec::Vec<(*mut u8, core::alloc::Layout)>,
-        > = None;
+        static mut CHILD_MMAP_ALLOCS: Option<alloc::vec::Vec<(*mut u8, core::alloc::Layout)>> =
+            None;
 
         fn dispatch(nr: u64, args: [u64; 6]) -> syscall::SyscallResult {
             const SYS_CLONE: u64 = 56;
@@ -1591,7 +1651,9 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             };
 
             // Poll the network stack on every syscall entry.
-            unsafe { poll_network(); }
+            unsafe {
+                poll_network();
+            }
 
             // ── Idle watchdog ──────────────────────────────────────────
             // If no TCP I/O has occurred for IDLE_KILL_THRESHOLD_MS,
@@ -1616,7 +1678,9 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             if is_fork {
                 let count = unsafe { FORK_COUNT };
                 if count == 0 {
-                    unsafe { FORK_COUNT = 1; }
+                    unsafe {
+                        FORK_COUNT = 1;
+                    }
                     return syscall::SyscallResult {
                         retval: 0,
                         exited: false,
@@ -1662,7 +1726,9 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             }
 
             // Poll again after the syscall.
-            unsafe { poll_network(); }
+            unsafe {
+                poll_network();
+            }
 
             // ── Fork child creation ─────────────────────────────────
             // If a fork syscall just created a NEW child at the root level,
@@ -1670,7 +1736,10 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             // re-triggering when a nested fork (from the child) creates a
             // grandchild — those are handled by the Linuxulator's internal
             // active_process() routing.
-            if is_fork && retval > 0 && syscall::fork_depth() == 0 && lx.pending_fork_child().is_some()
+            if is_fork
+                && retval > 0
+                && syscall::fork_depth() == 0
+                && lx.pending_fork_child().is_some()
             {
                 serial_write_str(b"[FORK] real fork - saving parent context\n");
                 unsafe {
@@ -1729,7 +1798,9 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
                 // Reset watchdog — session ended, parent returns to accept loop.
                 // Without this, the watchdog would fire during the idle accept
                 // wait and brick the unikernel.
-                unsafe { LAST_TCP_IO_MS = 0; }
+                unsafe {
+                    LAST_TCP_IO_MS = 0;
+                }
                 // Call active_process() to trigger recover_child_state().
                 let _ = lx.active_process();
                 // Re-create any pipe buffers removed by the child's close().
@@ -2004,6 +2075,8 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
     #[cfg(feature = "qemu-test")]
     qemu_debug_exit(0x10);
 
+    let mut neighbor_table = NeighborTable::new();
+
     loop {
         let now = pit.now_ms();
         let smoltcp_now = smoltcp::time::Instant::from_millis(now as i64);
@@ -2016,9 +2089,16 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
             while let Some(frame) = net.receive_raw() {
                 match virtio::net::ethertype(&frame) {
                     0x88B5 => {
-                        // Raw Harmony — strip Ethernet header, feed to runtime
+                        // Raw Harmony — learn neighbor from announces, then
+                        // strip Ethernet header and feed to runtime.
                         if frame.len() > ETH_HEADER_LEN {
-                            harmony_packets.push(frame[ETH_HEADER_LEN..].to_vec());
+                            let mut src_mac = [0u8; 6];
+                            src_mac.copy_from_slice(&frame[6..12]);
+                            let payload = &frame[ETH_HEADER_LEN..];
+                            neighbor_table.learn_from_announce(
+                                payload, src_mac, now,
+                            );
+                            harmony_packets.push(payload.to_vec());
                         }
                     }
                     0x0800 | 0x0806 => {
@@ -2032,7 +2112,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         // Dispatch Harmony packets (borrow on virtio_net is released)
         for payload in harmony_packets {
             let actions = runtime.handle_packet("eth0", payload, now);
-            dispatch_actions(&actions, &mut virtio_net, &netstack, &mut serial);
+            dispatch_actions(&actions, &mut virtio_net, &netstack, &mut serial, &neighbor_table, now);
         }
 
         // Process IP stack (inbound)
@@ -2054,12 +2134,12 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         };
         for pkt in udp_packets {
             let actions = runtime.handle_packet("udp0", pkt, now);
-            dispatch_actions(&actions, &mut virtio_net, &netstack, &mut serial);
+            dispatch_actions(&actions, &mut virtio_net, &netstack, &mut serial, &neighbor_table, now);
         }
 
         // Timer tick
         let actions = runtime.tick(now);
-        dispatch_actions(&actions, &mut virtio_net, &netstack, &mut serial);
+        dispatch_actions(&actions, &mut virtio_net, &netstack, &mut serial, &neighbor_table, now);
 
         // Flush outbound UDP frames (re-sample time so smoltcp sees elapsed millis)
         let smoltcp_now = smoltcp::time::Instant::from_millis(pit.now_ms() as i64);
@@ -2079,6 +2159,345 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         );
 
         core::hint::spin_loop();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Neighbor table: maps Harmony identity hashes to Ethernet MAC addresses.
+// Learned from received announce packets; used for unicast TX.
+// ---------------------------------------------------------------------------
+
+const NEIGHBOR_TABLE_SIZE: usize = 32;
+const NEIGHBOR_TTL_MS: u64 = 300_000; // 5 minutes
+
+#[derive(Clone)]
+struct NeighborEntry {
+    identity_hash: [u8; 16],
+    mac: [u8; 6],
+    last_seen_ms: u64,
+}
+
+struct NeighborTable {
+    entries: [Option<NeighborEntry>; NEIGHBOR_TABLE_SIZE],
+}
+
+impl NeighborTable {
+    fn new() -> Self {
+        Self {
+            entries: [const { None }; NEIGHBOR_TABLE_SIZE],
+        }
+    }
+
+    fn learn(&mut self, identity_hash: [u8; 16], mac: [u8; 6], now_ms: u64) {
+        // Update existing entry if identity_hash matches
+        for entry in self.entries.iter_mut().flatten() {
+            if entry.identity_hash == identity_hash {
+                entry.mac = mac;
+                entry.last_seen_ms = now_ms;
+                return;
+            }
+        }
+        // Find first empty slot
+        for slot in self.entries.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(NeighborEntry {
+                    identity_hash,
+                    mac,
+                    last_seen_ms: now_ms,
+                });
+                return;
+            }
+        }
+        // Table full — evict oldest entry
+        let oldest_idx = self
+            .entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, e)| e.as_ref().map_or(u64::MAX, |e| e.last_seen_ms))
+            .map(|(i, _)| i)
+            .unwrap(); // table is full, so unwrap is safe
+        self.entries[oldest_idx] = Some(NeighborEntry {
+            identity_hash,
+            mac,
+            last_seen_ms: now_ms,
+        });
+    }
+
+    fn lookup(&self, identity_hash: &[u8; 16], now_ms: u64) -> Option<[u8; 6]> {
+        for entry in self.entries.iter().flatten() {
+            if entry.identity_hash == *identity_hash
+                && now_ms.saturating_sub(entry.last_seen_ms) < NEIGHBOR_TTL_MS
+            {
+                return Some(entry.mac);
+            }
+        }
+        None
+    }
+
+    /// Learn a neighbor from an inbound Harmony frame if it's an announce packet.
+    /// Announce packets (packet_type bits 1..0 == 0x01) carry the announcer's
+    /// identity as the destination_hash in a Type1 header (bytes 2..18).
+    fn learn_from_announce(&mut self, payload: &[u8], src_mac: [u8; 6], now_ms: u64) {
+        // Minimum Type1 header: 1 (flags) + 1 (hops) + 16 (dest_hash) + 1 (context) = 19
+        if payload.len() < 19 {
+            return;
+        }
+        // IFAC packets have a different field layout — skip them.
+        // The raw Harmony path does not currently use IFAC.
+        if payload[0] & 0x80 != 0 {
+            return;
+        }
+        // Announce packets are always Type1. Type2 would mean bytes 2..18
+        // are transport_id, not the announcer's identity hash.
+        if payload[0] & 0x40 != 0 {
+            return;
+        }
+        // Check packet_type == Announce (bits 1..0 of flags byte)
+        let packet_type = payload[0] & 0x03;
+        if packet_type != 0x01 {
+            return;
+        }
+        let mut identity_hash = [0u8; 16];
+        identity_hash.copy_from_slice(&payload[2..18]);
+        self.learn(identity_hash, src_mac, now_ms);
+    }
+}
+
+/// Extract the destination hash from an outbound Harmony/Reticulum packet.
+/// Returns `None` if the packet is too short to contain a valid header.
+fn extract_dest_hash(raw: &[u8]) -> Option<[u8; 16]> {
+    if raw.len() < 2 {
+        return None;
+    }
+    // IFAC packets (bit 7) have a different field layout — dest hash
+    // is not at the standard offsets.
+    if raw[0] & 0x80 != 0 {
+        return None;
+    }
+    let header_type2 = (raw[0] & 0x40) != 0;
+    let (offset, min_len) = if header_type2 {
+        (18, 34) // Type2: transport_id at 2..18, dest_hash at 18..34
+    } else {
+        (2, 18) // Type1: dest_hash at 2..18
+    };
+    if raw.len() < min_len {
+        return None;
+    }
+    let mut hash = [0u8; 16];
+    hash.copy_from_slice(&raw[offset..offset + 16]);
+    Some(hash)
+}
+
+#[cfg(test)]
+mod neighbor_tests {
+    use super::*;
+
+    #[test]
+    fn learn_and_lookup() {
+        let mut table = NeighborTable::new();
+        let hash = [0xAA; 16];
+        let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        table.learn(hash, mac, 1000);
+        assert_eq!(table.lookup(&hash, 1000), Some(mac));
+    }
+
+    #[test]
+    fn lookup_unknown_returns_none() {
+        let table = NeighborTable::new();
+        let hash = [0xBB; 16];
+        assert_eq!(table.lookup(&hash, 1000), None);
+    }
+
+    #[test]
+    fn ttl_expiry() {
+        let mut table = NeighborTable::new();
+        let hash = [0xCC; 16];
+        let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+        table.learn(hash, mac, 1000);
+        // Just before expiry: still valid
+        assert_eq!(table.lookup(&hash, 1000 + NEIGHBOR_TTL_MS - 1), Some(mac));
+        // At expiry: stale
+        assert_eq!(table.lookup(&hash, 1000 + NEIGHBOR_TTL_MS), None);
+    }
+
+    #[test]
+    fn update_existing_entry() {
+        let mut table = NeighborTable::new();
+        let hash = [0xDD; 16];
+        let mac1 = [0x02, 0x00, 0x00, 0x00, 0x00, 0x03];
+        let mac2 = [0x02, 0x00, 0x00, 0x00, 0x00, 0x04];
+        table.learn(hash, mac1, 1000);
+        table.learn(hash, mac2, 2000);
+        assert_eq!(table.lookup(&hash, 2000), Some(mac2));
+    }
+
+    #[test]
+    fn eviction_when_full() {
+        let mut table = NeighborTable::new();
+        // Fill all 32 slots
+        for i in 0..NEIGHBOR_TABLE_SIZE {
+            let mut hash = [0u8; 16];
+            hash[0] = i as u8;
+            let mac = [0x02, 0x00, 0x00, 0x00, 0x00, i as u8];
+            table.learn(hash, mac, 1000 + i as u64);
+        }
+        // Add 33rd — should evict slot 0 (oldest, last_seen_ms=1000)
+        let new_hash = [0xFF; 16];
+        let new_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0xFF];
+        table.learn(new_hash, new_mac, 2000);
+
+        // New entry is findable
+        assert_eq!(table.lookup(&new_hash, 2000), Some(new_mac));
+        // Evicted entry is gone
+        let evicted_hash = [0u8; 16]; // slot 0 had hash[0]=0
+        assert_eq!(table.lookup(&evicted_hash, 2000), None);
+        // Other entries still present
+        let mut hash1 = [0u8; 16];
+        hash1[0] = 1;
+        assert_eq!(
+            table.lookup(&hash1, 2000),
+            Some([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])
+        );
+    }
+
+    #[test]
+    fn learn_from_announce_packet() {
+        let mut table = NeighborTable::new();
+        let src_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        // Build a minimal announce packet:
+        // Byte 0: flags — packet_type=Announce (0x01), header_type=Type1 (bit 6=0)
+        // Byte 1: hops
+        // Bytes 2..18: destination_hash (the announcer's identity)
+        // Byte 18: context
+        let mut payload = [0u8; 19];
+        payload[0] = 0x01; // packet_type=Announce (bits 1..0 = 01)
+        payload[1] = 0x00; // hops
+        let identity = [0xAA; 16];
+        payload[2..18].copy_from_slice(&identity);
+
+        table.learn_from_announce(&payload, src_mac, 5000);
+        assert_eq!(table.lookup(&identity, 5000), Some(src_mac));
+    }
+
+    #[test]
+    fn learn_from_non_announce_does_nothing() {
+        let mut table = NeighborTable::new();
+        let src_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+        // Build a data packet (packet_type=Data = 0x00)
+        let mut payload = [0u8; 19];
+        payload[0] = 0x00; // packet_type=Data
+        let identity = [0xBB; 16];
+        payload[2..18].copy_from_slice(&identity);
+
+        table.learn_from_announce(&payload, src_mac, 5000);
+        // Should NOT have learned anything
+        assert_eq!(table.lookup(&identity, 5000), None);
+    }
+
+    #[test]
+    fn learn_from_short_packet_does_nothing() {
+        let mut table = NeighborTable::new();
+        let src_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x03];
+        let short_payload = [0x01; 10]; // Announce flag but too short
+
+        table.learn_from_announce(&short_payload, src_mac, 5000);
+        // Table should be empty — no crash, no entry
+        assert_eq!(table.lookup(&[0x01; 16], 5000), None);
+    }
+
+    #[test]
+    fn extract_dest_hash_type1() {
+        // Type1: bit 6 of flags = 0, dest at bytes 2..18
+        let mut packet = [0u8; 20];
+        packet[0] = 0x00; // Type1 header
+        let dest = [0x11; 16];
+        packet[2..18].copy_from_slice(&dest);
+
+        assert_eq!(extract_dest_hash(&packet), Some(dest));
+    }
+
+    #[test]
+    fn extract_dest_hash_type2() {
+        // Type2: bit 6 of flags = 1, dest at bytes 18..34
+        let mut packet = [0u8; 35];
+        packet[0] = 0x40; // Type2 header (bit 6 set)
+        let dest = [0x22; 16];
+        packet[18..34].copy_from_slice(&dest);
+
+        assert_eq!(extract_dest_hash(&packet), Some(dest));
+    }
+
+    #[test]
+    fn extract_dest_hash_short_packet() {
+        let short = [0u8; 5];
+        assert_eq!(extract_dest_hash(&short), None);
+
+        // Type1 but not enough bytes for dest hash
+        let mut short_type1 = [0u8; 17];
+        short_type1[0] = 0x00;
+        assert_eq!(extract_dest_hash(&short_type1), None);
+
+        // Type2 but not enough bytes for dest hash
+        let mut short_type2 = [0u8; 33];
+        short_type2[0] = 0x40;
+        assert_eq!(extract_dest_hash(&short_type2), None);
+    }
+
+    #[test]
+    fn learn_from_ifac_packet_does_nothing() {
+        let mut table = NeighborTable::new();
+        let src_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x04];
+        let mut payload = [0u8; 19];
+        // IFAC flag set (bit 7) + announce packet_type
+        payload[0] = 0x80 | 0x01;
+        let identity = [0xCC; 16];
+        payload[2..18].copy_from_slice(&identity);
+
+        table.learn_from_announce(&payload, src_mac, 5000);
+        assert_eq!(table.lookup(&identity, 5000), None);
+    }
+
+    #[test]
+    fn learn_from_type2_announce_does_nothing() {
+        let mut table = NeighborTable::new();
+        let src_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x05];
+        let mut payload = [0u8; 35];
+        // Type2 flag set (bit 6) + announce packet_type
+        payload[0] = 0x40 | 0x01;
+        let identity = [0xDD; 16];
+        // bytes 2..18 would be transport_id in Type2, not identity
+        payload[2..18].copy_from_slice(&identity);
+
+        table.learn_from_announce(&payload, src_mac, 5000);
+        assert_eq!(table.lookup(&identity, 5000), None);
+    }
+
+    #[test]
+    fn extract_dest_hash_ifac_returns_none() {
+        // IFAC flag set (bit 7) — field layout differs
+        let mut packet = [0u8; 20];
+        packet[0] = 0x80; // IFAC flag set
+        let dest = [0x33; 16];
+        packet[2..18].copy_from_slice(&dest);
+        assert_eq!(extract_dest_hash(&packet), None);
+    }
+
+    #[test]
+    fn announce_packet_detected_for_broadcast() {
+        // Announce packet_type = 0x01 (bits 1..0)
+        let mut announce = [0u8; 19];
+        announce[0] = 0x01; // Announce
+        assert_eq!(announce[0] & 0x03, 0x01);
+
+        // Data packet_type = 0x00
+        let mut data = [0u8; 19];
+        data[0] = 0x00; // Data
+        assert_eq!(data[0] & 0x03, 0x00);
+
+        // LinkRequest packet_type = 0x02
+        let mut link_req = [0u8; 19];
+        link_req[0] = 0x02;
+        assert_eq!(link_req[0] & 0x03, 0x02);
     }
 }
 
@@ -2166,6 +2585,7 @@ extern "x86-interrupt" fn double_fault_handler(
 // Panic handler
 // ---------------------------------------------------------------------------
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     serial_init();
