@@ -14,6 +14,14 @@ compile_error!("Exactly one platform feature must be enabled: `qemu-virt` or `rp
 #[cfg(feature = "qemu-virt")]
 pub const PL011_BASE: usize = 0x0900_0000;
 
+/// GICv3 Distributor base address (QEMU virt).
+#[cfg(feature = "qemu-virt")]
+pub const GICD_BASE: usize = 0x0800_0000;
+
+/// GICv3 Redistributor base address (QEMU virt).
+#[cfg(feature = "qemu-virt")]
+pub const GICR_BASE: usize = 0x080A_0000;
+
 /// PL011 UART base address for RPi5 (BCM2712 debug UART).
 ///
 /// This is the SoC-native debug UART at 0x107d001000, connected to the
@@ -55,7 +63,9 @@ pub const XHCI_BASE: usize = 0x1F_000D_0000;
 /// Each entry: (base_address, page_count).
 #[cfg(feature = "qemu-virt")]
 pub const MMIO_REGIONS: &[(usize, usize)] = &[
-    (PL011_BASE, 1),
+    (PL011_BASE, 1),   // PL011 UART (4 KiB)
+    (GICD_BASE, 16),   // GICv3 Distributor (64 KiB)
+    (GICR_BASE, 256),  // GICv3 Redistributor (1 MiB — 128 KiB per CPU × 8 max)
 ];
 
 /// Locally-administered test MAC address for GENET (RPi5).
@@ -84,5 +94,27 @@ mod tests {
     #[test]
     fn uart_clock_is_set() {
         assert!(UART_CLOCK_HZ > 0);
+    }
+
+    #[test]
+    fn gic_bases_are_set() {
+        #[cfg(feature = "qemu-virt")]
+        {
+            assert_ne!(GICD_BASE, 0);
+            assert_ne!(GICR_BASE, 0);
+            // GICR must be after GICD (separate MMIO region)
+            assert!(GICR_BASE > GICD_BASE);
+        }
+    }
+
+    #[test]
+    fn mmio_regions_include_gic() {
+        #[cfg(feature = "qemu-virt")]
+        {
+            let has_gicd = MMIO_REGIONS.iter().any(|&(base, _)| base == GICD_BASE);
+            let has_gicr = MMIO_REGIONS.iter().any(|&(base, _)| base == GICR_BASE);
+            assert!(has_gicd, "MMIO_REGIONS must include GICD");
+            assert!(has_gicr, "MMIO_REGIONS must include GICR");
+        }
     }
 }
