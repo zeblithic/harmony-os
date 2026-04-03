@@ -397,7 +397,9 @@ impl VirtioNet {
             ptr::copy_nonoverlapping(frame.as_ptr(), buf.add(VIRTIO_NET_HDR_LEN), frame.len());
         }
 
-        self.tx_queue.commit_send(idx, total_len);
+        // SAFETY: idx was returned by prepare_send above; total_len bytes
+        // were written to the DMA buffer (VirtIO header + Ethernet frame).
+        unsafe { self.tx_queue.commit_send(idx, total_len) };
 
         // Notify the device that a TX buffer is available.
         unsafe { mmio_write16(self.tx_notify_addr, 1) };
@@ -435,7 +437,9 @@ impl VirtioNet {
             ptr::copy_nonoverlapping(data.as_ptr(), buf.add(h + ETH_HEADER_LEN), data.len());
         }
 
-        self.tx_queue.commit_send(idx, frame_len);
+        // SAFETY: idx was returned by prepare_send above; frame_len bytes
+        // were written to the DMA buffer (VirtIO header + ETH header + payload).
+        unsafe { self.tx_queue.commit_send(idx, frame_len) };
 
         // Notify the device that a TX buffer is available.
         unsafe { mmio_write16(self.tx_notify_addr, 1) };

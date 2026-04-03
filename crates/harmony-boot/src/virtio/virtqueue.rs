@@ -293,17 +293,18 @@ impl Virtqueue {
     /// Writes the descriptor table entry and adds the descriptor to the
     /// available ring so the device can consume it.
     ///
-    /// # Arguments
+    /// # Safety
     ///
-    /// * `idx` — Descriptor index returned by `prepare_send`.
-    /// * `len` — Number of bytes written into the buffer.
-    pub fn commit_send(&mut self, idx: u16, len: usize) {
+    /// - `idx` must have been returned by [`prepare_send`] on this same queue
+    ///   and must not have been passed to `commit_send` before.
+    /// - At least `len` bytes must have been written to the DMA buffer
+    ///   returned by the paired `prepare_send` call.
+    pub unsafe fn commit_send(&mut self, idx: u16, len: usize) {
         debug_assert!(
-            (idx as usize) < QUEUE_SIZE as usize,
+            (idx as usize) < self.queue_size as usize,
             "commit_send: idx out of range"
         );
         debug_assert!(len <= BUF_SIZE, "commit_send: len exceeds BUF_SIZE");
-        unsafe {
             // Volatile writes for descriptor table — device reads via DMA.
             let desc = self.desc.add(idx as usize);
             ptr::write_volatile(&raw mut (*desc).addr, self.buffer_phys(idx));
@@ -423,7 +424,8 @@ mod tests {
             );
         }
 
-        vq.commit_send(idx, test_data.len());
+        // SAFETY: idx from prepare_send; test_data.len() bytes written above.
+        unsafe { vq.commit_send(idx, test_data.len()) };
 
         // Verify the descriptor table entry.
         unsafe {
