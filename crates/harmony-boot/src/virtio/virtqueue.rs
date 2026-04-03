@@ -233,6 +233,11 @@ impl Virtqueue {
     ///
     /// Returns the descriptor index on success, or `None` if no descriptors
     /// are free or `data` exceeds `BUF_SIZE`.
+    ///
+    /// Note: [`prepare_send`]/[`commit_send`] is preferred for new code —
+    /// it avoids the intermediate copy. This method is retained as a
+    /// convenience for callers that already have a complete buffer.
+    #[allow(dead_code)]
     pub fn submit_send(&mut self, data: &[u8]) -> Option<u16> {
         if data.len() > BUF_SIZE {
             return None;
@@ -293,6 +298,11 @@ impl Virtqueue {
     /// * `idx` — Descriptor index returned by `prepare_send`.
     /// * `len` — Number of bytes written into the buffer.
     pub fn commit_send(&mut self, idx: u16, len: usize) {
+        debug_assert!(
+            (idx as usize) < QUEUE_SIZE as usize,
+            "commit_send: idx out of range"
+        );
+        debug_assert!(len <= BUF_SIZE, "commit_send: len exceeds BUF_SIZE");
         unsafe {
             // Volatile writes for descriptor table — device reads via DMA.
             let desc = self.desc.add(idx as usize);
