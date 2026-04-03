@@ -65,12 +65,19 @@ pub unsafe fn parse_fdt(dtb_ptr: *const u8) -> HardwareConfig {
                     }
                 }
                 "arm,gic-v3" => {
-                    if let Some(reg) = node.reg().and_then(|mut r| r.next()) {
-                        config.interrupt_controller = Some(InterruptControllerConfig {
-                            base: reg.starting_address as u64,
-                            size: reg.size.unwrap_or(0x10000) as u64,
-                            variant: InterruptControllerVariant::GicV3,
-                        });
+                    if let Some(mut regs) = node.reg() {
+                        if let Some(gicd_reg) = regs.next() {
+                            let gicr_reg = regs.next();
+                            config.interrupt_controller = Some(InterruptControllerConfig {
+                                base: gicd_reg.starting_address as u64,
+                                size: gicd_reg.size.unwrap_or(0x10000) as u64,
+                                variant: InterruptControllerVariant::GicV3,
+                                redistributor_base: gicr_reg
+                                    .map(|r| r.starting_address as u64),
+                                redistributor_size: gicr_reg
+                                    .map(|r| r.size.unwrap_or(0xF60000) as u64),
+                            });
+                        }
                     }
                 }
                 "arm,cortex-a15-gic" | "arm,gic-400" => {
@@ -79,6 +86,8 @@ pub unsafe fn parse_fdt(dtb_ptr: *const u8) -> HardwareConfig {
                             base: reg.starting_address as u64,
                             size: reg.size.unwrap_or(0x10000) as u64,
                             variant: InterruptControllerVariant::GicV2,
+                            redistributor_base: None,
+                            redistributor_size: None,
                         });
                     }
                 }
@@ -88,6 +97,8 @@ pub unsafe fn parse_fdt(dtb_ptr: *const u8) -> HardwareConfig {
                             base: reg.starting_address as u64,
                             size: reg.size.unwrap_or(0xC000) as u64,
                             variant: InterruptControllerVariant::AppleAic,
+                            redistributor_base: None,
+                            redistributor_size: None,
                         });
                     }
                 }
