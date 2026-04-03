@@ -305,23 +305,22 @@ impl Virtqueue {
             "commit_send: idx out of range"
         );
         debug_assert!(len <= BUF_SIZE, "commit_send: len exceeds BUF_SIZE");
-            // Volatile writes for descriptor table — device reads via DMA.
-            let desc = self.desc.add(idx as usize);
-            ptr::write_volatile(&raw mut (*desc).addr, self.buffer_phys(idx));
-            ptr::write_volatile(&raw mut (*desc).len, len as u32);
-            ptr::write_volatile(&raw mut (*desc).flags, 0u16);
-            ptr::write_volatile(&raw mut (*desc).next, 0u16);
+        // Volatile writes for descriptor table — device reads via DMA.
+        let desc = self.desc.add(idx as usize);
+        ptr::write_volatile(&raw mut (*desc).addr, self.buffer_phys(idx));
+        ptr::write_volatile(&raw mut (*desc).len, len as u32);
+        ptr::write_volatile(&raw mut (*desc).flags, 0u16);
+        ptr::write_volatile(&raw mut (*desc).next, 0u16);
 
-            // Volatile writes for avail ring — device reads via DMA.
-            let avail_idx = ptr::read_volatile(&(*self.avail).idx);
-            let ring_slot = &mut (*self.avail).ring[(avail_idx % self.queue_size) as usize];
-            ptr::write_volatile(ring_slot, idx);
+        // Volatile writes for avail ring — device reads via DMA.
+        let avail_idx = ptr::read_volatile(&(*self.avail).idx);
+        let ring_slot = &mut (*self.avail).ring[(avail_idx % self.queue_size) as usize];
+        ptr::write_volatile(ring_slot, idx);
 
-            // Ensure descriptor + data writes are visible before the device
-            // sees the updated available index.
-            fence(Ordering::Release);
-            ptr::write_volatile(&mut (*self.avail).idx, avail_idx.wrapping_add(1));
-        }
+        // Ensure descriptor + data writes are visible before the device
+        // sees the updated available index.
+        fence(Ordering::Release);
+        ptr::write_volatile(&mut (*self.avail).idx, avail_idx.wrapping_add(1));
     }
 
     /// Poll the used ring for completed descriptors.
