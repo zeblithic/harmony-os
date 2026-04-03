@@ -167,16 +167,15 @@ mod tests {
                             if let Some(mut regs) = node.reg() {
                                 if let Some(gicd_reg) = regs.next() {
                                     let gicr_reg = regs.next();
-                                    config.interrupt_controller =
-                                        Some(InterruptControllerConfig {
-                                            base: gicd_reg.starting_address as u64,
-                                            size: gicd_reg.size.unwrap_or(0x10000) as u64,
-                                            variant: InterruptControllerVariant::GicV3,
-                                            redistributor_base: gicr_reg
-                                                .map(|r| r.starting_address as u64),
-                                            redistributor_size: gicr_reg
-                                                .map(|r| r.size.unwrap_or(0xF60000) as u64),
-                                        });
+                                    config.interrupt_controller = Some(InterruptControllerConfig {
+                                        base: gicd_reg.starting_address as u64,
+                                        size: gicd_reg.size.unwrap_or(0x10000) as u64,
+                                        variant: InterruptControllerVariant::GicV3,
+                                        redistributor_base: gicr_reg
+                                            .map(|r| r.starting_address as u64),
+                                        redistributor_size: gicr_reg
+                                            .map(|r| r.size.unwrap_or(0xF60000) as u64),
+                                    });
                                 }
                             }
                         }

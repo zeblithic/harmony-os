@@ -22,11 +22,19 @@ pub fn counter_to_ms(count: u64, freq: u64) -> u64 {
 // ── Hardware access (aarch64 only) ────────────────────────────────────
 
 #[cfg(target_arch = "aarch64")]
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Cached timer frequency read from `CNTFRQ_EL0` during [`init`].
 #[cfg(target_arch = "aarch64")]
 static TIMER_FREQ: AtomicU64 = AtomicU64::new(0);
+
+/// Monotonic tick counter — incremented by the IRQ handler on each timer tick.
+#[cfg(target_arch = "aarch64")]
+static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Cached reload value for `rearm()` — set by `enable_tick()`.
+#[cfg(target_arch = "aarch64")]
+static RELOAD_VALUE: AtomicU32 = AtomicU32::new(0);
 
 /// Read `CNTFRQ_EL0` and cache the result in [`TIMER_FREQ`].
 ///
@@ -59,6 +67,57 @@ pub fn counter() -> u64 {
 #[cfg(target_arch = "aarch64")]
 pub fn now_ms() -> u64 {
     counter_to_ms(counter(), freq())
+}
+
+/// Arm the physical timer to fire periodic interrupts at `hz` Hz.
+///
+/// Computes the reload value from the cached timer frequency, writes
+/// `CNTP_TVAL_EL0` (countdown), and enables the timer with interrupts
+/// unmasked via `CNTP_CTL_EL0`.
+///
+/// # Panics
+///
+/// Panics if `hz` is 0 or if `init()` has not been called.
+#[cfg(target_arch = "aarch64")]
+pub fn enable_tick(hz: u32) {
+    assert!(hz > 0, "tick frequency must be > 0");
+    let f = freq();
+    assert!(f > 0, "timer::init() must be called before enable_tick()");
+    let reload = (f / hz as u64) as u32;
+    RELOAD_VALUE.store(reload, Ordering::Relaxed);
+    unsafe {
+        // Load countdown register — fires interrupt when it reaches 0.
+        core::arch::asm!("msr cntp_tval_el0, {}", in(reg) reload as u64);
+        // Enable timer, unmask interrupt (ENABLE=1, IMASK=0).
+        core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) 1_u64);
+    }
+}
+
+/// Reload the countdown timer for the next tick.
+///
+/// Called by the IRQ handler after each tick. Writes `CNTP_TVAL_EL0`
+/// with the cached reload value, restarting the countdown from *now*.
+#[cfg(target_arch = "aarch64")]
+pub fn rearm() {
+    let reload = RELOAD_VALUE.load(Ordering::Relaxed);
+    unsafe {
+        core::arch::asm!("msr cntp_tval_el0, {}", in(reg) reload as u64);
+    }
+}
+
+/// Timer tick callback — called by the IRQ handler on each timer interrupt.
+///
+/// Increments the tick counter and rearms the timer for the next interval.
+#[cfg(target_arch = "aarch64")]
+pub fn on_tick() {
+    TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    rearm();
+}
+
+/// Return the number of timer ticks since interrupts were enabled.
+#[cfg(target_arch = "aarch64")]
+pub fn tick_count() -> u64 {
+    TICK_COUNT.load(Ordering::Relaxed)
 }
 
 // ── Tests (run on host) ──────────────────────────────────────────────
@@ -94,5 +153,32 @@ mod tests {
     fn fractional_ms_truncates() {
         // At 62.5 MHz, 1 ms = 62_500 ticks.  62_499 ticks < 1 ms -> 0.
         assert_eq!(counter_to_ms(62_499, 62_500_000), 0);
+    }
+
+    #[test]
+    fn reload_value_100hz_at_62_5_mhz() {
+        // 62,500,000 Hz / 100 Hz = 625,000 ticks per interval
+        let freq: u64 = 62_500_000;
+        let hz: u32 = 100;
+        let reload = (freq / hz as u64) as u32;
+        assert_eq!(reload, 625_000);
+    }
+
+    #[test]
+    fn reload_value_100hz_at_54_mhz() {
+        // QEMU virt often reports 54 MHz
+        let freq: u64 = 54_000_000;
+        let hz: u32 = 100;
+        let reload = (freq / hz as u64) as u32;
+        assert_eq!(reload, 540_000);
+    }
+
+    #[test]
+    fn reload_value_fits_u32() {
+        // Even at 1 GHz / 100 Hz = 10,000,000 — fits in u32
+        let freq: u64 = 1_000_000_000;
+        let hz: u32 = 100;
+        let reload = freq / hz as u64;
+        assert!(reload <= u32::MAX as u64);
     }
 }
