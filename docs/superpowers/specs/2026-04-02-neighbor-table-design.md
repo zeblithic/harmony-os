@@ -71,7 +71,7 @@ Design choices:
 
 ### TX Unicast Path
 
-In `dispatch_actions`, when handling `RuntimeAction::SendOnInterface { interface_name: "eth0", raw, weight }`:
+In `dispatch_actions`, when handling `RuntimeAction::SendOnInterface { interface_name: "eth0", raw }`:
 
 **Current behavior:**
 ```rust
@@ -80,16 +80,13 @@ let _ = harmony_platform::NetworkInterface::send(net, raw);
 
 **New behavior:**
 ```rust
-// Broadcast sends skip unicast lookup
-if weight.is_some() {
-    let _ = harmony_platform::NetworkInterface::send(net, raw);
-} else {
-    // Parse destination hash from outbound Harmony packet
-    let dst_mac = extract_dest_hash(raw)
-        .and_then(|hash| neighbor_table.lookup(&hash, now));
-    net.send_to(raw, dst_mac.as_ref());
-}
+// Parse destination hash from outbound Harmony packet
+let dst_mac = extract_dest_hash(raw)
+    .and_then(|hash| neighbor_table.lookup(&hash, now_ms));
+let _ = net.send_to(raw, dst_mac.as_ref());
 ```
+
+Note: The unikernel's `RuntimeAction::SendOnInterface` does not have a `weight` field (unlike the full `harmony-runtime`). All sends go through the unicast lookup path, falling back to broadcast when the destination is unknown.
 
 **`extract_dest_hash(raw: &[u8]) -> Option<[u8; 16]>`:**
 - Free function, parses the flags byte to determine header type.
