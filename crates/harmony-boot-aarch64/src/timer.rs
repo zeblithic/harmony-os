@@ -107,11 +107,51 @@ pub fn rearm() {
 
 /// Timer tick callback — called by the IRQ handler on each timer interrupt.
 ///
-/// Increments the tick counter and rearms the timer for the next interval.
+/// Increments the tick counter, rearms the timer, and prints the tick
+/// count once per second (every 100 ticks) for boot verification.
 #[cfg(target_arch = "aarch64")]
 pub fn on_tick() {
-    TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    let count = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     rearm();
+
+    // Print tick count once per second (every 100 ticks) for verification.
+    if count % 100 == 0 {
+        print_tick(count);
+    }
+}
+
+/// Minimal serial print for IRQ context — no allocator, no formatting.
+/// Writes "[Tick] NNNNN\r\n" via PL011.
+#[cfg(target_arch = "aarch64")]
+fn print_tick(count: u64) {
+    use crate::pl011;
+
+    let prefix = b"[Tick] ";
+    for &b in prefix {
+        unsafe { pl011::write_byte(b) };
+    }
+
+    // Convert count to decimal digits.
+    let mut buf = [0u8; 20]; // u64 max is 20 digits
+    let mut n = count;
+    let mut i = buf.len();
+    if n == 0 {
+        i -= 1;
+        buf[i] = b'0';
+    } else {
+        while n > 0 {
+            i -= 1;
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+    }
+    for &b in &buf[i..] {
+        unsafe { pl011::write_byte(b) };
+    }
+    unsafe {
+        pl011::write_byte(b'\r');
+        pl011::write_byte(b'\n');
+    }
 }
 
 /// Return the number of timer ticks since interrupts were enabled.
