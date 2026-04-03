@@ -862,6 +862,8 @@ fn dispatch_actions(
     virtio_net: &mut Option<virtio::net::VirtioNet>,
     netstack: &core::cell::RefCell<harmony_netstack::NetStack>,
     serial: &mut SerialWriter<impl FnMut(u8)>,
+    neighbor_table: &NeighborTable,
+    now_ms: u64,
 ) {
     use core::fmt::Write;
 
@@ -873,7 +875,9 @@ fn dispatch_actions(
             } => match interface_name.as_ref() {
                 "eth0" | "virtio0" => {
                     if let Some(ref mut net) = virtio_net {
-                        let _ = harmony_platform::NetworkInterface::send(net, raw);
+                        let dst_mac = extract_dest_hash(raw)
+                            .and_then(|hash| neighbor_table.lookup(&hash, now_ms));
+                        let _ = net.send_to(raw, dst_mac.as_ref());
                     }
                 }
                 "udp0" => {
@@ -2097,7 +2101,7 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         // Dispatch Harmony packets (borrow on virtio_net is released)
         for payload in harmony_packets {
             let actions = runtime.handle_packet("eth0", payload, now);
-            dispatch_actions(&actions, &mut virtio_net, &netstack, &mut serial);
+            dispatch_actions(&actions, &mut virtio_net, &netstack, &mut serial, &neighbor_table, now);
         }
 
         // Process IP stack (inbound)
@@ -2119,12 +2123,12 @@ unsafe extern "C" fn kernel_continue(state: *mut BootState) -> ! {
         };
         for pkt in udp_packets {
             let actions = runtime.handle_packet("udp0", pkt, now);
-            dispatch_actions(&actions, &mut virtio_net, &netstack, &mut serial);
+            dispatch_actions(&actions, &mut virtio_net, &netstack, &mut serial, &neighbor_table, now);
         }
 
         // Timer tick
         let actions = runtime.tick(now);
-        dispatch_actions(&actions, &mut virtio_net, &netstack, &mut serial);
+        dispatch_actions(&actions, &mut virtio_net, &netstack, &mut serial, &neighbor_table, now);
 
         // Flush outbound UDP frames (re-sample time so smoltcp sees elapsed millis)
         let smoltcp_now = smoltcp::time::Instant::from_millis(pit.now_ms() as i64);
