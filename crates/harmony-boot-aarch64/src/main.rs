@@ -315,6 +315,21 @@ fn main() -> Status {
     );
     let mut bump = bump_alloc::BumpAllocator::new(bump_base, BUMP_REGION_SIZE);
 
+    // Enable FP/SIMD access at EL1 and EL0. CPACR_EL1.FPEN [21:20] = 0b11.
+    // Must be done before any code uses floating-point (including memcpy
+    // optimizations in musl libc). Reset value is IMPLEMENTATION DEFINED.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "mrs {tmp}, CPACR_EL1",
+            "orr {tmp}, {tmp}, #(0x3 << 20)",
+            "msr CPACR_EL1, {tmp}",
+            "isb",
+            tmp = out(reg) _,
+        );
+    }
+    let _ = writeln!(serial, "[FP] SIMD/FP access enabled (CPACR_EL1.FPEN)");
+
     // ── Build identity map and enable MMU ──
     unsafe {
         mmu::init_and_enable(

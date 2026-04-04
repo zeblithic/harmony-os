@@ -9,9 +9,8 @@
 //! # Limitations (Phase 3)
 //!
 //! - EL1-only tasks (no EL0 user mode).
-//! - FP/SIMD fields are present in TrapFrame but assembly save/restore
-//!   is not yet wired in — tasks must not use floating-point until Phase 4.
-//!   See design spec section 8 for options (eager vs lazy save via CPACR_EL1.FPEN).
+//! - Eager FP/SIMD context save: all 32 Q registers + FPCR + FPSR are
+//!   saved/restored on every context switch.
 //! - No priority or fairness — pure round-robin alternation.
 //! - Mutable statics are safe because the IRQ handler is non-reentrant
 //!   (PSTATE.I is set on exception entry).
@@ -289,6 +288,28 @@ pub unsafe fn enter_scheduler() -> ! {
     core::arch::asm!(
         // Set SP to task 0's kernel stack (TrapFrame base).
         "mov sp, {sp}",
+
+        // Restore Q0-Q31 from task 0's TrapFrame.
+        "ldp q0,  q1,  [sp, #288]",
+        "ldp q2,  q3,  [sp, #320]",
+        "ldp q4,  q5,  [sp, #352]",
+        "ldp q6,  q7,  [sp, #384]",
+        "ldp q8,  q9,  [sp, #416]",
+        "ldp q10, q11, [sp, #448]",
+        "ldp q12, q13, [sp, #480]",
+        "ldp q14, q15, [sp, #512]",
+        "ldp q16, q17, [sp, #544]",
+        "ldp q18, q19, [sp, #576]",
+        "ldp q20, q21, [sp, #608]",
+        "ldp q22, q23, [sp, #640]",
+        "ldp q24, q25, [sp, #672]",
+        "ldp q26, q27, [sp, #704]",
+        "ldp q28, q29, [sp, #736]",
+        "ldp q30, q31, [sp, #768]",
+        // Restore FPCR and FPSR.
+        "ldp x10, x11, [sp, #264]",
+        "msr fpcr, x10",
+        "msr fpsr, x11",
 
         // Restore ELR and SPSR from the TrapFrame.
         "ldp x10, x11, [sp, #248]",
