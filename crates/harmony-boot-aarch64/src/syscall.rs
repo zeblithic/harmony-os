@@ -162,6 +162,14 @@ pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
 
             if tid != 0 {
                 // Spawned thread exit — CLEARTID cleanup and die.
+                if result.exit_group && !PROCESS_EXITED {
+                    // exit_group from a spawned thread: record process exit.
+                    // We can't redirect the main thread's RETURN_ADDR from here
+                    // (it's a different task's TrapFrame), but marking the
+                    // process as exited ensures correct status reporting.
+                    PROCESS_EXITED = true;
+                    EXIT_CODE = result.exit_code;
+                }
                 let clear_addr = crate::sched::current_task_clear_child_tid();
                 if clear_addr != 0 {
                     *(clear_addr as *mut u32) = 0;
