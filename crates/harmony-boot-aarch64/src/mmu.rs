@@ -296,6 +296,41 @@ unsafe fn configure_system_regs(root_paddr: u64) {
     );
 }
 
+/// Mark a single page as inaccessible (guard page).
+///
+/// Reads TTBR0_EL1 to reconstruct the page table, then unmaps the page
+/// at `addr`. Any subsequent access triggers a data abort. A TLB
+/// invalidation ensures the stale mapping is flushed.
+///
+/// # Safety
+///
+/// - `addr` must be page-aligned and currently mapped in the identity map.
+/// - The MMU must be enabled (`init_and_enable` must have been called).
+/// - Must not be called concurrently with other page table modifications.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn mark_guard_page(addr: u64) {
+    let root: u64;
+    core::arch::asm!("mrs {}, ttbr0_el1", out(reg) root);
+
+    let mut pt = Aarch64PageTable::new(PhysAddr(root), identity_phys_to_virt);
+
+    // Unmap the page. The no-op deallocator discards the frame address —
+    // the bump allocator cannot free, and the frame stays reserved as a
+    // guard (not reclaimable memory).
+    let _ = pt.unmap(VirtAddr(addr), &mut |_| {});
+
+    // TLB invalidate for this specific VA.
+    // TLBI VALE1IS: invalidate by VA, last-level, EL1, Inner Shareable.
+    // The register contains VA[47:12] (VA shifted right by 12).
+    core::arch::asm!(
+        "dsb ishst",
+        "tlbi vale1is, {va}",
+        "dsb ish",
+        "isb",
+        va = in(reg) addr >> 12,
+    );
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]

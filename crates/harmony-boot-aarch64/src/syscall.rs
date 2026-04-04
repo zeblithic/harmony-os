@@ -150,8 +150,9 @@ pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
 
 /// Rust abort handler — called from the exception vector table asm.
 ///
-/// Prints diagnostic info (faulting address, PC, syndrome) to PL011
-/// serial and halts via panic.
+/// Checks for stack overflow (guard page hit) first, then prints
+/// diagnostic info (faulting address, PC, syndrome) to PL011 serial
+/// and halts via panic.
 #[cfg(target_arch = "aarch64")]
 #[no_mangle]
 pub unsafe extern "C" fn abort_handler(frame: &TrapFrame, esr: u64) -> ! {
@@ -159,6 +160,16 @@ pub unsafe extern "C" fn abort_handler(frame: &TrapFrame, esr: u64) -> ! {
     let iss = esr & 0x1FF_FFFF;
     let far: u64;
     core::arch::asm!("mrs {}, far_el1", out(reg) far);
+
+    // Check for stack overflow (guard page hit on data abort).
+    if ec == 0x25 {
+        if let Some((name, pid)) = crate::sched::check_guard_page(far) {
+            panic!(
+                "Stack overflow in task \"{}\" (PID {}): FAR={:#x} ELR={:#x} ESR={:#x}",
+                name, pid, far, frame.elr, esr
+            );
+        }
+    }
 
     let kind = match ec {
         0x21 => "Instruction Abort (current EL)",

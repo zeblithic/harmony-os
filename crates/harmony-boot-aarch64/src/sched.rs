@@ -113,18 +113,37 @@ pub unsafe fn spawn_task(
     let page_size = PAGE_SIZE as usize;
     let pages_needed = (KERNEL_STACK_SIZE + page_size - 1) / page_size;
 
-    // Allocate contiguous pages for the kernel stack.
-    // No other allocations may occur between these calls — the bump
-    // allocator must produce contiguous frames for a valid stack.
-    let base = bump.alloc_frame().expect("sched: kernel stack frame 0").0 as usize;
+    // Allocate guard page + stack pages (pages_needed + 1 total).
+    // Guard page is the first (lowest) frame. If the stack overflows
+    // downward into it, it triggers a clean data abort.
+    let guard_frame = bump
+        .alloc_frame()
+        .expect("sched: guard page frame")
+        .0 as usize;
+    let base = bump
+        .alloc_frame()
+        .expect("sched: kernel stack frame 0")
+        .0 as usize;
+    assert_eq!(
+        base,
+        guard_frame + page_size,
+        "guard page must be contiguous with stack"
+    );
     for i in 1..pages_needed {
-        let frame = bump.alloc_frame().expect("sched: kernel stack frame").0 as usize;
+        let frame = bump
+            .alloc_frame()
+            .expect("sched: kernel stack frame")
+            .0 as usize;
         assert_eq!(
             frame,
             base + i * page_size,
             "kernel stack frames must be contiguous"
         );
     }
+
+    // Mark guard page as inaccessible in the page table.
+    #[cfg(target_arch = "aarch64")]
+    crate::mmu::mark_guard_page(guard_frame as u64);
 
     let stack_size = pages_needed * page_size;
     let stack_top = base + stack_size;
