@@ -36,6 +36,10 @@ pub const TIMER_INTID: u32 = 30;
 /// Spurious interrupt — returned by `ack()` when no valid interrupt is pending.
 pub const SPURIOUS: u32 = 1023;
 
+/// SGI used for voluntary yield from block_current().
+/// SGI 0 is reserved by convention; we use SGI 1.
+pub const YIELD_SGI: u32 = 1;
+
 /// Initialize the GICv3 for timer interrupt delivery.
 ///
 /// Enables the Distributor (Group 1 NS, affinity routing), wakes the
@@ -82,19 +86,24 @@ pub unsafe fn init(gicd_base: *mut u8, gicr_base: *mut u8) {
         "GIC: GICR_WAKER.ChildrenAsleep never cleared — wrong GICR base address?"
     );
 
-    // Configure PPI 30 in the SGI_base frame.
-    // Set to Group 1 NS (bit 30 of IGROUPR0).
+    // Configure interrupts in the SGI_base frame.
+    // Set Group 1 NS for both YIELD_SGI (bit 1) and timer PPI (bit 30).
     let igroupr0 = gicr_base.add(GICR_IGROUPR0) as *mut u32;
-    write_volatile(igroupr0, read_volatile(igroupr0) | (1 << TIMER_INTID));
+    write_volatile(
+        igroupr0,
+        read_volatile(igroupr0) | (1 << YIELD_SGI) | (1 << TIMER_INTID),
+    );
 
-    // Set priority 0 (highest) for INTID 30.
+    // Set priority 0 (highest) for both interrupts.
     // IPRIORITYR is byte-addressable — one byte per INTID.
-    let priority = gicr_base.add(GICR_IPRIORITYR + TIMER_INTID as usize) as *mut u8;
-    write_volatile(priority, 0);
+    let timer_pri = gicr_base.add(GICR_IPRIORITYR + TIMER_INTID as usize) as *mut u8;
+    write_volatile(timer_pri, 0);
+    let sgi_pri = gicr_base.add(GICR_IPRIORITYR + YIELD_SGI as usize) as *mut u8;
+    write_volatile(sgi_pri, 0);
 
-    // Enable INTID 30 (write-1-to-set in ISENABLER0).
+    // Enable both (write-1-to-set in ISENABLER0).
     let isenabler0 = gicr_base.add(GICR_ISENABLER0) as *mut u32;
-    write_volatile(isenabler0, 1 << TIMER_INTID);
+    write_volatile(isenabler0, (1 << YIELD_SGI) | (1 << TIMER_INTID));
 
     // ── 3. CPU Interface (ICC system registers) ─────────────────────────
     // Allow all interrupt priorities.
@@ -128,4 +137,29 @@ pub fn ack() -> u32 {
 #[cfg(target_arch = "aarch64")]
 pub fn eoi(intid: u32) {
     unsafe { core::arch::asm!("msr ICC_EOIR1_EL1, {}", in(reg) intid as u64) };
+}
+
+/// Send a Software Generated Interrupt to the current PE (self).
+///
+/// Used by `block_current()` to trigger a reschedule through the normal
+/// IRQ handler path. The SGI fires immediately (tasks run with IRQs
+/// unmasked), enters the IRQ handler, saves the TrapFrame, and calls
+/// `schedule()`.
+///
+/// # Safety
+///
+/// Must be called with IRQs unmasked (PSTATE.I = 0).
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn send_sgi_self(intid: u32) {
+    // ICC_SGI1_EL1 format:
+    //   [27:24] = INTID (SGI number, 0-15)
+    //   [23:16] = Aff3 = 0
+    //   [15:0]  = TargetList = 1 (PE 0, i.e., self on single-core)
+    //   [40]    = IRM = 0 (use target list, not all-but-self)
+    let val: u64 = ((intid as u64) & 0xF) << 24 | 1;
+    core::arch::asm!(
+        "msr S3_0_C12_C11_5, {}",  // ICC_SGI1_EL1
+        "isb",
+        in(reg) val,
+    );
 }
