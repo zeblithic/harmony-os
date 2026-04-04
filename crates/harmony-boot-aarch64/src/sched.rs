@@ -215,12 +215,17 @@ pub unsafe fn schedule(current_sp: usize) -> usize {
 
     // Save the interrupted task's SP. Only transition Running→Ready;
     // if a syscall already marked it Blocked or Dead, preserve that.
-    let current_tcb = TASKS[cur].assume_init_mut();
-    current_tcb.kernel_sp = current_sp;
-    if current_tcb.state == TaskState::Running {
-        current_tcb.state = TaskState::Ready;
+    // Scoped to end the mutable borrow before the scan loop — the loop
+    // may revisit index `cur` at offset == n, and two live &mut refs to
+    // the same TASKS slot is UB even in unsafe code.
+    {
+        let current_tcb = TASKS[cur].assume_init_mut();
+        current_tcb.kernel_sp = current_sp;
+        if current_tcb.state == TaskState::Running {
+            current_tcb.state = TaskState::Ready;
+            current_tcb.preempt_count += 1;
+        }
     }
-    current_tcb.preempt_count += 1;
 
     // Scan for next Ready task (round-robin).
     for offset in 1..=n {
@@ -233,7 +238,10 @@ pub unsafe fn schedule(current_sp: usize) -> usize {
         }
     }
 
-    // No Ready task found — stay on current.
+    // No Ready task found. This cannot happen when the idle task is
+    // functioning (it is always Ready), but if it does, staying on
+    // current_sp is the least-bad option — the eret resumes whatever
+    // was interrupted.
     current_sp
 }
 
@@ -307,6 +315,11 @@ pub unsafe fn enter_scheduler() -> ! {
 mod tests {
     use super::*;
     use harmony_microkernel::vm::PAGE_SIZE;
+    use std::sync::Mutex;
+
+    /// Serialize tests that mutate TASKS/NUM_TASKS globals.
+    /// Prevents data races from the parallel test runner.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn task_state_has_four_variants() {
@@ -330,6 +343,7 @@ mod tests {
 
     #[test]
     fn check_guard_page_detects_hit() {
+        let _lock = TEST_LOCK.lock().unwrap();
         unsafe {
             NUM_TASKS = 1;
             TASKS[0] = MaybeUninit::new(TaskControlBlock {
@@ -355,6 +369,7 @@ mod tests {
 
     #[test]
     fn check_guard_page_empty_returns_none() {
+        let _lock = TEST_LOCK.lock().unwrap();
         unsafe { NUM_TASKS = 0 };
         assert_eq!(check_guard_page(0x1000), None);
     }

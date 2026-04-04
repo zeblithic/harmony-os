@@ -898,12 +898,12 @@ fn main() -> Status {
     }
 }
 
-/// Idle task — executes WFE in a loop. Always Ready; the scheduler
+/// Idle task — executes WFI in a loop. Always Ready; the scheduler
 /// falls through to it when no other task is schedulable.
 #[cfg(all(feature = "qemu-virt", target_os = "uefi"))]
 fn idle_task() -> ! {
     loop {
-        unsafe { core::arch::asm!("wfe") };
+        unsafe { core::arch::asm!("wfi") };
     }
 }
 
@@ -925,7 +925,7 @@ fn system_task() -> ! {
         for action in &actions {
             dispatch_action(action, &mut serial);
         }
-        unsafe { core::arch::asm!("wfe") };
+        unsafe { core::arch::asm!("wfi") };
     }
 }
 

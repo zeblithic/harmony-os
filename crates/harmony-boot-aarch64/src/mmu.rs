@@ -317,7 +317,8 @@ pub unsafe fn mark_guard_page(addr: u64) {
     // Unmap the page. The no-op deallocator discards the frame address —
     // the bump allocator cannot free, and the frame stays reserved as a
     // guard (not reclaimable memory).
-    let _ = pt.unmap(VirtAddr(addr), &mut |_| {});
+    pt.unmap(VirtAddr(addr), &mut |_| {})
+        .expect("mark_guard_page: unmap failed — page not in identity map");
 
     // TLB invalidate for this specific VA.
     // TLBI VALE1IS: invalidate by VA, last-level, EL1, Inner Shareable.
