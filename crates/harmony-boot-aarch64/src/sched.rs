@@ -196,3 +196,61 @@ pub unsafe fn schedule(current_sp: usize) -> usize {
 pub fn num_tasks() -> usize {
     unsafe { NUM_TASKS }
 }
+
+/// Enter the scheduler by loading task 0's TrapFrame and executing `eret`.
+///
+/// This is the initial entry into the scheduler loop. It loads the first
+/// task's pre-filled TrapFrame exactly as the IRQ handler would on a
+/// context switch: restore all GP registers, ELR, SPSR, then `eret` into
+/// the task.
+///
+/// # Safety
+///
+/// - At least one task must have been spawned via [`spawn_task`].
+/// - IRQs must already be unmasked so the task will be preempted.
+/// - This function never returns.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn enter_scheduler() -> ! {
+    assert!(NUM_TASKS > 0, "enter_scheduler: no tasks spawned");
+
+    // Mark task 0 as Running.
+    TASKS[0].assume_init_mut().state = TaskState::Running;
+    CURRENT = 0;
+
+    let sp = TASKS[0].assume_init_ref().kernel_sp;
+
+    core::arch::asm!(
+        // Set SP to task 0's kernel stack (TrapFrame base).
+        "mov sp, {sp}",
+
+        // Restore ELR and SPSR from the TrapFrame.
+        "ldp x10, x11, [sp, #248]",
+        "msr elr_el1, x10",
+        "msr spsr_el1, x11",
+
+        // Restore X0-X29.
+        "ldp x0,  x1,  [sp, #0]",
+        "ldp x2,  x3,  [sp, #16]",
+        "ldp x4,  x5,  [sp, #32]",
+        "ldp x6,  x7,  [sp, #48]",
+        "ldp x8,  x9,  [sp, #64]",
+        "ldp x10, x11, [sp, #80]",
+        "ldp x12, x13, [sp, #96]",
+        "ldp x14, x15, [sp, #112]",
+        "ldp x16, x17, [sp, #128]",
+        "ldp x18, x19, [sp, #144]",
+        "ldp x20, x21, [sp, #160]",
+        "ldp x22, x23, [sp, #176]",
+        "ldp x24, x25, [sp, #192]",
+        "ldp x26, x27, [sp, #208]",
+        "ldp x28, x29, [sp, #224]",
+        "ldr x30, [sp, #240]",
+
+        // Deallocate TrapFrame and eret into the task.
+        "add sp, sp, #272",
+        "eret",
+
+        sp = in(reg) sp,
+        options(noreturn),
+    );
+}

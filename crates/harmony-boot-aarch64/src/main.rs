@@ -9,20 +9,20 @@ extern crate alloc;
 
 mod bump_alloc;
 mod fdt_parse;
+mod gic;
 mod mmu;
 mod pl011;
 mod rndr;
-mod timer;
-mod gic;
 mod sched;
+mod timer;
 
 mod platform;
 
-mod syscall;
-mod vectors;
 mod cache;
 mod mmio;
 mod pe;
+mod syscall;
+mod vectors;
 
 #[cfg(not(test))]
 use linked_list_allocator::LockedHeap;
@@ -342,10 +342,7 @@ fn main() -> Status {
         dest_hash[0], dest_hash[1], dest_hash[2], dest_hash[3],
     );
 
-    let _ = writeln!(
-        serial,
-        "[Runtime] UnikernelRuntime created"
-    );
+    let _ = writeln!(serial, "[Runtime] UnikernelRuntime created");
 
     // ── Initialise Linuxulator ──
     // Must happen BEFORE vectors::init() so the SVC dispatch function is
@@ -477,10 +474,20 @@ fn main() -> Status {
             timer::freq() / 100,
         );
 
+        // Spawn two test tasks for scheduler verification.
+        unsafe { sched::spawn_task(sched::task0, &mut bump) };
+        unsafe { sched::spawn_task(sched::task1, &mut bump) };
+        let _ = writeln!(serial, "[Sched] Spawned 2 tasks");
+
         // Unmask IRQ exceptions.
         // From this point forward, el1_irq_handler fires on every timer tick.
         unsafe { core::arch::asm!("msr daifclr, #2") };
         let _ = writeln!(serial, "[IRQ] Interrupts unmasked");
+
+        // Enter the scheduler — loads task 0's TrapFrame and erets into it.
+        // This never returns.
+        let _ = writeln!(serial, "[Sched] Entering scheduler");
+        unsafe { sched::enter_scheduler() };
     }
 
     // ── Phase 3: Load and run embedded test ELF ──
@@ -664,7 +671,13 @@ fn main() -> Status {
         let _ = writeln!(
             serial,
             "[GENET] Initializing at {:#x}, MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            platform::GENET_BASE, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            platform::GENET_BASE,
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5],
         );
 
         let driver = match GenetDriver::<256, 256>::init(&mut bank, mac, 1000) {
@@ -680,17 +693,29 @@ fn main() -> Status {
 
         // Allocate DMA buffer pools from bump allocator.
         // Each page = 4 KiB, one 2048-byte DMA buffer per page.
-        let mut tx_bufs = [DmaBuffer { virt: core::ptr::null_mut(), phys: 0 }; 256];
+        let mut tx_bufs = [DmaBuffer {
+            virt: core::ptr::null_mut(),
+            phys: 0,
+        }; 256];
         for buf in tx_bufs.iter_mut() {
             let frame = bump.alloc_frame().expect("TX DMA buffer alloc failed");
-            *buf = DmaBuffer { virt: frame.as_u64() as *mut u8, phys: frame.as_u64() };
+            *buf = DmaBuffer {
+                virt: frame.as_u64() as *mut u8,
+                phys: frame.as_u64(),
+            };
         }
         let tx_pool = DmaPool::new(tx_bufs, 2048);
 
-        let mut rx_bufs = [DmaBuffer { virt: core::ptr::null_mut(), phys: 0 }; 256];
+        let mut rx_bufs = [DmaBuffer {
+            virt: core::ptr::null_mut(),
+            phys: 0,
+        }; 256];
         for buf in rx_bufs.iter_mut() {
             let frame = bump.alloc_frame().expect("RX DMA buffer alloc failed");
-            *buf = DmaBuffer { virt: frame.as_u64() as *mut u8, phys: frame.as_u64() };
+            *buf = DmaBuffer {
+                virt: frame.as_u64() as *mut u8,
+                phys: frame.as_u64(),
+            };
         }
         let mut rx_pool = DmaPool::new(rx_bufs, 2048);
 
@@ -728,13 +753,11 @@ fn main() -> Status {
 
             while let Some(frame) = genet_driver.poll_rx(&mut genet_bank, &mut rx_pool) {
                 if frame.data.len() >= 14 {
-                    let ethertype =
-                        u16::from_be_bytes([frame.data[12], frame.data[13]]);
+                    let ethertype = u16::from_be_bytes([frame.data[12], frame.data[13]]);
                     if ethertype == 0x88B5 {
                         // Raw Harmony frame — strip Ethernet header
                         let payload = frame.data[14..].to_vec();
-                        let rx_actions =
-                            runtime.handle_packet("eth0", payload, now);
+                        let rx_actions = runtime.handle_packet("eth0", payload, now);
                         for action in &rx_actions {
                             let mut handled = false;
                             // Dispatch TX actions from RX path (e.g., announce responses).
@@ -744,10 +767,15 @@ fn main() -> Status {
                             } = action
                             {
                                 if interface_name.as_ref() != "eth0" {
-                                    let _ = writeln!(serial, "[TX] WARN: unknown interface {:?}, skipping", interface_name);
+                                    let _ = writeln!(
+                                        serial,
+                                        "[TX] WARN: unknown interface {:?}, skipping",
+                                        interface_name
+                                    );
                                 } else {
                                     let mac = platform::NODE_MAC;
-                                    let mut tx_frame = alloc::vec::Vec::with_capacity(14 + raw.len());
+                                    let mut tx_frame =
+                                        alloc::vec::Vec::with_capacity(14 + raw.len());
                                     tx_frame.extend_from_slice(&[0xFF; 6]);
                                     tx_frame.extend_from_slice(&mac);
                                     tx_frame.extend_from_slice(&0x88B5u16.to_be_bytes());
@@ -757,12 +785,24 @@ fn main() -> Status {
                                         unsafe { cache::clean_range(buf.virt, 2048) };
                                     }
                                     genet_driver.reclaim_tx(&genet_bank, &mut tx_pool);
-                                    match genet_driver.send(&mut genet_bank, &tx_frame, &mut tx_pool) {
+                                    match genet_driver.send(
+                                        &mut genet_bank,
+                                        &tx_frame,
+                                        &mut tx_pool,
+                                    ) {
                                         Ok(()) => {
-                                            let _ = writeln!(serial, "[TX] {} bytes on eth0 (rx-resp)", tx_frame.len());
+                                            let _ = writeln!(
+                                                serial,
+                                                "[TX] {} bytes on eth0 (rx-resp)",
+                                                tx_frame.len()
+                                            );
                                         }
                                         Err(e) => {
-                                            let _ = writeln!(serial, "[TX] rx-resp send error: {:?}", e);
+                                            let _ = writeln!(
+                                                serial,
+                                                "[TX] rx-resp send error: {:?}",
+                                                e
+                                            );
                                         }
                                     }
                                 }
@@ -797,7 +837,11 @@ fn main() -> Status {
                 {
                     sent = true;
                     if interface_name.as_ref() != "eth0" {
-                        let _ = writeln!(serial, "[TX] WARN: unknown interface {:?}, skipping", interface_name);
+                        let _ = writeln!(
+                            serial,
+                            "[TX] WARN: unknown interface {:?}, skipping",
+                            interface_name
+                        );
                     } else {
                         let mac = platform::NODE_MAC;
                         let mut frame = alloc::vec::Vec::with_capacity(14 + raw.len());
@@ -851,21 +895,14 @@ fn dispatch_action(action: &harmony_unikernel::RuntimeAction, serial: &mut impl 
             let _ = writeln!(
                 serial,
                 "[Peer] Discovered {:02x}{:02x}{:02x}{:02x} ({} hops)",
-                address_hash[0],
-                address_hash[1],
-                address_hash[2],
-                address_hash[3],
-                hops,
+                address_hash[0], address_hash[1], address_hash[2], address_hash[3], hops,
             );
         }
         RuntimeAction::PeerLost { address_hash } => {
             let _ = writeln!(
                 serial,
                 "[Peer] Lost {:02x}{:02x}{:02x}{:02x}",
-                address_hash[0],
-                address_hash[1],
-                address_hash[2],
-                address_hash[3],
+                address_hash[0], address_hash[1], address_hash[2], address_hash[3],
             );
         }
         RuntimeAction::HeartbeatReceived {
@@ -875,11 +912,7 @@ fn dispatch_action(action: &harmony_unikernel::RuntimeAction, serial: &mut impl 
             let _ = writeln!(
                 serial,
                 "[Peer] Heartbeat {:02x}{:02x}{:02x}{:02x} uptime={}ms",
-                address_hash[0],
-                address_hash[1],
-                address_hash[2],
-                address_hash[3],
-                uptime_ms,
+                address_hash[0], address_hash[1], address_hash[2], address_hash[3], uptime_ms,
             );
         }
         RuntimeAction::DeliverLocally {
@@ -933,11 +966,11 @@ core::arch::global_asm!(
     //   x1 = saved kernel SP (post-prologue)
     //   x2 = saved kernel LR
     ".Lelf_return:",
-    "mov sp, x1",  // restore kernel SP (post-prologue)
+    "mov sp, x1", // restore kernel SP (post-prologue)
     // AAPCS64 epilogue: restore callee-saved regs + LR
     "ldp x29, x30, [sp, #16]",
     "ldp x19, x20, [sp], #32",
-    "ret",         // return to Rust caller with exit code in x0
+    "ret", // return to Rust caller with exit code in x0
 );
 
 #[cfg(target_arch = "aarch64")]
