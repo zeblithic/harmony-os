@@ -2657,31 +2657,22 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         })
     }
 
-    /// Blocking pipe write retry loop.  Spin-waits until enough buffer
-    /// space is available for the write (respecting POSIX atomic semantics
-    /// for writes <= PIPE_BUF), then performs the write and returns the
-    /// byte count.  Returns EINTR on timeout, EPIPE on broken pipe.
-    ///
-    /// Uses a single deadline for the entire wait — retries after
-    /// insufficient-space wakeups share the same 30-second cap rather
-    /// than resetting it.
+    /// Blocking pipe write retry loop.  Yields to the scheduler until enough
+    /// buffer space is available for the write (respecting POSIX atomic
+    /// semantics for writes <= PIPE_BUF), then performs the write and returns
+    /// the byte count.  Returns EINTR on interrupt, EPIPE on broken pipe,
+    /// EAGAIN when no scheduler is available.
     fn pipe_write_blocking(
         &mut self,
-        poll_fn: fn() -> u64,
+        fd: i32,
         pipe_id: usize,
         buf_ptr: usize,
         count: usize,
     ) -> i64 {
         const PIPE_BUF_CAP: usize = 65536;
         const PIPE_BUF: usize = 4096;
-        const MAX_BLOCK_MS: u64 = 30_000;
-
-        let start_ms = poll_fn();
-        let deadline = start_ms.saturating_add(MAX_BLOCK_MS);
 
         loop {
-            let now = poll_fn();
-
             // Check if enough space is available.
             let has_reader = self
                 .fd_table
@@ -2703,14 +2694,24 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 let to_write = count.min(avail);
                 let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, to_write) };
                 pipe_buf.extend_from_slice(data);
+                // Wake any task blocked on reading from this pipe.
+                if let Some(wake) = self.wake_fn {
+                    if let Some(read_fd) = self.find_pipe_read_fd(pipe_id) {
+                        wake(read_fd, BLOCK_OP_READABLE);
+                    }
+                }
                 return to_write as i64;
             }
 
-            // Not enough space — check timeout before spinning.
-            if now >= deadline {
-                return EINTR;
+            // Buffer full — block until space available.
+            if self.block_fn.is_some() {
+                match self.block_until(BLOCK_OP_WRITABLE, fd) {
+                    BlockResult::Ready => continue, // Retry write
+                    BlockResult::Interrupted => return EINTR,
+                }
+            } else {
+                return EAGAIN;
             }
-            core::hint::spin_loop();
         }
     }
 
@@ -3567,9 +3568,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 if needs_block {
                     let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                     if !nonblock {
-                        if let Some(pf) = self.poll_fn {
-                            return self.pipe_write_blocking(pf, pipe_id, buf_ptr, count);
-                        }
+                        return self.pipe_write_blocking(fd, pipe_id, buf_ptr, count);
                     }
                     return EAGAIN;
                 }
@@ -5648,7 +5647,11 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     /// For TCP sockets the real readiness state is checked via the
     /// [`TcpProvider`]; all other fds are always reported as ready
     /// (existing stub behaviour).
-    fn sys_epoll_wait(&mut self, epfd: i32, events_ptr: u64, maxevents: i32, _timeout: i32) -> i64 {
+    ///
+    /// When no fds are immediately ready and `timeout != 0`, yields to the
+    /// scheduler and rechecks on each wake until an fd becomes ready or the
+    /// timeout expires.
+    fn sys_epoll_wait(&mut self, epfd: i32, events_ptr: u64, maxevents: i32, timeout: i32) -> i64 {
         let epoll_id = match self.require_epoll(epfd) {
             Ok(id) => id,
             Err(e) => return e,
@@ -5667,15 +5670,51 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         let now_ms = (self.monotonic_ns / 1_000_000) as i64;
         self.tcp.tcp_poll(now_ms);
 
-        // Collect the interest list snapshot to avoid borrow conflicts when
-        // looking up socket / tcp state later.
+        let ready_count = self.epoll_check_once(epoll_id, events_ptr, maxevents);
+
+        // If no events ready and blocking requested, yield to scheduler.
+        if ready_count == 0 && timeout != 0 && self.block_fn.is_some() {
+            let start_ms = self.poll_fn.map_or(0, |pf| pf());
+            let deadline: u64 = if timeout > 0 {
+                start_ms.saturating_add(timeout as u64)
+            } else {
+                u64::MAX // -1 = infinite wait
+            };
+
+            while let BlockResult::Ready = self.block_until(BLOCK_OP_POLL, -1) {
+                // Drive the network stack.
+                if let Some(pf) = self.poll_fn {
+                    let now = pf() as i64;
+                    self.tcp.tcp_poll(now);
+                }
+                let count = self.epoll_check_once(epoll_id, events_ptr, maxevents);
+                if count > 0 {
+                    return count;
+                }
+                if timeout > 0 {
+                    let now = self.poll_fn.map_or(deadline, |pf| pf());
+                    if now >= deadline {
+                        break;
+                    }
+                }
+                // No fds ready, not timed out — re-block.
+            }
+            return 0;
+        }
+
+        ready_count
+    }
+
+    /// Single-pass readiness check for epoll_wait(). Writes ready events into
+    /// `events_ptr` and returns the count of ready fds.
+    fn epoll_check_once(&self, epoll_id: usize, events_ptr: u64, maxevents: i32) -> i64 {
         let interests: Vec<(i32, u32, u64)> = match self.epolls.get(&epoll_id) {
             Some(s) => s
                 .interests
                 .iter()
                 .map(|(&fd, &(m, d))| (fd, m, d))
                 .collect(),
-            None => return EINVAL,
+            None => return 0,
         };
 
         const EPOLLIN: u32 = 0x001;
@@ -8484,8 +8523,8 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
     /// Linux poll(2): synchronous I/O multiplexing via pollfd array.
     ///
-    /// Spin-waits until at least one fd is ready or the timeout expires.
-    fn sys_poll(&self, fds_ptr: u64, nfds: u64, timeout_ms: i32) -> i64 {
+    /// Yields to the scheduler until at least one fd is ready or the timeout expires.
+    fn sys_poll(&mut self, fds_ptr: u64, nfds: u64, timeout_ms: i32) -> i64 {
         const POLL_MAX_FDS: u64 = 1 << 20;
         if nfds > POLL_MAX_FDS {
             return EINVAL;
@@ -8494,46 +8533,48 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             return EFAULT;
         }
 
-        // Non-blocking: check once.
+        // Non-blocking: check once and return immediately.
         if timeout_ms == 0 {
             return self.poll_check_once(fds_ptr, nfds);
         }
 
-        // Blocking requires poll_fn to drive the network stack and read time.
-        let poll_fn = match self.poll_fn {
-            Some(f) => f,
-            None => return self.poll_check_once(fds_ptr, nfds),
-        };
+        // Without poll_fn there is no way to read time — fall back to a
+        // single check so the caller at least gets the current state.
+        if self.poll_fn.is_none() {
+            return self.poll_check_once(fds_ptr, nfds);
+        }
 
-        // Cap blocking duration so control returns to dispatch() periodically,
-        // allowing the idle watchdog to fire. Without this cap, a NULL-timeout
-        // select/poll would spin forever inside a single dispatch() call,
-        // bypassing the watchdog entirely.
-        const MAX_BLOCK_MS: u64 = 30_000; // 30 seconds
-
-        let deadline_ms: u64 = {
-            let now = poll_fn();
-            if timeout_ms < 0 {
-                now.saturating_add(MAX_BLOCK_MS)
+        // Blocking path: yield to the scheduler on each iteration.
+        if self.block_fn.is_some() {
+            let start_ms = self.poll_fn.map_or(0, |pf| pf());
+            let deadline = if timeout_ms > 0 {
+                start_ms.saturating_add(timeout_ms as u64)
             } else {
-                let requested = now.saturating_add(timeout_ms as u64);
-                requested.min(now.saturating_add(MAX_BLOCK_MS))
+                u64::MAX // Negative timeout = infinite wait
+            };
+
+            loop {
+                match self.block_until(BLOCK_OP_POLL, -1) {
+                    BlockResult::Ready => {
+                        let ready = self.poll_check_once(fds_ptr, nfds);
+                        if ready > 0 {
+                            return ready;
+                        }
+                        // Check timeout.
+                        if timeout_ms > 0 {
+                            let now = self.poll_fn.map_or(deadline, |pf| pf());
+                            if now >= deadline {
+                                return 0;
+                            }
+                        }
+                        // No fds ready, timeout not expired — re-block.
+                    }
+                    BlockResult::Interrupted => return 0,
+                }
             }
-        };
-
-        loop {
-            let now = poll_fn();
-
-            let ready = self.poll_check_once(fds_ptr, nfds);
-            if ready > 0 {
-                return ready;
-            }
-
-            if now >= deadline_ms {
-                return 0;
-            }
-
-            core::hint::spin_loop();
+        } else {
+            // No scheduler — do one check and return.
+            self.poll_check_once(fds_ptr, nfds)
         }
     }
 
@@ -8592,7 +8633,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     }
 
     /// Linux ppoll(2): like poll but with timespec and signal mask.
-    fn sys_ppoll(&self, fds_ptr: u64, nfds: u64, timeout_ptr: u64, _sigmask: u64) -> i64 {
+    fn sys_ppoll(&mut self, fds_ptr: u64, nfds: u64, timeout_ptr: u64, _sigmask: u64) -> i64 {
         let timeout_ms: i32 = if timeout_ptr == 0 {
             -1 // NULL → block forever
         } else {
@@ -8612,10 +8653,9 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
     /// Linux select(2): synchronous I/O multiplexing via fd_set bitmasks.
     ///
-    /// Spin-waits until at least one fd is ready or the timeout expires.
-    /// Calls poll_fn on each iteration to drive the network stack.
+    /// Yields to the scheduler until at least one fd is ready or the timeout expires.
     fn sys_select(
-        &self,
+        &mut self,
         nfds: i32,
         readfds: u64,
         writefds: u64,
@@ -8648,25 +8688,11 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             return self.select_check_once(nfds, readfds, writefds, exceptfds);
         }
 
-        // Blocking requires poll_fn to drive the network stack and read time.
-        let poll_fn = match self.poll_fn {
-            Some(f) => f,
-            None => return self.select_check_once(nfds, readfds, writefds, exceptfds),
-        };
-
-        // Cap blocking duration so control returns to dispatch() periodically,
-        // allowing the idle watchdog to fire.
-        const MAX_BLOCK_MS: u64 = 30_000; // 30 seconds
-
-        let deadline_ms: u64 = {
-            let now = poll_fn();
-            if timeout_ms == u64::MAX {
-                now.saturating_add(MAX_BLOCK_MS)
-            } else {
-                let requested = now.saturating_add(timeout_ms);
-                requested.min(now.saturating_add(MAX_BLOCK_MS))
-            }
-        };
+        // Without poll_fn there is no way to read time — fall back to a
+        // single check so the caller at least gets the current state.
+        if self.poll_fn.is_none() {
+            return self.select_check_once(nfds, readfds, writefds, exceptfds);
+        }
 
         // Save copies of the input fd_sets (select overwrites them with results).
         let read_bytes = (nfds as usize).div_ceil(8);
@@ -8681,49 +8707,66 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             saved_writefds[..read_bytes].copy_from_slice(src);
         }
 
-        loop {
-            // Drive the network stack and get current time.
-            let now = poll_fn();
-
-            // Restore input fd_sets (previous iteration may have cleared bits).
-            if readfds != 0 && read_bytes > 0 {
-                let dst =
-                    unsafe { core::slice::from_raw_parts_mut(readfds as *mut u8, read_bytes) };
-                dst.copy_from_slice(&saved_readfds[..read_bytes]);
+        // Helper closure to clear all fd_sets (Linux convention on timeout/interrupt).
+        let clear_fdsets = |readfds: u64, writefds: u64, exceptfds: u64, read_bytes: usize| {
+            if readfds != 0 {
+                unsafe { core::ptr::write_bytes(readfds as *mut u8, 0, read_bytes) };
             }
-            if writefds != 0 && read_bytes > 0 {
-                let dst =
-                    unsafe { core::slice::from_raw_parts_mut(writefds as *mut u8, read_bytes) };
-                dst.copy_from_slice(&saved_writefds[..read_bytes]);
+            if writefds != 0 {
+                unsafe { core::ptr::write_bytes(writefds as *mut u8, 0, read_bytes) };
             }
-
-            let ready = self.select_check_once(nfds, readfds, writefds, exceptfds);
-            if ready > 0 {
-                return ready;
+            if exceptfds != 0 {
+                unsafe { core::ptr::write_bytes(exceptfds as *mut u8, 0, read_bytes) };
             }
+        };
 
-            // Timeout expired.
-            if now >= deadline_ms {
-                // Clear all fd_sets on timeout (Linux convention).
-                if readfds != 0 {
-                    unsafe {
-                        core::ptr::write_bytes(readfds as *mut u8, 0, read_bytes);
+        // Blocking path: yield to the scheduler on each iteration.
+        if self.block_fn.is_some() {
+            let start_ms = self.poll_fn.map_or(0, |pf| pf());
+            let deadline = if timeout_ms == u64::MAX {
+                u64::MAX // NULL timeout = infinite wait
+            } else {
+                start_ms.saturating_add(timeout_ms)
+            };
+
+            loop {
+                // Restore input fd_sets before each check (previous iteration may have cleared bits).
+                if readfds != 0 && read_bytes > 0 {
+                    let dst =
+                        unsafe { core::slice::from_raw_parts_mut(readfds as *mut u8, read_bytes) };
+                    dst.copy_from_slice(&saved_readfds[..read_bytes]);
+                }
+                if writefds != 0 && read_bytes > 0 {
+                    let dst =
+                        unsafe { core::slice::from_raw_parts_mut(writefds as *mut u8, read_bytes) };
+                    dst.copy_from_slice(&saved_writefds[..read_bytes]);
+                }
+
+                match self.block_until(BLOCK_OP_POLL, -1) {
+                    BlockResult::Ready => {
+                        let ready = self.select_check_once(nfds, readfds, writefds, exceptfds);
+                        if ready > 0 {
+                            return ready;
+                        }
+                        // Check timeout.
+                        if timeout_ms != u64::MAX {
+                            let now = self.poll_fn.map_or(deadline, |pf| pf());
+                            if now >= deadline {
+                                clear_fdsets(readfds, writefds, exceptfds, read_bytes);
+                                return 0;
+                            }
+                        }
+                        // No fds ready, timeout not expired — re-block.
+                    }
+                    BlockResult::Interrupted => {
+                        clear_fdsets(readfds, writefds, exceptfds, read_bytes);
+                        return 0;
                     }
                 }
-                if writefds != 0 {
-                    unsafe {
-                        core::ptr::write_bytes(writefds as *mut u8, 0, read_bytes);
-                    }
-                }
-                if exceptfds != 0 {
-                    unsafe {
-                        core::ptr::write_bytes(exceptfds as *mut u8, 0, read_bytes);
-                    }
-                }
-                return 0;
             }
-
-            core::hint::spin_loop();
+        } else {
+            // No scheduler — do one check and return.
+            self.select_check_once(nfds, readfds, writefds, exceptfds)
         }
     }
 
@@ -17537,9 +17580,10 @@ mod integration_tests {
     }
 
     #[test]
-    fn blocking_pipe_write_full_returns_eintr() {
+    fn blocking_pipe_write_full_returns_eagain_without_scheduler() {
         let mut lx = Linuxulator::new(MockBackend::new());
         lx.set_poll_fn(timeout_poll_fn);
+        // Note: no block_fn set — no scheduler available.
         let (rfd, wfd) = create_pipe(&mut lx);
 
         // Fill the pipe buffer (65536 bytes).
@@ -17551,14 +17595,14 @@ mod integration_tests {
         });
         assert_eq!(w, 65536);
 
-        // Blocking write to full pipe — times out → EINTR.
+        // Blocking write to full pipe with no scheduler → EAGAIN (no one to wake us).
         let data = b"overflow";
         let r = lx.dispatch_syscall(LinuxSyscall::Write {
             fd: wfd,
             buf: data.as_ptr() as u64,
             count: data.len() as u64,
         });
-        assert_eq!(r, EINTR);
+        assert_eq!(r, EAGAIN);
 
         // Keep rfd alive so pipe isn't broken.
         let _ = rfd;
