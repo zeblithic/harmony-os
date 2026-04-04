@@ -135,24 +135,15 @@ pub unsafe fn spawn_task(
     // Allocate guard page + stack pages (pages_needed + 1 total).
     // Guard page is the first (lowest) frame. If the stack overflows
     // downward into it, it triggers a clean data abort.
-    let guard_frame = bump
-        .alloc_frame()
-        .expect("sched: guard page frame")
-        .0 as usize;
-    let base = bump
-        .alloc_frame()
-        .expect("sched: kernel stack frame 0")
-        .0 as usize;
+    let guard_frame = bump.alloc_frame().expect("sched: guard page frame").0 as usize;
+    let base = bump.alloc_frame().expect("sched: kernel stack frame 0").0 as usize;
     assert_eq!(
         base,
         guard_frame + page_size,
         "guard page must be contiguous with stack"
     );
     for i in 1..pages_needed {
-        let frame = bump
-            .alloc_frame()
-            .expect("sched: kernel stack frame")
-            .0 as usize;
+        let frame = bump.alloc_frame().expect("sched: kernel stack frame").0 as usize;
         assert_eq!(
             frame,
             base + i * page_size,

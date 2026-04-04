@@ -50,6 +50,88 @@ type ConcreteRuntime = UnikernelRuntime<KernelEntropy<fn(&mut [u8])>, MemoryStat
 #[cfg(target_os = "uefi")]
 static mut RUNTIME: Option<ConcreteRuntime> = None;
 
+/// DirectBackend: wraps SerialServer directly for the Linuxulator.
+/// Routes write(2) output through PL011 serial.
+#[cfg(target_os = "uefi")]
+struct DirectBackend {
+    server: harmony_microkernel::serial_server::SerialServer,
+}
+
+#[cfg(target_os = "uefi")]
+impl DirectBackend {
+    fn new() -> Self {
+        Self {
+            server: harmony_microkernel::serial_server::SerialServer::new(),
+        }
+    }
+}
+
+#[cfg(target_os = "uefi")]
+impl harmony_os::linuxulator::SyscallBackend for DirectBackend {
+    fn walk(
+        &mut self,
+        _path: &str,
+        new_fid: harmony_microkernel::Fid,
+    ) -> Result<harmony_microkernel::QPath, harmony_microkernel::IpcError> {
+        use harmony_microkernel::FileServer;
+        self.server.walk(0, new_fid, "log")
+    }
+    fn open(
+        &mut self,
+        fid: harmony_microkernel::Fid,
+        mode: harmony_microkernel::OpenMode,
+    ) -> Result<(), harmony_microkernel::IpcError> {
+        use harmony_microkernel::FileServer;
+        self.server.open(fid, mode)
+    }
+    fn read(
+        &mut self,
+        fid: harmony_microkernel::Fid,
+        offset: u64,
+        count: u32,
+    ) -> Result<alloc::vec::Vec<u8>, harmony_microkernel::IpcError> {
+        use harmony_microkernel::FileServer;
+        self.server.read(fid, offset, count)
+    }
+    fn write(
+        &mut self,
+        _fid: harmony_microkernel::Fid,
+        _offset: u64,
+        data: &[u8],
+    ) -> Result<u32, harmony_microkernel::IpcError> {
+        // Route stdout/stderr writes through PL011 serial
+        for &byte in data {
+            unsafe { pl011::write_byte(byte) };
+        }
+        Ok(data.len() as u32)
+    }
+    fn clunk(
+        &mut self,
+        fid: harmony_microkernel::Fid,
+    ) -> Result<(), harmony_microkernel::IpcError> {
+        use harmony_microkernel::FileServer;
+        self.server.clunk(fid)
+    }
+    fn stat(
+        &mut self,
+        fid: harmony_microkernel::Fid,
+    ) -> Result<harmony_microkernel::FileStat, harmony_microkernel::IpcError> {
+        use harmony_microkernel::FileServer;
+        self.server.stat(fid)
+    }
+}
+
+/// Concrete Linuxulator type — `DirectBackend` with default `NoTcp`.
+#[cfg(target_os = "uefi")]
+type ConcreteLinuxulator = harmony_os::linuxulator::Linuxulator<DirectBackend>;
+
+/// Global Linuxulator — populated during boot, used by the system task
+/// (for poll_network/is_wait_ready) and by the SVC dispatch function.
+/// Access is safe: boot init writes it once before spawning tasks;
+/// only the system task and SVC handler access it after that.
+#[cfg(target_os = "uefi")]
+static mut LINUXULATOR: Option<ConcreteLinuxulator> = None;
+
 #[cfg(target_os = "uefi")]
 use mmu::MemoryRegion;
 
@@ -366,84 +448,32 @@ fn main() -> Status {
     // Must happen BEFORE vectors::init() so the SVC dispatch function is
     // installed before any exception can fire.
     {
-        use harmony_microkernel::serial_server::SerialServer;
-        use harmony_microkernel::FileServer;
-        use harmony_os::linuxulator::{LinuxSyscall, Linuxulator, SyscallBackend};
+        use harmony_os::linuxulator::{LinuxSyscall, Linuxulator};
 
         let _ = writeln!(serial, "[Linux] Initializing Linuxulator");
 
-        // DirectBackend: wraps SerialServer directly, same pattern as x86_64
-        struct DirectBackend {
-            server: SerialServer,
-        }
+        let mut linuxulator = Linuxulator::new(DirectBackend::new());
+        linuxulator.init_stdio().expect("init_stdio failed");
 
-        impl DirectBackend {
-            fn new() -> Self {
-                Self {
-                    server: SerialServer::new(),
-                }
-            }
-        }
+        // Install scheduler callbacks so blocking syscalls yield the CPU
+        // instead of spin-waiting.
+        linuxulator.set_block_fn(|op, fd| {
+            let reason = match op {
+                0 => sched::WaitReason::FdReadable(fd),
+                1 => sched::WaitReason::FdWritable(fd),
+                2 => sched::WaitReason::FdConnectDone(fd),
+                3 => sched::WaitReason::PollWait,
+                _ => unreachable!(),
+            };
+            unsafe { sched::block_current(reason) };
+        });
 
-        impl SyscallBackend for DirectBackend {
-            fn walk(
-                &mut self,
-                _path: &str,
-                new_fid: harmony_microkernel::Fid,
-            ) -> Result<harmony_microkernel::QPath, harmony_microkernel::IpcError> {
-                self.server.walk(0, new_fid, "log")
-            }
-            fn open(
-                &mut self,
-                fid: harmony_microkernel::Fid,
-                mode: harmony_microkernel::OpenMode,
-            ) -> Result<(), harmony_microkernel::IpcError> {
-                self.server.open(fid, mode)
-            }
-            fn read(
-                &mut self,
-                fid: harmony_microkernel::Fid,
-                offset: u64,
-                count: u32,
-            ) -> Result<alloc::vec::Vec<u8>, harmony_microkernel::IpcError> {
-                self.server.read(fid, offset, count)
-            }
-            fn write(
-                &mut self,
-                _fid: harmony_microkernel::Fid,
-                _offset: u64,
-                data: &[u8],
-            ) -> Result<u32, harmony_microkernel::IpcError> {
-                // Route stdout/stderr writes through PL011 serial
-                for &byte in data {
-                    unsafe { pl011::write_byte(byte) };
-                }
-                Ok(data.len() as u32)
-            }
-            fn clunk(
-                &mut self,
-                fid: harmony_microkernel::Fid,
-            ) -> Result<(), harmony_microkernel::IpcError> {
-                self.server.clunk(fid)
-            }
-            fn stat(
-                &mut self,
-                fid: harmony_microkernel::Fid,
-            ) -> Result<harmony_microkernel::FileStat, harmony_microkernel::IpcError> {
-                self.server.stat(fid)
-            }
-        }
+        linuxulator.set_wake_fn(|fd, op| {
+            unsafe { sched::wake_by_fd(fd, op) };
+        });
 
-        // Store Linuxulator in static for the SVC handler to access
-        static mut LINUXULATOR: Option<Linuxulator<DirectBackend>> = None;
-        unsafe {
-            LINUXULATOR = Some(Linuxulator::new(DirectBackend::new()));
-            LINUXULATOR
-                .as_mut()
-                .unwrap()
-                .init_stdio()
-                .expect("init_stdio failed");
-        }
+        // Move fully-configured Linuxulator to module-level static.
+        unsafe { LINUXULATOR = Some(linuxulator) };
 
         // Install dispatch function for the SVC handler
         fn dispatch(syscall: LinuxSyscall) -> syscall::SyscallDispatchResult {
@@ -492,11 +522,13 @@ fn main() -> Status {
             timer::freq() / 100,
         );
 
-        // Spawn idle task (PID 0) and system task (PID 1).
+        // Spawn idle (PID 0), system (PID 1), and elf (PID 2) tasks.
         unsafe { sched::spawn_task("idle", 0, idle_task, &mut bump) };
         let _ = writeln!(serial, "[Sched] Spawned idle task (PID 0)");
         unsafe { sched::spawn_task("system", 1, system_task, &mut bump) };
         let _ = writeln!(serial, "[Sched] Spawned system task (PID 1)");
+        unsafe { sched::spawn_task("elf", 2, elf_task, &mut bump) };
+        let _ = writeln!(serial, "[Sched] Spawned elf task (PID 2)");
 
         // Enter the scheduler — loads task 0's TrapFrame and erets into it.
         // The eret atomically unmasks IRQs via SPSR (I=0 in INITIAL_SPSR),
@@ -907,10 +939,12 @@ fn idle_task() -> ! {
     }
 }
 
-/// System task — runs the event loop that was previously inline in main().
-/// Prints a startup message (QEMU test milestone), then polls the runtime
-/// in a loop. Reads UnikernelRuntime from the RUNTIME static populated
-/// during boot init.
+/// System task — network poller and waker.
+///
+/// Polls smoltcp via the Linuxulator, runs the Harmony runtime tick,
+/// then checks all blocked tasks and wakes any whose I/O is ready.
+/// This is the sole task that touches LINUXULATOR and RUNTIME in the
+/// main loop, ensuring single-threaded access.
 #[cfg(all(feature = "qemu-virt", target_os = "uefi"))]
 fn system_task() -> ! {
     use core::fmt::Write;
@@ -920,12 +954,219 @@ fn system_task() -> ! {
 
     loop {
         let now = timer::now_ms();
+
+        // 1. Poll smoltcp
+        let linuxulator = unsafe { LINUXULATOR.as_mut().unwrap() };
+        linuxulator.poll_network();
+
+        // 2. Run Harmony runtime
         let runtime = unsafe { RUNTIME.as_mut().unwrap() };
         let actions = runtime.tick(now);
         for action in &actions {
             dispatch_action(action, &mut serial);
         }
+
+        // 3. Check blocked tasks — wake any whose I/O is ready
+        check_and_wake_blocked_tasks();
+
+        // 4. Low-power wait
         unsafe { core::arch::asm!("wfi") };
+    }
+}
+
+/// ELF task — loads and runs the embedded test ELF binary.
+///
+/// Moved out of main() so the ELF binary runs as a separate scheduled
+/// task (PID 2) that can be preempted and blocked by the scheduler.
+/// DISPATCH_FN is already installed during boot init, so SVC dispatch
+/// works from the first instruction of the binary.
+#[cfg(all(feature = "qemu-virt", target_os = "uefi"))]
+fn elf_task() -> ! {
+    use core::fmt::Write;
+    use harmony_microkernel::vm::{FrameClassification, PageFlags, VmError};
+    use harmony_os::elf_loader::{ElfLoader, InterpreterLoader};
+    use harmony_os::linuxulator::SyscallBackend;
+
+    let mut serial =
+        harmony_unikernel::SerialWriter::new(|byte| unsafe { pl011::write_byte(byte) });
+    let _ = writeln!(serial, "[ELF] Task started");
+
+    // Embedded at compile time from the cross-compiled test binary.
+    static TEST_ELF: &[u8] = include_bytes!(
+        "../../../crates/harmony-test-elf/target/aarch64-unknown-linux-musl/release/harmony-test-elf"
+    );
+
+    let _ = writeln!(
+        serial,
+        "[ELF] Loading test binary ({} bytes)",
+        TEST_ELF.len()
+    );
+
+    // Bare-metal identity-map backend for the ELF loader.
+    //
+    // With the MMU identity map active, all RAM is directly
+    // accessible at its physical address. vm_mmap just returns the
+    // requested address (no page table manipulation needed — the
+    // identity map already covers it).
+    struct IdentityMapBackend;
+
+    impl SyscallBackend for IdentityMapBackend {
+        fn walk(
+            &mut self,
+            _path: &str,
+            _new_fid: harmony_microkernel::Fid,
+        ) -> Result<harmony_microkernel::QPath, harmony_microkernel::IpcError> {
+            Err(harmony_microkernel::IpcError::NotFound)
+        }
+        fn open(
+            &mut self,
+            _fid: harmony_microkernel::Fid,
+            _mode: harmony_microkernel::OpenMode,
+        ) -> Result<(), harmony_microkernel::IpcError> {
+            Err(harmony_microkernel::IpcError::NotFound)
+        }
+        fn read(
+            &mut self,
+            _fid: harmony_microkernel::Fid,
+            _offset: u64,
+            _count: u32,
+        ) -> Result<alloc::vec::Vec<u8>, harmony_microkernel::IpcError> {
+            Err(harmony_microkernel::IpcError::NotFound)
+        }
+        fn write(
+            &mut self,
+            _fid: harmony_microkernel::Fid,
+            _offset: u64,
+            _data: &[u8],
+        ) -> Result<u32, harmony_microkernel::IpcError> {
+            Err(harmony_microkernel::IpcError::NotFound)
+        }
+        fn clunk(
+            &mut self,
+            _fid: harmony_microkernel::Fid,
+        ) -> Result<(), harmony_microkernel::IpcError> {
+            Ok(())
+        }
+        fn stat(
+            &mut self,
+            _fid: harmony_microkernel::Fid,
+        ) -> Result<harmony_microkernel::FileStat, harmony_microkernel::IpcError> {
+            Err(harmony_microkernel::IpcError::NotFound)
+        }
+
+        fn has_vm_support(&self) -> bool {
+            true
+        }
+
+        fn vm_mmap(
+            &mut self,
+            vaddr: u64,
+            _len: usize,
+            _flags: PageFlags,
+            _classification: FrameClassification,
+        ) -> Result<u64, VmError> {
+            // Identity-mapped: the address is already accessible.
+            Ok(vaddr)
+        }
+
+        fn vm_munmap(&mut self, _vaddr: u64, _len: usize) -> Result<(), VmError> {
+            Ok(())
+        }
+
+        fn vm_mprotect(
+            &mut self,
+            _vaddr: u64,
+            _len: usize,
+            _flags: PageFlags,
+        ) -> Result<(), VmError> {
+            // No-op: identity map has full RWX in EL1.
+            Ok(())
+        }
+
+        fn vm_find_free_region(&self, _len: usize) -> Result<u64, VmError> {
+            Err(VmError::PageTableError)
+        }
+    }
+
+    let mut backend = IdentityMapBackend;
+    let mut loader = InterpreterLoader::default();
+
+    match loader.load(TEST_ELF, &mut backend) {
+        Ok(load_result) => {
+            let _ = writeln!(serial, "[ELF] Loaded: entry={:#x}", load_result.entry_point);
+
+            // Allocate an 8 KiB stack (2 pages) for the test binary.
+            // Uses the heap allocator since we don't have access to the bump
+            // allocator from this task context.
+            let stack_layout = core::alloc::Layout::from_size_align(8192, 4096).unwrap();
+            let stack_base = unsafe { alloc::alloc::alloc(stack_layout) } as u64;
+            assert!(stack_base != 0, "stack alloc failed");
+            let stack_top = stack_base + 8192;
+
+            let _ = writeln!(
+                serial,
+                "[ELF] Stack: base={:#x} top={:#x}",
+                stack_base, stack_top,
+            );
+
+            // Flush instruction cache for the loaded ELF text segment.
+            unsafe {
+                let start = load_result.entry_point & !0xFFFF; // page-align down
+                let end = start + (TEST_ELF.len() as u64);
+                let mut addr = start;
+                while addr < end {
+                    core::arch::asm!("dc cvau, {}", in(reg) addr);
+                    addr += 64;
+                }
+                core::arch::asm!("dsb ish");
+                addr = start;
+                while addr < end {
+                    core::arch::asm!("ic ivau, {}", in(reg) addr);
+                    addr += 64;
+                }
+                core::arch::asm!("dsb ish", "isb");
+            }
+
+            let _ = writeln!(serial, "[ELF] Jumping to entry point...");
+
+            let code = unsafe { run_elf_binary(load_result.entry_point, stack_top) };
+            // Clear stale return context so a future exit_group doesn't
+            // redirect to an invalid stack frame.
+            unsafe { syscall::reset_return_context() };
+
+            let _ = writeln!(serial, "[ELF] Test binary exited with code {}", code);
+        }
+        Err(e) => {
+            let _ = writeln!(serial, "[ELF] FATAL: Load failed: {:?}", e);
+        }
+    }
+
+    let _ = writeln!(serial, "[ELF] Binary exited, task halting");
+    loop {
+        unsafe { core::arch::asm!("wfi") };
+    }
+}
+
+/// Check all blocked tasks and wake any whose I/O condition is satisfied.
+///
+/// Called by the system task after polling smoltcp. Uses the Linuxulator's
+/// `is_wait_ready` to evaluate whether each blocked task's wait condition
+/// has been met.
+#[cfg(all(feature = "qemu-virt", target_os = "uefi"))]
+fn check_and_wake_blocked_tasks() {
+    let linuxulator = unsafe { LINUXULATOR.as_ref().unwrap() };
+    unsafe {
+        sched::for_each_blocked(|idx, reason| {
+            let (op, fd) = match reason {
+                sched::WaitReason::FdReadable(fd) => (0u8, fd),
+                sched::WaitReason::FdWritable(fd) => (1, fd),
+                sched::WaitReason::FdConnectDone(fd) => (2, fd),
+                sched::WaitReason::PollWait => (3, -1),
+            };
+            if linuxulator.is_wait_ready(op, fd) {
+                sched::wake(idx);
+            }
+        });
     }
 }
 
