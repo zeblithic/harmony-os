@@ -4871,7 +4871,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                                         Err(e) => return net_error_to_errno(e),
                                     }
                                 }
-                                BlockResult::Interrupted => return EINTR,
+                                BlockResult::Interrupted => return EAGAIN,
                             }
                         }
                     }
@@ -4976,7 +4976,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                                     0
                                 }
                             }
-                            BlockResult::Interrupted => EINTR,
+                            BlockResult::Interrupted => EAGAIN,
                         }
                     } else {
                         // No scheduler — return EINPROGRESS like nonblocking.
