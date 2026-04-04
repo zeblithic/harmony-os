@@ -1207,6 +1207,10 @@ fn check_and_wake_blocked_tasks() {
                         sched::wake(idx);
                     }
                 }
+                sched::WaitReason::Futex(_) => {
+                    // Futex waiters are woken by futex_wake(), not by I/O
+                    // readiness. The system task has nothing to do here.
+                }
             }
         });
     }

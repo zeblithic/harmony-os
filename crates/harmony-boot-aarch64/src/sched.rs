@@ -243,6 +243,12 @@ pub unsafe fn schedule(current_sp: usize) -> usize {
     {
         let current_tcb = TASKS[cur].assume_init_mut();
         current_tcb.kernel_sp = current_sp;
+        #[cfg(target_arch = "aarch64")]
+        {
+            let tls: u64;
+            core::arch::asm!("mrs {}, tpidr_el0", out(reg) tls);
+            current_tcb.tls = tls;
+        }
         if current_tcb.state == TaskState::Running {
             current_tcb.state = TaskState::Ready;
             current_tcb.preempt_count += 1;
@@ -256,6 +262,8 @@ pub unsafe fn schedule(current_sp: usize) -> usize {
         if tcb.state == TaskState::Ready {
             CURRENT = idx;
             tcb.state = TaskState::Running;
+            #[cfg(target_arch = "aarch64")]
+            core::arch::asm!("msr tpidr_el0, {}", in(reg) tcb.tls);
             return tcb.kernel_sp;
         }
     }
@@ -296,6 +304,10 @@ pub unsafe fn enter_scheduler() -> ! {
     CURRENT = 0;
 
     let sp = TASKS[0].assume_init_ref().kernel_sp;
+    let tls = TASKS[0].assume_init_ref().tls;
+
+    #[cfg(target_arch = "aarch64")]
+    core::arch::asm!("msr tpidr_el0, {}", in(reg) tls);
 
     core::arch::asm!(
         // Set SP to task 0's kernel stack (TrapFrame base).
@@ -380,6 +392,12 @@ pub unsafe fn block_current(reason: WaitReason) {
         let tcb = TASKS[cur].assume_init_mut();
         tcb.state = TaskState::Blocked;
         tcb.wait_reason = Some(reason);
+        #[cfg(target_arch = "aarch64")]
+        {
+            let tls: u64;
+            core::arch::asm!("mrs {}, tpidr_el0", out(reg) tls);
+            tcb.tls = tls;
+        }
     }
 
     #[cfg(target_arch = "aarch64")]
