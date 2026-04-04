@@ -64,6 +64,8 @@ pub enum WaitReason {
     /// Waiting for any network activity (poll/select/epoll).
     /// Woken on any smoltcp state change; handler rechecks specific fds.
     PollWait,
+    /// Waiting on a futex word at this address.
+    Futex(u64),
 }
 
 /// Per-task scheduling state. Stored in a fixed-size array, indexed by task number.
@@ -92,6 +94,13 @@ pub struct TaskControlBlock {
     pub entry: Option<fn() -> !>,
     /// Why this task is Blocked. `None` when state is Ready/Running/Dead.
     pub wait_reason: Option<WaitReason>,
+    /// TPIDR_EL0 value — per-thread TLS pointer. Saved/restored on context switch.
+    pub tls: u64,
+    /// Linux Thread ID. Main thread: TID == PID. Spawned threads: unique TID.
+    pub tid: u32,
+    /// Address to zero + futex_wake on thread exit (CLONE_CHILD_CLEARTID).
+    /// 0 means no cleanup needed.
+    pub clear_child_tid: u64,
 }
 
 /// Task array — only accessed from the IRQ handler (non-reentrant).
@@ -178,6 +187,9 @@ pub unsafe fn spawn_task(
         name,
         entry: Some(entry),
         wait_reason: None,
+        tls: 0,
+        tid: pid, // Boot-time tasks: TID == PID
+        clear_child_tid: 0,
     });
     NUM_TASKS = n + 1;
     n
@@ -514,6 +526,9 @@ mod tests {
                 name: "test-task",
                 entry: None,
                 wait_reason: None,
+                tls: 0,
+                tid: 7,
+                clear_child_tid: 0,
             });
         }
         let guard_start = 0x2_0000 - PAGE_SIZE as usize;
@@ -547,6 +562,9 @@ mod tests {
             name: "test",
             entry: None,
             wait_reason,
+            tls: 0,
+            tid: idx as u32,
+            clear_child_tid: 0,
         });
     }
 
@@ -671,5 +689,39 @@ mod tests {
 
             NUM_TASKS = 0;
         }
+    }
+
+    #[test]
+    fn tcb_has_thread_fields() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            NUM_TASKS = 1;
+            TASKS[0] = MaybeUninit::new(TaskControlBlock {
+                kernel_sp: 0,
+                kernel_stack_base: 0x1_0000,
+                kernel_stack_size: 8192,
+                state: TaskState::Ready,
+                preempt_count: 0,
+                pid: 1,
+                name: "test",
+                entry: None,
+                wait_reason: None,
+                tls: 0xDEAD_BEEF,
+                tid: 42,
+                clear_child_tid: 0xCAFE,
+            });
+            let tcb = TASKS[0].assume_init_ref();
+            assert_eq!(tcb.tls, 0xDEAD_BEEF);
+            assert_eq!(tcb.tid, 42);
+            assert_eq!(tcb.clear_child_tid, 0xCAFE);
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn wait_reason_futex_variant() {
+        assert_ne!(WaitReason::Futex(0x1000), WaitReason::Futex(0x2000));
+        assert_eq!(WaitReason::Futex(0x1000), WaitReason::Futex(0x1000));
+        assert_ne!(WaitReason::Futex(0x1000), WaitReason::FdReadable(1));
     }
 }
