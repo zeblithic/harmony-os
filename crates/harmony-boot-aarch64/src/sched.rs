@@ -435,18 +435,16 @@ pub unsafe fn spawn_task_runtime(
     }
     let guard_frame = alloc_or_unmask!(bump);
     let base = alloc_or_unmask!(bump);
-    assert_eq!(
-        base,
-        guard_frame + page_size,
-        "guard page must be contiguous"
-    );
+    if base != guard_frame + page_size {
+        core::arch::asm!("msr daifclr, #2");
+        return None;
+    }
     for i in 1..pages_needed {
         let frame = alloc_or_unmask!(bump);
-        assert_eq!(
-            frame,
-            base + i * page_size,
-            "stack frames must be contiguous"
-        );
+        if frame != base + i * page_size {
+            core::arch::asm!("msr daifclr, #2");
+            return None;
+        }
     }
 
     // Mark guard page as inaccessible.

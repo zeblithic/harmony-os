@@ -151,10 +151,11 @@ pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
         let result = dispatch(syscall);
         if result.exited {
             // Check if this is a thread exit or process exit.
+            // Boot-time tasks have tid=0 (main thread sentinel).
+            // Spawned threads have tid>0 (from alloc_tid).
             let tid = crate::sched::current_task_tid();
-            let pid = crate::sched::current_task_pid();
 
-            if tid != pid {
+            if tid != 0 {
                 // Spawned thread exit — clean up and die.
                 let clear_addr = crate::sched::current_task_clear_child_tid();
                 if clear_addr != 0 {
@@ -173,7 +174,8 @@ pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
                 }
             }
 
-            // Main thread exit (TID == PID) — kill all sibling threads first.
+            // Main thread exit (TID == 0) — kill all sibling threads first.
+            let pid = crate::sched::current_task_pid();
             crate::sched::kill_threads_by_pid(pid);
 
             // Existing exit_group behavior: redirect ELR to return address.
