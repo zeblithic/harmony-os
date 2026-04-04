@@ -193,33 +193,6 @@ pub fn check_guard_page(addr: u64) -> Option<(&'static str, u32)> {
     None
 }
 
-#[cfg(target_arch = "aarch64")]
-use core::sync::atomic::{AtomicU64, Ordering};
-
-/// Counter incremented by task 0 — proves it received CPU time.
-#[cfg(target_arch = "aarch64")]
-static TASK0_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Counter incremented by task 1 — proves it received CPU time.
-#[cfg(target_arch = "aarch64")]
-static TASK1_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Test task 0: tight loop incrementing its counter until preempted.
-#[cfg(target_arch = "aarch64")]
-pub fn task0() -> ! {
-    loop {
-        TASK0_COUNTER.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// Test task 1: tight loop incrementing its counter until preempted.
-#[cfg(target_arch = "aarch64")]
-pub fn task1() -> ! {
-    loop {
-        TASK1_COUNTER.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
 /// State-aware round-robin scheduler — called from `irq_dispatch` on
 /// each timer tick.
 ///
