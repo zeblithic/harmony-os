@@ -2611,9 +2611,14 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
     /// Drive the network stack. Called by the system task's event loop
     /// to move packets through smoltcp. Wraps the internal poll_fn.
-    pub fn poll_network(&mut self) {
+    /// Returns `true` if the network stack was polled (poll_fn is set),
+    /// used by the caller to gate PollWait wakeups.
+    pub fn poll_network(&mut self) -> bool {
         if let Some(pf) = self.poll_fn {
             pf();
+            true
+        } else {
+            false
         }
     }
 
@@ -5717,7 +5722,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 .iter()
                 .map(|(&fd, &(m, d))| (fd, m, d))
                 .collect(),
-            None => return 0,
+            None => return EINVAL,
         };
 
         const EPOLLIN: u32 = 0x001;

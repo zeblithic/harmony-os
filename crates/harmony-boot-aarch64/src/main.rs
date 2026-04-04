@@ -132,6 +132,12 @@ type ConcreteLinuxulator = harmony_os::linuxulator::Linuxulator<DirectBackend>;
 #[cfg(target_os = "uefi")]
 static mut LINUXULATOR: Option<ConcreteLinuxulator> = None;
 
+/// Set by poll_network when smoltcp processes packets. Read and cleared
+/// by check_and_wake_blocked_tasks to gate PollWait wakes — without this,
+/// PollWait tasks would be woken on every system-task iteration (busy-poll).
+#[cfg(all(feature = "qemu-virt", target_os = "uefi"))]
+static mut NETWORK_CHANGED: bool = false;
+
 #[cfg(target_os = "uefi")]
 use mmu::MemoryRegion;
 
@@ -955,9 +961,10 @@ fn system_task() -> ! {
     loop {
         let now = timer::now_ms();
 
-        // 1. Poll smoltcp
+        // 1. Poll smoltcp — track whether the network stack had activity
         let linuxulator = unsafe { LINUXULATOR.as_mut().unwrap() };
-        linuxulator.poll_network();
+        let network_polled = linuxulator.poll_network();
+        unsafe { NETWORK_CHANGED = network_polled };
 
         // 2. Run Harmony runtime
         let runtime = unsafe { RUNTIME.as_mut().unwrap() };
@@ -1155,16 +1162,33 @@ fn elf_task() -> ! {
 #[cfg(all(feature = "qemu-virt", target_os = "uefi"))]
 fn check_and_wake_blocked_tasks() {
     let linuxulator = unsafe { LINUXULATOR.as_ref().unwrap() };
+    let network_changed = unsafe { NETWORK_CHANGED };
     unsafe {
         sched::for_each_blocked(|idx, reason| {
-            let (op, fd) = match reason {
-                sched::WaitReason::FdReadable(fd) => (0u8, fd),
-                sched::WaitReason::FdWritable(fd) => (1, fd),
-                sched::WaitReason::FdConnectDone(fd) => (2, fd),
-                sched::WaitReason::PollWait => (3, -1),
-            };
-            if linuxulator.is_wait_ready(op, fd) {
-                sched::wake(idx);
+            match reason {
+                sched::WaitReason::PollWait => {
+                    // Only wake poll/select/epoll tasks when the network stack
+                    // actually processed packets. Without this gate, PollWait
+                    // tasks would be woken every system-task iteration (busy-poll).
+                    if network_changed {
+                        sched::wake(idx);
+                    }
+                }
+                sched::WaitReason::FdReadable(fd) => {
+                    if linuxulator.is_wait_ready(0, fd) {
+                        sched::wake(idx);
+                    }
+                }
+                sched::WaitReason::FdWritable(fd) => {
+                    if linuxulator.is_wait_ready(1, fd) {
+                        sched::wake(idx);
+                    }
+                }
+                sched::WaitReason::FdConnectDone(fd) => {
+                    if linuxulator.is_wait_ready(2, fd) {
+                        sched::wake(idx);
+                    }
+                }
             }
         });
     }
