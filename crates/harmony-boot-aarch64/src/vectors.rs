@@ -264,6 +264,11 @@ extern "C" fn irq_dispatch(current_sp: usize) -> usize {
             timer::on_tick();
             unsafe { sched::schedule(current_sp) }
         }
+        gic::YIELD_SGI => {
+            // Voluntary yield from block_current() — just reschedule,
+            // no timer work. The task is already marked Blocked.
+            unsafe { sched::schedule(current_sp) }
+        }
         gic::SPURIOUS => current_sp,
         _ => current_sp,
     };

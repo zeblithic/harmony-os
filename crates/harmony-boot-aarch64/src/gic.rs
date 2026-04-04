@@ -36,6 +36,10 @@ pub const TIMER_INTID: u32 = 30;
 /// Spurious interrupt — returned by `ack()` when no valid interrupt is pending.
 pub const SPURIOUS: u32 = 1023;
 
+/// SGI used for voluntary yield from block_current().
+/// SGI 0 is reserved by convention; we use SGI 1.
+pub const YIELD_SGI: u32 = 1;
+
 /// Initialize the GICv3 for timer interrupt delivery.
 ///
 /// Enables the Distributor (Group 1 NS, affinity routing), wakes the
@@ -128,4 +132,29 @@ pub fn ack() -> u32 {
 #[cfg(target_arch = "aarch64")]
 pub fn eoi(intid: u32) {
     unsafe { core::arch::asm!("msr ICC_EOIR1_EL1, {}", in(reg) intid as u64) };
+}
+
+/// Send a Software Generated Interrupt to the current PE (self).
+///
+/// Used by `block_current()` to trigger a reschedule through the normal
+/// IRQ handler path. The SGI fires immediately (tasks run with IRQs
+/// unmasked), enters the IRQ handler, saves the TrapFrame, and calls
+/// `schedule()`.
+///
+/// # Safety
+///
+/// Must be called with IRQs unmasked (PSTATE.I = 0).
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn send_sgi_self(intid: u32) {
+    // ICC_SGI1_EL1 format:
+    //   [27:24] = INTID (SGI number, 0-15)
+    //   [23:16] = Aff3 = 0
+    //   [15:0]  = TargetList = 1 (PE 0, i.e., self on single-core)
+    //   [40]    = IRM = 0 (use target list, not all-but-self)
+    let val: u64 = ((intid as u64) & 0xF) << 24 | 1;
+    core::arch::asm!(
+        "msr ICC_SGI1_EL1, {}",
+        "isb",
+        in(reg) val,
+    );
 }
