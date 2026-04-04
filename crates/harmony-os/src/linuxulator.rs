@@ -79,12 +79,19 @@ const SS_DISABLE: i32 = 2;
 const MINSIGSTKSZ: u64 = 2048;
 
 /// Result of a `block_until` spin-wait.
+#[derive(PartialEq, Debug)]
 enum BlockResult {
     /// The readiness check returned true — caller should retry the operation.
     Ready,
     /// The 30-second watchdog cap expired — caller should return EINTR.
     Interrupted,
 }
+
+/// block_until operation types — match WaitReason encoding in sched.rs.
+pub const BLOCK_OP_READABLE: u8 = 0;
+pub const BLOCK_OP_WRITABLE: u8 = 1;
+pub const BLOCK_OP_CONNECT: u8 = 2;
+pub const BLOCK_OP_POLL: u8 = 3;
 
 fn ipc_err_to_errno(e: IpcError) -> i64 {
     match e {
@@ -2492,6 +2499,14 @@ pub struct Linuxulator<
     /// Drives VirtIO RX/TX + smoltcp processing and returns current
     /// time in milliseconds. Set by the kernel at init.
     poll_fn: Option<fn() -> u64>,
+    /// Callback to block the current task. Called by block_until() instead
+    /// of spin-waiting. Arguments: (op: u8, fd: i32) where op is:
+    /// 0=FdReadable, 1=FdWritable, 2=FdConnectDone, 3=PollWait.
+    block_fn: Option<fn(u8, i32)>,
+    /// Callback to wake a task blocked on a specific fd. Called after
+    /// pipe/eventfd writes for synchronous waking. Arguments: (fd: i32, op: u8)
+    /// where op is 0=readable, 1=writable.
+    wake_fn: Option<fn(i32, u8)>,
 }
 
 impl<B: SyscallBackend> Linuxulator<B, NoTcp> {
@@ -2562,6 +2577,8 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             pending_signal_return: None,
             embedded_fs: None,
             poll_fn: None,
+            block_fn: None,
+            wake_fn: None,
         }
     }
 
@@ -2580,31 +2597,41 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         self.poll_fn = Some(f);
     }
 
-    /// Spin-wait until `ready_check(self, fd)` returns true, or 30 seconds
-    /// elapse.  Calls `poll_fn` on every iteration to drive the network
-    /// stack and read the current time.
-    ///
-    /// Returns [`BlockResult::Ready`] when the fd becomes ready, or
-    /// [`BlockResult::Interrupted`] on timeout (caller returns EINTR).
-    fn block_until(
-        &mut self,
-        poll_fn: fn() -> u64,
-        ready_check: fn(&Self, i32) -> bool,
-        fd: i32,
-    ) -> BlockResult {
-        const MAX_BLOCK_MS: u64 = 30_000;
-        let start_ms = poll_fn();
-        let deadline = start_ms.saturating_add(MAX_BLOCK_MS);
+    /// Set the blocking callback. Called by block_until() to yield the CPU
+    /// to the scheduler instead of spin-waiting.
+    pub fn set_block_fn(&mut self, f: fn(u8, i32)) {
+        self.block_fn = Some(f);
+    }
 
-        loop {
-            let now = poll_fn();
-            if ready_check(self, fd) {
-                return BlockResult::Ready;
-            }
-            if now >= deadline {
-                return BlockResult::Interrupted;
-            }
-            core::hint::spin_loop();
+    /// Set the wake callback. Called after pipe/eventfd writes to immediately
+    /// wake any task blocked on the corresponding read end.
+    pub fn set_wake_fn(&mut self, f: fn(i32, u8)) {
+        self.wake_fn = Some(f);
+    }
+
+    /// Drive the network stack. Called by the system task's event loop
+    /// to move packets through smoltcp. Wraps the internal poll_fn.
+    pub fn poll_network(&mut self) {
+        if let Some(pf) = self.poll_fn {
+            pf();
+        }
+    }
+
+    /// Block the current task until woken by the system task's wake-check loop.
+    ///
+    /// If `block_fn` is set (scheduler available), calls it to yield the CPU.
+    /// The task is marked Blocked, a Self-SGI triggers a context switch, and
+    /// execution resumes here when woken. Returns `Ready`.
+    ///
+    /// If `block_fn` is not set (no scheduler), returns `Interrupted` so the
+    /// caller can fall back to EAGAIN.
+    fn block_until(&mut self, op: u8, fd: i32) -> BlockResult {
+        if let Some(block) = self.block_fn {
+            block(op, fd);
+            // Execution resumes here after wake + reschedule.
+            BlockResult::Ready
+        } else {
+            BlockResult::Interrupted
         }
     }
 
@@ -3599,22 +3626,18 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                             let nonblock =
                                 self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                             if !nonblock {
-                                if let Some(pf) = self.poll_fn {
-                                    match self.block_until(pf, Self::is_fd_writable, fd) {
-                                        BlockResult::Ready => {
-                                            let data = unsafe {
-                                                core::slice::from_raw_parts(
-                                                    buf_ptr as *const u8,
-                                                    count,
-                                                )
-                                            };
-                                            match self.tcp.tcp_send(h, data) {
-                                                Ok(n) => return n as i64,
-                                                Err(e) => return net_error_to_errno(e),
-                                            }
+                                // TODO(phase4-task4): update to new block_until signature
+                                match self.block_until(BLOCK_OP_WRITABLE, fd) {
+                                    BlockResult::Ready => {
+                                        let data = unsafe {
+                                            core::slice::from_raw_parts(buf_ptr as *const u8, count)
+                                        };
+                                        match self.tcp.tcp_send(h, data) {
+                                            Ok(n) => return n as i64,
+                                            Err(e) => return net_error_to_errno(e),
                                         }
-                                        BlockResult::Interrupted => return EINTR,
                                     }
+                                    BlockResult::Interrupted => return EINTR,
                                 }
                             }
                             EAGAIN
@@ -3693,32 +3716,30 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                         if nonblock {
                             return EAGAIN;
                         }
-                        if let Some(pf) = self.poll_fn {
-                            match self.block_until(pf, Self::is_fd_readable, fd) {
-                                BlockResult::Ready => {
-                                    // Re-borrow after block_until releases the borrow.
-                                    let buf = match self.pipes.get_mut(&pipe_id) {
-                                        Some(b) => b,
-                                        None => return 0, // EOF
-                                    };
-                                    if buf.is_empty() {
-                                        return 0; // Write end closed during wait (EOF).
-                                    }
-                                    let n = count.min(buf.len());
-                                    unsafe {
-                                        core::ptr::copy_nonoverlapping(
-                                            buf.as_ptr(),
-                                            buf_ptr as *mut u8,
-                                            n,
-                                        );
-                                    }
-                                    buf.drain(..n);
-                                    return n as i64;
+                        // TODO(phase4-task4): update to new block_until signature
+                        match self.block_until(BLOCK_OP_READABLE, fd) {
+                            BlockResult::Ready => {
+                                // Re-borrow after block_until releases the borrow.
+                                let buf = match self.pipes.get_mut(&pipe_id) {
+                                    Some(b) => b,
+                                    None => return 0, // EOF
+                                };
+                                if buf.is_empty() {
+                                    return 0; // Write end closed during wait (EOF).
                                 }
-                                BlockResult::Interrupted => return EINTR,
+                                let n = count.min(buf.len());
+                                unsafe {
+                                    core::ptr::copy_nonoverlapping(
+                                        buf.as_ptr(),
+                                        buf_ptr as *mut u8,
+                                        n,
+                                    );
+                                }
+                                buf.drain(..n);
+                                n as i64
                             }
+                            BlockResult::Interrupted => EINTR,
                         }
-                        EAGAIN
                     } else {
                         0 // EOF — write end closed
                     }
@@ -3812,22 +3833,21 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                             let nonblock =
                                 self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                             if !nonblock {
-                                if let Some(pf) = self.poll_fn {
-                                    match self.block_until(pf, Self::is_fd_readable, fd) {
-                                        BlockResult::Ready => {
-                                            let buf = unsafe {
-                                                core::slice::from_raw_parts_mut(
-                                                    buf_ptr as *mut u8,
-                                                    count,
-                                                )
-                                            };
-                                            match self.tcp.tcp_recv(h, buf) {
-                                                Ok(n) => return n as i64,
-                                                Err(e) => return net_error_to_errno(e),
-                                            }
+                                // TODO(phase4-task4): update to new block_until signature
+                                match self.block_until(BLOCK_OP_READABLE, fd) {
+                                    BlockResult::Ready => {
+                                        let buf = unsafe {
+                                            core::slice::from_raw_parts_mut(
+                                                buf_ptr as *mut u8,
+                                                count,
+                                            )
+                                        };
+                                        match self.tcp.tcp_recv(h, buf) {
+                                            Ok(n) => return n as i64,
+                                            Err(e) => return net_error_to_errno(e),
                                         }
-                                        BlockResult::Interrupted => return EINTR,
                                     }
+                                    BlockResult::Interrupted => return EINTR,
                                 }
                             }
                             EAGAIN
@@ -4901,11 +4921,12 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                     if nonblock {
                         EINPROGRESS
-                    } else if let Some(pf) = self.poll_fn {
-                        // Spin-wait until the handshake completes or fails.
-                        // Uses is_fd_connect_done (not is_fd_writable) so that
+                    } else {
+                        // TODO(phase4-task4): update to new block_until signature
+                        // Block until the handshake completes or fails.
+                        // Uses BLOCK_OP_CONNECT (not BLOCK_OP_WRITABLE) so that
                         // connection failures (RST → Closed) also unblock.
-                        match self.block_until(pf, Self::is_fd_connect_done, fd) {
+                        match self.block_until(BLOCK_OP_CONNECT, fd) {
                             BlockResult::Ready => {
                                 // Check whether the connect succeeded or failed.
                                 // CloseWait/Closing imply the connection WAS established
@@ -4920,8 +4941,6 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                             }
                             BlockResult::Interrupted => EINTR,
                         }
-                    } else {
-                        EINPROGRESS
                     }
                 }
                 Err(e) => net_error_to_errno(e),
@@ -4989,19 +5008,17 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 Err(NetError::WouldBlock) => {
                     let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                     if !nonblock {
-                        if let Some(pf) = self.poll_fn {
-                            match self.block_until(pf, Self::is_fd_writable, fd) {
-                                BlockResult::Ready => {
-                                    let data = unsafe {
-                                        core::slice::from_raw_parts(buf as *const u8, count)
-                                    };
-                                    match self.tcp.tcp_send(h, data) {
-                                        Ok(n) => return n as i64,
-                                        Err(e) => return net_error_to_errno(e),
-                                    }
+                        // TODO(phase4-task4): update to new block_until signature
+                        match self.block_until(BLOCK_OP_WRITABLE, fd) {
+                            BlockResult::Ready => {
+                                let data =
+                                    unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
+                                match self.tcp.tcp_send(h, data) {
+                                    Ok(n) => return n as i64,
+                                    Err(e) => return net_error_to_errno(e),
                                 }
-                                BlockResult::Interrupted => return EINTR,
                             }
+                            BlockResult::Interrupted => return EINTR,
                         }
                     }
                     EAGAIN
@@ -5032,19 +5049,18 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                             let nonblock =
                                 self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                             if !nonblock {
-                                if let Some(pf) = self.poll_fn {
-                                    match self.block_until(pf, Self::is_fd_writable, fd) {
-                                        BlockResult::Ready => {
-                                            let data = unsafe {
-                                                core::slice::from_raw_parts(buf as *const u8, count)
-                                            };
-                                            match self.tcp.udp_sendto(h, data, ip, port) {
-                                                Ok(n) => return n as i64,
-                                                Err(e) => return net_error_to_errno(e),
-                                            }
+                                // TODO(phase4-task4): update to new block_until signature
+                                match self.block_until(BLOCK_OP_WRITABLE, fd) {
+                                    BlockResult::Ready => {
+                                        let data = unsafe {
+                                            core::slice::from_raw_parts(buf as *const u8, count)
+                                        };
+                                        match self.tcp.udp_sendto(h, data, ip, port) {
+                                            Ok(n) => return n as i64,
+                                            Err(e) => return net_error_to_errno(e),
                                         }
-                                        BlockResult::Interrupted => return EINTR,
                                     }
+                                    BlockResult::Interrupted => return EINTR,
                                 }
                             }
                             EAGAIN
@@ -5063,19 +5079,18 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     Err(NetError::WouldBlock) => {
                         let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                         if !nonblock {
-                            if let Some(pf) = self.poll_fn {
-                                match self.block_until(pf, Self::is_fd_writable, fd) {
-                                    BlockResult::Ready => {
-                                        let data = unsafe {
-                                            core::slice::from_raw_parts(buf as *const u8, count)
-                                        };
-                                        match self.tcp.udp_send(h, data) {
-                                            Ok(n) => return n as i64,
-                                            Err(e) => return net_error_to_errno(e),
-                                        }
+                            // TODO(phase4-task4): update to new block_until signature
+                            match self.block_until(BLOCK_OP_WRITABLE, fd) {
+                                BlockResult::Ready => {
+                                    let data = unsafe {
+                                        core::slice::from_raw_parts(buf as *const u8, count)
+                                    };
+                                    match self.tcp.udp_send(h, data) {
+                                        Ok(n) => return n as i64,
+                                        Err(e) => return net_error_to_errno(e),
                                     }
-                                    BlockResult::Interrupted => return EINTR,
                                 }
+                                BlockResult::Interrupted => return EINTR,
                             }
                         }
                         EAGAIN
@@ -5121,19 +5136,18 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 Err(NetError::WouldBlock) => {
                     let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                     if !nonblock {
-                        if let Some(pf) = self.poll_fn {
-                            match self.block_until(pf, Self::is_fd_readable, fd) {
-                                BlockResult::Ready => {
-                                    let data = unsafe {
-                                        core::slice::from_raw_parts_mut(buf as *mut u8, count)
-                                    };
-                                    match self.tcp.tcp_recv(h, data) {
-                                        Ok(n) => return n as i64,
-                                        Err(e) => return net_error_to_errno(e),
-                                    }
+                        // TODO(phase4-task4): update to new block_until signature
+                        match self.block_until(BLOCK_OP_READABLE, fd) {
+                            BlockResult::Ready => {
+                                let data = unsafe {
+                                    core::slice::from_raw_parts_mut(buf as *mut u8, count)
+                                };
+                                match self.tcp.tcp_recv(h, data) {
+                                    Ok(n) => return n as i64,
+                                    Err(e) => return net_error_to_errno(e),
                                 }
-                                BlockResult::Interrupted => return EINTR,
                             }
+                            BlockResult::Interrupted => return EINTR,
                         }
                     }
                     EAGAIN
@@ -5167,38 +5181,37 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     Err(NetError::WouldBlock) => {
                         let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                         if !nonblock {
-                            if let Some(pf) = self.poll_fn {
-                                match self.block_until(pf, Self::is_fd_readable, fd) {
-                                    BlockResult::Ready => {
-                                        // Retry the full UDP recv logic.
-                                        let data = unsafe {
-                                            core::slice::from_raw_parts_mut(buf as *mut u8, count)
-                                        };
-                                        let retry = match self.tcp.udp_recv(h, data) {
-                                            Ok(r) => Ok(r),
-                                            Err(NetError::NotConnected) => {
-                                                let data = unsafe {
-                                                    core::slice::from_raw_parts_mut(
-                                                        buf as *mut u8,
-                                                        count,
-                                                    )
-                                                };
-                                                self.tcp.udp_recvfrom(h, data)
-                                            }
-                                            Err(e) => Err(e),
-                                        };
-                                        return match retry {
-                                            Ok((n, src_addr, src_port)) => {
-                                                self.write_sockaddr_in(
-                                                    src, addrlen, src_addr, src_port,
-                                                );
-                                                n as i64
-                                            }
-                                            Err(e) => net_error_to_errno(e),
-                                        };
-                                    }
-                                    BlockResult::Interrupted => return EINTR,
+                            // TODO(phase4-task4): update to new block_until signature
+                            match self.block_until(BLOCK_OP_READABLE, fd) {
+                                BlockResult::Ready => {
+                                    // Retry the full UDP recv logic.
+                                    let data = unsafe {
+                                        core::slice::from_raw_parts_mut(buf as *mut u8, count)
+                                    };
+                                    let retry = match self.tcp.udp_recv(h, data) {
+                                        Ok(r) => Ok(r),
+                                        Err(NetError::NotConnected) => {
+                                            let data = unsafe {
+                                                core::slice::from_raw_parts_mut(
+                                                    buf as *mut u8,
+                                                    count,
+                                                )
+                                            };
+                                            self.tcp.udp_recvfrom(h, data)
+                                        }
+                                        Err(e) => Err(e),
+                                    };
+                                    return match retry {
+                                        Ok((n, src_addr, src_port)) => {
+                                            self.write_sockaddr_in(
+                                                src, addrlen, src_addr, src_port,
+                                            );
+                                            n as i64
+                                        }
+                                        Err(e) => net_error_to_errno(e),
+                                    };
                                 }
+                                BlockResult::Interrupted => return EINTR,
                             }
                         }
                         EAGAIN
@@ -6075,6 +6088,9 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             embedded_fs: self.embedded_fs.clone(),
             // Function pointer — copy to child so blocking ops work in forked processes.
             poll_fn: self.poll_fn,
+            // Scheduler callbacks — inherited by child so blocking ops use the same scheduler.
+            block_fn: self.block_fn,
+            wake_fn: self.wake_fn,
         };
         // Move shared pipe/eventfd state to child
         core::mem::swap(&mut self.pipes, &mut child.pipes);
@@ -8846,6 +8862,24 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             }
         }
         false
+    }
+
+    /// Check if a blocked task's wait condition is satisfied.
+    ///
+    /// Called by the system task's wake-check loop. `op` and `fd` match
+    /// the values passed to `block_fn`:
+    /// - 0 = FdReadable(fd)
+    /// - 1 = FdWritable(fd)
+    /// - 2 = FdConnectDone(fd)
+    /// - 3 = PollWait (always returns true — caller handles network-change gating)
+    pub fn is_wait_ready(&self, op: u8, fd: i32) -> bool {
+        match op {
+            0 => self.is_fd_readable(fd),
+            1 => self.is_fd_writable(fd),
+            2 => self.is_fd_connect_done(fd),
+            3 => true,
+            _ => false,
+        }
     }
 
     /// Linux sched_getaffinity(2): get CPU affinity mask.
@@ -17653,5 +17687,49 @@ mod integration_tests {
         });
         // NoTcp → tcp_handle is None → stub returns 0.
         assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn block_until_calls_block_fn() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+
+        let mut lx = Linuxulator::new(MockBackend::new());
+        static BLOCK_CALLED: AtomicBool = AtomicBool::new(false);
+
+        lx.set_block_fn(|_op, _fd| {
+            BLOCK_CALLED.store(true, Ordering::SeqCst);
+        });
+
+        BLOCK_CALLED.store(false, Ordering::SeqCst);
+        let result = lx.block_until(BLOCK_OP_READABLE, 5);
+        assert!(BLOCK_CALLED.load(Ordering::SeqCst));
+        assert_eq!(result, BlockResult::Ready);
+    }
+
+    #[test]
+    fn block_until_returns_interrupted_without_block_fn() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        // No block_fn set — should return Interrupted
+        let result = lx.block_until(BLOCK_OP_READABLE, 5);
+        assert_eq!(result, BlockResult::Interrupted);
+    }
+
+    #[test]
+    fn is_wait_ready_op3_always_true() {
+        let lx = Linuxulator::new(MockBackend::new());
+        assert!(lx.is_wait_ready(BLOCK_OP_POLL, -1));
+    }
+
+    #[test]
+    fn is_wait_ready_unknown_op_returns_false() {
+        let lx = Linuxulator::new(MockBackend::new());
+        assert!(!lx.is_wait_ready(42, -1));
+    }
+
+    #[test]
+    fn poll_network_no_panic_without_poll_fn() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        // Should not panic when poll_fn is None
+        lx.poll_network();
     }
 }
