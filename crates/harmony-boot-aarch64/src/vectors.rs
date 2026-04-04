@@ -105,8 +105,8 @@ core::arch::global_asm!(
     // Lives outside the vector table so it doesn't overflow the
     // 128-byte entry at 0x200.
     "el1_sync_handler:",
-    // Allocate TrapFrame on the stack (264 bytes, rounded up to 272 for 16-byte alignment)
-    "sub sp, sp, #272",
+    // Allocate TrapFrame on the stack (800 bytes: 264 GP regs + 8 pad + 16 FP ctrl + 512 Q0-Q31)
+    "sub sp, sp, #800",
     // Save X0-X29 as pairs
     "stp x0,  x1,  [sp, #0]",
     "stp x2,  x3,  [sp, #16]",
@@ -129,6 +129,27 @@ core::arch::global_asm!(
     "mrs x10, elr_el1",
     "mrs x11, spsr_el1",
     "stp x10, x11, [sp, #248]",
+    // Save FPCR and FPSR
+    "mrs x10, fpcr",
+    "mrs x11, fpsr",
+    "stp x10, x11, [sp, #264]",
+    // Save Q0-Q31 (32 SIMD regs, 128 bits each, at offset 288)
+    "stp q0,  q1,  [sp, #288]",
+    "stp q2,  q3,  [sp, #320]",
+    "stp q4,  q5,  [sp, #352]",
+    "stp q6,  q7,  [sp, #384]",
+    "stp q8,  q9,  [sp, #416]",
+    "stp q10, q11, [sp, #448]",
+    "stp q12, q13, [sp, #480]",
+    "stp q14, q15, [sp, #512]",
+    "stp q16, q17, [sp, #544]",
+    "stp q18, q19, [sp, #576]",
+    "stp q20, q21, [sp, #608]",
+    "stp q22, q23, [sp, #640]",
+    "stp q24, q25, [sp, #672]",
+    "stp q26, q27, [sp, #704]",
+    "stp q28, q29, [sp, #736]",
+    "stp q30, q31, [sp, #768]",
     // Read ESR_EL1 for exception class
     "mrs x1, esr_el1",
     // EC = ESR[31:26] — ubfx extracts and masks in one instruction
@@ -148,6 +169,27 @@ core::arch::global_asm!(
     "call_svc_handler:",
     "mov x0, sp",     // x0 = &TrapFrame
     "bl svc_handler", // svc_handler(&mut TrapFrame)
+    // Restore Q0-Q31
+    "ldp q0,  q1,  [sp, #288]",
+    "ldp q2,  q3,  [sp, #320]",
+    "ldp q4,  q5,  [sp, #352]",
+    "ldp q6,  q7,  [sp, #384]",
+    "ldp q8,  q9,  [sp, #416]",
+    "ldp q10, q11, [sp, #448]",
+    "ldp q12, q13, [sp, #480]",
+    "ldp q14, q15, [sp, #512]",
+    "ldp q16, q17, [sp, #544]",
+    "ldp q18, q19, [sp, #576]",
+    "ldp q20, q21, [sp, #608]",
+    "ldp q22, q23, [sp, #640]",
+    "ldp q24, q25, [sp, #672]",
+    "ldp q26, q27, [sp, #704]",
+    "ldp q28, q29, [sp, #736]",
+    "ldp q30, q31, [sp, #768]",
+    // Restore FPCR and FPSR
+    "ldp x10, x11, [sp, #264]",
+    "msr fpcr, x10",
+    "msr fpsr, x11",
     // Restore ELR and SPSR
     "ldp x10, x11, [sp, #248]",
     "msr elr_el1, x10",
@@ -170,7 +212,7 @@ core::arch::global_asm!(
     "ldp x28, x29, [sp, #224]",
     "ldr x30, [sp, #240]",
     // Deallocate TrapFrame
-    "add sp, sp, #272",
+    "add sp, sp, #800",
     "eret",
     // ── Abort handler dispatch ──
     "call_abort_handler:",
@@ -182,8 +224,8 @@ core::arch::global_asm!(
     // Saves the full TrapFrame (identical layout to el1_sync_handler)
     // so Phase 2 can context-switch from IRQ as easily as from SVC.
     "el1_irq_handler:",
-    // Allocate TrapFrame (264 bytes, padded to 272 for 16-byte alignment)
-    "sub sp, sp, #272",
+    // Allocate TrapFrame on the stack (800 bytes: 264 GP regs + 8 pad + 16 FP ctrl + 512 Q0-Q31)
+    "sub sp, sp, #800",
     // Save X0-X29 as pairs
     "stp x0,  x1,  [sp, #0]",
     "stp x2,  x3,  [sp, #16]",
@@ -206,10 +248,52 @@ core::arch::global_asm!(
     "mrs x10, elr_el1",
     "mrs x11, spsr_el1",
     "stp x10, x11, [sp, #248]",
+    // Save FPCR and FPSR
+    "mrs x10, fpcr",
+    "mrs x11, fpsr",
+    "stp x10, x11, [sp, #264]",
+    // Save Q0-Q31 (32 SIMD regs, 128 bits each, at offset 288)
+    "stp q0,  q1,  [sp, #288]",
+    "stp q2,  q3,  [sp, #320]",
+    "stp q4,  q5,  [sp, #352]",
+    "stp q6,  q7,  [sp, #384]",
+    "stp q8,  q9,  [sp, #416]",
+    "stp q10, q11, [sp, #448]",
+    "stp q12, q13, [sp, #480]",
+    "stp q14, q15, [sp, #512]",
+    "stp q16, q17, [sp, #544]",
+    "stp q18, q19, [sp, #576]",
+    "stp q20, q21, [sp, #608]",
+    "stp q22, q23, [sp, #640]",
+    "stp q24, q25, [sp, #672]",
+    "stp q26, q27, [sp, #704]",
+    "stp q28, q29, [sp, #736]",
+    "stp q30, q31, [sp, #768]",
     // Call Rust IRQ dispatch — pass current SP, receive (possibly new) SP
     "mov x0, sp",
     "bl irq_dispatch",
     "mov sp, x0",
+    // Restore Q0-Q31
+    "ldp q0,  q1,  [sp, #288]",
+    "ldp q2,  q3,  [sp, #320]",
+    "ldp q4,  q5,  [sp, #352]",
+    "ldp q6,  q7,  [sp, #384]",
+    "ldp q8,  q9,  [sp, #416]",
+    "ldp q10, q11, [sp, #448]",
+    "ldp q12, q13, [sp, #480]",
+    "ldp q14, q15, [sp, #512]",
+    "ldp q16, q17, [sp, #544]",
+    "ldp q18, q19, [sp, #576]",
+    "ldp q20, q21, [sp, #608]",
+    "ldp q22, q23, [sp, #640]",
+    "ldp q24, q25, [sp, #672]",
+    "ldp q26, q27, [sp, #704]",
+    "ldp q28, q29, [sp, #736]",
+    "ldp q30, q31, [sp, #768]",
+    // Restore FPCR and FPSR
+    "ldp x10, x11, [sp, #264]",
+    "msr fpcr, x10",
+    "msr fpsr, x11",
     // Restore ELR and SPSR
     "ldp x10, x11, [sp, #248]",
     "msr elr_el1, x10",
@@ -232,7 +316,7 @@ core::arch::global_asm!(
     "ldp x28, x29, [sp, #224]",
     "ldr x30, [sp, #240]",
     // Deallocate TrapFrame
-    "add sp, sp, #272",
+    "add sp, sp, #800",
     "eret",
 );
 
