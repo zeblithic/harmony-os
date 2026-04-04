@@ -554,6 +554,9 @@ fn main() -> Status {
         unsafe { sched::spawn_task("elf", 2, elf_task, &mut bump) };
         let _ = writeln!(serial, "[Sched] Spawned elf task (PID 2)");
 
+        // Move bump allocator to static for runtime task spawning (Phase 5 threads).
+        unsafe { sched::set_bump_allocator(bump) };
+
         // Enter the scheduler — loads task 0's TrapFrame and erets into it.
         // The eret atomically unmasks IRQs via SPSR (I=0 in INITIAL_SPSR),
         // so we do NOT use `msr daifclr` here.

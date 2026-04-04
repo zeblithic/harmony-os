@@ -113,6 +113,15 @@ static mut CURRENT: usize = 0;
 /// Number of tasks that have been spawned.
 static mut NUM_TASKS: usize = 0;
 
+/// Bump allocator for runtime kernel stack allocation. Moved from
+/// main()'s local variable so spawn_task_runtime can allocate after boot.
+static mut BUMP_ALLOCATOR: Option<crate::bump_alloc::BumpAllocator> = None;
+
+/// Initialize the bump allocator static. Called once during boot.
+pub unsafe fn set_bump_allocator(bump: crate::bump_alloc::BumpAllocator) {
+    BUMP_ALLOCATOR = Some(bump);
+}
+
 /// SPSR value for new tasks: EL1h (M=0b0101), D=1, A=1, I=0, F=1.
 /// Debug, SError, and FIQ masked; IRQ **unmasked** so the task is preemptible.
 const INITIAL_SPSR: u64 = 0x345;
@@ -365,6 +374,118 @@ pub unsafe fn enter_scheduler() -> ! {
         sp = in(reg) sp,
         options(noreturn),
     );
+}
+
+/// Spawn a new task at runtime (after scheduler is running).
+///
+/// Copies `parent_trapframe` to the new task's kernel stack, sets the
+/// child's return value to 0 (x[0]), and marks it Ready. Called from
+/// within syscall context (CLONE_VM/CLONE_THREAD).
+///
+/// # Safety
+///
+/// - Must be called from task context (not IRQ handler).
+/// - `parent_trapframe` must point to a valid TrapFrame.
+/// - IRQs will be temporarily masked.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn spawn_task_runtime(
+    name: &'static str,
+    pid: u32,
+    tid: u32,
+    tls: u64,
+    clear_child_tid: u64,
+    parent_trapframe: *const crate::syscall::TrapFrame,
+    child_stack: u64,
+) -> Option<usize> {
+    use harmony_microkernel::vm::PAGE_SIZE;
+
+    // Mask IRQs to prevent race with scheduler.
+    core::arch::asm!("msr daifset, #2");
+
+    let n = NUM_TASKS;
+    if n >= MAX_TASKS {
+        core::arch::asm!("msr daifclr, #2");
+        return None;
+    }
+
+    let bump = match BUMP_ALLOCATOR.as_mut() {
+        Some(b) => b,
+        None => {
+            core::arch::asm!("msr daifclr, #2");
+            return None;
+        }
+    };
+
+    let page_size = PAGE_SIZE as usize;
+    let pages_needed = (KERNEL_STACK_SIZE + page_size - 1) / page_size;
+
+    // Allocate guard page + stack pages (same as boot-time spawn_task).
+    let guard_frame = bump
+        .alloc_frame()
+        .expect("spawn_task_runtime: guard page")
+        .0 as usize;
+    let base = bump
+        .alloc_frame()
+        .expect("spawn_task_runtime: stack frame 0")
+        .0 as usize;
+    assert_eq!(
+        base,
+        guard_frame + page_size,
+        "guard page must be contiguous"
+    );
+    for i in 1..pages_needed {
+        let frame = bump
+            .alloc_frame()
+            .expect("spawn_task_runtime: stack frame")
+            .0 as usize;
+        assert_eq!(
+            frame,
+            base + i * page_size,
+            "stack frames must be contiguous"
+        );
+    }
+
+    // Mark guard page as inaccessible.
+    crate::mmu::mark_guard_page(guard_frame as u64);
+
+    let stack_size = pages_needed * page_size;
+    let stack_top = base + stack_size;
+    let sp = stack_top - TRAPFRAME_SIZE;
+
+    // Copy parent's TrapFrame to child's kernel stack.
+    core::ptr::copy_nonoverlapping(parent_trapframe as *const u8, sp as *mut u8, TRAPFRAME_SIZE);
+
+    // Modify child's TrapFrame: clone() returns 0 to child.
+    let child_frame = sp as *mut crate::syscall::TrapFrame;
+    (*child_frame).x[0] = 0;
+
+    // Note: child_stack is NOT written to the TrapFrame's SP here.
+    // On aarch64, musl's __clone passes child_stack in x1, and the
+    // child's clone wrapper does `mov sp, x1` after the syscall returns.
+    // Since we copied the parent's TrapFrame, x1 already contains
+    // the child_stack value from the parent's syscall arguments.
+    let _ = child_stack;
+
+    TASKS[n] = MaybeUninit::new(TaskControlBlock {
+        kernel_sp: sp,
+        kernel_stack_base: base,
+        kernel_stack_size: stack_size,
+        state: TaskState::Ready,
+        preempt_count: 0,
+        pid,
+        name,
+        entry: None,
+        wait_reason: None,
+        tls,
+        tid,
+        clear_child_tid,
+    });
+    NUM_TASKS = n + 1;
+
+    // Unmask IRQs.
+    core::arch::asm!("msr daifclr, #2");
+
+    Some(n)
 }
 
 /// Block the current task, recording why it is waiting.
