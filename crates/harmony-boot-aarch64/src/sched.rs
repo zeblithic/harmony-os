@@ -647,11 +647,6 @@ pub unsafe fn futex_wake(uaddr: u64, max: u32) -> u32 {
     woken
 }
 
-/// Get the current task's index.
-pub unsafe fn current_task_index() -> usize {
-    CURRENT
-}
-
 /// Get the current task's TID.
 pub unsafe fn current_task_tid() -> u32 {
     TASKS[CURRENT].assume_init_ref().tid

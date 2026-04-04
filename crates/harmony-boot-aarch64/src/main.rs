@@ -540,14 +540,32 @@ fn main() -> Status {
         // Move fully-configured Linuxulator to module-level static.
         unsafe { LINUXULATOR = Some(linuxulator) };
 
-        // Install dispatch function for the SVC handler
+        // Install dispatch function for the SVC handler.
+        // Detect exit from the syscall variant, NOT from lx.exited().
+        // lx.exited() is process-level state that poisons all threads —
+        // if a spawned thread calls SYS_EXIT and sets exit_code, every
+        // subsequent syscall from any thread would see exited=true.
         fn dispatch(syscall: LinuxSyscall) -> syscall::SyscallDispatchResult {
+            let is_exit = matches!(syscall, LinuxSyscall::Exit { .. });
+            let is_exit_group = matches!(syscall, LinuxSyscall::ExitGroup { .. });
+
             let lx = unsafe { LINUXULATOR.as_mut().unwrap() };
             let retval = lx.dispatch_syscall(syscall);
-            syscall::SyscallDispatchResult {
-                retval,
-                exited: lx.exited(),
-                exit_code: lx.exit_code().unwrap_or(0),
+
+            if is_exit || is_exit_group {
+                syscall::SyscallDispatchResult {
+                    retval,
+                    exited: true,
+                    exit_code: retval as i32,
+                    exit_group: is_exit_group,
+                }
+            } else {
+                syscall::SyscallDispatchResult {
+                    retval,
+                    exited: false,
+                    exit_code: 0,
+                    exit_group: false,
+                }
             }
         }
         unsafe { syscall::set_dispatch_fn(dispatch) };

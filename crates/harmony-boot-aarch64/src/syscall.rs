@@ -39,6 +39,8 @@ pub struct SyscallDispatchResult {
     pub retval: i64,
     pub exited: bool,
     pub exit_code: i32,
+    /// True for exit_group (kill all threads), false for thread-only exit.
+    pub exit_group: bool,
 }
 
 /// Global dispatch function pointer. Set during boot before SVC is possible.
@@ -150,16 +152,18 @@ pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
     if let Some(dispatch) = DISPATCH_FN {
         let result = dispatch(syscall);
         if result.exited {
-            // Check if this is a thread exit or process exit.
-            // Boot-time tasks have tid=0 (main thread sentinel).
-            // Spawned threads have tid>0 (from alloc_tid).
             let tid = crate::sched::current_task_tid();
+            let pid = crate::sched::current_task_pid();
+
+            // For exit_group (from any thread), kill all threads first.
+            if result.exit_group {
+                crate::sched::kill_threads_by_pid(pid);
+            }
 
             if tid != 0 {
-                // Spawned thread exit — clean up and die.
+                // Spawned thread exit — CLEARTID cleanup and die.
                 let clear_addr = crate::sched::current_task_clear_child_tid();
                 if clear_addr != 0 {
-                    // CLONE_CHILD_CLEARTID: zero the word and wake futex waiters.
                     *(clear_addr as *mut u32) = 0;
                     crate::sched::futex_wake(clear_addr, 1);
                 }
@@ -168,15 +172,16 @@ pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
                 core::arch::asm!("msr daifclr, #2");
                 crate::gic::send_sgi_self(crate::gic::YIELD_SGI);
                 core::arch::asm!("msr daifset, #2");
-                // Dead task is never rescheduled — loop as a safety net.
                 loop {
                     core::arch::asm!("wfi");
                 }
             }
 
-            // Main thread exit (TID == 0) — kill all sibling threads first.
-            let pid = crate::sched::current_task_pid();
-            crate::sched::kill_threads_by_pid(pid);
+            // Main thread exit — kill any remaining threads.
+            if !result.exit_group {
+                // SYS_EXIT from main thread — also kill all threads.
+                crate::sched::kill_threads_by_pid(pid);
+            }
 
             // Existing exit_group behavior: redirect ELR to return address.
             if !PROCESS_EXITED {
