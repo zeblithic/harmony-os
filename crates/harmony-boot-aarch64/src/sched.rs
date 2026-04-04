@@ -620,6 +620,77 @@ pub unsafe fn for_each_blocked(mut f: impl FnMut(usize, WaitReason)) {
     }
 }
 
+/// Wake up to `max` tasks blocked on `WaitReason::Futex(uaddr)`.
+///
+/// Returns the number of tasks actually woken. Used by FUTEX_WAKE
+/// and CLONE_CHILD_CLEARTID exit cleanup.
+///
+/// # Safety
+///
+/// Must only be called when TASKS[0..NUM_TASKS] are initialized.
+pub unsafe fn futex_wake(uaddr: u64, max: u32) -> u32 {
+    let mut woken = 0u32;
+    let n = NUM_TASKS;
+    for i in 0..n {
+        if woken >= max {
+            break;
+        }
+        let tcb = TASKS[i].assume_init_mut();
+        if tcb.state == TaskState::Blocked
+            && tcb.wait_reason == Some(WaitReason::Futex(uaddr))
+        {
+            tcb.state = TaskState::Ready;
+            tcb.wait_reason = None;
+            woken += 1;
+        }
+    }
+    woken
+}
+
+/// Get the current task's index.
+pub unsafe fn current_task_index() -> usize {
+    CURRENT
+}
+
+/// Get the current task's TID.
+pub unsafe fn current_task_tid() -> u32 {
+    TASKS[CURRENT].assume_init_ref().tid
+}
+
+/// Get the current task's PID.
+pub unsafe fn current_task_pid() -> u32 {
+    TASKS[CURRENT].assume_init_ref().pid
+}
+
+/// Get the current task's clear_child_tid address.
+pub unsafe fn current_task_clear_child_tid() -> u64 {
+    TASKS[CURRENT].assume_init_ref().clear_child_tid
+}
+
+/// Set the current task's clear_child_tid address.
+pub unsafe fn set_current_clear_child_tid(addr: u64) {
+    TASKS[CURRENT].assume_init_mut().clear_child_tid = addr;
+}
+
+/// Mark the current task as Dead.
+pub unsafe fn mark_current_dead() {
+    let tcb = TASKS[CURRENT].assume_init_mut();
+    tcb.state = TaskState::Dead;
+    tcb.wait_reason = None;
+}
+
+/// Mark all tasks with the given PID as Dead (exit_group).
+pub unsafe fn kill_threads_by_pid(pid: u32) {
+    let n = NUM_TASKS;
+    for i in 0..n {
+        let tcb = TASKS[i].assume_init_mut();
+        if tcb.pid == pid && tcb.state != TaskState::Dead {
+            tcb.state = TaskState::Dead;
+            tcb.wait_reason = None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -862,5 +933,94 @@ mod tests {
         assert_ne!(WaitReason::Futex(0x1000), WaitReason::Futex(0x2000));
         assert_eq!(WaitReason::Futex(0x1000), WaitReason::Futex(0x1000));
         assert_ne!(WaitReason::Futex(0x1000), WaitReason::FdReadable(1));
+    }
+
+    #[test]
+    fn futex_wake_wakes_matching_tasks() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            // Use put_tcb helper for task setup.
+            put_tcb(0, TaskState::Running, None);
+            TASKS[0].assume_init_mut().tid = 1;
+            TASKS[0].assume_init_mut().tls = 0;
+            TASKS[0].assume_init_mut().clear_child_tid = 0;
+
+            put_tcb(1, TaskState::Blocked, Some(WaitReason::Futex(0x1000)));
+            TASKS[1].assume_init_mut().tid = 2;
+            TASKS[1].assume_init_mut().tls = 0;
+            TASKS[1].assume_init_mut().clear_child_tid = 0;
+
+            put_tcb(2, TaskState::Blocked, Some(WaitReason::Futex(0x1000)));
+            TASKS[2].assume_init_mut().tid = 3;
+            TASKS[2].assume_init_mut().tls = 0;
+            TASKS[2].assume_init_mut().clear_child_tid = 0;
+
+            put_tcb(3, TaskState::Blocked, Some(WaitReason::Futex(0x2000)));
+            TASKS[3].assume_init_mut().tid = 4;
+            TASKS[3].assume_init_mut().tls = 0;
+            TASKS[3].assume_init_mut().clear_child_tid = 0;
+
+            NUM_TASKS = 4;
+            CURRENT = 0;
+
+            // Wake at most 1 task on 0x1000.
+            let woken = futex_wake(0x1000, 1);
+            assert_eq!(woken, 1);
+
+            // Task 3 (0x2000) still blocked.
+            assert_eq!(TASKS[3].assume_init_ref().state, TaskState::Blocked);
+
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn futex_wake_returns_zero_when_no_waiters() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            put_tcb(0, TaskState::Running, None);
+            TASKS[0].assume_init_mut().tid = 1;
+            TASKS[0].assume_init_mut().tls = 0;
+            TASKS[0].assume_init_mut().clear_child_tid = 0;
+            NUM_TASKS = 1;
+            CURRENT = 0;
+
+            let woken = futex_wake(0x1000, 10);
+            assert_eq!(woken, 0);
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn kill_threads_by_pid_marks_matching_dead() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            put_tcb(0, TaskState::Running, None);
+            TASKS[0].assume_init_mut().pid = 2;
+            TASKS[0].assume_init_mut().tid = 2;
+            TASKS[0].assume_init_mut().tls = 0;
+            TASKS[0].assume_init_mut().clear_child_tid = 0;
+
+            put_tcb(1, TaskState::Ready, None);
+            TASKS[1].assume_init_mut().pid = 2;
+            TASKS[1].assume_init_mut().tid = 3;
+            TASKS[1].assume_init_mut().tls = 0;
+            TASKS[1].assume_init_mut().clear_child_tid = 0;
+
+            put_tcb(2, TaskState::Ready, None);
+            TASKS[2].assume_init_mut().pid = 1; // Different PID
+            TASKS[2].assume_init_mut().tid = 1;
+            TASKS[2].assume_init_mut().tls = 0;
+            TASKS[2].assume_init_mut().clear_child_tid = 0;
+
+            NUM_TASKS = 3;
+
+            kill_threads_by_pid(2);
+
+            assert_eq!(TASKS[0].assume_init_ref().state, TaskState::Dead);
+            assert_eq!(TASKS[1].assume_init_ref().state, TaskState::Dead);
+            assert_eq!(TASKS[2].assume_init_ref().state, TaskState::Ready); // PID 1, untouched.
+            NUM_TASKS = 0;
+        }
     }
 }
