@@ -338,10 +338,16 @@ pub unsafe fn enter_scheduler() -> ! {
 ///   the scheduler has rescheduled this task. `wait_reason` is already
 ///   cleared by `wake()` before the resume.
 pub unsafe fn block_current(reason: WaitReason) {
-    let cur = CURRENT;
-    let tcb = TASKS[cur].assume_init_mut();
-    tcb.state = TaskState::Blocked;
-    tcb.wait_reason = Some(reason);
+    // Scoped to drop the &mut borrow before unmasking IRQs — the SGI
+    // (or a timer IRQ after daifclr) enters schedule() which does its
+    // own TASKS[cur].assume_init_mut(). Two live &mut refs to the same
+    // slot is UB even in unsafe code. Same pattern as schedule().
+    {
+        let cur = CURRENT;
+        let tcb = TASKS[cur].assume_init_mut();
+        tcb.state = TaskState::Blocked;
+        tcb.wait_reason = Some(reason);
+    }
 
     #[cfg(target_arch = "aarch64")]
     {
