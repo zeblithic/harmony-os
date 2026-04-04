@@ -497,15 +497,20 @@ fn main() -> Status {
         });
 
         // Thread spawning callback — creates a new scheduler task from clone().
-        linuxulator.set_spawn_fn(|pid, tid, tls, clear_child_tid, child_stack| {
+        // Uses the *scheduler* PID (from the calling task's TCB) so that
+        // kill_threads_by_pid can find spawned threads on exit_group.
+        // The Linuxulator passes its Linux PID (1), but the ELF task's
+        // scheduler PID is 2 — we must use the scheduler PID for consistency.
+        linuxulator.set_spawn_fn(|_linux_pid, tid, tls, clear_child_tid, child_stack| {
             let parent_tf = unsafe { syscall::current_trapframe() };
             if parent_tf.is_null() {
                 return None;
             }
+            let sched_pid = unsafe { sched::current_task_pid() };
             unsafe {
                 sched::spawn_task_runtime(
                     "thread",
-                    pid,
+                    sched_pid,
                     tid,
                     tls,
                     clear_child_tid,
@@ -513,7 +518,7 @@ fn main() -> Status {
                     child_stack,
                 )
             }
-            .map(|_idx| tid) // Return the TID on success, not the task index
+            .map(|_idx| tid)
         });
 
         // Futex blocking callback — blocks current task on a futex word.

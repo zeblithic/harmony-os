@@ -7708,11 +7708,16 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         if let Some(set_ctid) = self.set_clear_child_tid_fn {
             set_ctid(tidptr);
         }
+        // Return this thread's TID. For spawned threads, get_current_tid_fn
+        // returns the allocated TID (nonzero). For the main thread (TID=0
+        // in TCB), fall back to self.pid so gettid() == getpid().
         if let Some(get_tid) = self.get_current_tid_fn {
-            get_tid() as i64
-        } else {
-            self.pid as i64
+            let tid = get_tid();
+            if tid != 0 {
+                return tid as i64;
+            }
         }
+        self.pid as i64
     }
 
     /// Linux set_robust_list(2): stub — no futex cleanup needed.
@@ -8614,10 +8619,14 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     /// is present (single-threaded model).
     fn sys_gettid(&self) -> i64 {
         if let Some(get_tid) = self.get_current_tid_fn {
-            get_tid() as i64
-        } else {
-            self.pid as i64
+            let tid = get_tid();
+            if tid != 0 {
+                return tid as i64;
+            }
+            // TID == 0 means boot-time task (main thread).
+            // Fall through to return self.pid so gettid() == getpid().
         }
+        self.pid as i64
     }
 
     /// Linux getuid(2): return real user ID.

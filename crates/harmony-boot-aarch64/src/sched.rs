@@ -197,7 +197,7 @@ pub unsafe fn spawn_task(
         entry: Some(entry),
         wait_reason: None,
         tls: 0,
-        tid: pid, // Boot-time tasks: TID == PID
+        tid: 0, // Boot-time tasks: 0 = use Linuxulator PID for gettid()
         clear_child_tid: 0,
     });
     NUM_TASKS = n + 1;
@@ -420,24 +420,28 @@ pub unsafe fn spawn_task_runtime(
     let pages_needed = (KERNEL_STACK_SIZE + page_size - 1) / page_size;
 
     // Allocate guard page + stack pages (same as boot-time spawn_task).
-    let guard_frame = bump
-        .alloc_frame()
-        .expect("spawn_task_runtime: guard page")
-        .0 as usize;
-    let base = bump
-        .alloc_frame()
-        .expect("spawn_task_runtime: stack frame 0")
-        .0 as usize;
+    // On OOM, unmask IRQs and return None instead of panicking —
+    // a panic with IRQs masked leaves DAIF.I permanently set.
+    macro_rules! alloc_or_unmask {
+        ($bump:expr) => {
+            match $bump.alloc_frame() {
+                Some(f) => f.0 as usize,
+                None => {
+                    core::arch::asm!("msr daifclr, #2");
+                    return None;
+                }
+            }
+        };
+    }
+    let guard_frame = alloc_or_unmask!(bump);
+    let base = alloc_or_unmask!(bump);
     assert_eq!(
         base,
         guard_frame + page_size,
         "guard page must be contiguous"
     );
     for i in 1..pages_needed {
-        let frame = bump
-            .alloc_frame()
-            .expect("spawn_task_runtime: stack frame")
-            .0 as usize;
+        let frame = alloc_or_unmask!(bump);
         assert_eq!(
             frame,
             base + i * page_size,
