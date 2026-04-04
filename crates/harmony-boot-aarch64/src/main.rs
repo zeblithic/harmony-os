@@ -556,7 +556,7 @@ fn main() -> Status {
                 syscall::SyscallDispatchResult {
                     retval,
                     exited: true,
-                    exit_code: retval as i32,
+                    exit_code: lx.exit_code().unwrap_or(0),
                     exit_group: is_exit_group,
                 }
             } else {
