@@ -72,8 +72,7 @@ pub unsafe fn parse_fdt(dtb_ptr: *const u8) -> HardwareConfig {
                                 base: gicd_reg.starting_address as u64,
                                 size: gicd_reg.size.unwrap_or(0x10000) as u64,
                                 variant: InterruptControllerVariant::GicV3,
-                                redistributor_base: gicr_reg
-                                    .map(|r| r.starting_address as u64),
+                                redistributor_base: gicr_reg.map(|r| r.starting_address as u64),
                                 redistributor_size: gicr_reg
                                     .map(|r| r.size.unwrap_or(0xF60000) as u64),
                             });

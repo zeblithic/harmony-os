@@ -193,8 +193,7 @@ pub fn parse_sections_from_bytes(
 
     // 3. COFF header: NumberOfSections and SizeOfOptionalHeader.
     let coff_offset = pe_offset + 4; // skip PE signature
-    let num_sections =
-        read_u16(data, coff_offset + 2).ok_or(PeError::TruncatedHeader)? as usize;
+    let num_sections = read_u16(data, coff_offset + 2).ok_or(PeError::TruncatedHeader)? as usize;
     let size_of_optional =
         read_u16(data, coff_offset + 16).ok_or(PeError::TruncatedHeader)? as usize;
 
@@ -210,12 +209,9 @@ pub fn parse_sections_from_bytes(
     for i in 0..num_sections {
         let sec_offset = section_table_offset + i * SECTION_HEADER_SIZE;
 
-        let virtual_size =
-            read_u32(data, sec_offset + 8).ok_or(PeError::TruncatedHeader)? as u64;
-        let virtual_addr =
-            read_u32(data, sec_offset + 12).ok_or(PeError::TruncatedHeader)? as u64;
-        let characteristics =
-            read_u32(data, sec_offset + 36).ok_or(PeError::TruncatedHeader)?;
+        let virtual_size = read_u32(data, sec_offset + 8).ok_or(PeError::TruncatedHeader)? as u64;
+        let virtual_addr = read_u32(data, sec_offset + 12).ok_or(PeError::TruncatedHeader)? as u64;
+        let characteristics = read_u32(data, sec_offset + 36).ok_or(PeError::TruncatedHeader)?;
 
         let flags = characteristics_to_flags(characteristics)?;
 
@@ -293,8 +289,7 @@ mod tests {
         // DOS header
         buf[0] = 0x4D; // 'M'
         buf[1] = 0x5A; // 'Z'
-        buf[DOS_LFANEW_OFFSET..DOS_LFANEW_OFFSET + 4]
-            .copy_from_slice(&pe_offset.to_le_bytes());
+        buf[DOS_LFANEW_OFFSET..DOS_LFANEW_OFFSET + 4].copy_from_slice(&pe_offset.to_le_bytes());
 
         // PE signature
         let pe_off = pe_offset as usize;
@@ -303,8 +298,7 @@ mod tests {
         // COFF header
         let coff_off = pe_off + 4;
         buf[coff_off + 2..coff_off + 4].copy_from_slice(&num_sections.to_le_bytes());
-        buf[coff_off + 16..coff_off + 18]
-            .copy_from_slice(&optional_header_size.to_le_bytes());
+        buf[coff_off + 16..coff_off + 18].copy_from_slice(&optional_header_size.to_le_bytes());
 
         // Section headers
         let sec_table_off = coff_off + COFF_HEADER_SIZE;
@@ -324,9 +318,19 @@ mod tests {
     #[test]
     fn pe_parse_sections() {
         let sections = &[
-            (".text", 0x1000, 0x2000, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE),
+            (
+                ".text",
+                0x1000,
+                0x2000,
+                IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE,
+            ),
             (".rdata", 0x4000, 0x1000, IMAGE_SCN_MEM_READ),
-            (".data", 0x5000, 0x1000, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE),
+            (
+                ".data",
+                0x5000,
+                0x1000,
+                IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
+            ),
         ];
         let buf = build_pe_header(sections);
         let image_base = 0x4000_0000u64;
@@ -348,8 +352,7 @@ mod tests {
         let mut buf = vec![0u8; 256];
         buf[0] = 0x4D;
         buf[1] = 0x5A;
-        buf[DOS_LFANEW_OFFSET..DOS_LFANEW_OFFSET + 4]
-            .copy_from_slice(&0x80u32.to_le_bytes());
+        buf[DOS_LFANEW_OFFSET..DOS_LFANEW_OFFSET + 4].copy_from_slice(&0x80u32.to_le_bytes());
         // PE signature is all zeros — invalid
         let result = parse_sections_from_bytes(&buf, 0, 256);
         assert_eq!(result.unwrap_err(), PeError::BadPeSignature);
@@ -370,8 +373,7 @@ mod tests {
 
     #[test]
     fn pe_characteristics_to_flags_rx() {
-        let flags =
-            characteristics_to_flags(IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE).unwrap();
+        let flags = characteristics_to_flags(IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE).unwrap();
         assert!(flags.contains(PageFlags::READABLE));
         assert!(flags.contains(PageFlags::EXECUTABLE));
         assert!(!flags.contains(PageFlags::WRITABLE));
@@ -379,8 +381,7 @@ mod tests {
 
     #[test]
     fn pe_characteristics_to_flags_rw() {
-        let flags =
-            characteristics_to_flags(IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE).unwrap();
+        let flags = characteristics_to_flags(IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE).unwrap();
         assert!(flags.contains(PageFlags::READABLE));
         assert!(flags.contains(PageFlags::WRITABLE));
         assert!(!flags.contains(PageFlags::EXECUTABLE));
@@ -407,8 +408,18 @@ mod tests {
     #[test]
     fn image_sections_flags_for_addr() {
         let sections = &[
-            (".text", 0x1000, 0x2000, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE),
-            (".data", 0x4000, 0x1000, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE),
+            (
+                ".text",
+                0x1000,
+                0x2000,
+                IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE,
+            ),
+            (
+                ".data",
+                0x4000,
+                0x1000,
+                IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
+            ),
         ];
         let buf = build_pe_header(sections);
         let base = 0x4000_0000u64;
@@ -445,9 +456,12 @@ mod tests {
     fn outside_image_returns_none() {
         // Simulates MMU behavior: pages outside the image get None,
         // and the MMU maps them as RWX (default_outside) until vm_mprotect is implemented.
-        let sections = &[
-            (".text", 0x1000, 0x1000, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE),
-        ];
+        let sections = &[(
+            ".text",
+            0x1000,
+            0x1000,
+            IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE,
+        )];
         let buf = build_pe_header(sections);
         let base = 0x4000_0000u64;
         // image_size 0x10_0000 = image range 0x4000_0000..0x4010_0000
@@ -464,8 +478,18 @@ mod tests {
     fn inter_section_padding_is_rw() {
         // Gap between .text and .data within the image → RW (safe default)
         let sections = &[
-            (".text", 0x1000, 0x1000, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE),
-            (".data", 0x4000, 0x1000, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE),
+            (
+                ".text",
+                0x1000,
+                0x1000,
+                IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE,
+            ),
+            (
+                ".data",
+                0x4000,
+                0x1000,
+                IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
+            ),
         ];
         let buf = build_pe_header(sections);
         let base = 0x4000_0000u64;
@@ -481,8 +505,12 @@ mod tests {
 
     #[test]
     fn pe_parse_unaligned_section_rejected() {
-        let sections =
-            &[(".text", 0x1200, 0x1000, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE)];
+        let sections = &[(
+            ".text",
+            0x1200,
+            0x1000,
+            IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE,
+        )];
         let buf = build_pe_header(sections);
         let result = parse_sections_from_bytes(&buf, 0, 0x10_0000);
         assert_eq!(result.unwrap_err(), PeError::UnalignedSection);
@@ -490,8 +518,12 @@ mod tests {
 
     #[test]
     fn pe_parse_section_out_of_bounds_rejected() {
-        let sections =
-            &[(".text", 0x1000, 0x9000, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE)];
+        let sections = &[(
+            ".text",
+            0x1000,
+            0x9000,
+            IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE,
+        )];
         let buf = build_pe_header(sections);
         // section ends at 0xA000 > image_size 0x9000
         let result = parse_sections_from_bytes(&buf, 0, 0x9000);
@@ -502,7 +534,12 @@ mod tests {
     fn pe_parse_overlapping_sections_rejected() {
         // page_align_up of .text end (0x1000 + 0x1800 → 0x3000) overlaps .rdata start (0x2000)
         let sections = &[
-            (".text", 0x1000, 0x1800, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE),
+            (
+                ".text",
+                0x1000,
+                0x1800,
+                IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE,
+            ),
             (".rdata", 0x2000, 0x1000, IMAGE_SCN_MEM_READ),
         ];
         let buf = build_pe_header(sections);
@@ -531,8 +568,12 @@ mod tests {
 
     #[test]
     fn pe_parse_zero_virtual_size_rejected() {
-        let sections =
-            &[(".text", 0x1000, 0, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE)];
+        let sections = &[(
+            ".text",
+            0x1000,
+            0,
+            IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE,
+        )];
         let buf = build_pe_header(sections);
         let result = parse_sections_from_bytes(&buf, 0, 0x10_0000);
         assert_eq!(result.unwrap_err(), PeError::TruncatedHeader);
@@ -541,8 +582,18 @@ mod tests {
     #[test]
     fn pe_header_area_is_read_only() {
         let sections = &[
-            (".text", 0x1000, 0x2000, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE),
-            (".data", 0x4000, 0x1000, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE),
+            (
+                ".text",
+                0x1000,
+                0x2000,
+                IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE,
+            ),
+            (
+                ".data",
+                0x4000,
+                0x1000,
+                IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
+            ),
         ];
         let buf = build_pe_header(sections);
         let base = 0x4000_0000u64;
@@ -575,8 +626,12 @@ mod tests {
     #[test]
     fn pe_parse_virtual_addr_zero_rejected() {
         // VirtualAddress == 0 would overlap the PE header area.
-        let sections =
-            &[(".text", 0x0000, 0x1000, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE)];
+        let sections = &[(
+            ".text",
+            0x0000,
+            0x1000,
+            IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE,
+        )];
         let buf = build_pe_header(sections);
         let result = parse_sections_from_bytes(&buf, 0x4000_0000, 0x10_0000);
         assert_eq!(result.unwrap_err(), PeError::UnalignedSection);

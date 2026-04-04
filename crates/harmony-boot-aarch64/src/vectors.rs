@@ -53,40 +53,31 @@ core::arch::global_asm!(
     ".balign 2048",
     ".globl vector_table",
     "vector_table:",
-
     // 0x000 — Current EL, SP_EL0, Synchronous (unused)
     "b unexpected_exception",
     ".balign 0x80",
-
     // 0x080 — Current EL, SP_EL0, IRQ (unused)
     "b unexpected_exception",
     ".balign 0x80",
-
     // 0x100 — Current EL, SP_EL0, FIQ (unused)
     "b unexpected_exception",
     ".balign 0x80",
-
     // 0x180 — Current EL, SP_EL0, SError (unused)
     "b unexpected_exception",
     ".balign 0x80",
-
     // ── 0x200 — Current EL, SPx, Synchronous ── THE MAIN ENTRY ──
     // Branch out-of-line: handler body exceeds the 128-byte entry slot.
     "b el1_sync_handler",
     ".balign 0x80",
-
     // 0x280 — Current EL, SPx, IRQ (timer interrupt)
     "b el1_irq_handler",
     ".balign 0x80",
-
     // 0x300 — Current EL, SPx, FIQ (unexpected)
     "b unexpected_exception",
     ".balign 0x80",
-
     // 0x380 — Current EL, SPx, SError (unexpected)
     "b unexpected_exception",
     ".balign 0x80",
-
     // 0x400-0x780 — Lower EL entries
     // 0x400 — Lower EL, AArch64, Synchronous (SVC from EL0)
     // Routes to el1_sync_handler for diagnostics / future EL0 support
@@ -107,20 +98,15 @@ core::arch::global_asm!(
     ".balign 0x80",
     "b unexpected_exception",
     ".balign 0x80",
-
     // ── Unexpected exception handler ────────────────────────────
     "unexpected_exception:",
-    "b unexpected_exception",  // infinite loop
-
+    "b unexpected_exception", // infinite loop
     // ── Out-of-line synchronous exception handler ─────────────
     // Lives outside the vector table so it doesn't overflow the
     // 128-byte entry at 0x200.
-
     "el1_sync_handler:",
-
     // Allocate TrapFrame on the stack (264 bytes, rounded up to 272 for 16-byte alignment)
     "sub sp, sp, #272",
-
     // Save X0-X29 as pairs
     "stp x0,  x1,  [sp, #0]",
     "stp x2,  x3,  [sp, #16]",
@@ -143,37 +129,29 @@ core::arch::global_asm!(
     "mrs x10, elr_el1",
     "mrs x11, spsr_el1",
     "stp x10, x11, [sp, #248]",
-
     // Read ESR_EL1 for exception class
     "mrs x1, esr_el1",
     // EC = ESR[31:26] — ubfx extracts and masks in one instruction
     "ubfx x2, x1, #26, #6",
-
     // EC == 0x15 → SVC from AArch64
     "cmp x2, #0x15",
     "b.eq call_svc_handler",
-
     // EC == 0x25 → Data Abort, current EL
     "cmp x2, #0x25",
     "b.eq call_abort_handler",
-
     // EC == 0x21 → Instruction Abort, current EL
     "cmp x2, #0x21",
     "b.eq call_abort_handler",
-
     // Other — fall through to abort handler with ESR in x1
     "b call_abort_handler",
-
     // ── SVC handler dispatch ──
     "call_svc_handler:",
-    "mov x0, sp",              // x0 = &TrapFrame
-    "bl svc_handler",          // svc_handler(&mut TrapFrame)
-
+    "mov x0, sp",     // x0 = &TrapFrame
+    "bl svc_handler", // svc_handler(&mut TrapFrame)
     // Restore ELR and SPSR
     "ldp x10, x11, [sp, #248]",
     "msr elr_el1, x10",
     "msr spsr_el1, x11",
-
     // Restore X0-X29
     "ldp x0,  x1,  [sp, #0]",
     "ldp x2,  x3,  [sp, #16]",
@@ -191,27 +169,21 @@ core::arch::global_asm!(
     "ldp x26, x27, [sp, #208]",
     "ldp x28, x29, [sp, #224]",
     "ldr x30, [sp, #240]",
-
     // Deallocate TrapFrame
     "add sp, sp, #272",
     "eret",
-
     // ── Abort handler dispatch ──
     "call_abort_handler:",
-    "mov x0, sp",              // x0 = &TrapFrame
+    "mov x0, sp", // x0 = &TrapFrame
     // x1 already contains ESR_EL1 from above
-    "bl abort_handler",        // abort_handler(&TrapFrame, esr: u64) -> !
-    "b unexpected_exception",  // should not return, but safety net
-
+    "bl abort_handler",       // abort_handler(&TrapFrame, esr: u64) -> !
+    "b unexpected_exception", // should not return, but safety net
     // ── Out-of-line IRQ handler ──────────────────────────────────────
     // Saves the full TrapFrame (identical layout to el1_sync_handler)
     // so Phase 2 can context-switch from IRQ as easily as from SVC.
-
     "el1_irq_handler:",
-
     // Allocate TrapFrame (264 bytes, padded to 272 for 16-byte alignment)
     "sub sp, sp, #272",
-
     // Save X0-X29 as pairs
     "stp x0,  x1,  [sp, #0]",
     "stp x2,  x3,  [sp, #16]",
@@ -234,15 +206,14 @@ core::arch::global_asm!(
     "mrs x10, elr_el1",
     "mrs x11, spsr_el1",
     "stp x10, x11, [sp, #248]",
-
-    // Call Rust IRQ dispatch
+    // Call Rust IRQ dispatch — pass current SP, receive (possibly new) SP
+    "mov x0, sp",
     "bl irq_dispatch",
-
+    "mov sp, x0",
     // Restore ELR and SPSR
     "ldp x10, x11, [sp, #248]",
     "msr elr_el1, x10",
     "msr spsr_el1, x11",
-
     // Restore X0-X29
     "ldp x0,  x1,  [sp, #0]",
     "ldp x2,  x3,  [sp, #16]",
@@ -260,33 +231,44 @@ core::arch::global_asm!(
     "ldp x26, x27, [sp, #208]",
     "ldp x28, x29, [sp, #224]",
     "ldr x30, [sp, #240]",
-
     // Deallocate TrapFrame
     "add sp, sp, #272",
     "eret",
 );
 
 use crate::gic;
+use crate::sched;
 use crate::timer;
 
 /// IRQ dispatch — called from `el1_irq_handler` assembly.
 ///
 /// Acknowledges the interrupt via GIC, routes to the appropriate handler,
-/// and signals end-of-interrupt. Spurious interrupts (INTID 1023) are
-/// silently ignored — writing 1023 to ICC_EOIR1_EL1 is UNPREDICTABLE.
+/// and signals end-of-interrupt. On timer ticks, calls the scheduler which
+/// may return a different SP (context switch). Spurious interrupts (INTID
+/// 1023) are silently ignored — writing 1023 to ICC_EOIR1_EL1 is UNPREDICTABLE.
+///
+/// # Arguments
+///
+/// - `current_sp`: the interrupted task's kernel SP (points at saved TrapFrame)
+///
+/// # Returns
+///
+/// The kernel SP to restore from — same as `current_sp` if no switch, or the
+/// next task's SP if the scheduler decided to switch.
 #[cfg(target_arch = "aarch64")]
 #[no_mangle]
-extern "C" fn irq_dispatch() {
+extern "C" fn irq_dispatch(current_sp: usize) -> usize {
     let intid = gic::ack();
-    match intid {
-        gic::TIMER_INTID => timer::on_tick(),
-        gic::SPURIOUS => {}
-        _ => {
-            // Unexpected interrupt — EOI it to prevent the GIC from
-            // suppressing further interrupts, but otherwise ignore.
+    let new_sp = match intid {
+        gic::TIMER_INTID => {
+            timer::on_tick();
+            unsafe { sched::schedule(current_sp) }
         }
-    }
+        gic::SPURIOUS => current_sp,
+        _ => current_sp,
+    };
     if intid != gic::SPURIOUS {
         gic::eoi(intid);
     }
+    new_sp
 }
