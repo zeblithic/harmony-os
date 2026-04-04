@@ -235,8 +235,10 @@ core::arch::global_asm!(
     "mrs x11, spsr_el1",
     "stp x10, x11, [sp, #248]",
 
-    // Call Rust IRQ dispatch
+    // Call Rust IRQ dispatch — pass current SP, receive (possibly new) SP
+    "mov x0, sp",
     "bl irq_dispatch",
+    "mov sp, x0",
 
     // Restore ELR and SPSR
     "ldp x10, x11, [sp, #248]",
@@ -267,26 +269,38 @@ core::arch::global_asm!(
 );
 
 use crate::gic;
+use crate::sched;
 use crate::timer;
 
 /// IRQ dispatch — called from `el1_irq_handler` assembly.
 ///
 /// Acknowledges the interrupt via GIC, routes to the appropriate handler,
-/// and signals end-of-interrupt. Spurious interrupts (INTID 1023) are
-/// silently ignored — writing 1023 to ICC_EOIR1_EL1 is UNPREDICTABLE.
+/// and signals end-of-interrupt. On timer ticks, calls the scheduler which
+/// may return a different SP (context switch). Spurious interrupts (INTID
+/// 1023) are silently ignored — writing 1023 to ICC_EOIR1_EL1 is UNPREDICTABLE.
+///
+/// # Arguments
+///
+/// - `current_sp`: the interrupted task's kernel SP (points at saved TrapFrame)
+///
+/// # Returns
+///
+/// The kernel SP to restore from — same as `current_sp` if no switch, or the
+/// next task's SP if the scheduler decided to switch.
 #[cfg(target_arch = "aarch64")]
 #[no_mangle]
-extern "C" fn irq_dispatch() {
+extern "C" fn irq_dispatch(current_sp: usize) -> usize {
     let intid = gic::ack();
-    match intid {
-        gic::TIMER_INTID => timer::on_tick(),
-        gic::SPURIOUS => {}
-        _ => {
-            // Unexpected interrupt — EOI it to prevent the GIC from
-            // suppressing further interrupts, but otherwise ignore.
+    let new_sp = match intid {
+        gic::TIMER_INTID => {
+            timer::on_tick();
+            unsafe { sched::schedule(current_sp) }
         }
-    }
+        gic::SPURIOUS => current_sp,
+        _ => current_sp,
+    };
     if intid != gic::SPURIOUS {
         gic::eoi(intid);
     }
+    new_sp
 }
