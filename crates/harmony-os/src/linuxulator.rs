@@ -78,7 +78,7 @@ const SS_ONSTACK: i32 = 1;
 const SS_DISABLE: i32 = 2;
 const MINSIGSTKSZ: u64 = 2048;
 
-/// Result of a `block_until` spin-wait.
+/// Result of a `block_until` blocking operation.
 #[derive(PartialEq, Debug)]
 enum BlockResult {
     /// The readiness check returned true — caller should retry the operation.
@@ -3626,7 +3626,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                             let nonblock =
                                 self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                             if !nonblock {
-                                // TODO(phase4-task4): update to new block_until signature
+
                                 match self.block_until(BLOCK_OP_WRITABLE, fd) {
                                     BlockResult::Ready => {
                                         let data = unsafe {
@@ -3716,7 +3716,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                         if nonblock {
                             return EAGAIN;
                         }
-                        // TODO(phase4-task4): update to new block_until signature
+
                         match self.block_until(BLOCK_OP_READABLE, fd) {
                             BlockResult::Ready => {
                                 // Re-borrow after block_until releases the borrow.
@@ -3833,7 +3833,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                             let nonblock =
                                 self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                             if !nonblock {
-                                // TODO(phase4-task4): update to new block_until signature
+
                                 match self.block_until(BLOCK_OP_READABLE, fd) {
                                     BlockResult::Ready => {
                                         let buf = unsafe {
@@ -4922,7 +4922,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     if nonblock {
                         EINPROGRESS
                     } else {
-                        // TODO(phase4-task4): update to new block_until signature
+
                         // Block until the handshake completes or fails.
                         // Uses BLOCK_OP_CONNECT (not BLOCK_OP_WRITABLE) so that
                         // connection failures (RST → Closed) also unblock.
@@ -5008,7 +5008,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 Err(NetError::WouldBlock) => {
                     let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                     if !nonblock {
-                        // TODO(phase4-task4): update to new block_until signature
+
                         match self.block_until(BLOCK_OP_WRITABLE, fd) {
                             BlockResult::Ready => {
                                 let data =
@@ -5049,7 +5049,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                             let nonblock =
                                 self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                             if !nonblock {
-                                // TODO(phase4-task4): update to new block_until signature
+
                                 match self.block_until(BLOCK_OP_WRITABLE, fd) {
                                     BlockResult::Ready => {
                                         let data = unsafe {
@@ -5079,7 +5079,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     Err(NetError::WouldBlock) => {
                         let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                         if !nonblock {
-                            // TODO(phase4-task4): update to new block_until signature
+    
                             match self.block_until(BLOCK_OP_WRITABLE, fd) {
                                 BlockResult::Ready => {
                                     let data = unsafe {
@@ -5136,7 +5136,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 Err(NetError::WouldBlock) => {
                     let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                     if !nonblock {
-                        // TODO(phase4-task4): update to new block_until signature
+
                         match self.block_until(BLOCK_OP_READABLE, fd) {
                             BlockResult::Ready => {
                                 let data = unsafe {
@@ -5181,7 +5181,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     Err(NetError::WouldBlock) => {
                         let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                         if !nonblock {
-                            // TODO(phase4-task4): update to new block_until signature
+    
                             match self.block_until(BLOCK_OP_READABLE, fd) {
                                 BlockResult::Ready => {
                                     // Retry the full UDP recv logic.
