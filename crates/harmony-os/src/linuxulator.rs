@@ -4954,7 +4954,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                     if nonblock {
                         EINPROGRESS
-                    } else {
+                    } else if self.block_fn.is_some() {
                         // Block until the handshake completes or fails.
                         // Uses BLOCK_OP_CONNECT (not BLOCK_OP_WRITABLE) so that
                         // connection failures (RST → Closed) also unblock.
@@ -4973,6 +4973,9 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                             }
                             BlockResult::Interrupted => EINTR,
                         }
+                    } else {
+                        // No scheduler — return EINPROGRESS like nonblocking.
+                        EINPROGRESS
                     }
                 }
                 Err(e) => net_error_to_errno(e),
@@ -8704,6 +8707,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         let read_bytes = (nfds as usize).div_ceil(8);
         let mut saved_readfds = [0u8; 128];
         let mut saved_writefds = [0u8; 128];
+        let mut saved_exceptfds = [0u8; 128];
         if readfds != 0 && read_bytes > 0 {
             let src = unsafe { core::slice::from_raw_parts(readfds as *const u8, read_bytes) };
             saved_readfds[..read_bytes].copy_from_slice(src);
@@ -8711,6 +8715,10 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         if writefds != 0 && read_bytes > 0 {
             let src = unsafe { core::slice::from_raw_parts(writefds as *const u8, read_bytes) };
             saved_writefds[..read_bytes].copy_from_slice(src);
+        }
+        if exceptfds != 0 && read_bytes > 0 {
+            let src = unsafe { core::slice::from_raw_parts(exceptfds as *const u8, read_bytes) };
+            saved_exceptfds[..read_bytes].copy_from_slice(src);
         }
 
         // Helper closure to clear all fd_sets (Linux convention on timeout/interrupt).
@@ -8752,6 +8760,12 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     let dst =
                         unsafe { core::slice::from_raw_parts_mut(writefds as *mut u8, read_bytes) };
                     dst.copy_from_slice(&saved_writefds[..read_bytes]);
+                }
+                if exceptfds != 0 && read_bytes > 0 {
+                    let dst = unsafe {
+                        core::slice::from_raw_parts_mut(exceptfds as *mut u8, read_bytes)
+                    };
+                    dst.copy_from_slice(&saved_exceptfds[..read_bytes]);
                 }
 
                 match self.block_until(BLOCK_OP_POLL, -1) {
