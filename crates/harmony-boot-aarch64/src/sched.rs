@@ -23,6 +23,7 @@ use core::mem::MaybeUninit;
 
 use crate::bump_alloc::BumpAllocator;
 use crate::syscall::TrapFrame;
+use harmony_microkernel::vm::PAGE_SIZE;
 
 // Compile-time guard: if TrapFrame ever grows (e.g. FP/SIMD), this fires.
 const _: () = assert!(
@@ -33,7 +34,8 @@ const _: () = assert!(
 /// Maximum number of tasks. Fixed at 2 for Phase 2.
 const MAX_TASKS: usize = 2;
 
-/// Size of each task's kernel stack in bytes (8 KiB = 2 pages).
+/// Minimum kernel stack size in bytes (8 KiB).
+/// Actual allocation rounds up to whole pages — 2 pages at 4K, 1 page at 16K.
 const KERNEL_STACK_SIZE: usize = 8192;
 
 /// Size of the TrapFrame in bytes (31 GP regs + ELR + SPSR = 264,
@@ -41,7 +43,7 @@ const KERNEL_STACK_SIZE: usize = 8192;
 const TRAPFRAME_SIZE: usize = 272;
 
 /// Scheduling state for a task.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TaskState {
     Ready,
     Running,
@@ -55,12 +57,15 @@ pub struct TaskControlBlock {
     /// kernel stack. The IRQ restore path loads registers from here.
     pub kernel_sp: usize,
     /// Base address of the allocated kernel stack (low address).
+    /// Phase 3: used for guard-page setup and stack teardown on task exit.
     pub kernel_stack_base: usize,
     /// Size of the kernel stack in bytes.
+    /// Phase 3: used for guard-page setup and stack teardown on task exit.
     pub kernel_stack_size: usize,
     /// Current scheduling state.
     pub state: TaskState,
     /// Number of times this task has been preempted (for verification).
+    /// Phase 3: used for scheduling fairness metrics.
     pub preempt_count: u64,
 }
 
@@ -86,19 +91,31 @@ const INITIAL_SPSR: u64 = 0x345;
 ///
 /// # Safety
 ///
-/// - Must be called before IRQs are unmasked (before `msr daifclr, #2`).
-/// - `bump` must have at least 2 free frames.
+/// - Must be called before IRQs are unmasked (before `enter_scheduler`).
+/// - `bump` must have enough free frames for the kernel stack.
 /// - Must not be called more than [`MAX_TASKS`] times.
 pub unsafe fn spawn_task(entry: fn() -> !, bump: &mut BumpAllocator) {
     let n = unsafe { NUM_TASKS };
     assert!(n < MAX_TASKS, "spawn_task: MAX_TASKS exceeded");
 
-    // Allocate 2 contiguous pages (8 KiB) for the kernel stack.
-    let page0 = bump.alloc_frame().expect("sched: kernel stack page 0").0 as usize;
-    let page1 = bump.alloc_frame().expect("sched: kernel stack page 1").0 as usize;
-    assert_eq!(page1, page0 + 4096, "kernel stack pages must be contiguous");
+    let page_size = PAGE_SIZE as usize;
+    let pages_needed = (KERNEL_STACK_SIZE + page_size - 1) / page_size;
 
-    let stack_top = page0 + KERNEL_STACK_SIZE;
+    // Allocate contiguous pages for the kernel stack.
+    // No other allocations may occur between these calls — the bump
+    // allocator must produce contiguous frames for a valid stack.
+    let base = bump.alloc_frame().expect("sched: kernel stack frame 0").0 as usize;
+    for i in 1..pages_needed {
+        let frame = bump.alloc_frame().expect("sched: kernel stack frame").0 as usize;
+        assert_eq!(
+            frame,
+            base + i * page_size,
+            "kernel stack frames must be contiguous"
+        );
+    }
+
+    let stack_size = pages_needed * page_size;
+    let stack_top = base + stack_size;
 
     // Place a TrapFrame at the top of the stack.
     // kernel_sp points to the base of the TrapFrame (stack grows down).
@@ -113,8 +130,8 @@ pub unsafe fn spawn_task(entry: fn() -> !, bump: &mut BumpAllocator) {
 
     TASKS[n] = MaybeUninit::new(TaskControlBlock {
         kernel_sp: sp,
-        kernel_stack_base: page0,
-        kernel_stack_size: KERNEL_STACK_SIZE,
+        kernel_stack_base: base,
+        kernel_stack_size: stack_size,
         state: TaskState::Ready,
         preempt_count: 0,
     });
@@ -186,6 +203,9 @@ pub unsafe fn schedule(current_sp: usize) -> usize {
     CURRENT = next;
 
     let next_tcb = TASKS[next].assume_init_mut();
+    // Phase 3 will add Blocked state — this assert catches scheduling a
+    // non-Ready task, which would eret into a stale or invalid context.
+    debug_assert_eq!(next_tcb.state, TaskState::Ready);
     next_tcb.state = TaskState::Running;
 
     next_tcb.kernel_sp
@@ -207,7 +227,9 @@ pub fn num_tasks() -> usize {
 /// # Safety
 ///
 /// - At least one task must have been spawned via [`spawn_task`].
-/// - IRQs must already be unmasked so the task will be preempted.
+/// - IRQs should be **masked** when calling — `eret` atomically unmasks
+///   them via SPSR (I=0 in [`INITIAL_SPSR`]), avoiding a race window
+///   between IRQ unmask and task context setup.
 /// - This function never returns.
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn enter_scheduler() -> ! {

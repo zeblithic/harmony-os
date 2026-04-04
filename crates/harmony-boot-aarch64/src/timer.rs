@@ -161,6 +161,9 @@ fn print_sched_verification() {
     use crate::pl011;
 
     if c0 == 0 || c1 == 0 {
+        // The [Sched] Task 0: milestone won't match, so the QEMU boot test
+        // will time out (30s) and report failure. The FAIL message below
+        // appears in the serial output tail, aiding CI diagnosis.
         for &b in b"[Sched] FAIL: context switch broken (counter is zero)\r\n" {
             unsafe { pl011::write_byte(b) };
         }
