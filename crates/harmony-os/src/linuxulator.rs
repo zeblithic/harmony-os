@@ -336,7 +336,9 @@ pub enum LinuxSyscall {
         code: i32,
         addr: u64,
     },
-    SetTidAddress,
+    SetTidAddress {
+        tidptr: u64,
+    },
     ExitGroup {
         code: i32,
     },
@@ -1028,7 +1030,7 @@ impl LinuxSyscall {
                 dirp: args[1],
                 count: args[2],
             },
-            218 => LinuxSyscall::SetTidAddress,
+            218 => LinuxSyscall::SetTidAddress { tidptr: args[0] },
             228 => LinuxSyscall::ClockGettime {
                 clockid: args[0] as i32,
                 tp: args[1],
@@ -1354,7 +1356,7 @@ impl LinuxSyscall {
             94 => LinuxSyscall::ExitGroup {
                 code: args[0] as i32,
             },
-            96 => LinuxSyscall::SetTidAddress,
+            96 => LinuxSyscall::SetTidAddress { tidptr: args[0] },
             98 => LinuxSyscall::Futex {
                 uaddr: args[0],
                 op: args[1] as i32,
@@ -2507,6 +2509,22 @@ pub struct Linuxulator<
     /// pipe/eventfd writes for synchronous waking. Arguments: (fd: i32, op: u8)
     /// where op is 0=readable, 1=writable.
     wake_fn: Option<fn(i32, u8)>,
+    /// Spawn a new thread task. Args: (pid, tid, tls, clear_child_tid, child_stack).
+    /// Returns Some(task_index) on success, None if MAX_TASKS reached.
+    #[allow(clippy::type_complexity)]
+    spawn_fn: Option<fn(u32, u32, u64, u64, u64) -> Option<u32>>,
+    /// Block current task on a futex address.
+    futex_block_fn: Option<fn(u64)>,
+    /// Wake up to N tasks blocked on a futex address. Returns count woken.
+    futex_wake_fn: Option<fn(u64, u32) -> u32>,
+    /// Get the current task's TID.
+    get_current_tid_fn: Option<fn() -> u32>,
+    /// Set the current task's clear_child_tid address.
+    set_clear_child_tid_fn: Option<fn(u64)>,
+    /// Next TID to assign to a spawned thread. Starts at pid + 1.
+    // Used by sys_clone (Task 6); suppress dead_code until then.
+    #[allow(dead_code)]
+    next_tid: u32,
 }
 
 impl<B: SyscallBackend> Linuxulator<B, NoTcp> {
@@ -2579,6 +2597,12 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             poll_fn: None,
             block_fn: None,
             wake_fn: None,
+            spawn_fn: None,
+            futex_block_fn: None,
+            futex_wake_fn: None,
+            get_current_tid_fn: None,
+            set_clear_child_tid_fn: None,
+            next_tid: 2,
         }
     }
 
@@ -2607,6 +2631,33 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     /// wake any task blocked on the corresponding read end.
     pub fn set_wake_fn(&mut self, f: fn(i32, u8)) {
         self.wake_fn = Some(f);
+    }
+
+    /// Set the spawn callback. Called by sys_clone to create a new thread task.
+    pub fn set_spawn_fn(&mut self, f: fn(u32, u32, u64, u64, u64) -> Option<u32>) {
+        self.spawn_fn = Some(f);
+    }
+
+    /// Set the futex block callback. Called by FUTEX_WAIT when the value matches,
+    /// to block the current task until woken.
+    pub fn set_futex_block_fn(&mut self, f: fn(u64)) {
+        self.futex_block_fn = Some(f);
+    }
+
+    /// Set the futex wake callback. Called by FUTEX_WAKE to wake blocked tasks.
+    pub fn set_futex_wake_fn(&mut self, f: fn(u64, u32) -> u32) {
+        self.futex_wake_fn = Some(f);
+    }
+
+    /// Set the get-current-TID callback. Called by sys_gettid and sys_set_tid_address.
+    pub fn set_get_current_tid_fn(&mut self, f: fn() -> u32) {
+        self.get_current_tid_fn = Some(f);
+    }
+
+    /// Set the set-clear-child-tid callback. Called by sys_set_tid_address to
+    /// register the tidptr with the current task's TCB.
+    pub fn set_clear_child_tid_fn(&mut self, f: fn(u64)) {
+        self.set_clear_child_tid_fn = Some(f);
     }
 
     /// Drive the network stack. Called by the system task's event loop
@@ -2648,6 +2699,15 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         } else {
             BlockResult::Interrupted
         }
+    }
+
+    /// Allocate the next thread TID. Monotonically increasing; starts at 2.
+    // Used by sys_clone (Task 6); suppress dead_code until then.
+    #[allow(dead_code)]
+    fn alloc_tid(&mut self) -> u32 {
+        let tid = self.next_tid;
+        self.next_tid += 1;
+        tid
     }
 
     /// Find the fd number for the write end of the pipe with the given pipe_id.
@@ -3297,7 +3357,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             LinuxSyscall::ArchPrctl { code, addr } => self.sys_arch_prctl(code, addr),
             #[cfg(not(target_arch = "x86_64"))]
             LinuxSyscall::ArchPrctl { .. } => ENOSYS,
-            LinuxSyscall::SetTidAddress => self.sys_set_tid_address(),
+            LinuxSyscall::SetTidAddress { tidptr } => self.sys_set_tid_address(tidptr),
             LinuxSyscall::ExitGroup { code } => self.sys_exit_group(code),
             LinuxSyscall::Openat {
                 dirfd,
@@ -6182,6 +6242,14 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             // Scheduler callbacks — inherited by child so blocking ops use the same scheduler.
             block_fn: self.block_fn,
             wake_fn: self.wake_fn,
+            // Thread callbacks — inherited by child.
+            spawn_fn: self.spawn_fn,
+            futex_block_fn: self.futex_block_fn,
+            futex_wake_fn: self.futex_wake_fn,
+            get_current_tid_fn: self.get_current_tid_fn,
+            set_clear_child_tid_fn: self.set_clear_child_tid_fn,
+            // next_tid: child starts fresh from 2 (its own TID space).
+            next_tid: 2,
         };
         // Move shared pipe/eventfd state to child
         core::mem::swap(&mut self.pipes, &mut child.pipes);
@@ -7573,9 +7641,16 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         0
     }
 
-    /// Linux set_tid_address(2): return TID = 1 (single-threaded).
-    fn sys_set_tid_address(&self) -> i64 {
-        self.pid as i64
+    /// Linux set_tid_address(2): register clear_child_tid pointer and return current TID.
+    fn sys_set_tid_address(&self, tidptr: u64) -> i64 {
+        if let Some(set_ctid) = self.set_clear_child_tid_fn {
+            set_ctid(tidptr);
+        }
+        if let Some(get_tid) = self.get_current_tid_fn {
+            get_tid() as i64
+        } else {
+            self.pid as i64
+        }
     }
 
     /// Linux set_robust_list(2): stub — no futex cleanup needed.
@@ -8472,9 +8547,15 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
     /// Linux gettid(2): return thread ID.
     ///
-    /// Single-threaded model — TID matches PID.
+    /// When a scheduler is active, delegates to get_current_tid_fn so the
+    /// current task's TID is returned. Falls back to PID when no scheduler
+    /// is present (single-threaded model).
     fn sys_gettid(&self) -> i64 {
-        self.pid as i64
+        if let Some(get_tid) = self.get_current_tid_fn {
+            get_tid() as i64
+        } else {
+            self.pid as i64
+        }
     }
 
     /// Linux getuid(2): return real user ID.
@@ -8514,32 +8595,42 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
     /// Linux futex(2): fast userspace locking.
     ///
-    /// FUTEX_WAKE (cmd 1): returns 0 (no waiters — single-threaded).
-    /// FUTEX_WAIT (cmd 0): returns EAGAIN (can't block in single-threaded model).
+    /// FUTEX_WAIT (cmd 0): atomically checks *uaddr == val and blocks via
+    ///   futex_block_fn if a scheduler is registered. Returns EAGAIN when
+    ///   the value doesn't match or no scheduler is available.
+    /// FUTEX_WAKE (cmd 1): wakes up to val waiters via futex_wake_fn.
+    ///   Returns the count of woken tasks (0 when no scheduler).
     /// All other operations return ENOSYS.
-    fn sys_futex(&self, uaddr: u64, op: i32, val: u32) -> i64 {
+    fn sys_futex(&mut self, uaddr: u64, op: i32, val: u32) -> i64 {
         // The op field's lower bits encode the command; upper bits are
         // flags (FUTEX_PRIVATE_FLAG, etc.).  Mask to the command bits.
         const FUTEX_CMD_MASK: i32 = 0x7f;
         const FUTEX_WAIT: i32 = 0;
         const FUTEX_WAKE: i32 = 1;
-        match op & FUTEX_CMD_MASK {
-            FUTEX_WAKE => 0, // no waiters in single-threaded model
+
+        let cmd = op & FUTEX_CMD_MASK;
+        match cmd {
             FUTEX_WAIT => {
-                // In single-threaded model, FUTEX_WAIT checks *uaddr == val.
-                // If equal, would block (but we can't block) → EAGAIN.
-                // If not equal, return EAGAIN (value changed).
-                // Either way, return EAGAIN — there's no other thread to
-                // wake us up, so blocking would deadlock.
                 if uaddr == 0 {
                     return EFAULT;
                 }
-                let current = unsafe { *(uaddr as usize as *const u32) };
+                let current = unsafe { *(uaddr as *const u32) };
                 if current != val {
-                    return EAGAIN; // value changed
+                    return EAGAIN;
                 }
-                // Value matches — would block, but single-threaded → EAGAIN
-                EAGAIN
+                if let Some(block) = self.futex_block_fn {
+                    block(uaddr);
+                    0 // Woken successfully
+                } else {
+                    EAGAIN // No scheduler — can't block
+                }
+            }
+            FUTEX_WAKE => {
+                if let Some(wake) = self.futex_wake_fn {
+                    wake(uaddr, val) as i64
+                } else {
+                    0 // No scheduler — no waiters
+                }
             }
             _ => ENOSYS,
         }
@@ -11851,6 +11942,57 @@ mod integration_tests {
             val: 0,
         });
         assert_eq!(result, ENOSYS);
+    }
+
+    #[test]
+    fn futex_wait_returns_eagain_on_value_mismatch() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let mut val: u32 = 42;
+        let uaddr = &mut val as *mut u32 as u64;
+        // FUTEX_WAIT, expected 99 but actual is 42 → EAGAIN
+        let result = lx.sys_futex(uaddr, 0, 99);
+        assert_eq!(result, EAGAIN);
+    }
+
+    #[test]
+    fn futex_wait_blocks_when_value_matches() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        static BLOCKED: AtomicBool = AtomicBool::new(false);
+
+        lx.set_futex_block_fn(|_uaddr| {
+            BLOCKED.store(true, Ordering::SeqCst);
+        });
+
+        let mut val: u32 = 42;
+        let uaddr = &mut val as *mut u32 as u64;
+        BLOCKED.store(false, Ordering::SeqCst);
+        // FUTEX_WAIT, matches → calls block fn → returns 0
+        let result = lx.sys_futex(uaddr, 0, 42);
+        assert!(BLOCKED.load(Ordering::SeqCst));
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn futex_wake_calls_wake_fn() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.set_futex_wake_fn(|_uaddr, _max| 3);
+        // FUTEX_WAKE, max=5 → wake_fn returns 3
+        let result = lx.sys_futex(0x1000, 1, 5);
+        assert_eq!(result, 3);
+    }
+
+    #[test]
+    fn alloc_tid_increments() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let t1 = lx.alloc_tid();
+        let t2 = lx.alloc_tid();
+        assert_ne!(t1, t2);
+        assert_eq!(t2, t1 + 1);
     }
 
     // ── sched_getaffinity tests ───────────────────────────────────
