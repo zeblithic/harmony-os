@@ -391,9 +391,10 @@ pub unsafe fn wake(task_idx: usize) {
 /// Scans all spawned tasks. For each Blocked task whose `wait_reason`
 /// matches `fd` and `op`, transitions it to Ready and clears `wait_reason`.
 ///
-/// `op` encoding: `0` = readable, `1` = writable. `FdConnectDone` and
-/// `PollWait` are not matched by this function — use `for_each_blocked`
-/// and call `wake` manually for those.
+/// `op` encoding: `0` = readable, `1` = writable. Also wakes any
+/// `PollWait` task (poll/select/epoll waiting on multiple fds) since a
+/// pipe or eventfd change may satisfy their wait condition.
+/// `FdConnectDone` is not matched — use `for_each_blocked` for those.
 ///
 /// # Safety
 ///
