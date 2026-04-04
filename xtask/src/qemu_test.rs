@@ -52,12 +52,20 @@ fn aarch64_milestones() -> Vec<Milestone> {
             description: "system task spawned",
         },
         Milestone {
+            pattern: "[Sched] Spawned elf task (PID 2)",
+            description: "elf task spawned",
+        },
+        Milestone {
             pattern: "[Sched] Entering scheduler",
             description: "scheduler entry",
         },
         Milestone {
             pattern: "[System]",
             description: "system task running",
+        },
+        Milestone {
+            pattern: "[ELF]",
+            description: "elf task running",
         },
     ]
 }
