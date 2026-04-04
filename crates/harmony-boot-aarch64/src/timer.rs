@@ -145,6 +145,9 @@ fn print_tick(count: u64) {
 /// Print scheduler verification line: "[Sched] Task 0: N, Task 1: M".
 /// Called exactly once at tick 500. Uses the same IRQ-safe serial write
 /// approach as `print_tick` — no allocator, no fmt.
+///
+/// Only prints if both counters are nonzero — a zero counter means that
+/// task never got CPU time, indicating a broken context switch.
 #[cfg(target_arch = "aarch64")]
 fn print_sched_verification() {
     use crate::sched;
@@ -156,6 +159,13 @@ fn print_sched_verification() {
     let (c0, c1) = sched::task_counters();
 
     use crate::pl011;
+
+    if c0 == 0 || c1 == 0 {
+        for &b in b"[Sched] FAIL: context switch broken (counter is zero)\r\n" {
+            unsafe { pl011::write_byte(b) };
+        }
+        return;
+    }
 
     // "[Sched] Task 0: "
     for &b in b"[Sched] Task 0: " {

@@ -49,7 +49,7 @@ fn aarch64_milestones() -> Vec<Milestone> {
         },
         Milestone {
             pattern: "[Sched] Task 0:",
-            description: "scheduler verified",
+            description: "scheduler verified (both tasks got CPU)",
         },
     ]
 }

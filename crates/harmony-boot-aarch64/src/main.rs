@@ -479,14 +479,12 @@ fn main() -> Status {
         unsafe { sched::spawn_task(sched::task1, &mut bump) };
         let _ = writeln!(serial, "[Sched] Spawned 2 tasks");
 
-        // Unmask IRQ exceptions.
-        // From this point forward, el1_irq_handler fires on every timer tick.
-        unsafe { core::arch::asm!("msr daifclr, #2") };
-        let _ = writeln!(serial, "[IRQ] Interrupts unmasked");
-
         // Enter the scheduler — loads task 0's TrapFrame and erets into it.
-        // This never returns.
-        let _ = writeln!(serial, "[Sched] Entering scheduler");
+        // The eret atomically unmasks IRQs via SPSR (I=0 in INITIAL_SPSR),
+        // so we do NOT use `msr daifclr` here. Doing so would open a race
+        // window where a timer IRQ could fire before enter_scheduler sets up
+        // the task context, corrupting TASKS[0].kernel_sp with the boot stack.
+        let _ = writeln!(serial, "[Sched] Entering scheduler (eret unmasks IRQs)");
         unsafe { sched::enter_scheduler() };
     }
 
