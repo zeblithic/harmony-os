@@ -66,7 +66,9 @@ pub struct TaskControlBlock {
     pub kernel_stack_size: usize,
     /// Current scheduling state.
     pub state: TaskState,
-    /// Number of times this task has been preempted (for verification).
+    /// Number of times this task was preempted (Running→Ready by timer IRQ).
+    /// Only incremented on actual preemption, not when a task is already
+    /// Blocked or Dead at the time of the timer tick.
     pub preempt_count: u64,
     /// Microkernel Process ID (0 = idle, 1 = system, 2+ = user).
     pub pid: u32,
