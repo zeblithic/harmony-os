@@ -14,6 +14,7 @@ mod pl011;
 mod rndr;
 mod timer;
 mod gic;
+mod sched;
 
 mod platform;
 
