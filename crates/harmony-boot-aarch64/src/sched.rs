@@ -46,10 +46,25 @@ const TRAPFRAME_SIZE: usize = 272;
 pub enum TaskState {
     Ready,
     Running,
-    /// Waiting on syscall/IPC. Phase 4 adds block_current() and wake().
+    /// Waiting on syscall/IPC.
     Blocked,
     /// Exited — scheduler skips. Stack reclamation deferred to Phase 4+.
     Dead,
+}
+
+/// What a Blocked task is waiting for. Stored in the TCB so the
+/// system task's wake-check loop can evaluate readiness.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WaitReason {
+    /// Waiting for fd to become readable.
+    FdReadable(i32),
+    /// Waiting for fd to become writable.
+    FdWritable(i32),
+    /// Waiting for TCP connect to complete.
+    FdConnectDone(i32),
+    /// Waiting for any network activity (poll/select/epoll).
+    /// Woken on any smoltcp state change; handler rechecks specific fds.
+    PollWait,
 }
 
 /// Per-task scheduling state. Stored in a fixed-size array, indexed by task number.
@@ -76,6 +91,8 @@ pub struct TaskControlBlock {
     pub name: &'static str,
     /// Entry point (for debug; not re-invoked after initial start).
     pub entry: Option<fn() -> !>,
+    /// Why this task is Blocked. `None` when state is Ready/Running/Dead.
+    pub wait_reason: Option<WaitReason>,
 }
 
 /// Task array — only accessed from the IRQ handler (non-reentrant).
@@ -170,6 +187,7 @@ pub unsafe fn spawn_task(
         pid,
         name,
         entry: Some(entry),
+        wait_reason: None,
     });
     NUM_TASKS = n + 1;
     n
@@ -313,6 +331,109 @@ pub unsafe fn enter_scheduler() -> ! {
     );
 }
 
+/// Block the current task, recording why it is waiting.
+///
+/// Sets `state = Blocked` and `wait_reason = Some(reason)` on the current
+/// TCB. On aarch64, immediately yields via a self-directed SGI so the
+/// scheduler can switch to another ready task. On host (non-aarch64) builds
+/// the state change is visible but no context switch occurs (tests drive
+/// the scheduler directly).
+///
+/// # Safety
+///
+/// - Must be called from task context (not from an IRQ handler).
+/// - CURRENT must index a valid, initialised TCB.
+/// - On aarch64: execution resumes here after the waker calls `wake()` and
+///   the scheduler has rescheduled this task. `wait_reason` is already
+///   cleared by `wake()` before the resume.
+pub unsafe fn block_current(reason: WaitReason) {
+    let cur = CURRENT;
+    let tcb = TASKS[cur].assume_init_mut();
+    tcb.state = TaskState::Blocked;
+    tcb.wait_reason = Some(reason);
+
+    #[cfg(target_arch = "aarch64")]
+    crate::gic::send_sgi_self(crate::gic::YIELD_SGI);
+    // On aarch64: execution resumes here after wake + reschedule.
+    // wake() already cleared wait_reason and set state = Ready.
+}
+
+/// Wake a specific blocked task, transitioning it to Ready.
+///
+/// If the task at `task_idx` is in `Blocked` state, transitions it to
+/// `Ready` and clears `wait_reason`. If the task is not Blocked (e.g.,
+/// already Ready, Running, or Dead) this is a no-op.
+///
+/// # Safety
+///
+/// - `task_idx` must be less than `NUM_TASKS`.
+/// - Must only be called when the IRQ lock is held (i.e., from the system
+///   task or from an IRQ handler), to avoid races with the scheduler.
+pub unsafe fn wake(task_idx: usize) {
+    let tcb = TASKS[task_idx].assume_init_mut();
+    if tcb.state == TaskState::Blocked {
+        tcb.state = TaskState::Ready;
+        tcb.wait_reason = None;
+    }
+}
+
+/// Wake all blocked tasks waiting on `fd` for the given operation.
+///
+/// Scans all spawned tasks. For each Blocked task whose `wait_reason`
+/// matches `fd` and `op`, transitions it to Ready and clears `wait_reason`.
+///
+/// `op` encoding: `0` = readable, `1` = writable. `FdConnectDone` and
+/// `PollWait` are not matched by this function — use `for_each_blocked`
+/// and call `wake` manually for those.
+///
+/// # Safety
+///
+/// - Must only be called when the IRQ lock is held or IRQs are disabled,
+///   to avoid races with the scheduler.
+pub unsafe fn wake_by_fd(fd: i32, op: u8) {
+    let n = NUM_TASKS;
+    for i in 0..n {
+        let tcb = TASKS[i].assume_init_mut();
+        if tcb.state != TaskState::Blocked {
+            continue;
+        }
+        let matches = match (tcb.wait_reason, op) {
+            (Some(WaitReason::FdReadable(f)), 0) if f == fd => true,
+            (Some(WaitReason::FdWritable(f)), 1) if f == fd => true,
+            _ => false,
+        };
+        if matches {
+            tcb.state = TaskState::Ready;
+            tcb.wait_reason = None;
+        }
+    }
+}
+
+/// Iterate over all blocked tasks, calling `f(task_idx, wait_reason)` for each.
+///
+/// Provides a read-only view of blocked tasks for the system task's
+/// wake-check loop. The closure receives the task index and a copy of
+/// `WaitReason`. To wake a task from inside the closure, call `wake(i)`
+/// — but note that modifying `TASKS` while iterating is safe here because
+/// `for_each_blocked` takes a snapshot of `NUM_TASKS` upfront and accesses
+/// each slot exactly once.
+///
+/// # Safety
+///
+/// - Must only be called when the IRQ lock is held or IRQs are disabled.
+/// - `f` must not add or remove tasks (must not call `spawn_task`).
+pub unsafe fn for_each_blocked(mut f: impl FnMut(usize, WaitReason)) {
+    let n = NUM_TASKS;
+    for i in 0..n {
+        let tcb = TASKS[i].assume_init_ref();
+        if tcb.state == TaskState::Blocked {
+            if let Some(reason) = tcb.wait_reason {
+                f(i, reason);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,6 +478,7 @@ mod tests {
                 pid: 7,
                 name: "test-task",
                 entry: None,
+                wait_reason: None,
             });
         }
         let guard_start = 0x2_0000 - PAGE_SIZE as usize;
@@ -374,5 +496,145 @@ mod tests {
         let _lock = TEST_LOCK.lock().unwrap();
         unsafe { NUM_TASKS = 0 };
         assert_eq!(check_guard_page(0x1000), None);
+    }
+
+    // ── WaitReason tests ─────────────────────────────────────────────────────
+
+    /// Helper: write a TCB into slot `idx` with the given state/wait_reason.
+    unsafe fn put_tcb(idx: usize, state: TaskState, wait_reason: Option<WaitReason>) {
+        TASKS[idx] = MaybeUninit::new(TaskControlBlock {
+            kernel_sp: 0,
+            kernel_stack_base: 0x4_0000 + idx * 0x1_0000,
+            kernel_stack_size: 8192,
+            state,
+            preempt_count: 0,
+            pid: idx as u32,
+            name: "test",
+            entry: None,
+            wait_reason,
+        });
+    }
+
+    #[test]
+    fn wait_reason_variants_distinct() {
+        let variants = [
+            WaitReason::FdReadable(3),
+            WaitReason::FdWritable(3),
+            WaitReason::FdConnectDone(3),
+            WaitReason::PollWait,
+        ];
+        for i in 0..variants.len() {
+            for j in (i + 1)..variants.len() {
+                assert_ne!(variants[i], variants[j]);
+            }
+        }
+        // Same variant, same fd => equal.
+        assert_eq!(WaitReason::FdReadable(5), WaitReason::FdReadable(5));
+        // Same variant, different fd => not equal.
+        assert_ne!(WaitReason::FdReadable(5), WaitReason::FdReadable(6));
+    }
+
+    #[test]
+    fn tcb_wait_reason_default_none() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            put_tcb(0, TaskState::Ready, None);
+            NUM_TASKS = 1;
+            let tcb = TASKS[0].assume_init_ref();
+            assert_eq!(tcb.wait_reason, None);
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn block_current_sets_blocked_and_wait_reason() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            put_tcb(0, TaskState::Running, None);
+            NUM_TASKS = 1;
+            CURRENT = 0;
+            // block_current on non-aarch64 just mutates state — no SGI.
+            block_current(WaitReason::FdReadable(7));
+            let tcb = TASKS[0].assume_init_ref();
+            assert_eq!(tcb.state, TaskState::Blocked);
+            assert_eq!(tcb.wait_reason, Some(WaitReason::FdReadable(7)));
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn wake_transitions_blocked_to_ready() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            put_tcb(0, TaskState::Blocked, Some(WaitReason::FdWritable(4)));
+            NUM_TASKS = 1;
+            wake(0);
+            let tcb = TASKS[0].assume_init_ref();
+            assert_eq!(tcb.state, TaskState::Ready);
+            assert_eq!(tcb.wait_reason, None);
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn wake_ignores_non_blocked_task() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            put_tcb(0, TaskState::Ready, None);
+            NUM_TASKS = 1;
+            wake(0);
+            let tcb = TASKS[0].assume_init_ref();
+            assert_eq!(tcb.state, TaskState::Ready);
+            assert_eq!(tcb.wait_reason, None);
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn wake_by_fd_finds_matching_blocked_task() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            // Task 0: blocked waiting for fd 5 readable — should be woken (op=0).
+            put_tcb(0, TaskState::Blocked, Some(WaitReason::FdReadable(5)));
+            // Task 1: blocked waiting for fd 5 writable — should NOT be woken (op=0).
+            put_tcb(1, TaskState::Blocked, Some(WaitReason::FdWritable(5)));
+            // Task 2: blocked waiting for fd 9 readable — different fd, not woken.
+            put_tcb(2, TaskState::Blocked, Some(WaitReason::FdReadable(9)));
+            NUM_TASKS = 3;
+
+            wake_by_fd(5, 0); // wake readable fd=5
+
+            assert_eq!(TASKS[0].assume_init_ref().state, TaskState::Ready);
+            assert_eq!(TASKS[0].assume_init_ref().wait_reason, None);
+            assert_eq!(TASKS[1].assume_init_ref().state, TaskState::Blocked);
+            assert_eq!(
+                TASKS[1].assume_init_ref().wait_reason,
+                Some(WaitReason::FdWritable(5))
+            );
+            assert_eq!(TASKS[2].assume_init_ref().state, TaskState::Blocked);
+
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn for_each_blocked_iterates_blocked_tasks() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            put_tcb(0, TaskState::Running, None);
+            put_tcb(1, TaskState::Blocked, Some(WaitReason::PollWait));
+            put_tcb(2, TaskState::Ready, None);
+            put_tcb(3, TaskState::Blocked, Some(WaitReason::FdConnectDone(2)));
+            NUM_TASKS = 4;
+
+            let mut visited: Vec<(usize, WaitReason)> = Vec::new();
+            for_each_blocked(|idx, reason| visited.push((idx, reason)));
+
+            assert_eq!(visited.len(), 2);
+            assert!(visited.contains(&(1, WaitReason::PollWait)));
+            assert!(visited.contains(&(3, WaitReason::FdConnectDone(2))));
+
+            NUM_TASKS = 0;
+        }
     }
 }
