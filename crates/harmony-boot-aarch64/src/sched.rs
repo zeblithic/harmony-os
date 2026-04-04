@@ -9,9 +9,9 @@
 //! # Limitations (Phase 3)
 //!
 //! - EL1-only tasks (no EL0 user mode).
-//! - No FP/SIMD context save — tasks must not use floating-point.
-//!   FP context switch will be added no later than Phase 4; see design spec
-//!   section 8 for options (eager vs lazy save via CPACR_EL1.FPEN).
+//! - FP/SIMD fields are present in TrapFrame but assembly save/restore
+//!   is not yet wired in — tasks must not use floating-point until Phase 4.
+//!   See design spec section 8 for options (eager vs lazy save via CPACR_EL1.FPEN).
 //! - No priority or fairness — pure round-robin alternation.
 //! - Mutable statics are safe because the IRQ handler is non-reentrant
 //!   (PSTATE.I is set on exception entry).
@@ -37,9 +37,9 @@ pub const MAX_TASKS: usize = 64;
 /// Actual allocation rounds up to whole pages — 2 pages at 4K, 1 page at 16K.
 const KERNEL_STACK_SIZE: usize = 8192;
 
-/// Size of the TrapFrame in bytes (31 GP regs + ELR + SPSR = 264,
-/// padded to 272 for 16-byte alignment). Must match vectors.rs assembly.
-const TRAPFRAME_SIZE: usize = 272;
+/// Size of the TrapFrame in bytes (31 GP regs + ELR + SPSR + FPCR + FPSR
+/// + padding + 32 Q regs = 800). Must match vectors.rs assembly.
+const TRAPFRAME_SIZE: usize = 800;
 
 /// Scheduling state for a task.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -164,7 +164,7 @@ pub unsafe fn spawn_task(
 
     // Zero the TrapFrame region, then set elr and spsr.
     let frame_ptr = sp as *mut TrapFrame;
-    // Zero all 272 bytes (covers x[0..31], elr, spsr, and padding).
+    // Zero all 800 bytes (covers x[0..31], elr, spsr, fpcr, fpsr, padding, q[0..32]).
     core::ptr::write_bytes(frame_ptr as *mut u8, 0, TRAPFRAME_SIZE);
     (*frame_ptr).elr = entry as u64;
     (*frame_ptr).spsr = INITIAL_SPSR;
@@ -314,7 +314,7 @@ pub unsafe fn enter_scheduler() -> ! {
         "ldr x30, [sp, #240]",
 
         // Deallocate TrapFrame and eret into the task.
-        "add sp, sp, #272",
+        "add sp, sp, #800",
         "eret",
 
         sp = in(reg) sp,
