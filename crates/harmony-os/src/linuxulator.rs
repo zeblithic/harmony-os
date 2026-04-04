@@ -2635,6 +2635,28 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         }
     }
 
+    /// Find the fd number for the write end of the pipe with the given pipe_id.
+    fn find_pipe_write_fd(&self, pipe_id: usize) -> Option<i32> {
+        self.fd_table.iter().find_map(|(&fd, entry)| {
+            if matches!(entry.kind, FdKind::PipeWrite { pipe_id: id } if id == pipe_id) {
+                Some(fd)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Find the fd number for the read end of the pipe with the given pipe_id.
+    fn find_pipe_read_fd(&self, pipe_id: usize) -> Option<i32> {
+        self.fd_table.iter().find_map(|(&fd, entry)| {
+            if matches!(entry.kind, FdKind::PipeRead { pipe_id: id } if id == pipe_id) {
+                Some(fd)
+            } else {
+                None
+            }
+        })
+    }
+
     /// Blocking pipe write retry loop.  Spin-waits until enough buffer
     /// space is available for the write (respecting POSIX atomic semantics
     /// for writes <= PIPE_BUF), then performs the write and returns the
@@ -3554,6 +3576,13 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 let to_write = count.min(avail);
                 let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, to_write) };
                 pipe_buf.extend_from_slice(data);
+                // NLL ends the borrow after the last use of pipe_buf.
+                // Wake any task blocked on reading from this pipe.
+                if let Some(wake) = self.wake_fn {
+                    if let Some(read_fd) = self.find_pipe_read_fd(pipe_id) {
+                        wake(read_fd, BLOCK_OP_READABLE);
+                    }
+                }
                 to_write as i64
             }
             FdKind::PipeRead { .. } => EBADF,
@@ -3626,7 +3655,6 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                             let nonblock =
                                 self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                             if !nonblock {
-
                                 match self.block_until(BLOCK_OP_WRITABLE, fd) {
                                     BlockResult::Ready => {
                                         let data = unsafe {
@@ -3736,6 +3764,13 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                                     );
                                 }
                                 buf.drain(..n);
+                                // NLL ends the borrow after the last use of buf.
+                                // Wake any task blocked on writing to this pipe.
+                                if let Some(wake) = self.wake_fn {
+                                    if let Some(write_fd) = self.find_pipe_write_fd(pipe_id) {
+                                        wake(write_fd, BLOCK_OP_WRITABLE);
+                                    }
+                                }
                                 n as i64
                             }
                             BlockResult::Interrupted => EINTR,
@@ -3750,6 +3785,13 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                         core::ptr::copy_nonoverlapping(buf.as_ptr(), buf_ptr as *mut u8, n);
                     }
                     buf.drain(..n);
+                    // NLL ends the borrow after the last use of buf.
+                    // Wake any task blocked on writing to this pipe.
+                    if let Some(wake) = self.wake_fn {
+                        if let Some(write_fd) = self.find_pipe_write_fd(pipe_id) {
+                            wake(write_fd, BLOCK_OP_WRITABLE);
+                        }
+                    }
                     n as i64
                 }
             }
@@ -3833,7 +3875,6 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                             let nonblock =
                                 self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                             if !nonblock {
-
                                 match self.block_until(BLOCK_OP_READABLE, fd) {
                                     BlockResult::Ready => {
                                         let buf = unsafe {
@@ -4804,17 +4845,13 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     addrlen_ptr,
                 ),
                 Ok(None) => {
-                    if !parent_nonblock {
-                        if let Some(pf) = self.poll_fn {
-                            // Spin-wait with a single deadline so that spurious
-                            // wakeups (is_fd_readable true but tcp_accept returns
-                            // None) re-enter the wait without resetting the 30s cap.
-                            const MAX_BLOCK_MS: u64 = 30_000;
-                            let start_ms = pf();
-                            let deadline = start_ms.saturating_add(MAX_BLOCK_MS);
-                            loop {
-                                let now = pf();
-                                if Self::is_fd_readable(self, fd) {
+                    if !parent_nonblock && self.block_fn.is_some() {
+                        // Yield to the scheduler until a connection arrives.
+                        // Spurious wakes (block_until returns Ready but
+                        // tcp_accept still returns None) re-enter block_until.
+                        loop {
+                            match self.block_until(BLOCK_OP_READABLE, fd) {
+                                BlockResult::Ready => {
                                     match self.tcp.tcp_accept(h) {
                                         Ok(Some(accepted_handle)) => {
                                             return self.finish_tcp_accept(
@@ -4826,14 +4863,11 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                                                 addrlen_ptr,
                                             );
                                         }
-                                        Ok(None) => {} // spurious — keep waiting
+                                        Ok(None) => {} // spurious wake — re-block
                                         Err(e) => return net_error_to_errno(e),
                                     }
                                 }
-                                if now >= deadline {
-                                    return EINTR;
-                                }
-                                core::hint::spin_loop();
+                                BlockResult::Interrupted => return EINTR,
                             }
                         }
                     }
@@ -4922,7 +4956,6 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     if nonblock {
                         EINPROGRESS
                     } else {
-
                         // Block until the handshake completes or fails.
                         // Uses BLOCK_OP_CONNECT (not BLOCK_OP_WRITABLE) so that
                         // connection failures (RST → Closed) also unblock.
@@ -5008,7 +5041,6 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 Err(NetError::WouldBlock) => {
                     let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                     if !nonblock {
-
                         match self.block_until(BLOCK_OP_WRITABLE, fd) {
                             BlockResult::Ready => {
                                 let data =
@@ -5049,7 +5081,6 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                             let nonblock =
                                 self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                             if !nonblock {
-
                                 match self.block_until(BLOCK_OP_WRITABLE, fd) {
                                     BlockResult::Ready => {
                                         let data = unsafe {
@@ -5079,7 +5110,6 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     Err(NetError::WouldBlock) => {
                         let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                         if !nonblock {
-    
                             match self.block_until(BLOCK_OP_WRITABLE, fd) {
                                 BlockResult::Ready => {
                                     let data = unsafe {
@@ -5136,7 +5166,6 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 Err(NetError::WouldBlock) => {
                     let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                     if !nonblock {
-
                         match self.block_until(BLOCK_OP_READABLE, fd) {
                             BlockResult::Ready => {
                                 let data = unsafe {
@@ -5181,7 +5210,6 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     Err(NetError::WouldBlock) => {
                         let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                         if !nonblock {
-    
                             match self.block_until(BLOCK_OP_READABLE, fd) {
                                 BlockResult::Ready => {
                                     // Retry the full UDP recv logic.
@@ -17731,5 +17759,111 @@ mod integration_tests {
         let mut lx = Linuxulator::new(MockBackend::new());
         // Should not panic when poll_fn is None
         lx.poll_network();
+    }
+
+    // ── find_pipe_read_fd / find_pipe_write_fd tests ─────────────────────────
+
+    #[test]
+    fn find_pipe_write_fd_returns_correct_fd() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        let (rfd, wfd) = create_pipe(&mut lx);
+        // The write fd must be findable by its pipe_id.
+        let pipe_id = match lx.fd_table.get(&wfd) {
+            Some(e) => match e.kind {
+                FdKind::PipeWrite { pipe_id } => pipe_id,
+                _ => panic!("expected PipeWrite"),
+            },
+            None => panic!("wfd not found"),
+        };
+        let found = lx.find_pipe_write_fd(pipe_id);
+        assert_eq!(found, Some(wfd));
+        // The read fd is not a PipeWrite — should not be returned.
+        let _ = rfd; // used for pipe creation only
+    }
+
+    #[test]
+    fn find_pipe_read_fd_returns_correct_fd() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        let (rfd, wfd) = create_pipe(&mut lx);
+        // The read fd must be findable by its pipe_id.
+        let pipe_id = match lx.fd_table.get(&rfd) {
+            Some(e) => match e.kind {
+                FdKind::PipeRead { pipe_id } => pipe_id,
+                _ => panic!("expected PipeRead"),
+            },
+            None => panic!("rfd not found"),
+        };
+        let found = lx.find_pipe_read_fd(pipe_id);
+        assert_eq!(found, Some(rfd));
+        // The write fd is not a PipeRead — should not be returned.
+        let _ = wfd; // used for pipe creation only
+    }
+
+    #[test]
+    fn find_pipe_write_fd_returns_none_when_not_found() {
+        let lx = Linuxulator::new(MockBackend::new());
+        // No pipes in this linuxulator — should return None.
+        assert_eq!(lx.find_pipe_write_fd(99), None);
+    }
+
+    #[test]
+    fn find_pipe_read_fd_returns_none_when_not_found() {
+        let lx = Linuxulator::new(MockBackend::new());
+        // No pipes in this linuxulator — should return None.
+        assert_eq!(lx.find_pipe_read_fd(99), None);
+    }
+
+    #[test]
+    fn pipe_write_calls_wake_fn_for_reader() {
+        use core::sync::atomic::{AtomicI32, Ordering};
+        static WOKEN_FD: AtomicI32 = AtomicI32::new(-1);
+
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.set_wake_fn(|fd, _op| {
+            WOKEN_FD.store(fd, Ordering::SeqCst);
+        });
+
+        let (rfd, wfd) = create_pipe(&mut lx);
+        let data = b"ping";
+        let r = lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: wfd,
+            buf: data.as_ptr() as u64,
+            count: data.len() as u64,
+        });
+        assert_eq!(r, 4);
+        // wake_fn should have been called with the read end fd.
+        assert_eq!(WOKEN_FD.load(Ordering::SeqCst), rfd);
+    }
+
+    #[test]
+    fn pipe_read_calls_wake_fn_for_writer() {
+        use core::sync::atomic::{AtomicI32, Ordering};
+        static WOKEN_FD: AtomicI32 = AtomicI32::new(-1);
+
+        let mut lx = Linuxulator::new(MockBackend::new());
+        lx.set_wake_fn(|fd, _op| {
+            WOKEN_FD.store(fd, Ordering::SeqCst);
+        });
+
+        let (rfd, wfd) = create_pipe(&mut lx);
+        let data = b"pong";
+        // Write data first (wake_fn will fire but we reset after).
+        let _ = lx.dispatch_syscall(LinuxSyscall::Write {
+            fd: wfd,
+            buf: data.as_ptr() as u64,
+            count: data.len() as u64,
+        });
+        WOKEN_FD.store(-1, Ordering::SeqCst);
+
+        // Now read — should wake the writer.
+        let mut buf = [0u8; 4];
+        let r = lx.dispatch_syscall(LinuxSyscall::Read {
+            fd: rfd,
+            buf: buf.as_mut_ptr() as u64,
+            count: buf.len() as u64,
+        });
+        assert_eq!(r, 4);
+        // wake_fn should have been called with the write end fd.
+        assert_eq!(WOKEN_FD.load(Ordering::SeqCst), wfd);
     }
 }
