@@ -105,7 +105,7 @@ core::arch::global_asm!(
     // Lives outside the vector table so it doesn't overflow the
     // 128-byte entry at 0x200.
     "el1_sync_handler:",
-    // Allocate TrapFrame on the stack (800 bytes: 264 GP regs + 8 pad + 16 FP ctrl + 512 Q0-Q31)
+    // Allocate TrapFrame on the stack (800 bytes: 264 GP/ELR/SPSR + 16 FPCR/FPSR + 8 pad + 512 Q0-Q31)
     "sub sp, sp, #800",
     // Save X0-X29 as pairs
     "stp x0,  x1,  [sp, #0]",
@@ -224,7 +224,7 @@ core::arch::global_asm!(
     // Saves the full TrapFrame (identical layout to el1_sync_handler)
     // so Phase 2 can context-switch from IRQ as easily as from SVC.
     "el1_irq_handler:",
-    // Allocate TrapFrame on the stack (800 bytes: 264 GP regs + 8 pad + 16 FP ctrl + 512 Q0-Q31)
+    // Allocate TrapFrame on the stack (800 bytes: 264 GP/ELR/SPSR + 16 FPCR/FPSR + 8 pad + 512 Q0-Q31)
     "sub sp, sp, #800",
     // Save X0-X29 as pairs
     "stp x0,  x1,  [sp, #0]",

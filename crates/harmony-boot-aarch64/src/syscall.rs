@@ -8,11 +8,11 @@
 // the host test runner.
 #![cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 
-/// Saved register state on exception entry.
+/// Saved register state on exception entry (800 bytes).
 ///
-/// The assembly vector table saves X0-X30, ELR_EL1, and SPSR_EL1 in
-/// this exact layout. The struct must be `#[repr(C)]` so field offsets
-/// match the assembly push order.
+/// The assembly vector table saves X0-X30, ELR_EL1, SPSR_EL1, FPCR,
+/// FPSR, and Q0-Q31 (SIMD/FP) in this exact layout. The struct must
+/// be `#[repr(C)]` so field offsets match the assembly push order.
 #[repr(C)]
 pub struct TrapFrame {
     /// General-purpose registers X0-X30.
