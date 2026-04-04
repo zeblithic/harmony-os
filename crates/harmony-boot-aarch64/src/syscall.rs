@@ -8,11 +8,11 @@
 // the host test runner.
 #![cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 
-/// Saved register state on exception entry.
+/// Saved register state on exception entry (800 bytes).
 ///
-/// The assembly vector table saves X0-X30, ELR_EL1, and SPSR_EL1 in
-/// this exact layout. The struct must be `#[repr(C)]` so field offsets
-/// match the assembly push order.
+/// The assembly vector table saves X0-X30, ELR_EL1, SPSR_EL1, FPCR,
+/// FPSR, and Q0-Q31 (SIMD/FP) in this exact layout. The struct must
+/// be `#[repr(C)]` so field offsets match the assembly push order.
 #[repr(C)]
 pub struct TrapFrame {
     /// General-purpose registers X0-X30.
@@ -21,6 +21,14 @@ pub struct TrapFrame {
     pub elr: u64,
     /// Saved Processor State Register.
     pub spsr: u64,
+    /// Floating-Point Control Register.
+    pub fpcr: u64,
+    /// Floating-Point Status Register.
+    pub fpsr: u64,
+    /// Padding to align `q` to 16 bytes (required for `stp`/`ldp` of Q regs).
+    _pad: u64,
+    /// SIMD/FP registers Q0-Q31 (128 bits each).
+    pub q: [u128; 32],
 }
 
 #[cfg_attr(not(target_arch = "aarch64"), allow(unused_imports))]
@@ -190,8 +198,9 @@ mod tests {
 
     #[test]
     fn trap_frame_size() {
-        // 31 registers * 8 bytes + ELR (8) + SPSR (8) = 264 bytes
-        assert_eq!(mem::size_of::<TrapFrame>(), 264);
+        // 31 GP regs (248) + elr (8) + spsr (8) + fpcr (8) + fpsr (8)
+        // + _pad (8) + 32 Q regs (512) = 800 bytes
+        assert_eq!(mem::size_of::<TrapFrame>(), 800);
     }
 
     #[test]
@@ -211,5 +220,20 @@ mod tests {
     fn trap_frame_spsr_offset() {
         // SPSR comes after ELR = 256 bytes
         assert_eq!(mem::offset_of!(TrapFrame, spsr), 256);
+    }
+
+    #[test]
+    fn trap_frame_fpcr_offset() {
+        assert_eq!(mem::offset_of!(TrapFrame, fpcr), 264);
+    }
+
+    #[test]
+    fn trap_frame_fpsr_offset() {
+        assert_eq!(mem::offset_of!(TrapFrame, fpsr), 272);
+    }
+
+    #[test]
+    fn trap_frame_q_offset() {
+        assert_eq!(mem::offset_of!(TrapFrame, q), 288);
     }
 }

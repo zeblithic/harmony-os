@@ -234,6 +234,22 @@ fn main() -> Status {
     // Capture the memory map -- we need it to build the identity page table.
     let memory_map = unsafe { uefi::boot::exit_boot_services(None) };
 
+    // ── Enable FP/SIMD immediately after ExitBootServices ──
+    // CPACR_EL1.FPEN [21:20] = 0b11 — full FP/SIMD access at EL1 and EL0.
+    // Must be the FIRST thing after ExitBootServices: the reset value is
+    // IMPLEMENTATION DEFINED, and any Rust code below could emit SIMD/VFP
+    // instructions (memcpy, struct init, auto-vectorization).
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "mrs {tmp}, CPACR_EL1",
+            "orr {tmp}, {tmp}, #(0x3 << 20)",
+            "msr CPACR_EL1, {tmp}",
+            "isb",
+            tmp = out(reg) _,
+        );
+    }
+
     // ── Initialise PL011 UART (115200 8N1, FIFO enabled) ──
     unsafe { pl011::init() };
 
@@ -314,6 +330,8 @@ fn main() -> Status {
         bump_base, BUMP_REGION_SIZE
     );
     let mut bump = bump_alloc::BumpAllocator::new(bump_base, BUMP_REGION_SIZE);
+
+    let _ = writeln!(serial, "[FP] SIMD/FP access enabled (CPACR_EL1.FPEN)");
 
     // ── Build identity map and enable MMU ──
     unsafe {
