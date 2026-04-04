@@ -5680,6 +5680,12 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
         let ready_count = self.epoll_check_once(epoll_id, events_ptr, maxevents);
 
+        // Without poll_fn there is no way to read time — fall back to
+        // the single check already performed above.
+        if self.poll_fn.is_none() {
+            return ready_count;
+        }
+
         // If no events ready and blocking requested, yield to scheduler.
         if ready_count == 0 && timeout != 0 && self.block_fn.is_some() {
             let start_ms = self.poll_fn.map_or(0, |pf| pf());

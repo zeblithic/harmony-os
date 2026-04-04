@@ -405,6 +405,10 @@ pub unsafe fn wake_by_fd(fd: i32, op: u8) {
         let matches = match (tcb.wait_reason, op) {
             (Some(WaitReason::FdReadable(f)), 0) if f == fd => true,
             (Some(WaitReason::FdWritable(f)), 1) if f == fd => true,
+            // PollWait tasks are waiting on ANY fd activity — a pipe
+            // write that makes an fd readable should wake poll/select/epoll
+            // tasks that may be watching that fd.
+            (Some(WaitReason::PollWait), _) => true,
             _ => false,
         };
         if matches {
