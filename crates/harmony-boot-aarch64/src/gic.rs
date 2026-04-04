@@ -153,7 +153,7 @@ pub unsafe fn send_sgi_self(intid: u32) {
     //   [40]    = IRM = 0 (use target list, not all-but-self)
     let val: u64 = ((intid as u64) & 0xF) << 24 | 1;
     core::arch::asm!(
-        "msr ICC_SGI1_EL1, {}",
+        "msr S3_0_C12_C11_5, {}",  // ICC_SGI1_EL1
         "isb",
         in(reg) val,
     );

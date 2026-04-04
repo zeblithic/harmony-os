@@ -8544,8 +8544,14 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             return self.poll_check_once(fds_ptr, nfds);
         }
 
-        // Blocking path: yield to the scheduler on each iteration.
+        // Blocking path: check readiness first, then yield if not ready.
         if self.block_fn.is_some() {
+            // Initial check — return immediately if fds are already ready.
+            let ready = self.poll_check_once(fds_ptr, nfds);
+            if ready > 0 {
+                return ready;
+            }
+
             let start_ms = self.poll_fn.map_or(0, |pf| pf());
             let deadline = if timeout_ms > 0 {
                 start_ms.saturating_add(timeout_ms as u64)
@@ -8720,8 +8726,14 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             }
         };
 
-        // Blocking path: yield to the scheduler on each iteration.
+        // Blocking path: check readiness first, then yield if not ready.
         if self.block_fn.is_some() {
+            // Initial check — return immediately if fds are already ready.
+            let ready = self.select_check_once(nfds, readfds, writefds, exceptfds);
+            if ready > 0 {
+                return ready;
+            }
+
             let start_ms = self.poll_fn.map_or(0, |pf| pf());
             let deadline = if timeout_ms == u64::MAX {
                 u64::MAX // NULL timeout = infinite wait
