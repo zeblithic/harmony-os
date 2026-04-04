@@ -358,9 +358,13 @@ pub unsafe fn block_current(reason: WaitReason) {
         // results (single-retry paths) or infinite loops (poll/select).
         core::arch::asm!("msr daifclr, #2");
         crate::gic::send_sgi_self(crate::gic::YIELD_SGI);
+        // Execution resumes here after wake + reschedule.
+        // Re-mask IRQs to restore the SVC handler's invariant. The SVC
+        // restore assembly writes ELR_EL1/SPSR_EL1 then erets — a timer
+        // IRQ in that window would clobber those registers, causing eret
+        // to jump to the SVC assembly instead of user code.
+        core::arch::asm!("msr daifset, #2");
     }
-    // On aarch64: execution resumes here after wake + reschedule.
-    // wake() already cleared wait_reason and set state = Ready.
 }
 
 /// Wake a specific blocked task, transitioning it to Ready.

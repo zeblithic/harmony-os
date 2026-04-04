@@ -2613,6 +2613,16 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     /// to move packets through smoltcp. Wraps the internal poll_fn.
     /// Returns `true` if the network stack was polled (poll_fn is set),
     /// used by the caller to gate PollWait wakeups.
+    ///
+    /// # Limitations
+    ///
+    /// Returns `true` whenever poll_fn is set, regardless of whether smoltcp
+    /// actually processed any packets. This means PollWait tasks are woken on
+    /// every system-task iteration when a TCP stack is active. For the current
+    /// qemu-virt config (no poll_fn set), this returns `false` and PollWait
+    /// tasks rely on synchronous `wake_by_fd` wakes (e.g., pipe writes).
+    /// Precise network-change detection requires a richer poll callback
+    /// (tracked by `harmony-os-ltv`).
     pub fn poll_network(&mut self) -> bool {
         if let Some(pf) = self.poll_fn {
             pf();
@@ -8552,8 +8562,12 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             return self.poll_check_once(fds_ptr, nfds);
         }
 
-        // Without poll_fn there is no way to read time — fall back to a
-        // single check so the caller at least gets the current state.
+        // Without poll_fn there is no way to read time for timeout checks,
+        // and NETWORK_CHANGED will always be false (poll_network returns
+        // false), so PollWait tasks would never be woken by the system task.
+        // Fall back to a single-shot check. This means poll() is effectively
+        // non-blocking in the current qemu-virt config (no TCP stack).
+        // True scheduler-yielding poll requires poll_fn (future phase with TCP).
         if self.poll_fn.is_none() {
             return self.poll_check_once(fds_ptr, nfds);
         }
