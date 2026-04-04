@@ -210,11 +210,13 @@ pub fn task_counters() -> (u64, u64) {
     )
 }
 
-/// Round-robin schedule — called from `irq_dispatch` on each timer tick.
+/// State-aware round-robin scheduler — called from `irq_dispatch` on
+/// each timer tick.
 ///
-/// Saves `current_sp` into the running task's TCB, advances to the next
-/// Ready task, and returns that task's saved `kernel_sp`. If only one
-/// task exists (or zero), returns `current_sp` unchanged.
+/// Saves `current_sp` into the running task's TCB, then scans forward
+/// (round-robin) for the next Ready task. Blocked and Dead tasks are
+/// skipped. If no Ready task is found, returns `current_sp` unchanged
+/// (the idle task should always be Ready, so this is a safety net).
 ///
 /// # Safety
 ///
@@ -228,23 +230,28 @@ pub unsafe fn schedule(current_sp: usize) -> usize {
 
     let cur = CURRENT;
 
-    // Save the interrupted task's SP and mark it Ready.
+    // Save the interrupted task's SP. Only transition Running→Ready;
+    // if a syscall already marked it Blocked or Dead, preserve that.
     let current_tcb = TASKS[cur].assume_init_mut();
     current_tcb.kernel_sp = current_sp;
-    current_tcb.state = TaskState::Ready;
+    if current_tcb.state == TaskState::Running {
+        current_tcb.state = TaskState::Ready;
+    }
     current_tcb.preempt_count += 1;
 
-    // Advance to next task (round-robin).
-    let next = (cur + 1) % n;
-    CURRENT = next;
+    // Scan for next Ready task (round-robin).
+    for offset in 1..=n {
+        let idx = (cur + offset) % n;
+        let tcb = TASKS[idx].assume_init_mut();
+        if tcb.state == TaskState::Ready {
+            CURRENT = idx;
+            tcb.state = TaskState::Running;
+            return tcb.kernel_sp;
+        }
+    }
 
-    let next_tcb = TASKS[next].assume_init_mut();
-    // Phase 3 will add Blocked state — this assert catches scheduling a
-    // non-Ready task, which would eret into a stale or invalid context.
-    debug_assert_eq!(next_tcb.state, TaskState::Ready);
-    next_tcb.state = TaskState::Running;
-
-    next_tcb.kernel_sp
+    // No Ready task found — stay on current.
+    current_sp
 }
 
 /// Return the number of spawned tasks.
