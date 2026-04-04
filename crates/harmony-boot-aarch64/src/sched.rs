@@ -120,3 +120,79 @@ pub unsafe fn spawn_task(entry: fn() -> !, bump: &mut BumpAllocator) {
     });
     NUM_TASKS = n + 1;
 }
+
+#[cfg(target_arch = "aarch64")]
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Counter incremented by task 0 — proves it received CPU time.
+#[cfg(target_arch = "aarch64")]
+static TASK0_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Counter incremented by task 1 — proves it received CPU time.
+#[cfg(target_arch = "aarch64")]
+static TASK1_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Test task 0: tight loop incrementing its counter until preempted.
+#[cfg(target_arch = "aarch64")]
+pub fn task0() -> ! {
+    loop {
+        TASK0_COUNTER.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Test task 1: tight loop incrementing its counter until preempted.
+#[cfg(target_arch = "aarch64")]
+pub fn task1() -> ! {
+    loop {
+        TASK1_COUNTER.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Read both task counters (for verification output by timer::on_tick).
+#[cfg(target_arch = "aarch64")]
+pub fn task_counters() -> (u64, u64) {
+    (
+        TASK0_COUNTER.load(Ordering::Relaxed),
+        TASK1_COUNTER.load(Ordering::Relaxed),
+    )
+}
+
+/// Round-robin schedule — called from `irq_dispatch` on each timer tick.
+///
+/// Saves `current_sp` into the running task's TCB, advances to the next
+/// Ready task, and returns that task's saved `kernel_sp`. If only one
+/// task exists (or zero), returns `current_sp` unchanged.
+///
+/// # Safety
+///
+/// Must only be called from the IRQ handler path (non-reentrant, PSTATE.I set).
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn schedule(current_sp: usize) -> usize {
+    let n = NUM_TASKS;
+    if n <= 1 {
+        return current_sp;
+    }
+
+    let cur = CURRENT;
+
+    // Save the interrupted task's SP and mark it Ready.
+    let current_tcb = TASKS[cur].assume_init_mut();
+    current_tcb.kernel_sp = current_sp;
+    current_tcb.state = TaskState::Ready;
+    current_tcb.preempt_count += 1;
+
+    // Advance to next task (round-robin).
+    let next = (cur + 1) % n;
+    CURRENT = next;
+
+    let next_tcb = TASKS[next].assume_init_mut();
+    next_tcb.state = TaskState::Running;
+
+    next_tcb.kernel_sp
+}
+
+/// Return the number of spawned tasks.
+#[cfg(target_arch = "aarch64")]
+pub fn num_tasks() -> usize {
+    unsafe { NUM_TASKS }
+}
