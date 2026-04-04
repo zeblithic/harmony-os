@@ -3745,7 +3745,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     if has_writer {
                         // Writer exists but buffer is empty — would block.
                         let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
-                        if nonblock || !self.block_fn.is_some() {
+                        if nonblock || self.block_fn.is_none() {
                             return EAGAIN;
                         }
 

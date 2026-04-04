@@ -344,7 +344,15 @@ pub unsafe fn block_current(reason: WaitReason) {
     tcb.wait_reason = Some(reason);
 
     #[cfg(target_arch = "aarch64")]
-    crate::gic::send_sgi_self(crate::gic::YIELD_SGI);
+    {
+        // SVC exception entry masks IRQs (PSTATE.I=1). Unmask them so
+        // the Self-SGI can actually fire and the IRQ handler can context-
+        // switch us out. Without this, the SGI pends but never fires,
+        // and block_current returns immediately — causing either incorrect
+        // results (single-retry paths) or infinite loops (poll/select).
+        core::arch::asm!("msr daifclr, #2");
+        crate::gic::send_sgi_self(crate::gic::YIELD_SGI);
+    }
     // On aarch64: execution resumes here after wake + reschedule.
     // wake() already cleared wait_reason and set state = Ready.
 }
