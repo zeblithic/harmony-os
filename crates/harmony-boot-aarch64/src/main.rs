@@ -4,7 +4,6 @@
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), no_std)]
 
-#[cfg(not(test))]
 extern crate alloc;
 
 mod bump_alloc;
@@ -82,7 +81,7 @@ fn is_usable_memory(ty: uefi::mem::memory_map::MemoryType) -> bool {
     )
 }
 
-#[cfg(target_os = "uefi")]
+#[cfg(all(target_os = "uefi", not(test)))]
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().unwrap();
@@ -289,6 +288,7 @@ fn main() -> Status {
 
     let heap_size = core::cmp::min(heap_size, 4 * 1024 * 1024);
 
+    #[cfg(not(test))]
     unsafe {
         ALLOCATOR
             .lock()
@@ -475,8 +475,8 @@ fn main() -> Status {
         );
 
         // Spawn two test tasks for scheduler verification.
-        unsafe { sched::spawn_task(sched::task0, &mut bump) };
-        unsafe { sched::spawn_task(sched::task1, &mut bump) };
+        unsafe { sched::spawn_task("test0", 0, sched::task0, &mut bump) };
+        unsafe { sched::spawn_task("test1", 1, sched::task1, &mut bump) };
         let _ = writeln!(serial, "[Sched] Spawned 2 tasks");
 
         // Enter the scheduler — loads task 0's TrapFrame and erets into it.

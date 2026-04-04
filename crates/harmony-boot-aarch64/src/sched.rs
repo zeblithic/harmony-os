@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Preemptive round-robin scheduler for Phase 2 context switch validation.
+//! Preemptive round-robin scheduler for Phase 3.
 //!
 //! Owns per-task kernel stacks and [`TaskControlBlock`]s. The timer IRQ
 //! handler calls [`schedule`] on each tick, which round-robins between
 //! tasks by returning the next task's saved kernel SP. The IRQ assembly
 //! restores registers from that SP and `eret`s into the new task.
 //!
-//! # Limitations (Phase 2)
+//! # Limitations (Phase 3)
 //!
-//! - Fixed task count (`MAX_TASKS = 2`), no dynamic spawn/exit.
 //! - EL1-only tasks (no EL0 user mode).
 //! - No FP/SIMD context save — tasks must not use floating-point.
 //!   FP context switch will be added no later than Phase 4; see design spec
@@ -31,8 +30,8 @@ const _: () = assert!(
     "TrapFrame grew past TRAPFRAME_SIZE — update sched.rs"
 );
 
-/// Maximum number of tasks. Fixed at 2 for Phase 2.
-const MAX_TASKS: usize = 2;
+/// Maximum number of tasks.
+pub const MAX_TASKS: usize = 64;
 
 /// Minimum kernel stack size in bytes (8 KiB).
 /// Actual allocation rounds up to whole pages — 2 pages at 4K, 1 page at 16K.
@@ -47,31 +46,39 @@ const TRAPFRAME_SIZE: usize = 272;
 pub enum TaskState {
     Ready,
     Running,
+    /// Waiting on syscall/IPC. Phase 4 adds block_current() and wake().
+    Blocked,
+    /// Exited — scheduler skips. Stack reclamation deferred to Phase 4+.
+    Dead,
 }
 
-/// Per-task scheduling state. Stored in a fixed-size array, indexed by
-/// task number (0 or 1 in Phase 2).
+/// Per-task scheduling state. Stored in a fixed-size array, indexed by task number.
 #[repr(C)]
 pub struct TaskControlBlock {
     /// Saved SP_EL1 — points to the base of a TrapFrame on this task's
     /// kernel stack. The IRQ restore path loads registers from here.
     pub kernel_sp: usize,
     /// Base address of the allocated kernel stack (low address).
-    /// Phase 3: used for guard-page setup and stack teardown on task exit.
+    /// Used for guard-page setup and stack teardown on task exit.
     pub kernel_stack_base: usize,
     /// Size of the kernel stack in bytes.
-    /// Phase 3: used for guard-page setup and stack teardown on task exit.
+    /// Used for guard-page setup and stack teardown on task exit.
     pub kernel_stack_size: usize,
     /// Current scheduling state.
     pub state: TaskState,
     /// Number of times this task has been preempted (for verification).
-    /// Phase 3: used for scheduling fairness metrics.
     pub preempt_count: u64,
+    /// Microkernel Process ID (0 = idle, 1 = system, 2+ = user).
+    pub pid: u32,
+    /// Debug name for diagnostic output.
+    pub name: &'static str,
+    /// Entry point (for debug; not re-invoked after initial start).
+    pub entry: Option<fn() -> !>,
 }
 
 /// Task array — only accessed from the IRQ handler (non-reentrant).
-static mut TASKS: [MaybeUninit<TaskControlBlock>; MAX_TASKS] =
-    [MaybeUninit::uninit(), MaybeUninit::uninit()];
+const UNINIT_TCB: MaybeUninit<TaskControlBlock> = MaybeUninit::uninit();
+static mut TASKS: [MaybeUninit<TaskControlBlock>; MAX_TASKS] = [UNINIT_TCB; MAX_TASKS];
 
 /// Index of the currently running task.
 static mut CURRENT: usize = 0;
@@ -87,14 +94,19 @@ const INITIAL_SPSR: u64 = 0x345;
 ///
 /// Allocates an 8 KiB kernel stack from `bump`, writes a zeroed TrapFrame
 /// at the top with `elr = entry` and `spsr = INITIAL_SPSR`, and records
-/// the task in [`TASKS`].
+/// the task in [`TASKS`]. Returns the task index.
 ///
 /// # Safety
 ///
 /// - Must be called before IRQs are unmasked (before `enter_scheduler`).
 /// - `bump` must have enough free frames for the kernel stack.
 /// - Must not be called more than [`MAX_TASKS`] times.
-pub unsafe fn spawn_task(entry: fn() -> !, bump: &mut BumpAllocator) {
+pub unsafe fn spawn_task(
+    name: &'static str,
+    pid: u32,
+    entry: fn() -> !,
+    bump: &mut BumpAllocator,
+) -> usize {
     let n = unsafe { NUM_TASKS };
     assert!(n < MAX_TASKS, "spawn_task: MAX_TASKS exceeded");
 
@@ -122,11 +134,11 @@ pub unsafe fn spawn_task(entry: fn() -> !, bump: &mut BumpAllocator) {
     let sp = stack_top - TRAPFRAME_SIZE;
 
     // Zero the TrapFrame region, then set elr and spsr.
-    let frame = sp as *mut TrapFrame;
+    let frame_ptr = sp as *mut TrapFrame;
     // Zero all 272 bytes (covers x[0..31], elr, spsr, and padding).
-    core::ptr::write_bytes(frame as *mut u8, 0, TRAPFRAME_SIZE);
-    (*frame).elr = entry as u64;
-    (*frame).spsr = INITIAL_SPSR;
+    core::ptr::write_bytes(frame_ptr as *mut u8, 0, TRAPFRAME_SIZE);
+    (*frame_ptr).elr = entry as u64;
+    (*frame_ptr).spsr = INITIAL_SPSR;
 
     TASKS[n] = MaybeUninit::new(TaskControlBlock {
         kernel_sp: sp,
@@ -134,8 +146,32 @@ pub unsafe fn spawn_task(entry: fn() -> !, bump: &mut BumpAllocator) {
         kernel_stack_size: stack_size,
         state: TaskState::Ready,
         preempt_count: 0,
+        pid,
+        name,
+        entry: Some(entry),
     });
     NUM_TASKS = n + 1;
+    n
+}
+
+/// Check whether `addr` falls within the guard page of any spawned task's stack.
+///
+/// The guard page occupies the one page immediately below `kernel_stack_base`.
+/// Returns `(name, pid)` of the matching task, or `None` if no match.
+///
+/// Not cfg-gated so it is accessible in host tests.
+pub fn check_guard_page(addr: u64) -> Option<(&'static str, u32)> {
+    let page_size = PAGE_SIZE as u64;
+    let n = unsafe { NUM_TASKS };
+    for i in 0..n {
+        let tcb = unsafe { TASKS[i].assume_init_ref() };
+        let guard_base = (tcb.kernel_stack_base as u64).wrapping_sub(page_size);
+        let guard_top = tcb.kernel_stack_base as u64;
+        if addr >= guard_base && addr < guard_top {
+            return Some((tcb.name, tcb.pid));
+        }
+    }
+    None
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -275,4 +311,61 @@ pub unsafe fn enter_scheduler() -> ! {
         sp = in(reg) sp,
         options(noreturn),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harmony_microkernel::vm::PAGE_SIZE;
+
+    #[test]
+    fn task_state_has_four_variants() {
+        let states = [
+            TaskState::Ready,
+            TaskState::Running,
+            TaskState::Blocked,
+            TaskState::Dead,
+        ];
+        for i in 0..states.len() {
+            for j in (i + 1)..states.len() {
+                assert_ne!(states[i], states[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn max_tasks_is_64() {
+        assert_eq!(MAX_TASKS, 64);
+    }
+
+    #[test]
+    fn check_guard_page_detects_hit() {
+        unsafe {
+            NUM_TASKS = 1;
+            TASKS[0] = MaybeUninit::new(TaskControlBlock {
+                kernel_sp: 0,
+                kernel_stack_base: 0x2_0000,
+                kernel_stack_size: 8192,
+                state: TaskState::Ready,
+                preempt_count: 0,
+                pid: 7,
+                name: "test-task",
+                entry: None,
+            });
+        }
+        let guard_start = 0x2_0000 - PAGE_SIZE as usize;
+        assert_eq!(
+            check_guard_page(guard_start as u64 + 100),
+            Some(("test-task", 7))
+        );
+        assert_eq!(check_guard_page(0x3_0000), None);
+        assert_eq!(check_guard_page(guard_start as u64 - 1), None);
+        unsafe { NUM_TASKS = 0 };
+    }
+
+    #[test]
+    fn check_guard_page_empty_returns_none() {
+        unsafe { NUM_TASKS = 0 };
+        assert_eq!(check_guard_page(0x1000), None);
+    }
 }
