@@ -2522,8 +2522,6 @@ pub struct Linuxulator<
     /// Set the current task's clear_child_tid address.
     set_clear_child_tid_fn: Option<fn(u64)>,
     /// Next TID to assign to a spawned thread. Starts at pid + 1.
-    // Used by sys_clone (Task 6); suppress dead_code until then.
-    #[allow(dead_code)]
     next_tid: u32,
 }
 
@@ -3517,7 +3515,13 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             } => self.sys_epoll_wait(epfd, events, maxevents, timeout),
             LinuxSyscall::Fork => self.sys_fork(),
             LinuxSyscall::Vfork => self.sys_fork(),
-            LinuxSyscall::Clone { flags, .. } => self.sys_clone(flags),
+            LinuxSyscall::Clone {
+                flags,
+                child_stack,
+                parent_tid,
+                child_tid,
+                tls,
+            } => self.sys_clone(flags, child_stack, parent_tid, tls, child_tid),
             LinuxSyscall::Clone3 { .. } => ENOSYS,
             LinuxSyscall::Wait4 {
                 pid,
@@ -6294,35 +6298,93 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         child_pid as i64
     }
 
-    /// Linux clone(2): validate flags and delegate to fork.
+    /// Linux clone(2): thread creation via `spawn_fn`, or fork delegation.
     ///
-    /// Accepts SIGCHLD (17) optionally combined with CLONE_CHILD_SETTID
-    /// and CLONE_CHILD_CLEARTID (musl's fork() wrapper). Threading
-    /// flags (CLONE_VM, CLONE_THREAD, CLONE_FILES) return ENOSYS.
-    fn sys_clone(&mut self, flags: u64) -> i64 {
-        const CLONE_VM: u64 = 0x00000100;
-        const CLONE_FILES: u64 = 0x00000400;
-        const CLONE_THREAD: u64 = 0x00010000;
-        const CLONE_CHILD_SETTID: u64 = 0x01000000;
-        const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
+    /// Two paths:
+    /// 1. **Thread creation** — flags include CLONE_VM|CLONE_THREAD|
+    ///    CLONE_FILES|CLONE_SIGHAND (musl's pthread_create). Allocates a
+    ///    TID and calls `spawn_fn` to create a new scheduler task.
+    /// 2. **Fork** — SIGCHLD (17) optionally combined with
+    ///    CLONE_CHILD_SETTID/CLONE_CHILD_CLEARTID (musl's fork wrapper).
+    ///    Delegates to `sys_fork()`.
+    fn sys_clone(
+        &mut self,
+        flags: u64,
+        child_stack: u64,
+        parent_tidptr: u64,
+        tls: u64,
+        child_tidptr: u64,
+    ) -> i64 {
+        const CLONE_VM: u64 = 0x0000_0100;
+        const CLONE_FS: u64 = 0x0000_0200;
+        const CLONE_FILES: u64 = 0x0000_0400;
+        const CLONE_SIGHAND: u64 = 0x0000_0800;
+        const CLONE_THREAD: u64 = 0x0001_0000;
+        const CLONE_SYSVSEM: u64 = 0x0004_0000;
+        const CLONE_SETTLS: u64 = 0x0008_0000;
+        const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+        const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+        const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 
-        // Reject threading flags
-        if flags & (CLONE_VM | CLONE_FILES | CLONE_THREAD) != 0 {
-            return ENOSYS;
-        }
-
-        // Accept SIGCHLD with optional TID flags. CLONE_CHILD_SETTID and
-        // CLONE_CHILD_CLEARTID are accepted but not acted upon — the TID
-        // writes are not performed. This is safe for fork() because musl's
-        // waitpid uses SIGCHLD-based waiting for child processes, not
-        // futex-based TID polling (which is only used for threads).
         let sig = flags & 0xFF;
-        let known_flags = SIGCHLD_NUM as u64 | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
-        if sig != SIGCHLD_NUM as u64 || (flags & !known_flags) != 0 {
-            return ENOSYS;
-        }
+        let required_thread = CLONE_VM | CLONE_THREAD | CLONE_FILES | CLONE_SIGHAND;
 
-        self.sys_fork()
+        if flags & required_thread == required_thread {
+            // ── Thread creation path (musl pthreads) ──────────────
+            let spawn = match self.spawn_fn {
+                Some(f) => f,
+                None => return ENOSYS,
+            };
+
+            let tid = self.alloc_tid();
+            let clear_child_tid = if flags & CLONE_CHILD_CLEARTID != 0 {
+                child_tidptr
+            } else {
+                0
+            };
+
+            // Remaining flags are informational (FS, SYSVSEM, SETTLS) or
+            // handled here (PARENT_SETTID, CHILD_SETTID). We accept them
+            // without rejecting unknown extras — musl sends a fixed set and
+            // future flags can be handled incrementally.
+            let _ = (CLONE_FS, CLONE_SYSVSEM, CLONE_SETTLS);
+
+            // spawn_fn: (pid, tid, tls, clear_child_tid, child_stack)
+            // The boot crate's implementation reads CURRENT_TRAPFRAME to
+            // copy the parent's register state to the child.
+            match spawn(self.pid as u32, tid, tls, clear_child_tid, child_stack) {
+                Some(_task_idx) => {
+                    if flags & CLONE_PARENT_SETTID != 0 && parent_tidptr != 0 {
+                        // SAFETY: parent_tidptr is a userspace address in
+                        // the shared address space (CLONE_VM). The kernel
+                        // guarantees the page is mapped before clone.
+                        unsafe {
+                            *(parent_tidptr as *mut u32) = tid;
+                        }
+                    }
+                    if flags & CLONE_CHILD_SETTID != 0 && child_tidptr != 0 {
+                        unsafe {
+                            *(child_tidptr as *mut u32) = tid;
+                        }
+                    }
+                    tid as i64
+                }
+                None => EAGAIN, // MAX_TASKS reached
+            }
+        } else if sig == SIGCHLD_NUM as u64 {
+            // ── Fork path ─────────────────────────────────────────
+            // Accept SIGCHLD with optional TID flags. CLONE_CHILD_SETTID
+            // and CLONE_CHILD_CLEARTID are accepted but not acted upon —
+            // musl's waitpid uses SIGCHLD-based waiting for child
+            // processes, not futex-based TID polling (threads only).
+            let known_fork_flags = SIGCHLD_NUM as u64 | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
+            if (flags & !known_fork_flags) != 0 {
+                return ENOSYS;
+            }
+            self.sys_fork()
+        } else {
+            ENOSYS
+        }
     }
 
     /// Linux wait4(2): wait for a child process to exit.
@@ -11993,6 +12055,124 @@ mod integration_tests {
         let t2 = lx.alloc_tid();
         assert_ne!(t1, t2);
         assert_eq!(t2, t1 + 1);
+    }
+
+    // ── sys_clone thread creation tests ───────────────────────────
+
+    #[test]
+    fn sys_clone_thread_calls_spawn_fn() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        static SPAWN_CALLED: AtomicBool = AtomicBool::new(false);
+
+        lx.set_spawn_fn(|_pid, _tid, _tls, _ctid, _stack| {
+            SPAWN_CALLED.store(true, Ordering::SeqCst);
+            Some(42)
+        });
+
+        SPAWN_CALLED.store(false, Ordering::SeqCst);
+
+        const CLONE_VM: u64 = 0x0000_0100;
+        const CLONE_FS: u64 = 0x0000_0200;
+        const CLONE_FILES: u64 = 0x0000_0400;
+        const CLONE_SIGHAND: u64 = 0x0000_0800;
+        const CLONE_THREAD: u64 = 0x0001_0000;
+        const CLONE_SYSVSEM: u64 = 0x0004_0000;
+        const CLONE_SETTLS: u64 = 0x0008_0000;
+        const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+        const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+
+        let flags = CLONE_VM
+            | CLONE_FS
+            | CLONE_FILES
+            | CLONE_SIGHAND
+            | CLONE_THREAD
+            | CLONE_SYSVSEM
+            | CLONE_SETTLS
+            | CLONE_PARENT_SETTID
+            | CLONE_CHILD_CLEARTID;
+        let result = lx.sys_clone(flags, 0x7000_0000, 0, 0xFFFF_0000, 0);
+        assert!(SPAWN_CALLED.load(Ordering::SeqCst));
+        assert!(result > 0, "sys_clone should return TID, got {result}");
+    }
+
+    #[test]
+    fn sys_clone_thread_without_spawn_fn_returns_enosys() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        const CLONE_VM: u64 = 0x0000_0100;
+        const CLONE_FILES: u64 = 0x0000_0400;
+        const CLONE_SIGHAND: u64 = 0x0000_0800;
+        const CLONE_THREAD: u64 = 0x0001_0000;
+        let flags = CLONE_VM | CLONE_THREAD | CLONE_FILES | CLONE_SIGHAND;
+        let result = lx.sys_clone(flags, 0, 0, 0, 0);
+        assert_eq!(result, ENOSYS);
+    }
+
+    #[test]
+    fn sys_clone_thread_spawn_failure_returns_eagain() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.set_spawn_fn(|_pid, _tid, _tls, _ctid, _stack| None);
+
+        const CLONE_VM: u64 = 0x0000_0100;
+        const CLONE_FILES: u64 = 0x0000_0400;
+        const CLONE_SIGHAND: u64 = 0x0000_0800;
+        const CLONE_THREAD: u64 = 0x0001_0000;
+        let flags = CLONE_VM | CLONE_THREAD | CLONE_FILES | CLONE_SIGHAND;
+        let result = lx.sys_clone(flags, 0, 0, 0, 0);
+        assert_eq!(result, EAGAIN);
+    }
+
+    #[test]
+    fn sys_clone_sigchld_delegates_to_fork() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // SIGCHLD (17) without CLONE_VM — should use fork path.
+        let result = lx.sys_clone(17, 0, 0, 0, 0);
+        // Fork returns child PID (> 0).
+        assert!(result > 0, "SIGCHLD clone should fork, got {result}");
+    }
+
+    #[test]
+    fn sys_clone_thread_writes_parent_tid() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.set_spawn_fn(|_pid, _tid, _tls, _ctid, _stack| Some(42));
+
+        const CLONE_VM: u64 = 0x0000_0100;
+        const CLONE_FILES: u64 = 0x0000_0400;
+        const CLONE_SIGHAND: u64 = 0x0000_0800;
+        const CLONE_THREAD: u64 = 0x0001_0000;
+        const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+        let flags = CLONE_VM | CLONE_THREAD | CLONE_FILES | CLONE_SIGHAND | CLONE_PARENT_SETTID;
+
+        let mut parent_tid: u32 = 0;
+        let parent_tidptr = &mut parent_tid as *mut u32 as u64;
+        let result = lx.sys_clone(flags, 0x7000_0000, parent_tidptr, 0, 0);
+        assert!(result > 0);
+        assert_eq!(parent_tid, result as u32);
+    }
+
+    #[test]
+    fn sys_clone_thread_writes_child_tid() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.set_spawn_fn(|_pid, _tid, _tls, _ctid, _stack| Some(42));
+
+        const CLONE_VM: u64 = 0x0000_0100;
+        const CLONE_FILES: u64 = 0x0000_0400;
+        const CLONE_SIGHAND: u64 = 0x0000_0800;
+        const CLONE_THREAD: u64 = 0x0001_0000;
+        const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+        let flags = CLONE_VM | CLONE_THREAD | CLONE_FILES | CLONE_SIGHAND | CLONE_CHILD_SETTID;
+
+        let mut child_tid: u32 = 0;
+        let child_tidptr = &mut child_tid as *mut u32 as u64;
+        let result = lx.sys_clone(flags, 0x7000_0000, 0, 0, child_tidptr);
+        assert!(result > 0);
+        assert_eq!(child_tid, result as u32);
     }
 
     // ── sched_getaffinity tests ───────────────────────────────────
