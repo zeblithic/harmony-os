@@ -3658,7 +3658,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                         Err(NetError::WouldBlock) => {
                             let nonblock =
                                 self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
-                            if !nonblock {
+                            if !nonblock && self.block_fn.is_some() {
                                 match self.block_until(BLOCK_OP_WRITABLE, fd) {
                                     BlockResult::Ready => {
                                         let data = unsafe {
@@ -3669,7 +3669,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                                             Err(e) => return net_error_to_errno(e),
                                         }
                                     }
-                                    BlockResult::Interrupted => return EINTR,
+                                    BlockResult::Interrupted => return EAGAIN,
                                 }
                             }
                             EAGAIN
@@ -3745,7 +3745,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     if has_writer {
                         // Writer exists but buffer is empty — would block.
                         let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
-                        if nonblock {
+                        if nonblock || !self.block_fn.is_some() {
                             return EAGAIN;
                         }
 
@@ -3777,7 +3777,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                                 }
                                 n as i64
                             }
-                            BlockResult::Interrupted => EINTR,
+                            BlockResult::Interrupted => EAGAIN,
                         }
                     } else {
                         0 // EOF — write end closed
@@ -3878,7 +3878,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                         Err(NetError::WouldBlock) => {
                             let nonblock =
                                 self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
-                            if !nonblock {
+                            if !nonblock && self.block_fn.is_some() {
                                 match self.block_until(BLOCK_OP_READABLE, fd) {
                                     BlockResult::Ready => {
                                         let buf = unsafe {
@@ -3892,7 +3892,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                                             Err(e) => return net_error_to_errno(e),
                                         }
                                     }
-                                    BlockResult::Interrupted => return EINTR,
+                                    BlockResult::Interrupted => return EAGAIN,
                                 }
                             }
                             EAGAIN
@@ -5047,7 +5047,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 Ok(n) => n as i64,
                 Err(NetError::WouldBlock) => {
                     let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
-                    if !nonblock {
+                    if !nonblock && self.block_fn.is_some() {
                         match self.block_until(BLOCK_OP_WRITABLE, fd) {
                             BlockResult::Ready => {
                                 let data =
@@ -5057,7 +5057,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                                     Err(e) => return net_error_to_errno(e),
                                 }
                             }
-                            BlockResult::Interrupted => return EINTR,
+                            BlockResult::Interrupted => return EAGAIN,
                         }
                     }
                     EAGAIN
@@ -5087,7 +5087,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                         Err(NetError::WouldBlock) => {
                             let nonblock =
                                 self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
-                            if !nonblock {
+                            if !nonblock && self.block_fn.is_some() {
                                 match self.block_until(BLOCK_OP_WRITABLE, fd) {
                                     BlockResult::Ready => {
                                         let data = unsafe {
@@ -5098,7 +5098,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                                             Err(e) => return net_error_to_errno(e),
                                         }
                                     }
-                                    BlockResult::Interrupted => return EINTR,
+                                    BlockResult::Interrupted => return EAGAIN,
                                 }
                             }
                             EAGAIN
@@ -5116,7 +5116,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     }
                     Err(NetError::WouldBlock) => {
                         let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
-                        if !nonblock {
+                        if !nonblock && self.block_fn.is_some() {
                             match self.block_until(BLOCK_OP_WRITABLE, fd) {
                                 BlockResult::Ready => {
                                     let data = unsafe {
@@ -5127,7 +5127,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                                         Err(e) => return net_error_to_errno(e),
                                     }
                                 }
-                                BlockResult::Interrupted => return EINTR,
+                                BlockResult::Interrupted => return EAGAIN,
                             }
                         }
                         EAGAIN
@@ -5172,7 +5172,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 Ok(n) => n as i64,
                 Err(NetError::WouldBlock) => {
                     let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
-                    if !nonblock {
+                    if !nonblock && self.block_fn.is_some() {
                         match self.block_until(BLOCK_OP_READABLE, fd) {
                             BlockResult::Ready => {
                                 let data = unsafe {
@@ -5183,7 +5183,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                                     Err(e) => return net_error_to_errno(e),
                                 }
                             }
-                            BlockResult::Interrupted => return EINTR,
+                            BlockResult::Interrupted => return EAGAIN,
                         }
                     }
                     EAGAIN
@@ -5216,7 +5216,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     }
                     Err(NetError::WouldBlock) => {
                         let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
-                        if !nonblock {
+                        if !nonblock && self.block_fn.is_some() {
                             match self.block_until(BLOCK_OP_READABLE, fd) {
                                 BlockResult::Ready => {
                                     // Retry the full UDP recv logic.
@@ -5246,7 +5246,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                                         Err(e) => net_error_to_errno(e),
                                     };
                                 }
-                                BlockResult::Interrupted => return EINTR,
+                                BlockResult::Interrupted => return EAGAIN,
                             }
                         }
                         EAGAIN
@@ -17540,7 +17540,9 @@ mod integration_tests {
     }
 
     #[test]
-    fn blocking_pipe_read_empty_returns_eintr() {
+    fn blocking_pipe_read_empty_returns_eagain() {
+        // When block_fn is None (no scheduler), block_until returns Interrupted.
+        // The correct errno in that case is EAGAIN (not EINTR).
         let mut lx = Linuxulator::new(MockBackend::new());
         lx.set_poll_fn(timeout_poll_fn);
         let (rfd, _wfd) = create_pipe(&mut lx);
@@ -17551,7 +17553,7 @@ mod integration_tests {
             buf: buf.as_mut_ptr() as u64,
             count: buf.len() as u64,
         });
-        assert_eq!(r, EINTR);
+        assert_eq!(r, EAGAIN);
     }
 
     #[test]
