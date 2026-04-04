@@ -131,7 +131,10 @@ pub unsafe fn init_and_enable(
     let default_outside = rwx;
 
     if image_sections.is_none() {
-        let _ = writeln!(serial, "[MMU] WARNING: W^X disabled — mapping all RAM as RWX");
+        let _ = writeln!(
+            serial,
+            "[MMU] WARNING: W^X disabled — mapping all RAM as RWX"
+        );
     }
 
     let mut mapped_pages: u64 = 0;
@@ -165,12 +168,9 @@ pub unsafe fn init_and_enable(
     for &(base, pages) in platform::MMIO_REGIONS {
         for page_idx in 0..pages {
             let addr = base as u64 + page_idx as u64 * PAGE_SIZE;
-            let mmio_result = pt.map(
-                VirtAddr(addr),
-                PhysAddr(addr),
-                mmio_flags,
-                &mut || alloc_zeroed_frame(alloc),
-            );
+            let mmio_result = pt.map(VirtAddr(addr), PhysAddr(addr), mmio_flags, &mut || {
+                alloc_zeroed_frame(alloc)
+            });
             match mmio_result {
                 Ok(()) => mapped_pages += 1,
                 Err(VmError::RegionConflict(_)) => {

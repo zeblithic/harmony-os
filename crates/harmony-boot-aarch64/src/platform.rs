@@ -63,9 +63,9 @@ pub const XHCI_BASE: usize = 0x1F_000D_0000;
 /// Each entry: (base_address, page_count).
 #[cfg(feature = "qemu-virt")]
 pub const MMIO_REGIONS: &[(usize, usize)] = &[
-    (PL011_BASE, 1),   // PL011 UART (4 KiB)
-    (GICD_BASE, 16),   // GICv3 Distributor (64 KiB)
-    (GICR_BASE, 256),  // GICv3 Redistributor (1 MiB — 128 KiB per CPU × 8 max)
+    (PL011_BASE, 1),  // PL011 UART (4 KiB)
+    (GICD_BASE, 16),  // GICv3 Distributor (64 KiB)
+    (GICR_BASE, 256), // GICv3 Redistributor (1 MiB — 128 KiB per CPU × 8 max)
 ];
 
 /// Locally-administered test MAC address for GENET (RPi5).
@@ -78,8 +78,8 @@ pub const NODE_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 #[cfg(feature = "rpi5")]
 pub const MMIO_REGIONS: &[(usize, usize)] = &[
     (PL011_BASE, 1),
-    (GENET_BASE, 16),  // SYS through TDMA + descriptor RAM (~64KB)
-    (XHCI_BASE, 16),   // xHCI capability + operational + port registers (~64KB)
+    (GENET_BASE, 16), // SYS through TDMA + descriptor RAM (~64KB)
+    (XHCI_BASE, 16),  // xHCI capability + operational + port registers (~64KB)
 ];
 
 #[cfg(test)]
