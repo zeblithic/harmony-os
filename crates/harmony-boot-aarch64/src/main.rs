@@ -4,7 +4,6 @@
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), no_std)]
 
-#[cfg(not(test))]
 extern crate alloc;
 
 mod bump_alloc;
@@ -39,6 +38,17 @@ use uefi::proto::loaded_image::LoadedImage;
 #[cfg(not(test))]
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
+
+/// Concrete runtime type — `KernelEntropy` parameterised with a function
+/// pointer (the RNDR fill closure captures nothing, so it coerces to `fn`).
+#[cfg(target_os = "uefi")]
+type ConcreteRuntime = UnikernelRuntime<KernelEntropy<fn(&mut [u8])>, MemoryState>;
+
+/// Global runtime — populated during boot, read by the system task.
+/// Access is safe: boot init writes it once before spawning tasks;
+/// the system task is the sole reader after that.
+#[cfg(target_os = "uefi")]
+static mut RUNTIME: Option<ConcreteRuntime> = None;
 
 #[cfg(target_os = "uefi")]
 use mmu::MemoryRegion;
@@ -82,7 +92,7 @@ fn is_usable_memory(ty: uefi::mem::memory_map::MemoryType) -> bool {
     )
 }
 
-#[cfg(target_os = "uefi")]
+#[cfg(all(target_os = "uefi", not(test)))]
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().unwrap();
@@ -289,6 +299,7 @@ fn main() -> Status {
 
     let heap_size = core::cmp::min(heap_size, 4 * 1024 * 1024);
 
+    #[cfg(not(test))]
     unsafe {
         ALLOCATOR
             .lock()
@@ -303,9 +314,13 @@ fn main() -> Status {
     // ── Generate Ed25519 identity for Reticulum wire compat ──
     //    PQ identity is generated lazily by the runtime — PQ keygen's
     //    lattice operations overflow the UEFI-provided stack.
-    let mut entropy = KernelEntropy::new(|buf: &mut [u8]| {
+    // Coerce the non-capturing closure to a function pointer so the
+    // concrete type is `KernelEntropy<fn(&mut [u8])>` — nameable for
+    // the RUNTIME static.
+    let rndr_fill: fn(&mut [u8]) = |buf: &mut [u8]| {
         unsafe { rndr::fill(buf) };
-    });
+    };
+    let mut entropy = KernelEntropy::new(rndr_fill);
 
     let identity = PrivateIdentity::generate(&mut entropy);
     let addr = identity.public_identity().address_hash;
@@ -343,6 +358,9 @@ fn main() -> Status {
     );
 
     let _ = writeln!(serial, "[Runtime] UnikernelRuntime created");
+
+    // Move runtime to static for access by the system scheduler task.
+    unsafe { RUNTIME = Some(runtime) };
 
     // ── Initialise Linuxulator ──
     // Must happen BEFORE vectors::init() so the SVC dispatch function is
@@ -474,16 +492,15 @@ fn main() -> Status {
             timer::freq() / 100,
         );
 
-        // Spawn two test tasks for scheduler verification.
-        unsafe { sched::spawn_task(sched::task0, &mut bump) };
-        unsafe { sched::spawn_task(sched::task1, &mut bump) };
-        let _ = writeln!(serial, "[Sched] Spawned 2 tasks");
+        // Spawn idle task (PID 0) and system task (PID 1).
+        unsafe { sched::spawn_task("idle", 0, idle_task, &mut bump) };
+        let _ = writeln!(serial, "[Sched] Spawned idle task (PID 0)");
+        unsafe { sched::spawn_task("system", 1, system_task, &mut bump) };
+        let _ = writeln!(serial, "[Sched] Spawned system task (PID 1)");
 
         // Enter the scheduler — loads task 0's TrapFrame and erets into it.
         // The eret atomically unmasks IRQs via SPSR (I=0 in INITIAL_SPSR),
-        // so we do NOT use `msr daifclr` here. Doing so would open a race
-        // window where a timer IRQ could fire before enter_scheduler sets up
-        // the task context, corrupting TASKS[0].kernel_sp with the boot stack.
+        // so we do NOT use `msr daifclr` here.
         let _ = writeln!(serial, "[Sched] Entering scheduler (eret unmasks IRQs)");
         unsafe { sched::enter_scheduler() };
     }
@@ -736,6 +753,8 @@ fn main() -> Status {
         test_exit_code,
     );
 
+    let runtime = unsafe { RUNTIME.as_mut().unwrap() };
+
     loop {
         let now = timer::now_ms();
 
@@ -876,6 +895,37 @@ fn main() -> Status {
         // WFE = Wait For Event — ARM equivalent of HLT, saves power.
         // Timer interrupt will wake us for the next tick.
         unsafe { core::arch::asm!("wfe") };
+    }
+}
+
+/// Idle task — executes WFI in a loop. Always Ready; the scheduler
+/// falls through to it when no other task is schedulable.
+#[cfg(all(feature = "qemu-virt", target_os = "uefi"))]
+fn idle_task() -> ! {
+    loop {
+        unsafe { core::arch::asm!("wfi") };
+    }
+}
+
+/// System task — runs the event loop that was previously inline in main().
+/// Prints a startup message (QEMU test milestone), then polls the runtime
+/// in a loop. Reads UnikernelRuntime from the RUNTIME static populated
+/// during boot init.
+#[cfg(all(feature = "qemu-virt", target_os = "uefi"))]
+fn system_task() -> ! {
+    use core::fmt::Write;
+    let mut serial =
+        harmony_unikernel::SerialWriter::new(|byte| unsafe { pl011::write_byte(byte) });
+    let _ = writeln!(serial, "[System] Event loop started");
+
+    loop {
+        let now = timer::now_ms();
+        let runtime = unsafe { RUNTIME.as_mut().unwrap() };
+        let actions = runtime.tick(now);
+        for action in &actions {
+            dispatch_action(action, &mut serial);
+        }
+        unsafe { core::arch::asm!("wfi") };
     }
 }
 
