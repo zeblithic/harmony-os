@@ -44,8 +44,12 @@ fn aarch64_milestones() -> Vec<Milestone> {
             description: "PQ identity generated",
         },
         Milestone {
-            pattern: "[Boot] Entering event loop",
-            description: "event loop started",
+            pattern: "[Sched] Spawned 2 tasks",
+            description: "tasks spawned",
+        },
+        Milestone {
+            pattern: "[Sched] Task 0:",
+            description: "scheduler verified",
         },
     ]
 }
