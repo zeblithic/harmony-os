@@ -75,8 +75,8 @@ core::arch::global_asm!(
     "b el1_sync_handler",
     ".balign 0x80",
 
-    // 0x280 — Current EL, SPx, IRQ (unexpected)
-    "b unexpected_exception",
+    // 0x280 — Current EL, SPx, IRQ (timer interrupt)
+    "b el1_irq_handler",
     ".balign 0x80",
 
     // 0x300 — Current EL, SPx, FIQ (unexpected)
@@ -92,8 +92,8 @@ core::arch::global_asm!(
     // Routes to el1_sync_handler for diagnostics / future EL0 support
     "b el1_sync_handler",
     ".balign 0x80",
-    // 0x480 — Lower EL, AArch64, IRQ
-    "b unexpected_exception",
+    // 0x480 — Lower EL, AArch64, IRQ (timer interrupt from user mode)
+    "b el1_irq_handler",
     ".balign 0x80",
     "b unexpected_exception",
     ".balign 0x80",
@@ -202,4 +202,91 @@ core::arch::global_asm!(
     // x1 already contains ESR_EL1 from above
     "bl abort_handler",        // abort_handler(&TrapFrame, esr: u64) -> !
     "b unexpected_exception",  // should not return, but safety net
+
+    // ── Out-of-line IRQ handler ──────────────────────────────────────
+    // Saves the full TrapFrame (identical layout to el1_sync_handler)
+    // so Phase 2 can context-switch from IRQ as easily as from SVC.
+
+    "el1_irq_handler:",
+
+    // Allocate TrapFrame (264 bytes, padded to 272 for 16-byte alignment)
+    "sub sp, sp, #272",
+
+    // Save X0-X29 as pairs
+    "stp x0,  x1,  [sp, #0]",
+    "stp x2,  x3,  [sp, #16]",
+    "stp x4,  x5,  [sp, #32]",
+    "stp x6,  x7,  [sp, #48]",
+    "stp x8,  x9,  [sp, #64]",
+    "stp x10, x11, [sp, #80]",
+    "stp x12, x13, [sp, #96]",
+    "stp x14, x15, [sp, #112]",
+    "stp x16, x17, [sp, #128]",
+    "stp x18, x19, [sp, #144]",
+    "stp x20, x21, [sp, #160]",
+    "stp x22, x23, [sp, #176]",
+    "stp x24, x25, [sp, #192]",
+    "stp x26, x27, [sp, #208]",
+    "stp x28, x29, [sp, #224]",
+    // Save X30 (LR)
+    "str x30, [sp, #240]",
+    // Save ELR_EL1 and SPSR_EL1
+    "mrs x10, elr_el1",
+    "mrs x11, spsr_el1",
+    "stp x10, x11, [sp, #248]",
+
+    // Call Rust IRQ dispatch
+    "bl irq_dispatch",
+
+    // Restore ELR and SPSR
+    "ldp x10, x11, [sp, #248]",
+    "msr elr_el1, x10",
+    "msr spsr_el1, x11",
+
+    // Restore X0-X29
+    "ldp x0,  x1,  [sp, #0]",
+    "ldp x2,  x3,  [sp, #16]",
+    "ldp x4,  x5,  [sp, #32]",
+    "ldp x6,  x7,  [sp, #48]",
+    "ldp x8,  x9,  [sp, #64]",
+    "ldp x10, x11, [sp, #80]",
+    "ldp x12, x13, [sp, #96]",
+    "ldp x14, x15, [sp, #112]",
+    "ldp x16, x17, [sp, #128]",
+    "ldp x18, x19, [sp, #144]",
+    "ldp x20, x21, [sp, #160]",
+    "ldp x22, x23, [sp, #176]",
+    "ldp x24, x25, [sp, #192]",
+    "ldp x26, x27, [sp, #208]",
+    "ldp x28, x29, [sp, #224]",
+    "ldr x30, [sp, #240]",
+
+    // Deallocate TrapFrame
+    "add sp, sp, #272",
+    "eret",
 );
+
+use crate::gic;
+use crate::timer;
+
+/// IRQ dispatch — called from `el1_irq_handler` assembly.
+///
+/// Acknowledges the interrupt via GIC, routes to the appropriate handler,
+/// and signals end-of-interrupt. Spurious interrupts (INTID 1023) are
+/// silently ignored — writing 1023 to ICC_EOIR1_EL1 is UNPREDICTABLE.
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+extern "C" fn irq_dispatch() {
+    let intid = gic::ack();
+    match intid {
+        gic::TIMER_INTID => timer::on_tick(),
+        gic::SPURIOUS => {}
+        _ => {
+            // Unexpected interrupt — EOI it to prevent the GIC from
+            // suppressing further interrupts, but otherwise ignore.
+        }
+    }
+    if intid != gic::SPURIOUS {
+        gic::eoi(intid);
+    }
+}

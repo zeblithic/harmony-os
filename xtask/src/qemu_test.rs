@@ -259,7 +259,7 @@ fn aarch64_qemu_config(timeout: Duration, firmware: &Path) -> QemuConfig {
         qemu_binary: "qemu-system-aarch64".into(),
         qemu_args: vec![
             "-machine".into(),
-            "virt".into(),
+            "virt,gic-version=3".into(),
             "-cpu".into(),
             "max".into(),
             "-m".into(),

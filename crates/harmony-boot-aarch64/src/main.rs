@@ -13,6 +13,7 @@ mod mmu;
 mod pl011;
 mod rndr;
 mod timer;
+mod gic;
 
 mod platform;
 
@@ -448,6 +449,38 @@ fn main() -> Status {
     // dispatch target from the moment exceptions are enabled.
     unsafe { vectors::init() };
     let _ = writeln!(serial, "[Vectors] Exception vector table installed");
+
+    // ── Initialize GICv3 interrupt controller + timer interrupts ──
+    // GIC and timer constants are only defined for qemu-virt. RPi5 uses
+    // Apple AIC — interrupt support tracked by harmony-os-1hc.
+    #[cfg(feature = "qemu-virt")]
+    {
+        unsafe {
+            gic::init(
+                platform::GICD_BASE as *mut u8,
+                platform::GICR_BASE as *mut u8,
+            )
+        };
+        let _ = writeln!(
+            serial,
+            "[GIC] GICv3 initialized: GICD={:#x} GICR={:#x}",
+            platform::GICD_BASE,
+            platform::GICR_BASE,
+        );
+
+        // Arm the physical timer at 100 Hz.
+        timer::enable_tick(100);
+        let _ = writeln!(
+            serial,
+            "[Timer] 100 Hz tick armed (reload={})",
+            timer::freq() / 100,
+        );
+
+        // Unmask IRQ exceptions.
+        // From this point forward, el1_irq_handler fires on every timer tick.
+        unsafe { core::arch::asm!("msr daifclr, #2") };
+        let _ = writeln!(serial, "[IRQ] Interrupts unmasked");
+    }
 
     // ── Phase 3: Load and run embedded test ELF ──
     let test_exit_code: i64;

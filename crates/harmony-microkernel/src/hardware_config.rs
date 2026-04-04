@@ -49,6 +49,10 @@ pub struct InterruptControllerConfig {
     pub base: u64,
     pub size: u64,
     pub variant: InterruptControllerVariant,
+    /// GICv3 redistributor base address. `None` for GICv2/AIC.
+    pub redistributor_base: Option<u64>,
+    /// GICv3 redistributor region size in bytes. `None` for GICv2/AIC.
+    pub redistributor_size: Option<u64>,
 }
 
 // ── VirtIO MMIO device ───────────────────────────────────────────────────────
@@ -160,12 +164,19 @@ mod tests {
                             }
                         }
                         "arm,gic-v3" => {
-                            if let Some(reg) = node.reg().and_then(|mut r| r.next()) {
-                                config.interrupt_controller = Some(InterruptControllerConfig {
-                                    base: reg.starting_address as u64,
-                                    size: reg.size.unwrap_or(0x10000) as u64,
-                                    variant: InterruptControllerVariant::GicV3,
-                                });
+                            if let Some(mut regs) = node.reg() {
+                                if let Some(gicd_reg) = regs.next() {
+                                    let gicr_reg = regs.next();
+                                    config.interrupt_controller = Some(InterruptControllerConfig {
+                                        base: gicd_reg.starting_address as u64,
+                                        size: gicd_reg.size.unwrap_or(0x10000) as u64,
+                                        variant: InterruptControllerVariant::GicV3,
+                                        redistributor_base: gicr_reg
+                                            .map(|r| r.starting_address as u64),
+                                        redistributor_size: gicr_reg
+                                            .map(|r| r.size.unwrap_or(0xF60000) as u64),
+                                    });
+                                }
                             }
                         }
                         "arm,cortex-a15-gic" | "arm,gic-400" => {
@@ -174,6 +185,8 @@ mod tests {
                                     base: reg.starting_address as u64,
                                     size: reg.size.unwrap_or(0x10000) as u64,
                                     variant: InterruptControllerVariant::GicV2,
+                                    redistributor_base: None,
+                                    redistributor_size: None,
                                 });
                             }
                         }
@@ -234,5 +247,30 @@ mod tests {
         assert_eq!(aic, InterruptControllerVariant::AppleAic);
         assert_ne!(gicv2, gicv3);
         assert_ne!(gicv3, aic);
+    }
+
+    #[test]
+    fn gicv3_redistributor_fields() {
+        let config = InterruptControllerConfig {
+            base: 0x0800_0000,
+            size: 0x1_0000,
+            variant: InterruptControllerVariant::GicV3,
+            redistributor_base: Some(0x080A_0000),
+            redistributor_size: Some(0xF6_0000),
+        };
+        assert_eq!(config.redistributor_base, Some(0x080A_0000));
+        assert_eq!(config.redistributor_size, Some(0xF6_0000));
+    }
+
+    #[test]
+    fn gicv2_redistributor_fields_are_none() {
+        let config = InterruptControllerConfig {
+            base: 0x0800_0000,
+            size: 0x1_0000,
+            variant: InterruptControllerVariant::GicV2,
+            redistributor_base: None,
+            redistributor_size: None,
+        };
+        assert_eq!(config.redistributor_base, None);
     }
 }
