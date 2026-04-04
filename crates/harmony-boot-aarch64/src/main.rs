@@ -496,6 +496,42 @@ fn main() -> Status {
             unsafe { sched::wake_by_fd(fd, op) };
         });
 
+        // Thread spawning callback — creates a new scheduler task from clone().
+        linuxulator.set_spawn_fn(|pid, tid, tls, clear_child_tid, child_stack| {
+            let parent_tf = unsafe { syscall::current_trapframe() };
+            if parent_tf.is_null() {
+                return None;
+            }
+            unsafe {
+                sched::spawn_task_runtime(
+                    "thread",
+                    pid,
+                    tid,
+                    tls,
+                    clear_child_tid,
+                    parent_tf,
+                    child_stack,
+                )
+            }
+            .map(|_idx| tid) // Return the TID on success, not the task index
+        });
+
+        // Futex blocking callback — blocks current task on a futex word.
+        linuxulator.set_futex_block_fn(|uaddr| {
+            unsafe { sched::block_current(sched::WaitReason::Futex(uaddr)) };
+        });
+
+        // Futex wake callback — wakes up to `max` tasks blocked on a futex.
+        linuxulator.set_futex_wake_fn(|uaddr, max| unsafe { sched::futex_wake(uaddr, max) });
+
+        // Get current thread's TID.
+        linuxulator.set_get_current_tid_fn(|| unsafe { sched::current_task_tid() });
+
+        // Set current thread's clear_child_tid address (CLONE_CHILD_CLEARTID).
+        linuxulator.set_clear_child_tid_fn(|addr| {
+            unsafe { sched::set_current_clear_child_tid(addr) };
+        });
+
         // Move fully-configured Linuxulator to module-level static.
         unsafe { LINUXULATOR = Some(linuxulator) };
 

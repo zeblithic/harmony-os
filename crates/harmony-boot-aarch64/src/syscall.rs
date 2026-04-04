@@ -59,6 +59,21 @@ static mut RETURN_SP: u64 = 0;
 /// rather than from x2.  Kept for defensive completeness.
 static mut RETURN_LR: u64 = 0;
 
+/// Pointer to the current task's TrapFrame during SVC dispatch.
+/// Set by svc_handler before calling dispatch, read by spawn_fn callback
+/// to copy the parent's register state to the child.
+static mut CURRENT_TRAPFRAME: *const TrapFrame = core::ptr::null();
+
+/// Get the current TrapFrame pointer.
+///
+/// # Safety
+/// Must only be called from within the SVC dispatch path (i.e., from
+/// a callback invoked by svc_handler). The pointer is only valid for
+/// the duration of that dispatch.
+pub unsafe fn current_trapframe() -> *const TrapFrame {
+    CURRENT_TRAPFRAME
+}
+
 /// Install the syscall dispatch function.
 ///
 /// # Safety
@@ -122,6 +137,9 @@ pub unsafe fn reset_return_context() {
 #[cfg(target_arch = "aarch64")]
 #[no_mangle]
 pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
+    // Store TrapFrame pointer for spawn_fn callback (clone reads parent state).
+    CURRENT_TRAPFRAME = frame as *const TrapFrame;
+
     let nr = frame.x[8];
     let args = [
         frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
@@ -132,17 +150,46 @@ pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
     if let Some(dispatch) = DISPATCH_FN {
         let result = dispatch(syscall);
         if result.exited {
-            PROCESS_EXITED = true;
-            EXIT_CODE = result.exit_code;
-            if RETURN_ADDR != 0 {
-                // Redirect eret to the boot code's return point.
-                // The vector table restore sequence loads these from the
-                // TrapFrame before eret, so the binary never resumes.
-                frame.elr = RETURN_ADDR;
-                frame.x[0] = result.exit_code as u64;
-                frame.x[1] = RETURN_SP;
-                frame.x[2] = RETURN_LR;
-                return;
+            // Check if this is a thread exit or process exit.
+            let tid = crate::sched::current_task_tid();
+            let pid = crate::sched::current_task_pid();
+
+            if tid != pid {
+                // Spawned thread exit — clean up and die.
+                let clear_addr = crate::sched::current_task_clear_child_tid();
+                if clear_addr != 0 {
+                    // CLONE_CHILD_CLEARTID: zero the word and wake futex waiters.
+                    *(clear_addr as *mut u32) = 0;
+                    crate::sched::futex_wake(clear_addr, 1);
+                }
+                crate::sched::mark_current_dead();
+                // Trigger context switch away from this dead task.
+                core::arch::asm!("msr daifclr, #2");
+                crate::gic::send_sgi_self(crate::gic::YIELD_SGI);
+                core::arch::asm!("msr daifset, #2");
+                // Dead task is never rescheduled — loop as a safety net.
+                loop {
+                    core::arch::asm!("wfi");
+                }
+            }
+
+            // Main thread exit (TID == PID) — kill all sibling threads first.
+            crate::sched::kill_threads_by_pid(pid);
+
+            // Existing exit_group behavior: redirect ELR to return address.
+            if !PROCESS_EXITED {
+                PROCESS_EXITED = true;
+                EXIT_CODE = result.exit_code;
+                if RETURN_ADDR != 0 {
+                    // Redirect eret to the boot code's return point.
+                    // The vector table restore sequence loads these from the
+                    // TrapFrame before eret, so the binary never resumes.
+                    frame.elr = RETURN_ADDR;
+                    frame.x[0] = result.exit_code as u64;
+                    frame.x[1] = RETURN_SP;
+                    frame.x[2] = RETURN_LR;
+                    return;
+                }
             }
             // Fallback: halt if no return address was set.
             loop {

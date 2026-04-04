@@ -636,9 +636,7 @@ pub unsafe fn futex_wake(uaddr: u64, max: u32) -> u32 {
             break;
         }
         let tcb = TASKS[i].assume_init_mut();
-        if tcb.state == TaskState::Blocked
-            && tcb.wait_reason == Some(WaitReason::Futex(uaddr))
-        {
+        if tcb.state == TaskState::Blocked && tcb.wait_reason == Some(WaitReason::Futex(uaddr)) {
             tcb.state = TaskState::Ready;
             tcb.wait_reason = None;
             woken += 1;
