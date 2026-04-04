@@ -107,22 +107,15 @@ pub fn rearm() {
 
 /// Timer tick callback — called by the IRQ handler on each timer interrupt.
 ///
-/// Increments the tick counter, rearms the timer. Every 100 ticks (once
-/// per second), prints the tick count. At tick 500, prints the scheduler
-/// verification line with both task counters (if tasks are running).
+/// Increments the tick counter and rearms the timer. Every 100 ticks
+/// (once per second), prints the tick count for liveness verification.
 #[cfg(target_arch = "aarch64")]
 pub fn on_tick() {
     let count = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     rearm();
 
-    // Print tick count once per second (every 100 ticks) for boot verification.
     if count % 100 == 0 {
         print_tick(count);
-    }
-
-    // At tick 500 (5 seconds), print scheduler verification if tasks are running.
-    if count == 500 {
-        print_sched_verification();
     }
 }
 
@@ -136,52 +129,6 @@ fn print_tick(count: u64) {
         unsafe { pl011::write_byte(b) };
     }
     print_u64(count);
-    unsafe {
-        pl011::write_byte(b'\r');
-        pl011::write_byte(b'\n');
-    }
-}
-
-/// Print scheduler verification line: "[Sched] Task 0: N, Task 1: M".
-/// Called exactly once at tick 500. Uses the same IRQ-safe serial write
-/// approach as `print_tick` — no allocator, no fmt.
-///
-/// Only prints if both counters are nonzero — a zero counter means that
-/// task never got CPU time, indicating a broken context switch.
-#[cfg(target_arch = "aarch64")]
-fn print_sched_verification() {
-    use crate::sched;
-
-    if sched::num_tasks() < 2 {
-        return;
-    }
-
-    let (c0, c1) = sched::task_counters();
-
-    use crate::pl011;
-
-    if c0 == 0 || c1 == 0 {
-        // The [Sched] Task 0: milestone won't match, so the QEMU boot test
-        // will time out (30s) and report failure. The FAIL message below
-        // appears in the serial output tail, aiding CI diagnosis.
-        for &b in b"[Sched] FAIL: context switch broken (counter is zero)\r\n" {
-            unsafe { pl011::write_byte(b) };
-        }
-        return;
-    }
-
-    // "[Sched] Task 0: "
-    for &b in b"[Sched] Task 0: " {
-        unsafe { pl011::write_byte(b) };
-    }
-    print_u64(c0);
-
-    // ", Task 1: "
-    for &b in b", Task 1: " {
-        unsafe { pl011::write_byte(b) };
-    }
-    print_u64(c1);
-
     unsafe {
         pl011::write_byte(b'\r');
         pl011::write_byte(b'\n');

@@ -220,15 +220,6 @@ pub fn task1() -> ! {
     }
 }
 
-/// Read both task counters (for verification output by timer::on_tick).
-#[cfg(target_arch = "aarch64")]
-pub fn task_counters() -> (u64, u64) {
-    (
-        TASK0_COUNTER.load(Ordering::Relaxed),
-        TASK1_COUNTER.load(Ordering::Relaxed),
-    )
-}
-
 /// State-aware round-robin scheduler — called from `irq_dispatch` on
 /// each timer tick.
 ///
