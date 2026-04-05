@@ -448,22 +448,25 @@ pub unsafe fn spawn_task_runtime(
     crate::mmu::mark_guard_page(guard_frame as u64);
 
     let stack_size = pages_needed * page_size;
-    let stack_top = base + stack_size;
-    let sp = stack_top - TRAPFRAME_SIZE;
 
-    // Copy parent's TrapFrame to child's kernel stack.
+    // Place the initial TrapFrame just below child_stack so that after
+    // context switch the asm epilogue's `add sp, sp, #800` produces
+    // SP = child_stack. musl's child clone wrapper does
+    // `ldp x1, x0, [sp]` to load fn/arg that were stored at
+    // child_stack by the parent's `stp x0, x3, [x1, #-16]!`.
+    //
+    // The kernel-allocated stack (base..base+stack_size) is retained
+    // for guard-page infrastructure but is not used as the thread's
+    // runtime stack — after the first eret the thread runs on
+    // child_stack (the musl-allocated user stack).
+    let sp = (child_stack as usize) - TRAPFRAME_SIZE;
+
+    // Copy parent's TrapFrame to just below child_stack.
     core::ptr::copy_nonoverlapping(parent_trapframe as *const u8, sp as *mut u8, TRAPFRAME_SIZE);
 
     // Modify child's TrapFrame: clone() returns 0 to child.
     let child_frame = sp as *mut crate::syscall::TrapFrame;
     (*child_frame).x[0] = 0;
-
-    // Note: child_stack is NOT written to the TrapFrame's SP here.
-    // On aarch64, musl's __clone passes child_stack in x1, and the
-    // child's clone wrapper does `mov sp, x1` after the syscall returns.
-    // Since we copied the parent's TrapFrame, x1 already contains
-    // the child_stack value from the parent's syscall arguments.
-    let _ = child_stack;
 
     TASKS[n] = MaybeUninit::new(TaskControlBlock {
         kernel_sp: sp,

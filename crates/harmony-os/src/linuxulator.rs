@@ -8703,8 +8703,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     /// FUTEX_WAKE (cmd 1): wakes up to val waiters via futex_wake_fn.
     ///   Returns the count of woken tasks (0 when no scheduler).
     /// All other operations return ENOSYS.
-    fn sys_futex(&mut self, uaddr: u64, op: i32, val: u32, timeout: u64) -> i64 {
-        const ETIMEDOUT: i64 = -110;
+    fn sys_futex(&mut self, uaddr: u64, op: i32, val: u32, _timeout: u64) -> i64 {
         // The op field's lower bits encode the command; upper bits are
         // flags (FUTEX_PRIVATE_FLAG, etc.).  Mask to the command bits.
         const FUTEX_CMD_MASK: i32 = 0x7f;
@@ -8717,13 +8716,13 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 if uaddr == 0 {
                     return EFAULT;
                 }
-                // Timed futex waits are not yet supported (requires timer-based
-                // unblock, tracked by harmony-os-ltv). Return ETIMEDOUT
-                // immediately so callers (e.g. pthread_cond_timedwait) don't
-                // block forever.
-                if timeout != 0 {
-                    return ETIMEDOUT;
-                }
+                // TODO(harmony-os-ltv): timed futex waits are not yet
+                // supported. We block unconditionally (ignoring the timeout)
+                // and rely on FUTEX_WAKE to unblock. This is correct for the
+                // common case (callers always have a matching wake), but means
+                // the timeout safety net doesn't fire. Timer-based unblock
+                // will add real timeout support.
+                //
                 // Atomicity note: the read-compare-block sequence is safe on
                 // single-core because SVC entry masks IRQs (PSTATE.I=1). No
                 // other task can run between the value check and block_fn
