@@ -2704,11 +2704,17 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     }
 
     /// Allocate the next thread TID. Monotonically increasing; starts at 2.
+    /// Wraps around u32, skipping 0 (reserved as main-thread sentinel).
     // Used by sys_clone (Task 6); suppress dead_code until then.
     #[allow(dead_code)]
     fn alloc_tid(&mut self) -> u32 {
+        // Skip TID 0 on wrap — svc_handler uses tid==0 to identify the
+        // boot-time main thread vs spawned threads.
+        if self.next_tid == 0 {
+            self.next_tid = 1;
+        }
         let tid = self.next_tid;
-        self.next_tid += 1;
+        self.next_tid = self.next_tid.wrapping_add(1);
         tid
     }
 
@@ -12100,6 +12106,19 @@ mod integration_tests {
         let t2 = lx.alloc_tid();
         assert_ne!(t1, t2);
         assert_eq!(t2, t1 + 1);
+    }
+
+    #[test]
+    fn alloc_tid_skips_zero_on_wrap() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // Force next_tid to u32::MAX so it wraps on the next increment.
+        lx.next_tid = u32::MAX;
+        let t1 = lx.alloc_tid();
+        assert_eq!(t1, u32::MAX);
+        // After wrapping, next_tid would be 0 — alloc_tid must skip it.
+        let t2 = lx.alloc_tid();
+        assert_eq!(t2, 1, "TID 0 is reserved for main thread sentinel");
     }
 
     // ── sys_clone thread creation tests ───────────────────────────

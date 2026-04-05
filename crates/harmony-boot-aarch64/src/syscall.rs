@@ -198,21 +198,24 @@ pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
                 crate::sched::kill_threads_by_pid(pid);
             }
 
-            // Existing exit_group behavior: redirect ELR to return address.
+            // Record exit status (only the first exit sets the code).
             if !PROCESS_EXITED {
                 PROCESS_EXITED = true;
                 EXIT_CODE = result.exit_code;
-                if RETURN_ADDR != 0 {
-                    // Redirect eret to the boot code's return point.
-                    // The vector table restore sequence loads these from the
-                    // TrapFrame before eret, so the binary never resumes.
-                    frame.elr = RETURN_ADDR;
-                    frame.x[0] = result.exit_code as u64;
-                    frame.x[1] = RETURN_SP;
-                    frame.x[2] = RETURN_LR;
-                    return;
-                }
             }
+
+            // Redirect ELR to boot code's return point. Always redirect
+            // if RETURN_ADDR is set — even if a spawned thread's exit_group
+            // already set PROCESS_EXITED. Without this, the main thread
+            // falls into the wfe halt below instead of returning to boot.
+            if RETURN_ADDR != 0 {
+                frame.elr = RETURN_ADDR;
+                frame.x[0] = EXIT_CODE as u64;
+                frame.x[1] = RETURN_SP;
+                frame.x[2] = RETURN_LR;
+                return;
+            }
+
             // Fallback: halt if no return address was set.
             loop {
                 core::arch::asm!("wfe");
