@@ -2704,14 +2704,20 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     }
 
     /// Allocate the next thread TID. Monotonically increasing; starts at 2.
-    /// Wraps around u32, skipping 0 (reserved as main-thread sentinel).
-    // Used by sys_clone (Task 6); suppress dead_code until then.
-    #[allow(dead_code)]
+    /// Wraps around u32, skipping 0 (svc_handler main-thread sentinel) and
+    /// `self.pid` (main thread's effective TID from sys_gettid).
     fn alloc_tid(&mut self) -> u32 {
-        // Skip TID 0 on wrap — svc_handler uses tid==0 to identify the
-        // boot-time main thread vs spawned threads.
-        if self.next_tid == 0 {
-            self.next_tid = 1;
+        // Skip TID 0 (svc_handler sentinel) and self.pid (main thread's
+        // visible TID via sys_gettid) to avoid collisions on wrap.
+        loop {
+            if self.next_tid == 0 {
+                self.next_tid = 1;
+            }
+            if self.next_tid == self.pid as u32 {
+                self.next_tid = self.next_tid.wrapping_add(1);
+                continue;
+            }
+            break;
         }
         let tid = self.next_tid;
         self.next_tid = self.next_tid.wrapping_add(1);
@@ -12109,16 +12115,17 @@ mod integration_tests {
     }
 
     #[test]
-    fn alloc_tid_skips_zero_on_wrap() {
+    fn alloc_tid_skips_zero_and_pid_on_wrap() {
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
-        // Force next_tid to u32::MAX so it wraps on the next increment.
+        // Default pid is 1. Force next_tid to u32::MAX so it wraps.
         lx.next_tid = u32::MAX;
         let t1 = lx.alloc_tid();
         assert_eq!(t1, u32::MAX);
-        // After wrapping, next_tid would be 0 — alloc_tid must skip it.
+        // After wrapping, next_tid would be 0 — skip 0 (sentinel) and
+        // 1 (self.pid, main thread's effective TID).
         let t2 = lx.alloc_tid();
-        assert_eq!(t2, 1, "TID 0 is reserved for main thread sentinel");
+        assert_eq!(t2, 2, "TID 0 and self.pid (1) are both reserved");
     }
 
     // ── sys_clone thread creation tests ───────────────────────────
