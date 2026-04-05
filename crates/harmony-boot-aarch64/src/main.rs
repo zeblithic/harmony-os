@@ -489,7 +489,7 @@ fn main() -> Status {
                 3 => sched::WaitReason::PollWait,
                 _ => unreachable!(),
             };
-            unsafe { sched::block_current(reason) };
+            unsafe { sched::block_current(reason, None) };
         });
 
         linuxulator.set_wake_fn(|fd, op| {
@@ -523,7 +523,7 @@ fn main() -> Status {
 
         // Futex blocking callback — blocks current task on a futex word.
         linuxulator.set_futex_block_fn(|uaddr| {
-            unsafe { sched::block_current(sched::WaitReason::Futex(uaddr)) };
+            unsafe { sched::block_current(sched::WaitReason::Futex(uaddr), None) };
         });
 
         // Futex wake callback — wakes up to `max` tasks blocked on a futex.
