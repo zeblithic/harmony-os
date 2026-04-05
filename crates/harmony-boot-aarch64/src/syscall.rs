@@ -167,6 +167,11 @@ pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
                     // We can't redirect the main thread's RETURN_ADDR from here
                     // (it's a different task's TrapFrame), but marking the
                     // process as exited ensures correct status reporting.
+                    // TODO(Phase 6, harmony-os-g9i): exit_group from a non-main
+                    // thread leaves the main thread Dead without ELR redirect.
+                    // The boot code's elf_task never sees "Binary exited". Fix
+                    // by patching the main thread's saved TrapFrame.elr to
+                    // RETURN_ADDR via its TCB kernel_sp, then marking it Ready.
                     PROCESS_EXITED = true;
                     EXIT_CODE = result.exit_code;
                 }

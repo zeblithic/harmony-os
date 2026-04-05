@@ -6349,22 +6349,24 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             // future flags can be handled incrementally.
             let _ = (CLONE_FS, CLONE_SYSVSEM, CLONE_SETTLS);
 
+            // Write CLONE_CHILD_SETTID BEFORE spawning — spawn_task_runtime
+            // unmasks IRQs before returning, so the child could be scheduled
+            // before the parent writes the TID. musl's pthread_join waits on
+            // this word via futex, so it must be set before the child can exit.
+            if flags & CLONE_CHILD_SETTID != 0 && child_tidptr != 0 {
+                unsafe {
+                    *(child_tidptr as *mut u32) = tid;
+                }
+            }
+
             // spawn_fn: (pid, tid, tls, clear_child_tid, child_stack)
             // The boot crate's implementation reads CURRENT_TRAPFRAME to
             // copy the parent's register state to the child.
             match spawn(self.pid as u32, tid, tls, clear_child_tid, child_stack) {
                 Some(_task_idx) => {
                     if flags & CLONE_PARENT_SETTID != 0 && parent_tidptr != 0 {
-                        // SAFETY: parent_tidptr is a userspace address in
-                        // the shared address space (CLONE_VM). The kernel
-                        // guarantees the page is mapped before clone.
                         unsafe {
                             *(parent_tidptr as *mut u32) = tid;
-                        }
-                    }
-                    if flags & CLONE_CHILD_SETTID != 0 && child_tidptr != 0 {
-                        unsafe {
-                            *(child_tidptr as *mut u32) = tid;
                         }
                     }
                     tid as i64

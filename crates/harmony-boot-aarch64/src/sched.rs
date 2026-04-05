@@ -688,6 +688,13 @@ pub unsafe fn kill_threads_by_pid(pid: u32) {
         }
         let tcb = TASKS[i].assume_init_mut();
         if tcb.pid == pid && tcb.state != TaskState::Dead {
+            // Perform CLEARTID cleanup for each killed thread so that
+            // any pthread_join waiter on clear_child_tid is woken.
+            if tcb.clear_child_tid != 0 {
+                *(tcb.clear_child_tid as *mut u32) = 0;
+                futex_wake(tcb.clear_child_tid, 1);
+                tcb.clear_child_tid = 0;
+            }
             tcb.state = TaskState::Dead;
             tcb.wait_reason = None;
         }
