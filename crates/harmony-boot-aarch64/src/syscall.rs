@@ -176,10 +176,12 @@ pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
                     crate::sched::futex_wake(clear_addr, 1);
                 }
                 crate::sched::mark_current_dead();
-                // Trigger context switch away from this dead task.
+                // Unmask IRQs and trigger SGI to switch away. Stay unmasked —
+                // the dead task never resumes, so the SVC-handler IRQ invariant
+                // (daifset before eret) does not apply. Re-masking would
+                // prevent the SGI/timer from firing, deadlocking the system.
                 core::arch::asm!("msr daifclr, #2");
                 crate::gic::send_sgi_self(crate::gic::YIELD_SGI);
-                core::arch::asm!("msr daifset, #2");
                 loop {
                     core::arch::asm!("wfi");
                 }
