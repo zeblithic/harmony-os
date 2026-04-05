@@ -6625,6 +6625,15 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         }
 
         // If scheduler + clock are available, do a real blocking sleep.
+        //
+        // NOTE: The blocking path uses the hardware monotonic timer
+        // (now_ms_fn) for ALL clocks, including CLOCK_REALTIME.  Our
+        // kernel has no real wall clock — self.realtime_ns is a sans-I/O
+        // counter that only advances on clock_gettime calls, not in real
+        // time.  The scheduler's check_deadlines compares against
+        // timer::now_ms() (monotonic), so all deadlines must be expressed
+        // in monotonic time.  A real CLOCK_REALTIME implementation would
+        // need a wall-clock ↔ monotonic offset, which is future work.
         if let (Some(_), Some(now_ms_fn)) = (self.block_fn, self.now_ms_fn) {
             let now_ms = now_ms_fn();
             let deadline_ms = if flags & TIMER_ABSTIME != 0 {
@@ -8766,6 +8775,15 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 }
                 // Parse timeout: a pointer to struct timespec { i64 tv_sec; i64 tv_nsec },
                 // or 0 (null) for no timeout. FUTEX_WAIT timeouts are relative.
+                //
+                // When timeout != 0 but now_ms_fn is None (no clock wired),
+                // we cannot compute a deadline — deadline_ms becomes None and
+                // the task blocks indefinitely.  This is deliberate: EAGAIN
+                // means "value mismatch" in FUTEX_WAIT Linux semantics, and
+                // returning it here would mislead the caller.  Blocking
+                // without a timeout is the honest degradation for a config
+                // that lacks a clock.  In practice, main.rs always wires
+                // now_ms_fn alongside futex_block_fn.
                 let deadline_ms: Option<u64> = if let (true, Some(now_ms)) =
                     (timeout != 0, self.now_ms_fn)
                 {
