@@ -39,6 +39,8 @@ pub struct SyscallDispatchResult {
     pub retval: i64,
     pub exited: bool,
     pub exit_code: i32,
+    /// True for exit_group (kill all threads), false for thread-only exit.
+    pub exit_group: bool,
 }
 
 /// Global dispatch function pointer. Set during boot before SVC is possible.
@@ -58,6 +60,21 @@ static mut RETURN_SP: u64 = 0;
 /// Currently vestigial: the asm epilogue restores LR from the stack
 /// rather than from x2.  Kept for defensive completeness.
 static mut RETURN_LR: u64 = 0;
+
+/// Pointer to the current task's TrapFrame during SVC dispatch.
+/// Set by svc_handler before calling dispatch, read by spawn_fn callback
+/// to copy the parent's register state to the child.
+static mut CURRENT_TRAPFRAME: *const TrapFrame = core::ptr::null();
+
+/// Get the current TrapFrame pointer.
+///
+/// # Safety
+/// Must only be called from within the SVC dispatch path (i.e., from
+/// a callback invoked by svc_handler). The pointer is only valid for
+/// the duration of that dispatch.
+pub unsafe fn current_trapframe() -> *const TrapFrame {
+    CURRENT_TRAPFRAME
+}
 
 /// Install the syscall dispatch function.
 ///
@@ -122,6 +139,9 @@ pub unsafe fn reset_return_context() {
 #[cfg(target_arch = "aarch64")]
 #[no_mangle]
 pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
+    // Store TrapFrame pointer for spawn_fn callback (clone reads parent state).
+    CURRENT_TRAPFRAME = frame as *const TrapFrame;
+
     let nr = frame.x[8];
     let args = [
         frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
@@ -132,18 +152,76 @@ pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
     if let Some(dispatch) = DISPATCH_FN {
         let result = dispatch(syscall);
         if result.exited {
-            PROCESS_EXITED = true;
-            EXIT_CODE = result.exit_code;
+            let tid = crate::sched::current_task_tid();
+            let pid = crate::sched::current_task_pid();
+
+            // For exit_group (from any thread), kill all threads first.
+            if result.exit_group {
+                crate::sched::kill_threads_by_pid(pid);
+            }
+
+            if tid != 0 {
+                // Spawned thread exit — CLEARTID cleanup and die.
+                if result.exit_group && !PROCESS_EXITED {
+                    // exit_group from a spawned thread: record process exit.
+                    // We can't redirect the main thread's RETURN_ADDR from here
+                    // (it's a different task's TrapFrame), but marking the
+                    // process as exited ensures correct status reporting.
+                    // TODO(Phase 6, harmony-os-g9i): exit_group from a non-main
+                    // thread leaves the main thread Dead without ELR redirect.
+                    // The boot code's elf_task never sees "Binary exited". Fix
+                    // by patching the main thread's saved TrapFrame.elr to
+                    // RETURN_ADDR via its TCB kernel_sp, then marking it Ready.
+                    PROCESS_EXITED = true;
+                    EXIT_CODE = result.exit_code;
+                }
+                let clear_addr = crate::sched::current_task_clear_child_tid();
+                if clear_addr != 0 {
+                    *(clear_addr as *mut u32) = 0;
+                    crate::sched::futex_wake(clear_addr, 1);
+                }
+                crate::sched::mark_current_dead();
+                // Unmask IRQs and trigger SGI to switch away. Stay unmasked —
+                // the dead task never resumes, so the SVC-handler IRQ invariant
+                // (daifset before eret) does not apply. Re-masking would
+                // prevent the SGI/timer from firing, deadlocking the system.
+                core::arch::asm!("msr daifclr, #2");
+                crate::gic::send_sgi_self(crate::gic::YIELD_SGI);
+                loop {
+                    core::arch::asm!("wfi");
+                }
+            }
+
+            // SYS_EXIT from main thread: per Linux semantics, only the
+            // calling thread exits — other threads continue running.
+            // We do NOT call kill_threads_by_pid here (exit_group
+            // already handled that above for the exit_group case).
+            //
+            // TODO(Phase 6, harmony-os-g9i): the main thread still
+            // redirects ELR to RETURN_ADDR below, which returns
+            // control to boot code while spawned threads may still
+            // be running. Correct behavior requires last-thread-exit
+            // detection so the boot code is only notified when every
+            // thread has exited.
+
+            // Record exit status (only the first exit sets the code).
+            if !PROCESS_EXITED {
+                PROCESS_EXITED = true;
+                EXIT_CODE = result.exit_code;
+            }
+
+            // Redirect ELR to boot code's return point. Always redirect
+            // if RETURN_ADDR is set — even if a spawned thread's exit_group
+            // already set PROCESS_EXITED. Without this, the main thread
+            // falls into the wfe halt below instead of returning to boot.
             if RETURN_ADDR != 0 {
-                // Redirect eret to the boot code's return point.
-                // The vector table restore sequence loads these from the
-                // TrapFrame before eret, so the binary never resumes.
                 frame.elr = RETURN_ADDR;
-                frame.x[0] = result.exit_code as u64;
+                frame.x[0] = EXIT_CODE as u64;
                 frame.x[1] = RETURN_SP;
                 frame.x[2] = RETURN_LR;
                 return;
             }
+
             // Fallback: halt if no return address was set.
             loop {
                 core::arch::asm!("wfe");

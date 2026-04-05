@@ -496,17 +496,76 @@ fn main() -> Status {
             unsafe { sched::wake_by_fd(fd, op) };
         });
 
+        // Thread spawning callback — creates a new scheduler task from clone().
+        // Uses the *scheduler* PID (from the calling task's TCB) so that
+        // kill_threads_by_pid can find spawned threads on exit_group.
+        // The Linuxulator passes its Linux PID (1), but the ELF task's
+        // scheduler PID is 2 — we must use the scheduler PID for consistency.
+        linuxulator.set_spawn_fn(|_linux_pid, tid, tls, clear_child_tid, child_stack| {
+            let parent_tf = unsafe { syscall::current_trapframe() };
+            if parent_tf.is_null() {
+                return None;
+            }
+            let sched_pid = unsafe { sched::current_task_pid() };
+            unsafe {
+                sched::spawn_task_runtime(
+                    "thread",
+                    sched_pid,
+                    tid,
+                    tls,
+                    clear_child_tid,
+                    parent_tf,
+                    child_stack,
+                )
+            }
+            .map(|_idx| tid)
+        });
+
+        // Futex blocking callback — blocks current task on a futex word.
+        linuxulator.set_futex_block_fn(|uaddr| {
+            unsafe { sched::block_current(sched::WaitReason::Futex(uaddr)) };
+        });
+
+        // Futex wake callback — wakes up to `max` tasks blocked on a futex.
+        linuxulator.set_futex_wake_fn(|uaddr, max| unsafe { sched::futex_wake(uaddr, max) });
+
+        // Get current thread's TID.
+        linuxulator.set_get_current_tid_fn(|| unsafe { sched::current_task_tid() });
+
+        // Set current thread's clear_child_tid address (CLONE_CHILD_CLEARTID).
+        linuxulator.set_clear_child_tid_fn(|addr| {
+            unsafe { sched::set_current_clear_child_tid(addr) };
+        });
+
         // Move fully-configured Linuxulator to module-level static.
         unsafe { LINUXULATOR = Some(linuxulator) };
 
-        // Install dispatch function for the SVC handler
+        // Install dispatch function for the SVC handler.
+        // Detect exit from the syscall variant, NOT from lx.exited().
+        // lx.exited() is process-level state that poisons all threads —
+        // if a spawned thread calls SYS_EXIT and sets exit_code, every
+        // subsequent syscall from any thread would see exited=true.
         fn dispatch(syscall: LinuxSyscall) -> syscall::SyscallDispatchResult {
+            let is_exit = matches!(syscall, LinuxSyscall::Exit { .. });
+            let is_exit_group = matches!(syscall, LinuxSyscall::ExitGroup { .. });
+
             let lx = unsafe { LINUXULATOR.as_mut().unwrap() };
             let retval = lx.dispatch_syscall(syscall);
-            syscall::SyscallDispatchResult {
-                retval,
-                exited: lx.exited(),
-                exit_code: lx.exit_code().unwrap_or(0),
+
+            if is_exit || is_exit_group {
+                syscall::SyscallDispatchResult {
+                    retval,
+                    exited: true,
+                    exit_code: lx.exit_code().unwrap_or(0),
+                    exit_group: is_exit_group,
+                }
+            } else {
+                syscall::SyscallDispatchResult {
+                    retval,
+                    exited: false,
+                    exit_code: 0,
+                    exit_group: false,
+                }
             }
         }
         unsafe { syscall::set_dispatch_fn(dispatch) };
@@ -553,6 +612,9 @@ fn main() -> Status {
         let _ = writeln!(serial, "[Sched] Spawned system task (PID 1)");
         unsafe { sched::spawn_task("elf", 2, elf_task, &mut bump) };
         let _ = writeln!(serial, "[Sched] Spawned elf task (PID 2)");
+
+        // Move bump allocator to static for runtime task spawning (Phase 5 threads).
+        unsafe { sched::set_bump_allocator(bump) };
 
         // Enter the scheduler — loads task 0's TrapFrame and erets into it.
         // The eret atomically unmasks IRQs via SPSR (I=0 in INITIAL_SPSR),
@@ -1206,6 +1268,10 @@ fn check_and_wake_blocked_tasks() {
                     if linuxulator.is_wait_ready(2, fd) {
                         sched::wake(idx);
                     }
+                }
+                sched::WaitReason::Futex(_) => {
+                    // Futex waiters are woken by futex_wake(), not by I/O
+                    // readiness. The system task has nothing to do here.
                 }
             }
         });

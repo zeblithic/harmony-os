@@ -336,7 +336,9 @@ pub enum LinuxSyscall {
         code: i32,
         addr: u64,
     },
-    SetTidAddress,
+    SetTidAddress {
+        tidptr: u64,
+    },
     ExitGroup {
         code: i32,
     },
@@ -437,6 +439,8 @@ pub enum LinuxSyscall {
         uaddr: u64,
         op: i32,
         val: u32,
+        /// Pointer to struct timespec for FUTEX_WAIT timeout. 0 = wait forever.
+        timeout: u64,
     },
     SchedGetaffinity {
         pid: i32,
@@ -1017,6 +1021,7 @@ impl LinuxSyscall {
                 uaddr: args[0],
                 op: args[1] as i32,
                 val: args[2] as u32,
+                timeout: args[3],
             },
             204 => LinuxSyscall::SchedGetaffinity {
                 pid: args[0] as i32,
@@ -1028,7 +1033,7 @@ impl LinuxSyscall {
                 dirp: args[1],
                 count: args[2],
             },
-            218 => LinuxSyscall::SetTidAddress,
+            218 => LinuxSyscall::SetTidAddress { tidptr: args[0] },
             228 => LinuxSyscall::ClockGettime {
                 clockid: args[0] as i32,
                 tp: args[1],
@@ -1354,11 +1359,12 @@ impl LinuxSyscall {
             94 => LinuxSyscall::ExitGroup {
                 code: args[0] as i32,
             },
-            96 => LinuxSyscall::SetTidAddress,
+            96 => LinuxSyscall::SetTidAddress { tidptr: args[0] },
             98 => LinuxSyscall::Futex {
                 uaddr: args[0],
                 op: args[1] as i32,
                 val: args[2] as u32,
+                timeout: args[3],
             },
             99 => LinuxSyscall::SetRobustList,
             101 => LinuxSyscall::Nanosleep {
@@ -2507,6 +2513,20 @@ pub struct Linuxulator<
     /// pipe/eventfd writes for synchronous waking. Arguments: (fd: i32, op: u8)
     /// where op is 0=readable, 1=writable.
     wake_fn: Option<fn(i32, u8)>,
+    /// Spawn a new thread task. Args: (pid, tid, tls, clear_child_tid, child_stack).
+    /// Returns Some(task_index) on success, None if MAX_TASKS reached.
+    #[allow(clippy::type_complexity)]
+    spawn_fn: Option<fn(u32, u32, u64, u64, u64) -> Option<u32>>,
+    /// Block current task on a futex address.
+    futex_block_fn: Option<fn(u64)>,
+    /// Wake up to N tasks blocked on a futex address. Returns count woken.
+    futex_wake_fn: Option<fn(u64, u32) -> u32>,
+    /// Get the current task's TID.
+    get_current_tid_fn: Option<fn() -> u32>,
+    /// Set the current task's clear_child_tid address.
+    set_clear_child_tid_fn: Option<fn(u64)>,
+    /// Next TID to assign to a spawned thread. Starts at pid + 1.
+    next_tid: u32,
 }
 
 impl<B: SyscallBackend> Linuxulator<B, NoTcp> {
@@ -2579,6 +2599,12 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             poll_fn: None,
             block_fn: None,
             wake_fn: None,
+            spawn_fn: None,
+            futex_block_fn: None,
+            futex_wake_fn: None,
+            get_current_tid_fn: None,
+            set_clear_child_tid_fn: None,
+            next_tid: 2,
         }
     }
 
@@ -2607,6 +2633,33 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     /// wake any task blocked on the corresponding read end.
     pub fn set_wake_fn(&mut self, f: fn(i32, u8)) {
         self.wake_fn = Some(f);
+    }
+
+    /// Set the spawn callback. Called by sys_clone to create a new thread task.
+    pub fn set_spawn_fn(&mut self, f: fn(u32, u32, u64, u64, u64) -> Option<u32>) {
+        self.spawn_fn = Some(f);
+    }
+
+    /// Set the futex block callback. Called by FUTEX_WAIT when the value matches,
+    /// to block the current task until woken.
+    pub fn set_futex_block_fn(&mut self, f: fn(u64)) {
+        self.futex_block_fn = Some(f);
+    }
+
+    /// Set the futex wake callback. Called by FUTEX_WAKE to wake blocked tasks.
+    pub fn set_futex_wake_fn(&mut self, f: fn(u64, u32) -> u32) {
+        self.futex_wake_fn = Some(f);
+    }
+
+    /// Set the get-current-TID callback. Called by sys_gettid and sys_set_tid_address.
+    pub fn set_get_current_tid_fn(&mut self, f: fn() -> u32) {
+        self.get_current_tid_fn = Some(f);
+    }
+
+    /// Set the set-clear-child-tid callback. Called by sys_set_tid_address to
+    /// register the tidptr with the current task's TCB.
+    pub fn set_clear_child_tid_fn(&mut self, f: fn(u64)) {
+        self.set_clear_child_tid_fn = Some(f);
     }
 
     /// Drive the network stack. Called by the system task's event loop
@@ -2648,6 +2701,27 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         } else {
             BlockResult::Interrupted
         }
+    }
+
+    /// Allocate the next thread TID. Monotonically increasing; starts at 2.
+    /// Wraps around u32, skipping 0 (svc_handler main-thread sentinel) and
+    /// `self.pid` (main thread's effective TID from sys_gettid).
+    fn alloc_tid(&mut self) -> u32 {
+        // Skip TID 0 (svc_handler sentinel) and self.pid (main thread's
+        // visible TID via sys_gettid) to avoid collisions on wrap.
+        loop {
+            if self.next_tid == 0 {
+                self.next_tid = 1;
+            }
+            if self.next_tid == self.pid as u32 {
+                self.next_tid = self.next_tid.wrapping_add(1);
+                continue;
+            }
+            break;
+        }
+        let tid = self.next_tid;
+        self.next_tid = self.next_tid.wrapping_add(1);
+        tid
     }
 
     /// Find the fd number for the write end of the pipe with the given pipe_id.
@@ -3297,7 +3371,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             LinuxSyscall::ArchPrctl { code, addr } => self.sys_arch_prctl(code, addr),
             #[cfg(not(target_arch = "x86_64"))]
             LinuxSyscall::ArchPrctl { .. } => ENOSYS,
-            LinuxSyscall::SetTidAddress => self.sys_set_tid_address(),
+            LinuxSyscall::SetTidAddress { tidptr } => self.sys_set_tid_address(tidptr),
             LinuxSyscall::ExitGroup { code } => self.sys_exit_group(code),
             LinuxSyscall::Openat {
                 dirfd,
@@ -3359,7 +3433,12 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             LinuxSyscall::Getgid => self.sys_getgid(),
             LinuxSyscall::Getegid => self.sys_getegid(),
             LinuxSyscall::Madvise { .. } => self.sys_madvise(),
-            LinuxSyscall::Futex { uaddr, op, val } => self.sys_futex(uaddr, op, val),
+            LinuxSyscall::Futex {
+                uaddr,
+                op,
+                val,
+                timeout,
+            } => self.sys_futex(uaddr, op, val, timeout),
             LinuxSyscall::SchedGetaffinity {
                 cpusetsize, mask, ..
             } => self.sys_sched_getaffinity(cpusetsize, mask),
@@ -3457,7 +3536,13 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             } => self.sys_epoll_wait(epfd, events, maxevents, timeout),
             LinuxSyscall::Fork => self.sys_fork(),
             LinuxSyscall::Vfork => self.sys_fork(),
-            LinuxSyscall::Clone { flags, .. } => self.sys_clone(flags),
+            LinuxSyscall::Clone {
+                flags,
+                child_stack,
+                parent_tid,
+                child_tid,
+                tls,
+            } => self.sys_clone(flags, child_stack, parent_tid, tls, child_tid),
             LinuxSyscall::Clone3 { .. } => ENOSYS,
             LinuxSyscall::Wait4 {
                 pid,
@@ -6182,6 +6267,14 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             // Scheduler callbacks — inherited by child so blocking ops use the same scheduler.
             block_fn: self.block_fn,
             wake_fn: self.wake_fn,
+            // Thread callbacks — inherited by child.
+            spawn_fn: self.spawn_fn,
+            futex_block_fn: self.futex_block_fn,
+            futex_wake_fn: self.futex_wake_fn,
+            get_current_tid_fn: self.get_current_tid_fn,
+            set_clear_child_tid_fn: self.set_clear_child_tid_fn,
+            // next_tid: child starts fresh from 2 (its own TID space).
+            next_tid: 2,
         };
         // Move shared pipe/eventfd state to child
         core::mem::swap(&mut self.pipes, &mut child.pipes);
@@ -6226,35 +6319,103 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         child_pid as i64
     }
 
-    /// Linux clone(2): validate flags and delegate to fork.
+    /// Linux clone(2): thread creation via `spawn_fn`, or fork delegation.
     ///
-    /// Accepts SIGCHLD (17) optionally combined with CLONE_CHILD_SETTID
-    /// and CLONE_CHILD_CLEARTID (musl's fork() wrapper). Threading
-    /// flags (CLONE_VM, CLONE_THREAD, CLONE_FILES) return ENOSYS.
-    fn sys_clone(&mut self, flags: u64) -> i64 {
-        const CLONE_VM: u64 = 0x00000100;
-        const CLONE_FILES: u64 = 0x00000400;
-        const CLONE_THREAD: u64 = 0x00010000;
-        const CLONE_CHILD_SETTID: u64 = 0x01000000;
-        const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
+    /// Two paths:
+    /// 1. **Thread creation** — flags include CLONE_VM|CLONE_THREAD|
+    ///    CLONE_FILES|CLONE_SIGHAND (musl's pthread_create). Allocates a
+    ///    TID and calls `spawn_fn` to create a new scheduler task.
+    /// 2. **Fork** — SIGCHLD (17) optionally combined with
+    ///    CLONE_CHILD_SETTID/CLONE_CHILD_CLEARTID (musl's fork wrapper).
+    ///    Delegates to `sys_fork()`.
+    fn sys_clone(
+        &mut self,
+        flags: u64,
+        child_stack: u64,
+        parent_tidptr: u64,
+        tls: u64,
+        child_tidptr: u64,
+    ) -> i64 {
+        const CLONE_VM: u64 = 0x0000_0100;
+        const CLONE_FS: u64 = 0x0000_0200;
+        const CLONE_FILES: u64 = 0x0000_0400;
+        const CLONE_SIGHAND: u64 = 0x0000_0800;
+        const CLONE_THREAD: u64 = 0x0001_0000;
+        const CLONE_SYSVSEM: u64 = 0x0004_0000;
+        const CLONE_SETTLS: u64 = 0x0008_0000;
+        const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+        const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+        const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 
-        // Reject threading flags
-        if flags & (CLONE_VM | CLONE_FILES | CLONE_THREAD) != 0 {
-            return ENOSYS;
-        }
-
-        // Accept SIGCHLD with optional TID flags. CLONE_CHILD_SETTID and
-        // CLONE_CHILD_CLEARTID are accepted but not acted upon — the TID
-        // writes are not performed. This is safe for fork() because musl's
-        // waitpid uses SIGCHLD-based waiting for child processes, not
-        // futex-based TID polling (which is only used for threads).
         let sig = flags & 0xFF;
-        let known_flags = SIGCHLD_NUM as u64 | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
-        if sig != SIGCHLD_NUM as u64 || (flags & !known_flags) != 0 {
-            return ENOSYS;
-        }
+        let required_thread = CLONE_VM | CLONE_THREAD | CLONE_FILES | CLONE_SIGHAND;
 
-        self.sys_fork()
+        if flags & required_thread == required_thread {
+            // ── Thread creation path (musl pthreads) ──────────────
+            let spawn = match self.spawn_fn {
+                Some(f) => f,
+                None => return ENOSYS,
+            };
+
+            let tid = self.alloc_tid();
+            let clear_child_tid = if flags & CLONE_CHILD_CLEARTID != 0 {
+                child_tidptr
+            } else {
+                0
+            };
+
+            // Remaining flags are informational (FS, SYSVSEM, SETTLS) or
+            // handled here (PARENT_SETTID, CHILD_SETTID). We accept them
+            // without rejecting unknown extras — musl sends a fixed set and
+            // future flags can be handled incrementally.
+            let _ = (CLONE_FS, CLONE_SYSVSEM, CLONE_SETTLS);
+
+            // Write CLONE_CHILD_SETTID BEFORE spawning — spawn_task_runtime
+            // unmasks IRQs before returning, so the child could be scheduled
+            // before the parent writes the TID. musl's pthread_join waits on
+            // this word via futex, so it must be set before the child can exit.
+            if flags & CLONE_CHILD_SETTID != 0 && child_tidptr != 0 {
+                unsafe {
+                    *(child_tidptr as *mut u32) = tid;
+                }
+            }
+
+            // spawn_fn: (pid, tid, tls, clear_child_tid, child_stack)
+            // The boot crate's implementation reads CURRENT_TRAPFRAME to
+            // copy the parent's register state to the child.
+            match spawn(self.pid as u32, tid, tls, clear_child_tid, child_stack) {
+                Some(_task_idx) => {
+                    if flags & CLONE_PARENT_SETTID != 0 && parent_tidptr != 0 {
+                        unsafe {
+                            *(parent_tidptr as *mut u32) = tid;
+                        }
+                    }
+                    tid as i64
+                }
+                None => {
+                    // Undo CHILD_SETTID write on failure.
+                    if flags & CLONE_CHILD_SETTID != 0 && child_tidptr != 0 {
+                        unsafe {
+                            *(child_tidptr as *mut u32) = 0;
+                        }
+                    }
+                    EAGAIN // MAX_TASKS reached
+                }
+            }
+        } else if sig == SIGCHLD_NUM as u64 {
+            // ── Fork path ─────────────────────────────────────────
+            // Accept SIGCHLD with optional TID flags. CLONE_CHILD_SETTID
+            // and CLONE_CHILD_CLEARTID are accepted but not acted upon —
+            // musl's waitpid uses SIGCHLD-based waiting for child
+            // processes, not futex-based TID polling (threads only).
+            let known_fork_flags = SIGCHLD_NUM as u64 | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
+            if (flags & !known_fork_flags) != 0 {
+                return ENOSYS;
+            }
+            self.sys_fork()
+        } else {
+            ENOSYS
+        }
     }
 
     /// Linux wait4(2): wait for a child process to exit.
@@ -7573,8 +7734,20 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         0
     }
 
-    /// Linux set_tid_address(2): return TID = 1 (single-threaded).
-    fn sys_set_tid_address(&self) -> i64 {
+    /// Linux set_tid_address(2): register clear_child_tid pointer and return current TID.
+    fn sys_set_tid_address(&self, tidptr: u64) -> i64 {
+        if let Some(set_ctid) = self.set_clear_child_tid_fn {
+            set_ctid(tidptr);
+        }
+        // Return this thread's TID. For spawned threads, get_current_tid_fn
+        // returns the allocated TID (nonzero). For the main thread (TID=0
+        // in TCB), fall back to self.pid so gettid() == getpid().
+        if let Some(get_tid) = self.get_current_tid_fn {
+            let tid = get_tid();
+            if tid != 0 {
+                return tid as i64;
+            }
+        }
         self.pid as i64
     }
 
@@ -8472,8 +8645,18 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
     /// Linux gettid(2): return thread ID.
     ///
-    /// Single-threaded model — TID matches PID.
+    /// When a scheduler is active, delegates to get_current_tid_fn so the
+    /// current task's TID is returned. Falls back to PID when no scheduler
+    /// is present (single-threaded model).
     fn sys_gettid(&self) -> i64 {
+        if let Some(get_tid) = self.get_current_tid_fn {
+            let tid = get_tid();
+            if tid != 0 {
+                return tid as i64;
+            }
+            // TID == 0 means boot-time task (main thread).
+            // Fall through to return self.pid so gettid() == getpid().
+        }
         self.pid as i64
     }
 
@@ -8514,32 +8697,54 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
     /// Linux futex(2): fast userspace locking.
     ///
-    /// FUTEX_WAKE (cmd 1): returns 0 (no waiters — single-threaded).
-    /// FUTEX_WAIT (cmd 0): returns EAGAIN (can't block in single-threaded model).
+    /// FUTEX_WAIT (cmd 0): atomically checks *uaddr == val and blocks via
+    ///   futex_block_fn if a scheduler is registered. Returns EAGAIN when
+    ///   the value doesn't match or no scheduler is available.
+    /// FUTEX_WAKE (cmd 1): wakes up to val waiters via futex_wake_fn.
+    ///   Returns the count of woken tasks (0 when no scheduler).
     /// All other operations return ENOSYS.
-    fn sys_futex(&self, uaddr: u64, op: i32, val: u32) -> i64 {
+    fn sys_futex(&mut self, uaddr: u64, op: i32, val: u32, _timeout: u64) -> i64 {
         // The op field's lower bits encode the command; upper bits are
         // flags (FUTEX_PRIVATE_FLAG, etc.).  Mask to the command bits.
         const FUTEX_CMD_MASK: i32 = 0x7f;
         const FUTEX_WAIT: i32 = 0;
         const FUTEX_WAKE: i32 = 1;
-        match op & FUTEX_CMD_MASK {
-            FUTEX_WAKE => 0, // no waiters in single-threaded model
+
+        let cmd = op & FUTEX_CMD_MASK;
+        match cmd {
             FUTEX_WAIT => {
-                // In single-threaded model, FUTEX_WAIT checks *uaddr == val.
-                // If equal, would block (but we can't block) → EAGAIN.
-                // If not equal, return EAGAIN (value changed).
-                // Either way, return EAGAIN — there's no other thread to
-                // wake us up, so blocking would deadlock.
                 if uaddr == 0 {
                     return EFAULT;
                 }
-                let current = unsafe { *(uaddr as usize as *const u32) };
+                // TODO(harmony-os-ltv): timed futex waits are not yet
+                // supported. We block unconditionally (ignoring the timeout)
+                // and rely on FUTEX_WAKE to unblock. This is correct for the
+                // common case (callers always have a matching wake), but means
+                // the timeout safety net doesn't fire. Timer-based unblock
+                // will add real timeout support.
+                //
+                // Atomicity note: the read-compare-block sequence is safe on
+                // single-core because SVC entry masks IRQs (PSTATE.I=1). No
+                // other task can run between the value check and block_fn
+                // (which calls block_current, which unmasks IRQs AFTER marking
+                // the task Blocked). On multi-core this would need a spinlock.
+                let current = unsafe { *(uaddr as *const u32) };
                 if current != val {
-                    return EAGAIN; // value changed
+                    return EAGAIN;
                 }
-                // Value matches — would block, but single-threaded → EAGAIN
-                EAGAIN
+                if let Some(block) = self.futex_block_fn {
+                    block(uaddr);
+                    0 // Woken successfully
+                } else {
+                    EAGAIN // No scheduler — can't block
+                }
+            }
+            FUTEX_WAKE => {
+                if let Some(wake) = self.futex_wake_fn {
+                    wake(uaddr, val) as i64
+                } else {
+                    0 // No scheduler — no waiters
+                }
             }
             _ => ENOSYS,
         }
@@ -11809,6 +12014,7 @@ mod integration_tests {
             uaddr: 0x1000,
             op: 1, // FUTEX_WAKE
             val: 1,
+            timeout: 0,
         });
         assert_eq!(result, 0);
     }
@@ -11822,6 +12028,7 @@ mod integration_tests {
             uaddr: 0x1000,
             op: 129,
             val: 1,
+            timeout: 0,
         });
         assert_eq!(result, 0);
     }
@@ -11836,6 +12043,7 @@ mod integration_tests {
             uaddr: &val as *const u32 as u64,
             op: 0,
             val: 42,
+            timeout: 0,
         });
         assert_eq!(result, EAGAIN);
     }
@@ -11849,8 +12057,192 @@ mod integration_tests {
             uaddr: 0x1000,
             op: 6,
             val: 0,
+            timeout: 0,
         });
         assert_eq!(result, ENOSYS);
+    }
+
+    #[test]
+    fn futex_wait_returns_eagain_on_value_mismatch() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let mut val: u32 = 42;
+        let uaddr = &mut val as *mut u32 as u64;
+        // FUTEX_WAIT, expected 99 but actual is 42 → EAGAIN
+        let result = lx.sys_futex(uaddr, 0, 99, 0);
+        assert_eq!(result, EAGAIN);
+    }
+
+    #[test]
+    fn futex_wait_blocks_when_value_matches() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        static BLOCKED: AtomicBool = AtomicBool::new(false);
+
+        lx.set_futex_block_fn(|_uaddr| {
+            BLOCKED.store(true, Ordering::SeqCst);
+        });
+
+        let mut val: u32 = 42;
+        let uaddr = &mut val as *mut u32 as u64;
+        BLOCKED.store(false, Ordering::SeqCst);
+        // FUTEX_WAIT, matches → calls block fn → returns 0
+        let result = lx.sys_futex(uaddr, 0, 42, 0);
+        assert!(BLOCKED.load(Ordering::SeqCst));
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn futex_wake_calls_wake_fn() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.set_futex_wake_fn(|_uaddr, _max| 3);
+        // FUTEX_WAKE, max=5 → wake_fn returns 3
+        let result = lx.sys_futex(0x1000, 1, 5, 0);
+        assert_eq!(result, 3);
+    }
+
+    #[test]
+    fn alloc_tid_increments() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        let t1 = lx.alloc_tid();
+        let t2 = lx.alloc_tid();
+        assert_ne!(t1, t2);
+        assert_eq!(t2, t1 + 1);
+    }
+
+    #[test]
+    fn alloc_tid_skips_zero_and_pid_on_wrap() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // Default pid is 1. Force next_tid to u32::MAX so it wraps.
+        lx.next_tid = u32::MAX;
+        let t1 = lx.alloc_tid();
+        assert_eq!(t1, u32::MAX);
+        // After wrapping, next_tid would be 0 — skip 0 (sentinel) and
+        // 1 (self.pid, main thread's effective TID).
+        let t2 = lx.alloc_tid();
+        assert_eq!(t2, 2, "TID 0 and self.pid (1) are both reserved");
+    }
+
+    // ── sys_clone thread creation tests ───────────────────────────
+
+    #[test]
+    fn sys_clone_thread_calls_spawn_fn() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        static SPAWN_CALLED: AtomicBool = AtomicBool::new(false);
+
+        lx.set_spawn_fn(|_pid, _tid, _tls, _ctid, _stack| {
+            SPAWN_CALLED.store(true, Ordering::SeqCst);
+            Some(42)
+        });
+
+        SPAWN_CALLED.store(false, Ordering::SeqCst);
+
+        const CLONE_VM: u64 = 0x0000_0100;
+        const CLONE_FS: u64 = 0x0000_0200;
+        const CLONE_FILES: u64 = 0x0000_0400;
+        const CLONE_SIGHAND: u64 = 0x0000_0800;
+        const CLONE_THREAD: u64 = 0x0001_0000;
+        const CLONE_SYSVSEM: u64 = 0x0004_0000;
+        const CLONE_SETTLS: u64 = 0x0008_0000;
+        const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+        const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+
+        let flags = CLONE_VM
+            | CLONE_FS
+            | CLONE_FILES
+            | CLONE_SIGHAND
+            | CLONE_THREAD
+            | CLONE_SYSVSEM
+            | CLONE_SETTLS
+            | CLONE_PARENT_SETTID
+            | CLONE_CHILD_CLEARTID;
+        let result = lx.sys_clone(flags, 0x7000_0000, 0, 0xFFFF_0000, 0);
+        assert!(SPAWN_CALLED.load(Ordering::SeqCst));
+        assert!(result > 0, "sys_clone should return TID, got {result}");
+    }
+
+    #[test]
+    fn sys_clone_thread_without_spawn_fn_returns_enosys() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        const CLONE_VM: u64 = 0x0000_0100;
+        const CLONE_FILES: u64 = 0x0000_0400;
+        const CLONE_SIGHAND: u64 = 0x0000_0800;
+        const CLONE_THREAD: u64 = 0x0001_0000;
+        let flags = CLONE_VM | CLONE_THREAD | CLONE_FILES | CLONE_SIGHAND;
+        let result = lx.sys_clone(flags, 0, 0, 0, 0);
+        assert_eq!(result, ENOSYS);
+    }
+
+    #[test]
+    fn sys_clone_thread_spawn_failure_returns_eagain() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.set_spawn_fn(|_pid, _tid, _tls, _ctid, _stack| None);
+
+        const CLONE_VM: u64 = 0x0000_0100;
+        const CLONE_FILES: u64 = 0x0000_0400;
+        const CLONE_SIGHAND: u64 = 0x0000_0800;
+        const CLONE_THREAD: u64 = 0x0001_0000;
+        let flags = CLONE_VM | CLONE_THREAD | CLONE_FILES | CLONE_SIGHAND;
+        let result = lx.sys_clone(flags, 0, 0, 0, 0);
+        assert_eq!(result, EAGAIN);
+    }
+
+    #[test]
+    fn sys_clone_sigchld_delegates_to_fork() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        // SIGCHLD (17) without CLONE_VM — should use fork path.
+        let result = lx.sys_clone(17, 0, 0, 0, 0);
+        // Fork returns child PID (> 0).
+        assert!(result > 0, "SIGCHLD clone should fork, got {result}");
+    }
+
+    #[test]
+    fn sys_clone_thread_writes_parent_tid() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.set_spawn_fn(|_pid, _tid, _tls, _ctid, _stack| Some(42));
+
+        const CLONE_VM: u64 = 0x0000_0100;
+        const CLONE_FILES: u64 = 0x0000_0400;
+        const CLONE_SIGHAND: u64 = 0x0000_0800;
+        const CLONE_THREAD: u64 = 0x0001_0000;
+        const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+        let flags = CLONE_VM | CLONE_THREAD | CLONE_FILES | CLONE_SIGHAND | CLONE_PARENT_SETTID;
+
+        let mut parent_tid: u32 = 0;
+        let parent_tidptr = &mut parent_tid as *mut u32 as u64;
+        let result = lx.sys_clone(flags, 0x7000_0000, parent_tidptr, 0, 0);
+        assert!(result > 0);
+        assert_eq!(parent_tid, result as u32);
+    }
+
+    #[test]
+    fn sys_clone_thread_writes_child_tid() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.set_spawn_fn(|_pid, _tid, _tls, _ctid, _stack| Some(42));
+
+        const CLONE_VM: u64 = 0x0000_0100;
+        const CLONE_FILES: u64 = 0x0000_0400;
+        const CLONE_SIGHAND: u64 = 0x0000_0800;
+        const CLONE_THREAD: u64 = 0x0001_0000;
+        const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+        let flags = CLONE_VM | CLONE_THREAD | CLONE_FILES | CLONE_SIGHAND | CLONE_CHILD_SETTID;
+
+        let mut child_tid: u32 = 0;
+        let child_tidptr = &mut child_tid as *mut u32 as u64;
+        let result = lx.sys_clone(flags, 0x7000_0000, 0, 0, child_tidptr);
+        assert!(result > 0);
+        assert_eq!(child_tid, result as u32);
     }
 
     // ── sched_getaffinity tests ───────────────────────────────────

@@ -64,6 +64,8 @@ pub enum WaitReason {
     /// Waiting for any network activity (poll/select/epoll).
     /// Woken on any smoltcp state change; handler rechecks specific fds.
     PollWait,
+    /// Waiting on a futex word at this address.
+    Futex(u64),
 }
 
 /// Per-task scheduling state. Stored in a fixed-size array, indexed by task number.
@@ -92,6 +94,13 @@ pub struct TaskControlBlock {
     pub entry: Option<fn() -> !>,
     /// Why this task is Blocked. `None` when state is Ready/Running/Dead.
     pub wait_reason: Option<WaitReason>,
+    /// TPIDR_EL0 value — per-thread TLS pointer. Saved/restored on context switch.
+    pub tls: u64,
+    /// Linux Thread ID. Main thread: TID == PID. Spawned threads: unique TID.
+    pub tid: u32,
+    /// Address to zero + futex_wake on thread exit (CLONE_CHILD_CLEARTID).
+    /// 0 means no cleanup needed.
+    pub clear_child_tid: u64,
 }
 
 /// Task array — only accessed from the IRQ handler (non-reentrant).
@@ -103,6 +112,15 @@ static mut CURRENT: usize = 0;
 
 /// Number of tasks that have been spawned.
 static mut NUM_TASKS: usize = 0;
+
+/// Bump allocator for runtime kernel stack allocation. Moved from
+/// main()'s local variable so spawn_task_runtime can allocate after boot.
+static mut BUMP_ALLOCATOR: Option<crate::bump_alloc::BumpAllocator> = None;
+
+/// Initialize the bump allocator static. Called once during boot.
+pub unsafe fn set_bump_allocator(bump: crate::bump_alloc::BumpAllocator) {
+    BUMP_ALLOCATOR = Some(bump);
+}
 
 /// SPSR value for new tasks: EL1h (M=0b0101), D=1, A=1, I=0, F=1.
 /// Debug, SError, and FIQ masked; IRQ **unmasked** so the task is preemptible.
@@ -178,6 +196,9 @@ pub unsafe fn spawn_task(
         name,
         entry: Some(entry),
         wait_reason: None,
+        tls: 0,
+        tid: 0, // Boot-time tasks: 0 = use Linuxulator PID for gettid()
+        clear_child_tid: 0,
     });
     NUM_TASKS = n + 1;
     n
@@ -231,6 +252,12 @@ pub unsafe fn schedule(current_sp: usize) -> usize {
     {
         let current_tcb = TASKS[cur].assume_init_mut();
         current_tcb.kernel_sp = current_sp;
+        #[cfg(target_arch = "aarch64")]
+        {
+            let tls: u64;
+            core::arch::asm!("mrs {}, tpidr_el0", out(reg) tls);
+            current_tcb.tls = tls;
+        }
         if current_tcb.state == TaskState::Running {
             current_tcb.state = TaskState::Ready;
             current_tcb.preempt_count += 1;
@@ -244,6 +271,8 @@ pub unsafe fn schedule(current_sp: usize) -> usize {
         if tcb.state == TaskState::Ready {
             CURRENT = idx;
             tcb.state = TaskState::Running;
+            #[cfg(target_arch = "aarch64")]
+            core::arch::asm!("msr tpidr_el0, {}", in(reg) tcb.tls);
             return tcb.kernel_sp;
         }
     }
@@ -284,6 +313,10 @@ pub unsafe fn enter_scheduler() -> ! {
     CURRENT = 0;
 
     let sp = TASKS[0].assume_init_ref().kernel_sp;
+    let tls = TASKS[0].assume_init_ref().tls;
+
+    #[cfg(target_arch = "aarch64")]
+    core::arch::asm!("msr tpidr_el0, {}", in(reg) tls);
 
     core::arch::asm!(
         // Set SP to task 0's kernel stack (TrapFrame base).
@@ -343,6 +376,117 @@ pub unsafe fn enter_scheduler() -> ! {
     );
 }
 
+/// Spawn a new task at runtime (after scheduler is running).
+///
+/// Copies `parent_trapframe` to the new task's kernel stack, sets the
+/// child's return value to 0 (x[0]), and marks it Ready. Called from
+/// within syscall context (CLONE_VM/CLONE_THREAD).
+///
+/// # Safety
+///
+/// - Must be called from task context (not IRQ handler).
+/// - `parent_trapframe` must point to a valid TrapFrame.
+/// - IRQs will be temporarily masked.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn spawn_task_runtime(
+    name: &'static str,
+    pid: u32,
+    tid: u32,
+    tls: u64,
+    clear_child_tid: u64,
+    parent_trapframe: *const crate::syscall::TrapFrame,
+    child_stack: u64,
+) -> Option<usize> {
+    use harmony_microkernel::vm::PAGE_SIZE;
+
+    // Mask IRQs defensively. This function is always called from the SVC
+    // dispatch path where IRQs are already masked by hardware (PSTATE.I=1),
+    // but we mask explicitly in case that precondition ever changes.
+    // We do NOT unmask on any exit path — the SVC epilogue writes
+    // ELR_EL1/SPSR_EL1 then erets, and a timer IRQ in that window would
+    // clobber those registers. The eret restores userspace PSTATE which
+    // has IRQs unmasked. Same invariant as block_current's daifset.
+    core::arch::asm!("msr daifset, #2");
+
+    let n = NUM_TASKS;
+    if n >= MAX_TASKS {
+        return None;
+    }
+
+    let bump = match BUMP_ALLOCATOR.as_mut() {
+        Some(b) => b,
+        None => return None,
+    };
+
+    let page_size = PAGE_SIZE as usize;
+    let pages_needed = (KERNEL_STACK_SIZE + page_size - 1) / page_size;
+
+    // Allocate guard page + stack pages (same as boot-time spawn_task).
+    // On OOM, return None instead of panicking — a panic with IRQs
+    // masked leaves DAIF.I permanently set.
+    macro_rules! alloc_or_return {
+        ($bump:expr) => {
+            match $bump.alloc_frame() {
+                Some(f) => f.0 as usize,
+                None => return None,
+            }
+        };
+    }
+    let guard_frame = alloc_or_return!(bump);
+    let base = alloc_or_return!(bump);
+    if base != guard_frame + page_size {
+        return None;
+    }
+    for i in 1..pages_needed {
+        let frame = alloc_or_return!(bump);
+        if frame != base + i * page_size {
+            return None;
+        }
+    }
+
+    // Mark guard page as inaccessible.
+    crate::mmu::mark_guard_page(guard_frame as u64);
+
+    let stack_size = pages_needed * page_size;
+
+    // Place the initial TrapFrame just below child_stack so that after
+    // context switch the asm epilogue's `add sp, sp, #800` produces
+    // SP = child_stack. musl's child clone wrapper does
+    // `ldp x1, x0, [sp]` to load fn/arg that were stored at
+    // child_stack by the parent's `stp x0, x3, [x1, #-16]!`.
+    //
+    // The kernel-allocated stack (base..base+stack_size) is retained
+    // for guard-page infrastructure but is not used as the thread's
+    // runtime stack — after the first eret the thread runs on
+    // child_stack (the musl-allocated user stack).
+    let sp = (child_stack as usize) - TRAPFRAME_SIZE;
+
+    // Copy parent's TrapFrame to just below child_stack.
+    core::ptr::copy_nonoverlapping(parent_trapframe as *const u8, sp as *mut u8, TRAPFRAME_SIZE);
+
+    // Modify child's TrapFrame: clone() returns 0 to child.
+    let child_frame = sp as *mut crate::syscall::TrapFrame;
+    (*child_frame).x[0] = 0;
+
+    TASKS[n] = MaybeUninit::new(TaskControlBlock {
+        kernel_sp: sp,
+        kernel_stack_base: base,
+        kernel_stack_size: stack_size,
+        state: TaskState::Ready,
+        preempt_count: 0,
+        pid,
+        name,
+        entry: None,
+        wait_reason: None,
+        tls,
+        tid,
+        clear_child_tid,
+    });
+    NUM_TASKS = n + 1;
+
+    Some(n)
+}
+
 /// Block the current task, recording why it is waiting.
 ///
 /// Sets `state = Blocked` and `wait_reason = Some(reason)` on the current
@@ -368,6 +512,12 @@ pub unsafe fn block_current(reason: WaitReason) {
         let tcb = TASKS[cur].assume_init_mut();
         tcb.state = TaskState::Blocked;
         tcb.wait_reason = Some(reason);
+        #[cfg(target_arch = "aarch64")]
+        {
+            let tls: u64;
+            core::arch::asm!("mrs {}, tpidr_el0", out(reg) tls);
+            tcb.tls = tls;
+        }
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -469,6 +619,98 @@ pub unsafe fn for_each_blocked(mut f: impl FnMut(usize, WaitReason)) {
     }
 }
 
+/// Wake up to `max` tasks blocked on `WaitReason::Futex(uaddr)`.
+///
+/// Returns the number of tasks actually woken. Used by FUTEX_WAKE
+/// and CLONE_CHILD_CLEARTID exit cleanup.
+///
+/// # Safety
+///
+/// Must only be called when TASKS[0..NUM_TASKS] are initialized.
+pub unsafe fn futex_wake(uaddr: u64, max: u32) -> u32 {
+    let mut woken = 0u32;
+    let n = NUM_TASKS;
+    for i in 0..n {
+        if woken >= max {
+            break;
+        }
+        let tcb = TASKS[i].assume_init_mut();
+        if tcb.state == TaskState::Blocked && tcb.wait_reason == Some(WaitReason::Futex(uaddr)) {
+            tcb.state = TaskState::Ready;
+            tcb.wait_reason = None;
+            woken += 1;
+        }
+    }
+    woken
+}
+
+/// Get the current task's TID.
+pub unsafe fn current_task_tid() -> u32 {
+    TASKS[CURRENT].assume_init_ref().tid
+}
+
+/// Get the current task's PID.
+pub unsafe fn current_task_pid() -> u32 {
+    TASKS[CURRENT].assume_init_ref().pid
+}
+
+/// Get the current task's clear_child_tid address.
+pub unsafe fn current_task_clear_child_tid() -> u64 {
+    TASKS[CURRENT].assume_init_ref().clear_child_tid
+}
+
+/// Set the current task's clear_child_tid address.
+pub unsafe fn set_current_clear_child_tid(addr: u64) {
+    TASKS[CURRENT].assume_init_mut().clear_child_tid = addr;
+}
+
+/// Mark the current task as Dead.
+pub unsafe fn mark_current_dead() {
+    let tcb = TASKS[CURRENT].assume_init_mut();
+    tcb.state = TaskState::Dead;
+    tcb.wait_reason = None;
+}
+
+/// Mark all tasks with the given PID as Dead (exit_group), except
+/// the currently running task. The caller handles its own lifecycle
+/// (main thread redirects via RETURN_ADDR, spawned thread does CLEARTID
+/// + mark_current_dead). Skipping CURRENT prevents the main thread from
+/// being marked Dead before its eret-to-RETURN_ADDR cleanup completes.
+pub unsafe fn kill_threads_by_pid(pid: u32) {
+    let n = NUM_TASKS;
+    let cur = CURRENT;
+    for i in 0..n {
+        if i == cur {
+            continue;
+        }
+        // Read phase — check if this task should be killed, extract
+        // clear_child_tid. Scoped to drop the borrow before futex_wake
+        // (which iterates TASKS and would alias this slot).
+        let (should_kill, clear_addr) = {
+            let tcb = TASKS[i].assume_init_ref();
+            (
+                tcb.pid == pid && tcb.state != TaskState::Dead,
+                tcb.clear_child_tid,
+            )
+        };
+        if !should_kill {
+            continue;
+        }
+        // Write phase — mark Dead, clear fields.
+        {
+            let tcb = TASKS[i].assume_init_mut();
+            tcb.clear_child_tid = 0;
+            tcb.state = TaskState::Dead;
+            tcb.wait_reason = None;
+        }
+        // CLEARTID cleanup — no live borrow on TASKS[i].
+        if clear_addr != 0 {
+            *(clear_addr as *mut u32) = 0;
+            futex_wake(clear_addr, 1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,6 +756,9 @@ mod tests {
                 name: "test-task",
                 entry: None,
                 wait_reason: None,
+                tls: 0,
+                tid: 7,
+                clear_child_tid: 0,
             });
         }
         let guard_start = 0x2_0000 - PAGE_SIZE as usize;
@@ -547,6 +792,9 @@ mod tests {
             name: "test",
             entry: None,
             wait_reason,
+            tls: 0,
+            tid: idx as u32,
+            clear_child_tid: 0,
         });
     }
 
@@ -669,6 +917,134 @@ mod tests {
             assert!(visited.contains(&(1, WaitReason::PollWait)));
             assert!(visited.contains(&(3, WaitReason::FdConnectDone(2))));
 
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn tcb_has_thread_fields() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            NUM_TASKS = 1;
+            TASKS[0] = MaybeUninit::new(TaskControlBlock {
+                kernel_sp: 0,
+                kernel_stack_base: 0x1_0000,
+                kernel_stack_size: 8192,
+                state: TaskState::Ready,
+                preempt_count: 0,
+                pid: 1,
+                name: "test",
+                entry: None,
+                wait_reason: None,
+                tls: 0xDEAD_BEEF,
+                tid: 42,
+                clear_child_tid: 0xCAFE,
+            });
+            let tcb = TASKS[0].assume_init_ref();
+            assert_eq!(tcb.tls, 0xDEAD_BEEF);
+            assert_eq!(tcb.tid, 42);
+            assert_eq!(tcb.clear_child_tid, 0xCAFE);
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn wait_reason_futex_variant() {
+        assert_ne!(WaitReason::Futex(0x1000), WaitReason::Futex(0x2000));
+        assert_eq!(WaitReason::Futex(0x1000), WaitReason::Futex(0x1000));
+        assert_ne!(WaitReason::Futex(0x1000), WaitReason::FdReadable(1));
+    }
+
+    #[test]
+    fn futex_wake_wakes_matching_tasks() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            // Use put_tcb helper for task setup.
+            put_tcb(0, TaskState::Running, None);
+            TASKS[0].assume_init_mut().tid = 1;
+            TASKS[0].assume_init_mut().tls = 0;
+            TASKS[0].assume_init_mut().clear_child_tid = 0;
+
+            put_tcb(1, TaskState::Blocked, Some(WaitReason::Futex(0x1000)));
+            TASKS[1].assume_init_mut().tid = 2;
+            TASKS[1].assume_init_mut().tls = 0;
+            TASKS[1].assume_init_mut().clear_child_tid = 0;
+
+            put_tcb(2, TaskState::Blocked, Some(WaitReason::Futex(0x1000)));
+            TASKS[2].assume_init_mut().tid = 3;
+            TASKS[2].assume_init_mut().tls = 0;
+            TASKS[2].assume_init_mut().clear_child_tid = 0;
+
+            put_tcb(3, TaskState::Blocked, Some(WaitReason::Futex(0x2000)));
+            TASKS[3].assume_init_mut().tid = 4;
+            TASKS[3].assume_init_mut().tls = 0;
+            TASKS[3].assume_init_mut().clear_child_tid = 0;
+
+            NUM_TASKS = 4;
+            CURRENT = 0;
+
+            // Wake at most 1 task on 0x1000.
+            let woken = futex_wake(0x1000, 1);
+            assert_eq!(woken, 1);
+
+            // Task 3 (0x2000) still blocked.
+            assert_eq!(TASKS[3].assume_init_ref().state, TaskState::Blocked);
+
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn futex_wake_returns_zero_when_no_waiters() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            put_tcb(0, TaskState::Running, None);
+            TASKS[0].assume_init_mut().tid = 1;
+            TASKS[0].assume_init_mut().tls = 0;
+            TASKS[0].assume_init_mut().clear_child_tid = 0;
+            NUM_TASKS = 1;
+            CURRENT = 0;
+
+            let woken = futex_wake(0x1000, 10);
+            assert_eq!(woken, 0);
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn kill_threads_by_pid_marks_matching_dead_except_current() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            CURRENT = 0;
+
+            put_tcb(0, TaskState::Running, None);
+            TASKS[0].assume_init_mut().pid = 2;
+            TASKS[0].assume_init_mut().tid = 0; // Main thread (CURRENT)
+            TASKS[0].assume_init_mut().tls = 0;
+            TASKS[0].assume_init_mut().clear_child_tid = 0;
+
+            put_tcb(1, TaskState::Ready, None);
+            TASKS[1].assume_init_mut().pid = 2;
+            TASKS[1].assume_init_mut().tid = 3; // Spawned thread
+            TASKS[1].assume_init_mut().tls = 0;
+            TASKS[1].assume_init_mut().clear_child_tid = 0;
+
+            put_tcb(2, TaskState::Ready, None);
+            TASKS[2].assume_init_mut().pid = 1; // Different PID
+            TASKS[2].assume_init_mut().tid = 1;
+            TASKS[2].assume_init_mut().tls = 0;
+            TASKS[2].assume_init_mut().clear_child_tid = 0;
+
+            NUM_TASKS = 3;
+
+            kill_threads_by_pid(2);
+
+            // Task 0 (CURRENT) is skipped — still Running.
+            assert_eq!(TASKS[0].assume_init_ref().state, TaskState::Running);
+            // Task 1 (same PID, not CURRENT) is Dead.
+            assert_eq!(TASKS[1].assume_init_ref().state, TaskState::Dead);
+            // Task 2 (different PID) is untouched.
+            assert_eq!(TASKS[2].assume_init_ref().state, TaskState::Ready);
             NUM_TASKS = 0;
         }
     }
