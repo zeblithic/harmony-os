@@ -8685,6 +8685,11 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 if uaddr == 0 {
                     return EFAULT;
                 }
+                // Atomicity note: the read-compare-block sequence is safe on
+                // single-core because SVC entry masks IRQs (PSTATE.I=1). No
+                // other task can run between the value check and block_fn
+                // (which calls block_current, which unmasks IRQs AFTER marking
+                // the task Blocked). On multi-core this would need a spinlock.
                 let current = unsafe { *(uaddr as *const u32) };
                 if current != val {
                     return EAGAIN;

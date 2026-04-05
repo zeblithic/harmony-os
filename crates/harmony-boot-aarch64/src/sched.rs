@@ -674,10 +674,18 @@ pub unsafe fn mark_current_dead() {
     tcb.wait_reason = None;
 }
 
-/// Mark all tasks with the given PID as Dead (exit_group).
+/// Mark all tasks with the given PID as Dead (exit_group), except
+/// the currently running task. The caller handles its own lifecycle
+/// (main thread redirects via RETURN_ADDR, spawned thread does CLEARTID
+/// + mark_current_dead). Skipping CURRENT prevents the main thread from
+/// being marked Dead before its eret-to-RETURN_ADDR cleanup completes.
 pub unsafe fn kill_threads_by_pid(pid: u32) {
     let n = NUM_TASKS;
+    let cur = CURRENT;
     for i in 0..n {
+        if i == cur {
+            continue;
+        }
         let tcb = TASKS[i].assume_init_mut();
         if tcb.pid == pid && tcb.state != TaskState::Dead {
             tcb.state = TaskState::Dead;
@@ -987,18 +995,20 @@ mod tests {
     }
 
     #[test]
-    fn kill_threads_by_pid_marks_matching_dead() {
+    fn kill_threads_by_pid_marks_matching_dead_except_current() {
         let _lock = TEST_LOCK.lock().unwrap();
         unsafe {
+            CURRENT = 0;
+
             put_tcb(0, TaskState::Running, None);
             TASKS[0].assume_init_mut().pid = 2;
-            TASKS[0].assume_init_mut().tid = 2;
+            TASKS[0].assume_init_mut().tid = 0; // Main thread (CURRENT)
             TASKS[0].assume_init_mut().tls = 0;
             TASKS[0].assume_init_mut().clear_child_tid = 0;
 
             put_tcb(1, TaskState::Ready, None);
             TASKS[1].assume_init_mut().pid = 2;
-            TASKS[1].assume_init_mut().tid = 3;
+            TASKS[1].assume_init_mut().tid = 3; // Spawned thread
             TASKS[1].assume_init_mut().tls = 0;
             TASKS[1].assume_init_mut().clear_child_tid = 0;
 
@@ -1012,9 +1022,12 @@ mod tests {
 
             kill_threads_by_pid(2);
 
-            assert_eq!(TASKS[0].assume_init_ref().state, TaskState::Dead);
+            // Task 0 (CURRENT) is skipped — still Running.
+            assert_eq!(TASKS[0].assume_init_ref().state, TaskState::Running);
+            // Task 1 (same PID, not CURRENT) is Dead.
             assert_eq!(TASKS[1].assume_init_ref().state, TaskState::Dead);
-            assert_eq!(TASKS[2].assume_init_ref().state, TaskState::Ready); // PID 1, untouched.
+            // Task 2 (different PID) is untouched.
+            assert_eq!(TASKS[2].assume_init_ref().state, TaskState::Ready);
             NUM_TASKS = 0;
         }
     }
