@@ -34,6 +34,7 @@ const EPIPE: i64 = -32;
 const ERANGE: i64 = -34;
 const ENOSYS: i64 = -38;
 const EOVERFLOW: i64 = -75;
+const ETIMEDOUT: i64 = -110;
 const EAFNOSUPPORT: i64 = -97;
 const ENOTSOCK: i64 = -88;
 const ECHILD: i64 = -10;
@@ -87,11 +88,13 @@ enum BlockResult {
     Interrupted,
 }
 
-/// block_until operation types — match WaitReason encoding in sched.rs.
+/// block_until operation types — decoded by the block_fn closure in main.rs
+/// which maps each code to the corresponding WaitReason variant.
 pub const BLOCK_OP_READABLE: u8 = 0;
 pub const BLOCK_OP_WRITABLE: u8 = 1;
 pub const BLOCK_OP_CONNECT: u8 = 2;
 pub const BLOCK_OP_POLL: u8 = 3;
+pub const BLOCK_OP_SLEEP: u8 = 4;
 
 fn ipc_err_to_errno(e: IpcError) -> i64 {
     match e {
@@ -2506,9 +2509,9 @@ pub struct Linuxulator<
     /// time in milliseconds. Set by the kernel at init.
     poll_fn: Option<fn() -> u64>,
     /// Callback to block the current task. Called by block_until() instead
-    /// of spin-waiting. Arguments: (op: u8, fd: i32) where op is:
-    /// 0=FdReadable, 1=FdWritable, 2=FdConnectDone, 3=PollWait.
-    block_fn: Option<fn(u8, i32)>,
+    /// of spin-waiting. Arguments: (op: u8, fd: i32, deadline_ms: Option<u64>) where op is:
+    /// 0=FdReadable, 1=FdWritable, 2=FdConnectDone, 3=PollWait, 4=Sleep.
+    block_fn: Option<fn(u8, i32, Option<u64>)>,
     /// Callback to wake a task blocked on a specific fd. Called after
     /// pipe/eventfd writes for synchronous waking. Arguments: (fd: i32, op: u8)
     /// where op is 0=readable, 1=writable.
@@ -2518,9 +2521,13 @@ pub struct Linuxulator<
     #[allow(clippy::type_complexity)]
     spawn_fn: Option<fn(u32, u32, u64, u64, u64) -> Option<u32>>,
     /// Block current task on a futex address.
-    futex_block_fn: Option<fn(u64)>,
+    futex_block_fn: Option<fn(u64, Option<u64>)>,
     /// Wake up to N tasks blocked on a futex address. Returns count woken.
     futex_wake_fn: Option<fn(u64, u32) -> u32>,
+    /// Check if the current task was woken by deadline expiry.
+    was_timeout_fn: Option<fn() -> bool>,
+    /// Read current monotonic time in milliseconds.
+    now_ms_fn: Option<fn() -> u64>,
     /// Get the current task's TID.
     get_current_tid_fn: Option<fn() -> u32>,
     /// Set the current task's clear_child_tid address.
@@ -2602,6 +2609,8 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             spawn_fn: None,
             futex_block_fn: None,
             futex_wake_fn: None,
+            was_timeout_fn: None,
+            now_ms_fn: None,
             get_current_tid_fn: None,
             set_clear_child_tid_fn: None,
             next_tid: 2,
@@ -2625,7 +2634,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
     /// Set the blocking callback. Called by block_until() to yield the CPU
     /// to the scheduler instead of spin-waiting.
-    pub fn set_block_fn(&mut self, f: fn(u8, i32)) {
+    pub fn set_block_fn(&mut self, f: fn(u8, i32, Option<u64>)) {
         self.block_fn = Some(f);
     }
 
@@ -2642,13 +2651,24 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
     /// Set the futex block callback. Called by FUTEX_WAIT when the value matches,
     /// to block the current task until woken.
-    pub fn set_futex_block_fn(&mut self, f: fn(u64)) {
+    pub fn set_futex_block_fn(&mut self, f: fn(u64, Option<u64>)) {
         self.futex_block_fn = Some(f);
     }
 
     /// Set the futex wake callback. Called by FUTEX_WAKE to wake blocked tasks.
     pub fn set_futex_wake_fn(&mut self, f: fn(u64, u32) -> u32) {
         self.futex_wake_fn = Some(f);
+    }
+
+    /// Set the timeout-detection callback. Returns true if the current task was
+    /// woken by a deadline expiry rather than a normal wake event.
+    pub fn set_was_timeout_fn(&mut self, f: fn() -> bool) {
+        self.was_timeout_fn = Some(f);
+    }
+
+    /// Set the monotonic clock callback. Returns the current time in milliseconds.
+    pub fn set_now_ms_fn(&mut self, f: fn() -> u64) {
+        self.now_ms_fn = Some(f);
     }
 
     /// Set the get-current-TID callback. Called by sys_gettid and sys_set_tid_address.
@@ -2693,9 +2713,9 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     ///
     /// If `block_fn` is not set (no scheduler), returns `Interrupted` so the
     /// caller can fall back to EAGAIN.
-    fn block_until(&mut self, op: u8, fd: i32) -> BlockResult {
+    fn block_until(&mut self, op: u8, fd: i32, deadline_ms: Option<u64>) -> BlockResult {
         if let Some(block) = self.block_fn {
-            block(op, fd);
+            block(op, fd, deadline_ms);
             // Execution resumes here after wake + reschedule.
             BlockResult::Ready
         } else {
@@ -2794,7 +2814,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
             // Buffer full — block until space available.
             if self.block_fn.is_some() {
-                match self.block_until(BLOCK_OP_WRITABLE, fd) {
+                match self.block_until(BLOCK_OP_WRITABLE, fd, None) {
                     BlockResult::Ready => continue, // Retry write
                     BlockResult::Interrupted => return EINTR,
                 }
@@ -3754,7 +3774,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                             let nonblock =
                                 self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                             if !nonblock && self.block_fn.is_some() {
-                                match self.block_until(BLOCK_OP_WRITABLE, fd) {
+                                match self.block_until(BLOCK_OP_WRITABLE, fd, None) {
                                     BlockResult::Ready => {
                                         let data = unsafe {
                                             core::slice::from_raw_parts(buf_ptr as *const u8, count)
@@ -3844,7 +3864,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                             return EAGAIN;
                         }
 
-                        match self.block_until(BLOCK_OP_READABLE, fd) {
+                        match self.block_until(BLOCK_OP_READABLE, fd, None) {
                             BlockResult::Ready => {
                                 // Re-borrow after block_until releases the borrow.
                                 let buf = match self.pipes.get_mut(&pipe_id) {
@@ -3974,7 +3994,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                             let nonblock =
                                 self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                             if !nonblock && self.block_fn.is_some() {
-                                match self.block_until(BLOCK_OP_READABLE, fd) {
+                                match self.block_until(BLOCK_OP_READABLE, fd, None) {
                                     BlockResult::Ready => {
                                         let buf = unsafe {
                                             core::slice::from_raw_parts_mut(
@@ -4949,7 +4969,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                         // Spurious wakes (block_until returns Ready but
                         // tcp_accept still returns None) re-enter block_until.
                         loop {
-                            match self.block_until(BLOCK_OP_READABLE, fd) {
+                            match self.block_until(BLOCK_OP_READABLE, fd, None) {
                                 BlockResult::Ready => {
                                     match self.tcp.tcp_accept(h) {
                                         Ok(Some(accepted_handle)) => {
@@ -5058,7 +5078,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                         // Block until the handshake completes or fails.
                         // Uses BLOCK_OP_CONNECT (not BLOCK_OP_WRITABLE) so that
                         // connection failures (RST → Closed) also unblock.
-                        match self.block_until(BLOCK_OP_CONNECT, fd) {
+                        match self.block_until(BLOCK_OP_CONNECT, fd, None) {
                             BlockResult::Ready => {
                                 // Check whether the connect succeeded or failed.
                                 // CloseWait/Closing imply the connection WAS established
@@ -5143,7 +5163,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 Err(NetError::WouldBlock) => {
                     let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                     if !nonblock && self.block_fn.is_some() {
-                        match self.block_until(BLOCK_OP_WRITABLE, fd) {
+                        match self.block_until(BLOCK_OP_WRITABLE, fd, None) {
                             BlockResult::Ready => {
                                 let data =
                                     unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
@@ -5183,7 +5203,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                             let nonblock =
                                 self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                             if !nonblock && self.block_fn.is_some() {
-                                match self.block_until(BLOCK_OP_WRITABLE, fd) {
+                                match self.block_until(BLOCK_OP_WRITABLE, fd, None) {
                                     BlockResult::Ready => {
                                         let data = unsafe {
                                             core::slice::from_raw_parts(buf as *const u8, count)
@@ -5212,7 +5232,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     Err(NetError::WouldBlock) => {
                         let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                         if !nonblock && self.block_fn.is_some() {
-                            match self.block_until(BLOCK_OP_WRITABLE, fd) {
+                            match self.block_until(BLOCK_OP_WRITABLE, fd, None) {
                                 BlockResult::Ready => {
                                     let data = unsafe {
                                         core::slice::from_raw_parts(buf as *const u8, count)
@@ -5268,7 +5288,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 Err(NetError::WouldBlock) => {
                     let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                     if !nonblock && self.block_fn.is_some() {
-                        match self.block_until(BLOCK_OP_READABLE, fd) {
+                        match self.block_until(BLOCK_OP_READABLE, fd, None) {
                             BlockResult::Ready => {
                                 let data = unsafe {
                                     core::slice::from_raw_parts_mut(buf as *mut u8, count)
@@ -5312,7 +5332,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     Err(NetError::WouldBlock) => {
                         let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                         if !nonblock && self.block_fn.is_some() {
-                            match self.block_until(BLOCK_OP_READABLE, fd) {
+                            match self.block_until(BLOCK_OP_READABLE, fd, None) {
                                 BlockResult::Ready => {
                                     // Retry the full UDP recv logic.
                                     let data = unsafe {
@@ -5789,8 +5809,13 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             } else {
                 u64::MAX // -1 = infinite wait
             };
+            let deadline_opt = if deadline == u64::MAX {
+                None
+            } else {
+                Some(deadline)
+            };
 
-            while let BlockResult::Ready = self.block_until(BLOCK_OP_POLL, -1) {
+            while let BlockResult::Ready = self.block_until(BLOCK_OP_POLL, -1, deadline_opt) {
                 // Drive the network stack.
                 if let Some(pf) = self.poll_fn {
                     let now = pf() as i64;
@@ -6271,6 +6296,8 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             spawn_fn: self.spawn_fn,
             futex_block_fn: self.futex_block_fn,
             futex_wake_fn: self.futex_wake_fn,
+            was_timeout_fn: self.was_timeout_fn,
+            now_ms_fn: self.now_ms_fn,
             get_current_tid_fn: self.get_current_tid_fn,
             set_clear_child_tid_fn: self.set_clear_child_tid_fn,
             // next_tid: child starts fresh from 2 (its own TID space).
@@ -6564,8 +6591,13 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
     /// Linux clock_nanosleep(2): sleep on a specific clock.
     ///
-    /// Supports both relative (flags=0) and absolute (TIMER_ABSTIME)
-    /// sleep. For absolute, computes delta from current clock value.
+    /// When `block_fn` and `now_ms_fn` are both set (scheduler available),
+    /// computes an absolute deadline in milliseconds and blocks via
+    /// `BLOCK_OP_SLEEP`. The timer IRQ's `check_deadlines` wakes the task.
+    ///
+    /// Without a scheduler (sans-I/O / host-test mode), falls back to the
+    /// old clock-advance behavior so host tests that inspect `monotonic_ns`
+    /// continue to pass.
     fn sys_clock_nanosleep(
         &mut self,
         clockid: i32,
@@ -6581,28 +6613,64 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         if flags & !TIMER_ABSTIME != 0 {
             return EINVAL;
         }
+
+        if req_ptr == 0 {
+            return EFAULT;
+        }
+        let req_bytes = unsafe { core::slice::from_raw_parts(req_ptr as usize as *const u8, 16) };
+        let tv_sec = i64::from_ne_bytes(req_bytes[0..8].try_into().unwrap());
+        let tv_nsec = i64::from_ne_bytes(req_bytes[8..16].try_into().unwrap());
+        if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
+            return EINVAL;
+        }
+
+        // If scheduler + clock are available, do a real blocking sleep.
+        //
+        // NOTE: The blocking path uses the hardware monotonic timer
+        // (now_ms_fn) for ALL clocks, including CLOCK_REALTIME.  Our
+        // kernel has no real wall clock — self.realtime_ns is a sans-I/O
+        // counter that only advances on clock_gettime calls, not in real
+        // time.  The scheduler's check_deadlines compares against
+        // timer::now_ms() (monotonic), so all deadlines must be expressed
+        // in monotonic time.  A real CLOCK_REALTIME implementation would
+        // need a wall-clock ↔ monotonic offset, which is future work.
+        if let (Some(_), Some(now_ms_fn)) = (self.block_fn, self.now_ms_fn) {
+            let now_ms = now_ms_fn();
+            let deadline_ms = if flags & TIMER_ABSTIME != 0 {
+                // Absolute: convert timespec to ms directly.
+                let abs_ms = (tv_sec as u64)
+                    .saturating_mul(1000)
+                    .saturating_add((tv_nsec as u64) / 1_000_000);
+                // If target is already in the past, return immediately.
+                if abs_ms <= now_ms {
+                    return 0;
+                }
+                abs_ms
+            } else {
+                // Relative: deadline = now + duration.
+                let duration_ms = (tv_sec as u64)
+                    .saturating_mul(1000)
+                    .saturating_add((tv_nsec as u64) / 1_000_000);
+                if duration_ms == 0 {
+                    return 0;
+                }
+                now_ms.saturating_add(duration_ms)
+            };
+            self.block_until(BLOCK_OP_SLEEP, -1, Some(deadline_ms));
+            return 0;
+        }
+
+        // Fallback: sans-I/O mode (no scheduler). Advance the clock by the
+        // requested duration and return immediately. Host tests rely on this.
         if flags & TIMER_ABSTIME != 0 {
-            // Absolute time: compute delta from current clock value.
-            if req_ptr == 0 {
-                return EFAULT;
-            }
-            let req_bytes =
-                unsafe { core::slice::from_raw_parts(req_ptr as usize as *const u8, 16) };
-            let abs_sec = i64::from_le_bytes(req_bytes[0..8].try_into().unwrap());
-            let abs_nsec = i64::from_le_bytes(req_bytes[8..16].try_into().unwrap());
-            if abs_sec < 0 || !(0..1_000_000_000).contains(&abs_nsec) {
-                return EINVAL;
-            }
-            let abs_ns = (abs_sec as u64)
+            let abs_ns = (tv_sec as u64)
                 .saturating_mul(1_000_000_000)
-                .saturating_add(abs_nsec as u64);
+                .saturating_add(tv_nsec as u64);
             let now = match clockid {
                 CLOCK_REALTIME => self.realtime_ns,
                 _ => self.monotonic_ns,
             };
-            // If target is already in the past, return immediately.
             let delta_ns = abs_ns.saturating_sub(now);
-            // Advance the clock we're sleeping on (not always monotonic).
             match clockid {
                 CLOCK_REALTIME => {
                     self.realtime_ns = self.realtime_ns.wrapping_add(delta_ns);
@@ -6611,28 +6679,17 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     self.monotonic_ns = self.monotonic_ns.wrapping_add(delta_ns);
                 }
             }
-            return 0;
-        }
-
-        // Relative sleep: advance the requested clock by the duration.
-        if req_ptr == 0 {
-            return EFAULT;
-        }
-        let req_bytes = unsafe { core::slice::from_raw_parts(req_ptr as usize as *const u8, 16) };
-        let tv_sec = i64::from_le_bytes(req_bytes[0..8].try_into().unwrap());
-        let tv_nsec = i64::from_le_bytes(req_bytes[8..16].try_into().unwrap());
-        if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
-            return EINVAL;
-        }
-        let duration_ns = (tv_sec as u64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add(tv_nsec as u64);
-        match clockid {
-            CLOCK_REALTIME => {
-                self.realtime_ns = self.realtime_ns.wrapping_add(duration_ns);
-            }
-            _ => {
-                self.monotonic_ns = self.monotonic_ns.wrapping_add(duration_ns);
+        } else {
+            let duration_ns = (tv_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(tv_nsec as u64);
+            match clockid {
+                CLOCK_REALTIME => {
+                    self.realtime_ns = self.realtime_ns.wrapping_add(duration_ns);
+                }
+                _ => {
+                    self.monotonic_ns = self.monotonic_ns.wrapping_add(duration_ns);
+                }
             }
         }
         0
@@ -8703,7 +8760,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     /// FUTEX_WAKE (cmd 1): wakes up to val waiters via futex_wake_fn.
     ///   Returns the count of woken tasks (0 when no scheduler).
     /// All other operations return ENOSYS.
-    fn sys_futex(&mut self, uaddr: u64, op: i32, val: u32, _timeout: u64) -> i64 {
+    fn sys_futex(&mut self, uaddr: u64, op: i32, val: u32, timeout: u64) -> i64 {
         // The op field's lower bits encode the command; upper bits are
         // flags (FUTEX_PRIVATE_FLAG, etc.).  Mask to the command bits.
         const FUTEX_CMD_MASK: i32 = 0x7f;
@@ -8716,13 +8773,35 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 if uaddr == 0 {
                     return EFAULT;
                 }
-                // TODO(harmony-os-ltv): timed futex waits are not yet
-                // supported. We block unconditionally (ignoring the timeout)
-                // and rely on FUTEX_WAKE to unblock. This is correct for the
-                // common case (callers always have a matching wake), but means
-                // the timeout safety net doesn't fire. Timer-based unblock
-                // will add real timeout support.
+                // Parse timeout: a pointer to struct timespec { i64 tv_sec; i64 tv_nsec },
+                // or 0 (null) for no timeout. FUTEX_WAIT timeouts are relative.
                 //
+                // When timeout != 0 but now_ms_fn is None (no clock wired),
+                // we cannot compute a deadline — deadline_ms becomes None and
+                // the task blocks indefinitely.  This is deliberate: EAGAIN
+                // means "value mismatch" in FUTEX_WAIT Linux semantics, and
+                // returning it here would mislead the caller.  Blocking
+                // without a timeout is the honest degradation for a config
+                // that lacks a clock.  In practice, main.rs always wires
+                // now_ms_fn alongside futex_block_fn.
+                let deadline_ms: Option<u64> = if let (true, Some(now_ms)) =
+                    (timeout != 0, self.now_ms_fn)
+                {
+                    let ts_bytes = unsafe { core::slice::from_raw_parts(timeout as *const u8, 16) };
+                    let tv_sec = i64::from_ne_bytes(ts_bytes[0..8].try_into().unwrap());
+                    let tv_nsec = i64::from_ne_bytes(ts_bytes[8..16].try_into().unwrap());
+                    if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
+                        return EINVAL;
+                    }
+                    let timeout_ms = (tv_sec as u64)
+                        .saturating_mul(1000)
+                        .saturating_add((tv_nsec as u64) / 1_000_000);
+                    let now = now_ms();
+                    Some(now.saturating_add(timeout_ms))
+                } else {
+                    None
+                };
+
                 // Atomicity note: the read-compare-block sequence is safe on
                 // single-core because SVC entry masks IRQs (PSTATE.I=1). No
                 // other task can run between the value check and block_fn
@@ -8733,8 +8812,14 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     return EAGAIN;
                 }
                 if let Some(block) = self.futex_block_fn {
-                    block(uaddr);
-                    0 // Woken successfully
+                    block(uaddr, deadline_ms);
+                    // Check if we were woken by timeout expiry.
+                    if let Some(was_timeout) = self.was_timeout_fn {
+                        if was_timeout() {
+                            return ETIMEDOUT;
+                        }
+                    }
+                    0 // Woken normally
                 } else {
                     EAGAIN // No scheduler — can't block
                 }
@@ -8791,9 +8876,14 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             } else {
                 u64::MAX // Negative timeout = infinite wait
             };
+            let deadline_opt = if deadline == u64::MAX {
+                None
+            } else {
+                Some(deadline)
+            };
 
             loop {
-                match self.block_until(BLOCK_OP_POLL, -1) {
+                match self.block_until(BLOCK_OP_POLL, -1, deadline_opt) {
                     BlockResult::Ready => {
                         let ready = self.poll_check_once(fds_ptr, nfds);
                         if ready > 0 {
@@ -8978,6 +9068,11 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             } else {
                 start_ms.saturating_add(timeout_ms)
             };
+            let deadline_opt = if deadline == u64::MAX {
+                None
+            } else {
+                Some(deadline)
+            };
 
             loop {
                 // Restore input fd_sets before each check (previous iteration may have cleared bits).
@@ -8998,7 +9093,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     dst.copy_from_slice(&saved_exceptfds[..read_bytes]);
                 }
 
-                match self.block_until(BLOCK_OP_POLL, -1) {
+                match self.block_until(BLOCK_OP_POLL, -1, deadline_opt) {
                     BlockResult::Ready => {
                         let ready = self.select_check_once(nfds, readfds, writefds, exceptfds);
                         if ready > 0 {
@@ -12080,7 +12175,7 @@ mod integration_tests {
         let mut lx = Linuxulator::new(mock);
         static BLOCKED: AtomicBool = AtomicBool::new(false);
 
-        lx.set_futex_block_fn(|_uaddr| {
+        lx.set_futex_block_fn(|_uaddr, _deadline| {
             BLOCKED.store(true, Ordering::SeqCst);
         });
 
@@ -12101,6 +12196,97 @@ mod integration_tests {
         // FUTEX_WAKE, max=5 → wake_fn returns 3
         let result = lx.sys_futex(0x1000, 1, 5, 0);
         assert_eq!(result, 3);
+    }
+
+    #[test]
+    fn futex_wait_timeout_returns_etimedout() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        static BLOCKED: AtomicBool = AtomicBool::new(false);
+        lx.set_futex_block_fn(|_uaddr, _deadline| {
+            BLOCKED.store(true, Ordering::SeqCst);
+        });
+        lx.set_was_timeout_fn(|| true);
+        lx.set_now_ms_fn(|| 1000);
+
+        let mut val: u32 = 42;
+        let uaddr = &mut val as *mut u32 as u64;
+
+        let ts = [1i64.to_le_bytes(), 0i64.to_le_bytes()].concat();
+        let timeout_ptr = ts.as_ptr() as u64;
+
+        BLOCKED.store(false, Ordering::SeqCst);
+        let result = lx.sys_futex(uaddr, 0, 42, timeout_ptr);
+        assert!(BLOCKED.load(Ordering::SeqCst));
+        assert_eq!(result, -110); // ETIMEDOUT
+    }
+
+    #[test]
+    fn futex_wait_no_timeout_returns_zero() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        static BLOCKED: AtomicBool = AtomicBool::new(false);
+        lx.set_futex_block_fn(|_uaddr, _deadline| {
+            BLOCKED.store(true, Ordering::SeqCst);
+        });
+        lx.set_was_timeout_fn(|| false);
+
+        let mut val: u32 = 42;
+        let uaddr = &mut val as *mut u32 as u64;
+
+        BLOCKED.store(false, Ordering::SeqCst);
+        let result = lx.sys_futex(uaddr, 0, 42, 0); // null timeout
+        assert!(BLOCKED.load(Ordering::SeqCst));
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn futex_wait_null_timeout_passes_none_deadline() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        static DEADLINE_SEEN: AtomicU64 = AtomicU64::new(0);
+        lx.set_futex_block_fn(|_uaddr, deadline| {
+            DEADLINE_SEEN.store(deadline.unwrap_or(u64::MAX), Ordering::SeqCst);
+        });
+        lx.set_was_timeout_fn(|| false);
+
+        let mut val: u32 = 42;
+        let uaddr = &mut val as *mut u32 as u64;
+
+        DEADLINE_SEEN.store(0, Ordering::SeqCst);
+        let _ = lx.sys_futex(uaddr, 0, 42, 0);
+        assert_eq!(DEADLINE_SEEN.load(Ordering::SeqCst), u64::MAX); // None sentinel
+    }
+
+    #[test]
+    fn futex_wait_timeout_computes_deadline() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        static DEADLINE_SEEN: AtomicU64 = AtomicU64::new(0);
+        lx.set_futex_block_fn(|_uaddr, deadline| {
+            DEADLINE_SEEN.store(deadline.unwrap_or(u64::MAX), Ordering::SeqCst);
+        });
+        lx.set_was_timeout_fn(|| false);
+        lx.set_now_ms_fn(|| 500);
+
+        let mut val: u32 = 42;
+        let uaddr = &mut val as *mut u32 as u64;
+
+        // 2 seconds + 500_000_000 nanoseconds = 2500ms
+        let ts = [2i64.to_le_bytes(), 500_000_000i64.to_le_bytes()].concat();
+        let timeout_ptr = ts.as_ptr() as u64;
+
+        DEADLINE_SEEN.store(0, Ordering::SeqCst);
+        let _ = lx.sys_futex(uaddr, 0, 42, timeout_ptr);
+        assert_eq!(DEADLINE_SEEN.load(Ordering::SeqCst), 3000); // 500 + 2500
     }
 
     #[test]
@@ -16826,6 +17012,69 @@ mod integration_tests {
         assert_eq!(fds[0].revents, 0);
     }
 
+    #[test]
+    fn poll_passes_deadline_to_block_fn() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let mut lx = Linuxulator::new(MockBackend::new());
+
+        static DEADLINE_SEEN: AtomicU64 = AtomicU64::new(0);
+        // poll_fn call counter: first call (start_ms) returns 1000, subsequent calls
+        // (timeout check inside loop) return 2000 so the loop exits after one block.
+        static POLL_CALL: AtomicU64 = AtomicU64::new(0);
+        lx.set_block_fn(|_op, _fd, deadline| {
+            DEADLINE_SEEN.store(deadline.unwrap_or(u64::MAX), Ordering::SeqCst);
+        });
+        lx.set_poll_fn(|| {
+            let n = POLL_CALL.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                1000
+            } else {
+                2000
+            }
+        });
+        lx.set_now_ms_fn(|| 1000);
+
+        // Create a pipe. The read end has no data → POLLIN not ready → initial
+        // poll_check_once returns 0 → blocking path is taken → block_fn fires.
+        let mut pipe_fds = [0i32; 2];
+        lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: pipe_fds.as_mut_ptr() as u64,
+            flags: 0,
+        });
+        let rfd = pipe_fds[0];
+
+        // struct pollfd { int fd; short events; short revents; }
+        let mut pollfd = [0u8; 8];
+        pollfd[0..4].copy_from_slice(&rfd.to_ne_bytes()); // fd=rfd
+        pollfd[4..6].copy_from_slice(&1i16.to_ne_bytes()); // POLLIN
+        pollfd[6..8].copy_from_slice(&0i16.to_ne_bytes()); // revents=0
+        let fds_ptr = pollfd.as_mut_ptr() as u64;
+
+        DEADLINE_SEEN.store(0, Ordering::SeqCst);
+        POLL_CALL.store(0, Ordering::SeqCst);
+        let _result = lx.sys_poll(fds_ptr, 1, 200); // 200ms timeout
+                                                    // deadline should be 1000 + 200 = 1200
+        assert_eq!(DEADLINE_SEEN.load(Ordering::SeqCst), 1200);
+    }
+
+    #[test]
+    fn poll_infinite_timeout_passes_none_deadline() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // sys_poll with timeout=-1 sets deadline=u64::MAX → deadline_opt=None.
+        // Verify None is forwarded through block_until to block_fn.
+        // We test block_until directly because the sys_poll loop would spin
+        // forever with an infinite timeout and no fd becoming ready.
+        let mut lx = Linuxulator::new(MockBackend::new());
+        static DEADLINE_SEEN2: AtomicU64 = AtomicU64::new(0);
+        lx.set_block_fn(|_op, _fd, deadline| {
+            DEADLINE_SEEN2.store(deadline.unwrap_or(u64::MAX), Ordering::SeqCst);
+        });
+        DEADLINE_SEEN2.store(0, Ordering::SeqCst);
+        // Call block_until with None — mirrors what sys_poll passes for -1 timeout.
+        let _ = lx.block_until(BLOCK_OP_POLL, -1, None);
+        assert_eq!(DEADLINE_SEEN2.load(Ordering::SeqCst), u64::MAX);
+    }
+
     // ── readv / socketpair / getrlimit / umask / ftruncate / renameat ──
 
     #[test]
@@ -18213,12 +18462,12 @@ mod integration_tests {
         let mut lx = Linuxulator::new(MockBackend::new());
         static BLOCK_CALLED: AtomicBool = AtomicBool::new(false);
 
-        lx.set_block_fn(|_op, _fd| {
+        lx.set_block_fn(|_op, _fd, _deadline| {
             BLOCK_CALLED.store(true, Ordering::SeqCst);
         });
 
         BLOCK_CALLED.store(false, Ordering::SeqCst);
-        let result = lx.block_until(BLOCK_OP_READABLE, 5);
+        let result = lx.block_until(BLOCK_OP_READABLE, 5, None);
         assert!(BLOCK_CALLED.load(Ordering::SeqCst));
         assert_eq!(result, BlockResult::Ready);
     }
@@ -18227,7 +18476,7 @@ mod integration_tests {
     fn block_until_returns_interrupted_without_block_fn() {
         let mut lx = Linuxulator::new(MockBackend::new());
         // No block_fn set — should return Interrupted
-        let result = lx.block_until(BLOCK_OP_READABLE, 5);
+        let result = lx.block_until(BLOCK_OP_READABLE, 5, None);
         assert_eq!(result, BlockResult::Interrupted);
     }
 
@@ -18354,5 +18603,70 @@ mod integration_tests {
         assert_eq!(r, 4);
         // wake_fn should have been called with the write end fd.
         assert_eq!(WOKEN_FD.load(Ordering::SeqCst), wfd);
+    }
+
+    // ── nanosleep real-blocking tests ─────────────────────────────
+
+    #[test]
+    fn nanosleep_blocks_with_correct_deadline() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let mut lx = Linuxulator::new(MockBackend::new());
+
+        static DEADLINE_SEEN: AtomicU64 = AtomicU64::new(0);
+        static OP_SEEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
+
+        lx.set_block_fn(|op, _fd, deadline| {
+            OP_SEEN.store(op, Ordering::SeqCst);
+            DEADLINE_SEEN.store(deadline.unwrap_or(u64::MAX), Ordering::SeqCst);
+        });
+        lx.set_now_ms_fn(|| 1000);
+
+        // nanosleep(500ms) = {0 sec, 500_000_000 nsec}
+        let ts = [0i64.to_le_bytes(), 500_000_000i64.to_le_bytes()].concat();
+        let req_ptr = ts.as_ptr() as u64;
+
+        DEADLINE_SEEN.store(0, Ordering::SeqCst);
+        OP_SEEN.store(255, Ordering::SeqCst);
+        let result = lx.sys_nanosleep(req_ptr, 0);
+        assert_eq!(result, 0);
+        assert_eq!(OP_SEEN.load(Ordering::SeqCst), BLOCK_OP_SLEEP);
+        assert_eq!(DEADLINE_SEEN.load(Ordering::SeqCst), 1500); // 1000 + 500
+    }
+
+    #[test]
+    fn clock_nanosleep_abstime_uses_raw_value() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let mut lx = Linuxulator::new(MockBackend::new());
+
+        static DEADLINE_SEEN: AtomicU64 = AtomicU64::new(0);
+
+        lx.set_block_fn(|_op, _fd, deadline| {
+            DEADLINE_SEEN.store(deadline.unwrap_or(u64::MAX), Ordering::SeqCst);
+        });
+        lx.set_now_ms_fn(|| 1000);
+
+        // clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, 3 seconds)
+        let ts = [3i64.to_le_bytes(), 0i64.to_le_bytes()].concat();
+        let req_ptr = ts.as_ptr() as u64;
+
+        DEADLINE_SEEN.store(0, Ordering::SeqCst);
+        // clockid=1 (CLOCK_MONOTONIC), flags=1 (TIMER_ABSTIME)
+        let result = lx.sys_clock_nanosleep(1, 1, req_ptr, 0);
+        assert_eq!(result, 0);
+        assert_eq!(DEADLINE_SEEN.load(Ordering::SeqCst), 3000); // 3 seconds = 3000ms
+    }
+
+    #[test]
+    fn nanosleep_falls_back_without_block_fn() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        // No block_fn or now_ms_fn set — should fall back to clock advance.
+
+        let ts = [0i64.to_le_bytes(), 500_000_000i64.to_le_bytes()].concat();
+        let req_ptr = ts.as_ptr() as u64;
+
+        let result = lx.sys_nanosleep(req_ptr, 0);
+        assert_eq!(result, 0);
+        // monotonic_ns should have advanced by 500ms = 500_000_000ns
+        assert_eq!(lx.monotonic_ns, 500_000_000);
     }
 }

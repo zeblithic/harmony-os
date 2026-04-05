@@ -66,6 +66,8 @@ pub enum WaitReason {
     PollWait,
     /// Waiting on a futex word at this address.
     Futex(u64),
+    /// Pure time wait — woken by the timer IRQ when deadline_ms expires.
+    Sleep,
 }
 
 /// Per-task scheduling state. Stored in a fixed-size array, indexed by task number.
@@ -101,6 +103,13 @@ pub struct TaskControlBlock {
     /// Address to zero + futex_wake on thread exit (CLONE_CHILD_CLEARTID).
     /// 0 means no cleanup needed.
     pub clear_child_tid: u64,
+    /// Absolute time (ms since boot) at which a blocked task should be
+    /// unconditionally woken. `None` means no deadline — the task waits
+    /// until explicitly woken by an I/O or futex event.
+    pub deadline_ms: Option<u64>,
+    /// Set to `true` by `check_deadlines` when the task is woken because
+    /// its deadline expired. Cleared by `consume_woken_by_timeout`.
+    pub woken_by_timeout: bool,
 }
 
 /// Task array — only accessed from the IRQ handler (non-reentrant).
@@ -199,6 +208,8 @@ pub unsafe fn spawn_task(
         tls: 0,
         tid: 0, // Boot-time tasks: 0 = use Linuxulator PID for gettid()
         clear_child_tid: 0,
+        deadline_ms: None,
+        woken_by_timeout: false,
     });
     NUM_TASKS = n + 1;
     n
@@ -481,6 +492,8 @@ pub unsafe fn spawn_task_runtime(
         tls,
         tid,
         clear_child_tid,
+        deadline_ms: None,
+        woken_by_timeout: false,
     });
     NUM_TASKS = n + 1;
 
@@ -502,7 +515,7 @@ pub unsafe fn spawn_task_runtime(
 /// - On aarch64: execution resumes here after the waker calls `wake()` and
 ///   the scheduler has rescheduled this task. `wait_reason` is already
 ///   cleared by `wake()` before the resume.
-pub unsafe fn block_current(reason: WaitReason) {
+pub unsafe fn block_current(reason: WaitReason, deadline_ms: Option<u64>) {
     // Scoped to drop the &mut borrow before unmasking IRQs — the SGI
     // (or a timer IRQ after daifclr) enters schedule() which does its
     // own TASKS[cur].assume_init_mut(). Two live &mut refs to the same
@@ -512,6 +525,8 @@ pub unsafe fn block_current(reason: WaitReason) {
         let tcb = TASKS[cur].assume_init_mut();
         tcb.state = TaskState::Blocked;
         tcb.wait_reason = Some(reason);
+        tcb.deadline_ms = deadline_ms;
+        tcb.woken_by_timeout = false;
         #[cfg(target_arch = "aarch64")]
         {
             let tls: u64;
@@ -538,6 +553,52 @@ pub unsafe fn block_current(reason: WaitReason) {
     }
 }
 
+/// Scan all blocked tasks and wake any whose `deadline_ms` has expired.
+///
+/// Called from the timer IRQ handler on each tick. For each Blocked task
+/// with a `deadline_ms` that satisfies `now_ms >= deadline`, the task is
+/// transitioned to Ready, `woken_by_timeout` is set, and deadline fields
+/// are cleared.
+///
+/// # Safety
+///
+/// - Must only be called from the IRQ handler path (non-reentrant, PSTATE.I set).
+/// - All `TASKS[0..NUM_TASKS]` must be initialized.
+pub unsafe fn check_deadlines(now_ms: u64) {
+    let n = NUM_TASKS;
+    for i in 0..n {
+        let tcb = TASKS[i].assume_init_mut();
+        if tcb.state == TaskState::Blocked {
+            if let Some(deadline) = tcb.deadline_ms {
+                if now_ms >= deadline {
+                    tcb.woken_by_timeout = true;
+                    tcb.state = TaskState::Ready;
+                    tcb.wait_reason = None;
+                    tcb.deadline_ms = None;
+                }
+            }
+        }
+    }
+}
+
+/// Read and clear the `woken_by_timeout` flag on the current task.
+///
+/// Returns `true` if the current task was woken by a timer deadline (i.e.,
+/// `check_deadlines` fired before an explicit wake), then clears the flag.
+/// Returns `false` if the task was woken by a normal wake call or the flag
+/// was already cleared.
+///
+/// # Safety
+///
+/// - `CURRENT` must index a valid, initialized TCB.
+/// - Must be called from task context (not IRQ handler).
+pub unsafe fn consume_woken_by_timeout() -> bool {
+    let tcb = TASKS[CURRENT].assume_init_mut();
+    let was_timeout = tcb.woken_by_timeout;
+    tcb.woken_by_timeout = false;
+    was_timeout
+}
+
 /// Wake a specific blocked task, transitioning it to Ready.
 ///
 /// If the task at `task_idx` is in `Blocked` state, transitions it to
@@ -554,6 +615,7 @@ pub unsafe fn wake(task_idx: usize) {
     if tcb.state == TaskState::Blocked {
         tcb.state = TaskState::Ready;
         tcb.wait_reason = None;
+        tcb.deadline_ms = None;
     }
 }
 
@@ -590,6 +652,7 @@ pub unsafe fn wake_by_fd(fd: i32, op: u8) {
         if matches {
             tcb.state = TaskState::Ready;
             tcb.wait_reason = None;
+            tcb.deadline_ms = None;
         }
     }
 }
@@ -638,6 +701,7 @@ pub unsafe fn futex_wake(uaddr: u64, max: u32) -> u32 {
         if tcb.state == TaskState::Blocked && tcb.wait_reason == Some(WaitReason::Futex(uaddr)) {
             tcb.state = TaskState::Ready;
             tcb.wait_reason = None;
+            tcb.deadline_ms = None;
             woken += 1;
         }
     }
@@ -702,6 +766,7 @@ pub unsafe fn kill_threads_by_pid(pid: u32) {
             tcb.clear_child_tid = 0;
             tcb.state = TaskState::Dead;
             tcb.wait_reason = None;
+            tcb.deadline_ms = None;
         }
         // CLEARTID cleanup — no live borrow on TASKS[i].
         if clear_addr != 0 {
@@ -759,6 +824,8 @@ mod tests {
                 tls: 0,
                 tid: 7,
                 clear_child_tid: 0,
+                deadline_ms: None,
+                woken_by_timeout: false,
             });
         }
         let guard_start = 0x2_0000 - PAGE_SIZE as usize;
@@ -795,6 +862,8 @@ mod tests {
             tls: 0,
             tid: idx as u32,
             clear_child_tid: 0,
+            deadline_ms: None,
+            woken_by_timeout: false,
         });
     }
 
@@ -837,7 +906,7 @@ mod tests {
             NUM_TASKS = 1;
             CURRENT = 0;
             // block_current on non-aarch64 just mutates state — no SGI.
-            block_current(WaitReason::FdReadable(7));
+            block_current(WaitReason::FdReadable(7), None);
             let tcb = TASKS[0].assume_init_ref();
             assert_eq!(tcb.state, TaskState::Blocked);
             assert_eq!(tcb.wait_reason, Some(WaitReason::FdReadable(7)));
@@ -939,6 +1008,8 @@ mod tests {
                 tls: 0xDEAD_BEEF,
                 tid: 42,
                 clear_child_tid: 0xCAFE,
+                deadline_ms: None,
+                woken_by_timeout: false,
             });
             let tcb = TASKS[0].assume_init_ref();
             assert_eq!(tcb.tls, 0xDEAD_BEEF);
@@ -1045,6 +1116,185 @@ mod tests {
             assert_eq!(TASKS[1].assume_init_ref().state, TaskState::Dead);
             // Task 2 (different PID) is untouched.
             assert_eq!(TASKS[2].assume_init_ref().state, TaskState::Ready);
+            NUM_TASKS = 0;
+        }
+    }
+
+    // ── Deadline / sleep tests ───────────────────────────────────────────────
+
+    #[test]
+    fn wait_reason_sleep_variant() {
+        // Sleep is a pure time wait — no fd or address.
+        let s = WaitReason::Sleep;
+        assert_eq!(s, WaitReason::Sleep);
+        assert_ne!(s, WaitReason::FdReadable(0));
+        assert_ne!(s, WaitReason::PollWait);
+    }
+
+    #[test]
+    fn block_current_stores_deadline() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            put_tcb(0, TaskState::Running, None);
+            NUM_TASKS = 1;
+            CURRENT = 0;
+            block_current(WaitReason::Sleep, Some(1234));
+            let tcb = TASKS[0].assume_init_ref();
+            assert_eq!(tcb.state, TaskState::Blocked);
+            assert_eq!(tcb.wait_reason, Some(WaitReason::Sleep));
+            assert_eq!(tcb.deadline_ms, Some(1234));
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn block_current_clears_stale_woken_by_timeout() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            put_tcb(0, TaskState::Running, None);
+            // Simulate a stale flag from a previous timeout wake.
+            TASKS[0].assume_init_mut().woken_by_timeout = true;
+            NUM_TASKS = 1;
+            CURRENT = 0;
+
+            block_current(WaitReason::Futex(0x1000), Some(500));
+
+            let tcb = TASKS[0].assume_init_ref();
+            assert_eq!(tcb.state, TaskState::Blocked);
+            // The stale flag must be cleared on entry to blocking.
+            assert!(!tcb.woken_by_timeout);
+            assert_eq!(tcb.deadline_ms, Some(500));
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn check_deadlines_wakes_expired_task() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            // Task 0: blocked with deadline at 100ms — now is 150ms, should wake.
+            put_tcb(0, TaskState::Blocked, Some(WaitReason::Sleep));
+            TASKS[0].assume_init_mut().deadline_ms = Some(100);
+            TASKS[0].assume_init_mut().woken_by_timeout = false;
+
+            // Task 1: blocked with deadline at 200ms — now is 150ms, should NOT wake.
+            put_tcb(1, TaskState::Blocked, Some(WaitReason::FdReadable(3)));
+            TASKS[1].assume_init_mut().deadline_ms = Some(200);
+            TASKS[1].assume_init_mut().woken_by_timeout = false;
+
+            // Task 2: no deadline — should NOT be affected.
+            put_tcb(2, TaskState::Blocked, Some(WaitReason::PollWait));
+            TASKS[2].assume_init_mut().deadline_ms = None;
+            TASKS[2].assume_init_mut().woken_by_timeout = false;
+
+            NUM_TASKS = 3;
+
+            check_deadlines(150);
+
+            // Task 0: deadline expired → Ready, woken_by_timeout=true, fields cleared.
+            let t0 = TASKS[0].assume_init_ref();
+            assert_eq!(t0.state, TaskState::Ready);
+            assert_eq!(t0.wait_reason, None);
+            assert_eq!(t0.deadline_ms, None);
+            assert!(t0.woken_by_timeout);
+
+            // Task 1: deadline not yet expired → still Blocked.
+            let t1 = TASKS[1].assume_init_ref();
+            assert_eq!(t1.state, TaskState::Blocked);
+            assert_eq!(t1.deadline_ms, Some(200));
+            assert!(!t1.woken_by_timeout);
+
+            // Task 2: no deadline → untouched.
+            let t2 = TASKS[2].assume_init_ref();
+            assert_eq!(t2.state, TaskState::Blocked);
+            assert!(!t2.woken_by_timeout);
+
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn check_deadlines_wakes_at_exact_deadline() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            put_tcb(0, TaskState::Blocked, Some(WaitReason::Sleep));
+            TASKS[0].assume_init_mut().deadline_ms = Some(500);
+            TASKS[0].assume_init_mut().woken_by_timeout = false;
+            NUM_TASKS = 1;
+
+            // Exactly at deadline — should wake (now_ms >= deadline).
+            check_deadlines(500);
+
+            let t0 = TASKS[0].assume_init_ref();
+            assert_eq!(t0.state, TaskState::Ready);
+            assert!(t0.woken_by_timeout);
+            assert_eq!(t0.deadline_ms, None);
+
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn check_deadlines_skips_non_blocked_tasks() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            put_tcb(0, TaskState::Ready, None);
+            TASKS[0].assume_init_mut().deadline_ms = Some(1); // Would expire immediately
+            TASKS[0].assume_init_mut().woken_by_timeout = false;
+
+            put_tcb(1, TaskState::Running, None);
+            TASKS[1].assume_init_mut().deadline_ms = Some(1);
+            TASKS[1].assume_init_mut().woken_by_timeout = false;
+
+            NUM_TASKS = 2;
+
+            check_deadlines(9999);
+
+            // Neither task should have woken_by_timeout set — only Blocked tasks are checked.
+            assert!(!TASKS[0].assume_init_ref().woken_by_timeout);
+            assert!(!TASKS[1].assume_init_ref().woken_by_timeout);
+
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn consume_woken_by_timeout_reads_and_clears() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            put_tcb(0, TaskState::Ready, None);
+            TASKS[0].assume_init_mut().woken_by_timeout = true;
+            NUM_TASKS = 1;
+            CURRENT = 0;
+
+            // First call: returns true, clears the flag.
+            assert!(consume_woken_by_timeout());
+            // Second call: flag already cleared, returns false.
+            assert!(!consume_woken_by_timeout());
+
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn normal_wake_clears_deadline_and_flag() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            // Task blocked with a deadline — woken via wake() before deadline fires.
+            put_tcb(0, TaskState::Blocked, Some(WaitReason::Sleep));
+            TASKS[0].assume_init_mut().deadline_ms = Some(9999);
+            TASKS[0].assume_init_mut().woken_by_timeout = false;
+            NUM_TASKS = 1;
+
+            wake(0);
+
+            let t0 = TASKS[0].assume_init_ref();
+            assert_eq!(t0.state, TaskState::Ready);
+            assert_eq!(t0.wait_reason, None);
+            assert_eq!(t0.deadline_ms, None);
+            // woken_by_timeout must remain false (it was a normal wake, not timer).
+            assert!(!t0.woken_by_timeout);
+
             NUM_TASKS = 0;
         }
     }

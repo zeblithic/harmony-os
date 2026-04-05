@@ -346,6 +346,7 @@ extern "C" fn irq_dispatch(current_sp: usize) -> usize {
     let new_sp = match intid {
         gic::TIMER_INTID => {
             timer::on_tick();
+            unsafe { sched::check_deadlines(timer::now_ms()) };
             unsafe { sched::schedule(current_sp) }
         }
         gic::YIELD_SGI => {
