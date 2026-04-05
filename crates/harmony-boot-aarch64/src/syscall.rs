@@ -26,7 +26,7 @@ pub struct TrapFrame {
     /// Floating-Point Status Register.
     pub fpsr: u64,
     /// Padding to align `q` to 16 bytes (required for `stp`/`ldp` of Q regs).
-    _pad: u64,
+    pub _pad: u64,
     /// SIMD/FP registers Q0-Q31 (128 bits each).
     pub q: [u128; 32],
 }

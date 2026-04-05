@@ -742,6 +742,55 @@ pub unsafe fn wake_waiting_parent(child_pid: u32) {
     }
 }
 
+/// Redirect the main thread (tid==0) of a process to the boot return point.
+///
+/// Called by a spawned thread's exit_group path when it needs to redirect
+/// the main thread to RETURN_ADDR. Finds the main thread's TCB (matching
+/// `pid` and `tid == 0`, excluding CURRENT), follows `kernel_sp` to the
+/// saved TrapFrame in memory, and patches:
+/// - `elr` = `ret_addr` (boot code return point)
+/// - `x[0]` = `exit_code`
+/// - `x[1]` = `ret_sp` (saved kernel stack pointer)
+/// - `x[2]` = `ret_lr` (saved kernel link register)
+///
+/// Marks the main thread `Ready` so the scheduler picks it up and erets
+/// into the boot code.
+///
+/// No-op if no matching task is found (e.g., main thread already exited).
+///
+/// # Safety
+///
+/// - TASKS[0..NUM_TASKS] must be initialized.
+/// - `ret_addr` must point to valid executable code.
+/// - Must only be called from the SVC handler path (IRQs masked).
+pub unsafe fn redirect_main_thread_to_boot(
+    pid: u32,
+    exit_code: i32,
+    ret_addr: u64,
+    ret_sp: u64,
+    ret_lr: u64,
+) {
+    let n = NUM_TASKS;
+    let cur = CURRENT;
+    for i in 0..n {
+        if i == cur {
+            continue;
+        }
+        let tcb = TASKS[i].assume_init_mut();
+        if tcb.pid == pid && tcb.tid == 0 {
+            let frame = &mut *(tcb.kernel_sp as *mut crate::syscall::TrapFrame);
+            frame.elr = ret_addr;
+            frame.x[0] = exit_code as u64;
+            frame.x[1] = ret_sp;
+            frame.x[2] = ret_lr;
+            tcb.state = TaskState::Ready;
+            tcb.wait_reason = None;
+            tcb.deadline_ms = None;
+            return;
+        }
+    }
+}
+
 /// Get the current task's TID.
 pub unsafe fn current_task_tid() -> u32 {
     TASKS[CURRENT].assume_init_ref().tid
@@ -1407,6 +1456,138 @@ mod tests {
             assert_eq!(TASKS[0].assume_init_ref().state, TaskState::Ready);
             assert_eq!(TASKS[1].assume_init_ref().state, TaskState::Blocked);
 
+            NUM_TASKS = 0;
+        }
+    }
+
+    // ── redirect_main_thread_to_boot tests ──────────────────────────────────
+
+    #[test]
+    fn redirect_main_thread_patches_trapframe() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            // Allocate a TrapFrame on the heap to simulate a kernel stack.
+            let frame = Box::new(crate::syscall::TrapFrame {
+                x: [0u64; 31],
+                elr: 0xDEAD,
+                spsr: 0,
+                fpcr: 0,
+                fpsr: 0,
+                _pad: 0,
+                q: [0u128; 32],
+            });
+            let frame_ptr = Box::into_raw(frame);
+
+            // Task 0 (current, spawned thread) — pid=2, tid=3.
+            put_tcb(0, TaskState::Running, None);
+            TASKS[0].assume_init_mut().pid = 2;
+            TASKS[0].assume_init_mut().tid = 3;
+
+            // Task 1 (main thread) — pid=2, tid=0, Dead (killed by kill_threads_by_pid).
+            put_tcb(1, TaskState::Dead, None);
+            TASKS[1].assume_init_mut().pid = 2;
+            TASKS[1].assume_init_mut().tid = 0;
+            TASKS[1].assume_init_mut().kernel_sp = frame_ptr as usize;
+
+            NUM_TASKS = 2;
+            CURRENT = 0;
+
+            redirect_main_thread_to_boot(2, 42, 0xB007, 0x5500, 0x1200);
+
+            // Main thread's TrapFrame should be patched.
+            let patched = &*frame_ptr;
+            assert_eq!(patched.elr, 0xB007);
+            assert_eq!(patched.x[0], 42); // exit_code
+            assert_eq!(patched.x[1], 0x5500); // ret_sp
+            assert_eq!(patched.x[2], 0x1200); // ret_lr
+
+            // Main thread should be Ready now.
+            assert_eq!(TASKS[1].assume_init_ref().state, TaskState::Ready);
+            assert_eq!(TASKS[1].assume_init_ref().wait_reason, None);
+            assert_eq!(TASKS[1].assume_init_ref().deadline_ms, None);
+
+            // Clean up.
+            let _ = Box::from_raw(frame_ptr);
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn redirect_main_thread_skips_current_task() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            let frame = Box::new(crate::syscall::TrapFrame {
+                x: [0u64; 31],
+                elr: 0xAAAA,
+                spsr: 0,
+                fpcr: 0,
+                fpsr: 0,
+                _pad: 0,
+                q: [0u128; 32],
+            });
+            let frame_ptr = Box::into_raw(frame);
+
+            // Task 0 is CURRENT, pid=2, tid=0 — should be skipped even though
+            // it matches pid and tid==0, because it's the calling task.
+            put_tcb(0, TaskState::Running, None);
+            TASKS[0].assume_init_mut().pid = 2;
+            TASKS[0].assume_init_mut().tid = 0;
+            TASKS[0].assume_init_mut().kernel_sp = frame_ptr as usize;
+
+            NUM_TASKS = 1;
+            CURRENT = 0;
+
+            redirect_main_thread_to_boot(2, 1, 0xB007, 0x5500, 0x1100);
+
+            // TrapFrame should NOT be patched — task was skipped.
+            let patched = &*frame_ptr;
+            assert_eq!(patched.elr, 0xAAAA);
+
+            // Task should still be Running.
+            assert_eq!(TASKS[0].assume_init_ref().state, TaskState::Running);
+
+            let _ = Box::from_raw(frame_ptr);
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn redirect_main_thread_skips_wrong_pid() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            let frame = Box::new(crate::syscall::TrapFrame {
+                x: [0u64; 31],
+                elr: 0xBBBB,
+                spsr: 0,
+                fpcr: 0,
+                fpsr: 0,
+                _pad: 0,
+                q: [0u128; 32],
+            });
+            let frame_ptr = Box::into_raw(frame);
+
+            // Task 0 (current) — pid=2, tid=3.
+            put_tcb(0, TaskState::Running, None);
+            TASKS[0].assume_init_mut().pid = 2;
+            TASKS[0].assume_init_mut().tid = 3;
+
+            // Task 1 — pid=9 (wrong), tid=0.
+            put_tcb(1, TaskState::Dead, None);
+            TASKS[1].assume_init_mut().pid = 9;
+            TASKS[1].assume_init_mut().tid = 0;
+            TASKS[1].assume_init_mut().kernel_sp = frame_ptr as usize;
+
+            NUM_TASKS = 2;
+            CURRENT = 0;
+
+            redirect_main_thread_to_boot(2, 1, 0xB007, 0x5500, 0x1100);
+
+            // TrapFrame should NOT be patched — wrong PID.
+            let patched = &*frame_ptr;
+            assert_eq!(patched.elr, 0xBBBB);
+            assert_eq!(TASKS[1].assume_init_ref().state, TaskState::Dead);
+
+            let _ = Box::from_raw(frame_ptr);
             NUM_TASKS = 0;
         }
     }
