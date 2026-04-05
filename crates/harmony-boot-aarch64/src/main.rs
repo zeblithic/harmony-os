@@ -488,6 +488,7 @@ fn main() -> Status {
                 2 => sched::WaitReason::FdConnectDone(fd),
                 3 => sched::WaitReason::PollWait,
                 4 => sched::WaitReason::Sleep,
+                5 => sched::WaitReason::WaitChild(fd),
                 _ => unreachable!(),
             };
             unsafe { sched::block_current(reason, deadline_ms) };
