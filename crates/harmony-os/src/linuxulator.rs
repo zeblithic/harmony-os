@@ -5808,8 +5808,13 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             } else {
                 u64::MAX // -1 = infinite wait
             };
+            let deadline_opt = if deadline == u64::MAX {
+                None
+            } else {
+                Some(deadline)
+            };
 
-            while let BlockResult::Ready = self.block_until(BLOCK_OP_POLL, -1, None) {
+            while let BlockResult::Ready = self.block_until(BLOCK_OP_POLL, -1, deadline_opt) {
                 // Drive the network stack.
                 if let Some(pf) = self.poll_fn {
                     let now = pf() as i64;
@@ -8850,9 +8855,14 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             } else {
                 u64::MAX // Negative timeout = infinite wait
             };
+            let deadline_opt = if deadline == u64::MAX {
+                None
+            } else {
+                Some(deadline)
+            };
 
             loop {
-                match self.block_until(BLOCK_OP_POLL, -1, None) {
+                match self.block_until(BLOCK_OP_POLL, -1, deadline_opt) {
                     BlockResult::Ready => {
                         let ready = self.poll_check_once(fds_ptr, nfds);
                         if ready > 0 {
@@ -9037,6 +9047,11 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             } else {
                 start_ms.saturating_add(timeout_ms)
             };
+            let deadline_opt = if deadline == u64::MAX {
+                None
+            } else {
+                Some(deadline)
+            };
 
             loop {
                 // Restore input fd_sets before each check (previous iteration may have cleared bits).
@@ -9057,7 +9072,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     dst.copy_from_slice(&saved_exceptfds[..read_bytes]);
                 }
 
-                match self.block_until(BLOCK_OP_POLL, -1, None) {
+                match self.block_until(BLOCK_OP_POLL, -1, deadline_opt) {
                     BlockResult::Ready => {
                         let ready = self.select_check_once(nfds, readfds, writefds, exceptfds);
                         if ready > 0 {
@@ -16974,6 +16989,69 @@ mod integration_tests {
         });
         assert_eq!(r, 0); // negative fd ignored, revents=0
         assert_eq!(fds[0].revents, 0);
+    }
+
+    #[test]
+    fn poll_passes_deadline_to_block_fn() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let mut lx = Linuxulator::new(MockBackend::new());
+
+        static DEADLINE_SEEN: AtomicU64 = AtomicU64::new(0);
+        // poll_fn call counter: first call (start_ms) returns 1000, subsequent calls
+        // (timeout check inside loop) return 2000 so the loop exits after one block.
+        static POLL_CALL: AtomicU64 = AtomicU64::new(0);
+        lx.set_block_fn(|_op, _fd, deadline| {
+            DEADLINE_SEEN.store(deadline.unwrap_or(u64::MAX), Ordering::SeqCst);
+        });
+        lx.set_poll_fn(|| {
+            let n = POLL_CALL.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                1000
+            } else {
+                2000
+            }
+        });
+        lx.set_now_ms_fn(|| 1000);
+
+        // Create a pipe. The read end has no data → POLLIN not ready → initial
+        // poll_check_once returns 0 → blocking path is taken → block_fn fires.
+        let mut pipe_fds = [0i32; 2];
+        lx.dispatch_syscall(LinuxSyscall::Pipe2 {
+            fds: pipe_fds.as_mut_ptr() as u64,
+            flags: 0,
+        });
+        let rfd = pipe_fds[0];
+
+        // struct pollfd { int fd; short events; short revents; }
+        let mut pollfd = [0u8; 8];
+        pollfd[0..4].copy_from_slice(&rfd.to_ne_bytes()); // fd=rfd
+        pollfd[4..6].copy_from_slice(&1i16.to_ne_bytes()); // POLLIN
+        pollfd[6..8].copy_from_slice(&0i16.to_ne_bytes()); // revents=0
+        let fds_ptr = pollfd.as_mut_ptr() as u64;
+
+        DEADLINE_SEEN.store(0, Ordering::SeqCst);
+        POLL_CALL.store(0, Ordering::SeqCst);
+        let _result = lx.sys_poll(fds_ptr, 1, 200); // 200ms timeout
+                                                    // deadline should be 1000 + 200 = 1200
+        assert_eq!(DEADLINE_SEEN.load(Ordering::SeqCst), 1200);
+    }
+
+    #[test]
+    fn poll_infinite_timeout_passes_none_deadline() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // sys_poll with timeout=-1 sets deadline=u64::MAX → deadline_opt=None.
+        // Verify None is forwarded through block_until to block_fn.
+        // We test block_until directly because the sys_poll loop would spin
+        // forever with an infinite timeout and no fd becoming ready.
+        let mut lx = Linuxulator::new(MockBackend::new());
+        static DEADLINE_SEEN2: AtomicU64 = AtomicU64::new(0);
+        lx.set_block_fn(|_op, _fd, deadline| {
+            DEADLINE_SEEN2.store(deadline.unwrap_or(u64::MAX), Ordering::SeqCst);
+        });
+        DEADLINE_SEEN2.store(0, Ordering::SeqCst);
+        // Call block_until with None — mirrors what sys_poll passes for -1 timeout.
+        let _ = lx.block_until(BLOCK_OP_POLL, -1, None);
+        assert_eq!(DEADLINE_SEEN2.load(Ordering::SeqCst), u64::MAX);
     }
 
     // ── readv / socketpair / getrlimit / umask / ftruncate / renameat ──
