@@ -6585,8 +6585,13 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
     /// Linux clock_nanosleep(2): sleep on a specific clock.
     ///
-    /// Supports both relative (flags=0) and absolute (TIMER_ABSTIME)
-    /// sleep. For absolute, computes delta from current clock value.
+    /// When `block_fn` and `now_ms_fn` are both set (scheduler available),
+    /// computes an absolute deadline in milliseconds and blocks via
+    /// `BLOCK_OP_SLEEP`. The timer IRQ's `check_deadlines` wakes the task.
+    ///
+    /// Without a scheduler (sans-I/O / host-test mode), falls back to the
+    /// old clock-advance behavior so host tests that inspect `monotonic_ns`
+    /// continue to pass.
     fn sys_clock_nanosleep(
         &mut self,
         clockid: i32,
@@ -6602,40 +6607,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         if flags & !TIMER_ABSTIME != 0 {
             return EINVAL;
         }
-        if flags & TIMER_ABSTIME != 0 {
-            // Absolute time: compute delta from current clock value.
-            if req_ptr == 0 {
-                return EFAULT;
-            }
-            let req_bytes =
-                unsafe { core::slice::from_raw_parts(req_ptr as usize as *const u8, 16) };
-            let abs_sec = i64::from_le_bytes(req_bytes[0..8].try_into().unwrap());
-            let abs_nsec = i64::from_le_bytes(req_bytes[8..16].try_into().unwrap());
-            if abs_sec < 0 || !(0..1_000_000_000).contains(&abs_nsec) {
-                return EINVAL;
-            }
-            let abs_ns = (abs_sec as u64)
-                .saturating_mul(1_000_000_000)
-                .saturating_add(abs_nsec as u64);
-            let now = match clockid {
-                CLOCK_REALTIME => self.realtime_ns,
-                _ => self.monotonic_ns,
-            };
-            // If target is already in the past, return immediately.
-            let delta_ns = abs_ns.saturating_sub(now);
-            // Advance the clock we're sleeping on (not always monotonic).
-            match clockid {
-                CLOCK_REALTIME => {
-                    self.realtime_ns = self.realtime_ns.wrapping_add(delta_ns);
-                }
-                _ => {
-                    self.monotonic_ns = self.monotonic_ns.wrapping_add(delta_ns);
-                }
-            }
-            return 0;
-        }
 
-        // Relative sleep: advance the requested clock by the duration.
         if req_ptr == 0 {
             return EFAULT;
         }
@@ -6645,15 +6617,64 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
             return EINVAL;
         }
-        let duration_ns = (tv_sec as u64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add(tv_nsec as u64);
-        match clockid {
-            CLOCK_REALTIME => {
-                self.realtime_ns = self.realtime_ns.wrapping_add(duration_ns);
+
+        // If scheduler + clock are available, do a real blocking sleep.
+        if self.block_fn.is_some() && self.now_ms_fn.is_some() {
+            let now_ms = (self.now_ms_fn.unwrap())();
+            let deadline_ms = if flags & TIMER_ABSTIME != 0 {
+                // Absolute: convert timespec to ms directly.
+                let abs_ms = (tv_sec as u64)
+                    .saturating_mul(1000)
+                    .saturating_add((tv_nsec as u64) / 1_000_000);
+                // If target is already in the past, return immediately.
+                if abs_ms <= now_ms {
+                    return 0;
+                }
+                abs_ms
+            } else {
+                // Relative: deadline = now + duration.
+                let duration_ms = (tv_sec as u64)
+                    .saturating_mul(1000)
+                    .saturating_add((tv_nsec as u64) / 1_000_000);
+                if duration_ms == 0 {
+                    return 0;
+                }
+                now_ms.saturating_add(duration_ms)
+            };
+            self.block_until(BLOCK_OP_SLEEP, -1, Some(deadline_ms));
+            return 0;
+        }
+
+        // Fallback: sans-I/O mode (no scheduler). Advance the clock by the
+        // requested duration and return immediately. Host tests rely on this.
+        if flags & TIMER_ABSTIME != 0 {
+            let abs_ns = (tv_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(tv_nsec as u64);
+            let now = match clockid {
+                CLOCK_REALTIME => self.realtime_ns,
+                _ => self.monotonic_ns,
+            };
+            let delta_ns = abs_ns.saturating_sub(now);
+            match clockid {
+                CLOCK_REALTIME => {
+                    self.realtime_ns = self.realtime_ns.wrapping_add(delta_ns);
+                }
+                _ => {
+                    self.monotonic_ns = self.monotonic_ns.wrapping_add(delta_ns);
+                }
             }
-            _ => {
-                self.monotonic_ns = self.monotonic_ns.wrapping_add(duration_ns);
+        } else {
+            let duration_ns = (tv_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(tv_nsec as u64);
+            match clockid {
+                CLOCK_REALTIME => {
+                    self.realtime_ns = self.realtime_ns.wrapping_add(duration_ns);
+                }
+                _ => {
+                    self.monotonic_ns = self.monotonic_ns.wrapping_add(duration_ns);
+                }
             }
         }
         0
@@ -18483,5 +18504,70 @@ mod integration_tests {
         assert_eq!(r, 4);
         // wake_fn should have been called with the write end fd.
         assert_eq!(WOKEN_FD.load(Ordering::SeqCst), wfd);
+    }
+
+    // ── nanosleep real-blocking tests ─────────────────────────────
+
+    #[test]
+    fn nanosleep_blocks_with_correct_deadline() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let mut lx = Linuxulator::new(MockBackend::new());
+
+        static DEADLINE_SEEN: AtomicU64 = AtomicU64::new(0);
+        static OP_SEEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
+
+        lx.set_block_fn(|op, _fd, deadline| {
+            OP_SEEN.store(op, Ordering::SeqCst);
+            DEADLINE_SEEN.store(deadline.unwrap_or(u64::MAX), Ordering::SeqCst);
+        });
+        lx.set_now_ms_fn(|| 1000);
+
+        // nanosleep(500ms) = {0 sec, 500_000_000 nsec}
+        let ts = [0i64.to_le_bytes(), 500_000_000i64.to_le_bytes()].concat();
+        let req_ptr = ts.as_ptr() as u64;
+
+        DEADLINE_SEEN.store(0, Ordering::SeqCst);
+        OP_SEEN.store(255, Ordering::SeqCst);
+        let result = lx.sys_nanosleep(req_ptr, 0);
+        assert_eq!(result, 0);
+        assert_eq!(OP_SEEN.load(Ordering::SeqCst), BLOCK_OP_SLEEP);
+        assert_eq!(DEADLINE_SEEN.load(Ordering::SeqCst), 1500); // 1000 + 500
+    }
+
+    #[test]
+    fn clock_nanosleep_abstime_uses_raw_value() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let mut lx = Linuxulator::new(MockBackend::new());
+
+        static DEADLINE_SEEN: AtomicU64 = AtomicU64::new(0);
+
+        lx.set_block_fn(|_op, _fd, deadline| {
+            DEADLINE_SEEN.store(deadline.unwrap_or(u64::MAX), Ordering::SeqCst);
+        });
+        lx.set_now_ms_fn(|| 1000);
+
+        // clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, 3 seconds)
+        let ts = [3i64.to_le_bytes(), 0i64.to_le_bytes()].concat();
+        let req_ptr = ts.as_ptr() as u64;
+
+        DEADLINE_SEEN.store(0, Ordering::SeqCst);
+        // clockid=1 (CLOCK_MONOTONIC), flags=1 (TIMER_ABSTIME)
+        let result = lx.sys_clock_nanosleep(1, 1, req_ptr, 0);
+        assert_eq!(result, 0);
+        assert_eq!(DEADLINE_SEEN.load(Ordering::SeqCst), 3000); // 3 seconds = 3000ms
+    }
+
+    #[test]
+    fn nanosleep_falls_back_without_block_fn() {
+        let mut lx = Linuxulator::new(MockBackend::new());
+        // No block_fn or now_ms_fn set — should fall back to clock advance.
+
+        let ts = [0i64.to_le_bytes(), 500_000_000i64.to_le_bytes()].concat();
+        let req_ptr = ts.as_ptr() as u64;
+
+        let result = lx.sys_nanosleep(req_ptr, 0);
+        assert_eq!(result, 0);
+        // monotonic_ns should have advanced by 500ms = 500_000_000ns
+        assert_eq!(lx.monotonic_ns, 500_000_000);
     }
 }
