@@ -777,6 +777,9 @@ pub unsafe fn redirect_main_thread_to_boot(
             continue;
         }
         let tcb = TASKS[i].assume_init_mut();
+        // No state guard: the main thread is typically Dead here (killed by
+        // kill_threads_by_pid before this call). We intentionally resurrect
+        // it from Dead → Ready with a patched ELR pointing at boot code.
         if tcb.pid == pid && tcb.tid == 0 {
             let frame = &mut *(tcb.kernel_sp as *mut crate::syscall::TrapFrame);
             frame.elr = ret_addr;

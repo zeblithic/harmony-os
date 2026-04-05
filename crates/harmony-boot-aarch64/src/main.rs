@@ -482,13 +482,17 @@ fn main() -> Status {
         // Install scheduler callbacks so blocking syscalls yield the CPU
         // instead of spin-waiting.
         linuxulator.set_block_fn(|op, fd, deadline_ms| {
+            use harmony_os::linuxulator::{
+                BLOCK_OP_CONNECT, BLOCK_OP_POLL, BLOCK_OP_READABLE, BLOCK_OP_SLEEP,
+                BLOCK_OP_WAIT, BLOCK_OP_WRITABLE,
+            };
             let reason = match op {
-                0 => sched::WaitReason::FdReadable(fd),
-                1 => sched::WaitReason::FdWritable(fd),
-                2 => sched::WaitReason::FdConnectDone(fd),
-                3 => sched::WaitReason::PollWait,
-                4 => sched::WaitReason::Sleep,
-                5 => sched::WaitReason::WaitChild(fd),
+                BLOCK_OP_READABLE => sched::WaitReason::FdReadable(fd),
+                BLOCK_OP_WRITABLE => sched::WaitReason::FdWritable(fd),
+                BLOCK_OP_CONNECT => sched::WaitReason::FdConnectDone(fd),
+                BLOCK_OP_POLL => sched::WaitReason::PollWait,
+                BLOCK_OP_SLEEP => sched::WaitReason::Sleep,
+                BLOCK_OP_WAIT => sched::WaitReason::WaitChild(fd),
                 _ => unreachable!(),
             };
             unsafe { sched::block_current(reason, deadline_ms) };
@@ -554,6 +558,14 @@ fn main() -> Status {
             let is_exit = matches!(syscall, LinuxSyscall::Exit { .. });
             let is_exit_group = matches!(syscall, LinuxSyscall::ExitGroup { .. });
 
+            // Extract exit code from syscall args BEFORE dispatch. We cannot
+            // rely on lx.exit_code() because sys_exit no longer sets it (to
+            // avoid poisoning deliver_pending_signals for other threads).
+            let exit_code_from_args = match syscall {
+                LinuxSyscall::Exit { code } | LinuxSyscall::ExitGroup { code } => code,
+                _ => 0,
+            };
+
             let lx = unsafe { LINUXULATOR.as_mut().unwrap() };
             let retval = lx.dispatch_syscall(syscall);
 
@@ -567,7 +579,7 @@ fn main() -> Status {
                 syscall::SyscallDispatchResult {
                     retval,
                     exited: true,
-                    exit_code: lx.exit_code().unwrap_or(0),
+                    exit_code: exit_code_from_args,
                     exit_group: is_exit_group || promote_to_exit_group,
                 }
             } else {

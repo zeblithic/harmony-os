@@ -6542,7 +6542,15 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
             // Block until a child exits. If no scheduler is available
             // (block_fn not set), block_until returns Interrupted and we
-            // fall back to ECHILD (can't actually block in sans-I/O mode).
+            // return ECHILD. We use ECHILD (not EINTR) because EINTR would
+            // cause glibc/musl to retry, spinning forever in sans-I/O mode
+            // where the child can never exit. ECHILD signals "stop trying".
+            //
+            // NOTE: wake_waiting_parent() uses the scheduler PID, while
+            // this blocks on a Linux PID. These match for the current
+            // single-process model but will diverge when concurrent fork
+            // creates child processes with separate scheduler tasks.
+            // pid=-1 (any child) is unaffected. Tracked by harmony-os-96y.
             match self.block_until(BLOCK_OP_WAIT, pid, None) {
                 BlockResult::Ready => continue,
                 BlockResult::Interrupted => return ECHILD,
@@ -7082,9 +7090,14 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
     /// Linux exit(2): terminate the calling thread.
     ///
-    /// In our single-threaded model, this is equivalent to exit_group.
-    fn sys_exit(&mut self, code: i32) -> i64 {
-        self.sys_exit_group(code)
+    /// Thread teardown is handled entirely by svc_handler in syscall.rs
+    /// (CLEARTID, wake_waiting_parent, mark_current_dead). Do NOT set
+    /// process-level exit_code here — that would poison
+    /// deliver_pending_signals for other threads still running.
+    /// The dispatch function in main.rs extracts the exit code directly
+    /// from the syscall arguments.
+    fn sys_exit(&mut self, _code: i32) -> i64 {
+        0
     }
 
     /// Linux execve(2): replace process image with a new ELF binary.
@@ -9800,13 +9813,17 @@ mod tests {
     // ── sys_exit tests ────────────────────────────────────────────────
 
     #[test]
-    fn sys_exit_is_same_as_exit_group() {
+    fn sys_exit_does_not_set_process_exit_code() {
+        // sys_exit is a thread-level exit — it must NOT poison the
+        // process-level exit_code. Thread teardown is handled by
+        // svc_handler, and the dispatch function extracts the exit code
+        // directly from syscall args.
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
         let result = lx.handle_syscall(60, [7, 0, 0, 0, 0, 0]);
         assert_eq!(result, 0);
-        assert!(lx.exited());
-        assert_eq!(lx.exit_code(), Some(7));
+        assert!(!lx.exited());
+        assert_eq!(lx.exit_code(), None);
     }
 
     // ── sys_fstat tests ──────────────────────────────────────────────
