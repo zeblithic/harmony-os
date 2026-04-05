@@ -2970,6 +2970,18 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         self.exit_code
     }
 
+    /// Clear the exit_code flag without changing any other state.
+    ///
+    /// Used by the dispatch function in main.rs to undo the exit_code
+    /// set by sys_exit for thread-only exits. This prevents poisoning
+    /// deliver_pending_signals for other threads on the shared
+    /// Linuxulator, while preserving the flag for sys_exit_group
+    /// (process-level exit) and for the sequential fork model (where
+    /// the dispatch function is not involved).
+    pub fn clear_exit_code(&mut self) {
+        self.exit_code = None;
+    }
+
     /// Recover shared state (pipes/eventfds) from an exited child.
     fn recover_child_state(&mut self) {
         let should_recover = self
@@ -7090,13 +7102,13 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
     /// Linux exit(2): terminate the calling thread.
     ///
-    /// Thread teardown is handled entirely by svc_handler in syscall.rs
-    /// (CLEARTID, wake_waiting_parent, mark_current_dead). Do NOT set
-    /// process-level exit_code here — that would poison
-    /// deliver_pending_signals for other threads still running.
-    /// The dispatch function in main.rs extracts the exit code directly
-    /// from the syscall arguments.
-    fn sys_exit(&mut self, _code: i32) -> i64 {
+    /// Sets exit_code so the sequential fork model's `recover_child_state`
+    /// and `active_process` can detect child completion. For the concurrent
+    /// thread model (shared Linuxulator), the dispatch function in main.rs
+    /// calls `clear_exit_code()` after dispatch to prevent poisoning
+    /// `deliver_pending_signals` for other threads.
+    fn sys_exit(&mut self, code: i32) -> i64 {
+        self.exit_code = Some(code);
         0
     }
 
@@ -9813,15 +9825,28 @@ mod tests {
     // ── sys_exit tests ────────────────────────────────────────────────
 
     #[test]
-    fn sys_exit_does_not_set_process_exit_code() {
-        // sys_exit is a thread-level exit — it must NOT poison the
-        // process-level exit_code. Thread teardown is handled by
-        // svc_handler, and the dispatch function extracts the exit code
-        // directly from syscall args.
+    fn sys_exit_sets_exit_code() {
+        // sys_exit sets exit_code for the sequential fork model (child
+        // detection via recover_child_state). In the concurrent thread
+        // model, the dispatch function in main.rs clears it after dispatch
+        // to prevent poisoning deliver_pending_signals.
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
         let result = lx.handle_syscall(60, [7, 0, 0, 0, 0, 0]);
         assert_eq!(result, 0);
+        assert!(lx.exited());
+        assert_eq!(lx.exit_code(), Some(7));
+    }
+
+    #[test]
+    fn clear_exit_code_undoes_sys_exit() {
+        // The dispatch function calls clear_exit_code after thread-only
+        // exit to prevent poisoning deliver_pending_signals.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.handle_syscall(60, [7, 0, 0, 0, 0, 0]);
+        assert!(lx.exited());
+        lx.clear_exit_code();
         assert!(!lx.exited());
         assert_eq!(lx.exit_code(), None);
     }

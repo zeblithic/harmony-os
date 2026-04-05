@@ -570,6 +570,17 @@ fn main() -> Status {
             let retval = lx.dispatch_syscall(syscall);
 
             if is_exit || is_exit_group {
+                // For thread-only exit (SYS_EXIT, not exit_group), clear the
+                // process-level exit_code that sys_exit set on the shared
+                // Linuxulator. This prevents poisoning deliver_pending_signals
+                // for other threads. In the sequential fork model, this
+                // dispatch function is not involved (child runs via direct
+                // dispatch_syscall), so the child's exit_code stays set for
+                // recover_child_state.
+                if is_exit && !is_exit_group {
+                    lx.clear_exit_code();
+                }
+
                 // Promote main-thread SYS_EXIT to exit_group: when the main
                 // thread (tid=0) calls exit(), kill all sibling threads first.
                 // This matches glibc/musl behavior (they emit exit_group).
