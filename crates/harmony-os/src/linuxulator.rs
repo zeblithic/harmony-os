@@ -15431,48 +15431,15 @@ mod integration_tests {
     }
 
     #[test]
-    fn test_wait4_blocking_calls_block_fn() {
-        use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
-
-        let mock = MockBackend::new();
-        let mut lx = Linuxulator::new(mock);
-
-        static BLOCK_CALLED: AtomicBool = AtomicBool::new(false);
-        static OP_SEEN: AtomicU8 = AtomicU8::new(255);
-        static FD_SEEN: AtomicI32 = AtomicI32::new(0);
-
-        lx.set_block_fn(|op, fd, _deadline| {
-            BLOCK_CALLED.store(true, Ordering::SeqCst);
-            OP_SEEN.store(op, Ordering::SeqCst);
-            FD_SEEN.store(fd, Ordering::SeqCst);
-        });
-
-        // Fork a child — it sits in children with exit_code=None (running).
+    fn test_wait4_without_block_fn_returns_echild() {
+        // Without block_fn (sans-I/O mode), blocking wait on a running child
+        // returns ECHILD via the Interrupted fallback — the linuxulator can't
+        // actually block without a scheduler.
+        let mut lx = Linuxulator::new(MockBackend::new());
         let child_pid = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
         assert!(child_pid > 0);
-        // Do NOT call ExitGroup — child is still "running".
 
-        BLOCK_CALLED.store(false, Ordering::SeqCst);
-        OP_SEEN.store(255, Ordering::SeqCst);
-        FD_SEEN.store(0, Ordering::SeqCst);
-
-        // Blocking wait (no WNOHANG) with running child — should call block_fn
-        // with BLOCK_OP_WAIT. After block_fn returns (Ready), the loop retries
-        // and still finds no exited child. Since the child still hasn't exited,
-        // block_fn is called again (infinite loop in real scenario). Here block_fn
-        // doesn't actually yield, so the loop would be infinite. We use a counter
-        // to break after the first call.
-        // Actually, block_fn returns Ready which loops, so we need to make the
-        // child exit on the second iteration. We can't do that from inside
-        // block_fn. Instead, test that without block_fn, blocking wait returns
-        // ECHILD (the Interrupted fallback).
-
-        // Without block_fn, blocking wait on running child → ECHILD (Interrupted fallback).
-        let mut lx2 = Linuxulator::new(MockBackend::new());
-        let child_pid2 = lx2.dispatch_syscall(LinuxSyscall::Fork) as i32;
-        assert!(child_pid2 > 0);
-
-        let r = lx2.dispatch_syscall(LinuxSyscall::Wait4 {
+        let r = lx.dispatch_syscall(LinuxSyscall::Wait4 {
             pid: -1,
             wstatus: 0,
             options: 0, // no WNOHANG — would block, but no block_fn → ECHILD
@@ -15506,7 +15473,6 @@ mod integration_tests {
         // Call block_until directly to verify BLOCK_OP_WAIT encoding.
         let _ = lx.block_until(BLOCK_OP_WAIT, 42, None);
         assert_eq!(OP_SEEN_W.load(Ordering::SeqCst), BLOCK_OP_WAIT);
-        assert_eq!(OP_SEEN_W.load(Ordering::SeqCst), 5);
         assert_eq!(FD_SEEN_W.load(Ordering::SeqCst), 42);
 
         // Also verify pid=-1 is passed correctly.
