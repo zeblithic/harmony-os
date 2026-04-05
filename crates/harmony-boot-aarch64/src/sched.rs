@@ -686,17 +686,30 @@ pub unsafe fn kill_threads_by_pid(pid: u32) {
         if i == cur {
             continue;
         }
-        let tcb = TASKS[i].assume_init_mut();
-        if tcb.pid == pid && tcb.state != TaskState::Dead {
-            // Perform CLEARTID cleanup for each killed thread so that
-            // any pthread_join waiter on clear_child_tid is woken.
-            if tcb.clear_child_tid != 0 {
-                *(tcb.clear_child_tid as *mut u32) = 0;
-                futex_wake(tcb.clear_child_tid, 1);
-                tcb.clear_child_tid = 0;
-            }
+        // Read phase — check if this task should be killed, extract
+        // clear_child_tid. Scoped to drop the borrow before futex_wake
+        // (which iterates TASKS and would alias this slot).
+        let (should_kill, clear_addr) = {
+            let tcb = TASKS[i].assume_init_ref();
+            (
+                tcb.pid == pid && tcb.state != TaskState::Dead,
+                tcb.clear_child_tid,
+            )
+        };
+        if !should_kill {
+            continue;
+        }
+        // Write phase — mark Dead, clear fields.
+        {
+            let tcb = TASKS[i].assume_init_mut();
+            tcb.clear_child_tid = 0;
             tcb.state = TaskState::Dead;
             tcb.wait_reason = None;
+        }
+        // CLEARTID cleanup — no live borrow on TASKS[i].
+        if clear_addr != 0 {
+            *(clear_addr as *mut u32) = 0;
+            futex_wake(clear_addr, 1);
         }
     }
 }

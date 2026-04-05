@@ -6371,7 +6371,15 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     }
                     tid as i64
                 }
-                None => EAGAIN, // MAX_TASKS reached
+                None => {
+                    // Undo CHILD_SETTID write on failure.
+                    if flags & CLONE_CHILD_SETTID != 0 && child_tidptr != 0 {
+                        unsafe {
+                            *(child_tidptr as *mut u32) = 0;
+                        }
+                    }
+                    EAGAIN // MAX_TASKS reached
+                }
             }
         } else if sig == SIGCHLD_NUM as u64 {
             // ── Fork path ─────────────────────────────────────────
