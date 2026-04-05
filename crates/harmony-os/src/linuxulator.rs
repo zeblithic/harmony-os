@@ -2297,6 +2297,7 @@ struct TimerFdState {
 
 /// Register state the caller provides for signal frame construction.
 /// Matches the x86_64 GPR set needed for Linux sigcontext.
+#[cfg(target_arch = "x86_64")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SavedRegisters {
     pub r8: u64,
@@ -2321,6 +2322,7 @@ pub struct SavedRegisters {
 
 /// Returned by `setup_signal_frame` — tells the caller where to jump
 /// and what register values to set for signal handler invocation.
+#[cfg(target_arch = "x86_64")]
 #[derive(Debug, Clone, Copy)]
 pub struct SignalHandlerSetup {
     /// Handler function address (set RIP to this).
@@ -2342,14 +2344,55 @@ pub struct SignalReturn {
     pub regs: SavedRegisters,
 }
 
+/// Register state for aarch64 signal frame construction.
+/// Matches the aarch64 Linux sigcontext layout (regs[31], sp, pc, pstate)
+/// plus FPSIMD state (fpcr, fpsr, q[0-31]).
+#[cfg(target_arch = "aarch64")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SavedRegisters {
+    /// General-purpose registers x0-x30.
+    pub x: [u64; 31],
+    /// User stack pointer (SP_EL0).
+    pub sp: u64,
+    /// Program counter (ELR_EL1 at exception time).
+    pub pc: u64,
+    /// Processor state (SPSR_EL1 at exception time).
+    pub pstate: u64,
+    /// Floating-point control register.
+    pub fpcr: u64,
+    /// Floating-point status register.
+    pub fpsr: u64,
+    /// SIMD/FP registers Q0-Q31 (128 bits each).
+    pub q: [u128; 32],
+}
+
+/// Returned by `setup_signal_frame` — tells the caller where to jump
+/// and what register values to set for signal handler invocation.
+#[cfg(target_arch = "aarch64")]
+#[derive(Debug, Clone, Copy)]
+pub struct SignalHandlerSetup {
+    /// Handler function address (set ELR to this).
+    pub handler_pc: u64,
+    /// Signal frame base on user stack (set SP_EL0 to this).
+    pub handler_sp: u64,
+    /// First argument: signal number (set x0).
+    pub x0: u64,
+    /// Second argument: pointer to siginfo_t (set x1). 0 if !SA_SIGINFO.
+    pub x1: u64,
+    /// Third argument: pointer to ucontext_t (set x2). 0 if !SA_SIGINFO.
+    pub x2: u64,
+    /// Link register: sa_restorer trampoline (set x30).
+    pub x30: u64,
+}
+
 /// Per-signal handler disposition, stored in a 64-element array.
 #[derive(Clone, Copy)]
 struct SignalAction {
     handler: u64,
     mask: u64,
     flags: u64,
-    /// sa_restorer (x86_64 only; 0 on other arches). Needed for
-    /// signal stack frame construction in the delivery bead.
+    /// sa_restorer (x86_64 and aarch64; 0 on other arches). Used for
+    /// signal stack frame construction — points to the sigreturn trampoline.
     restorer: u64,
 }
 
@@ -3101,10 +3144,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         let idx = (signum - 1) as usize;
         let action = self.signal_handlers[idx];
 
-        assert!(
-            action.flags & SA_RESTORER != 0,
-            "SA_RESTORER must be set on x86_64"
-        );
+        assert!(action.flags & SA_RESTORER != 0, "SA_RESTORER must be set");
 
         // ── Choose stack base ────────────────────────────────────────
         // Save on_alt_stack BEFORE modification — this is written into the
@@ -7623,18 +7663,18 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 .unwrap(),
         );
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let restorer = u64::from_ne_bytes(
             unsafe { core::slice::from_raw_parts((addr + 16) as *const u8, 8) }
                 .try_into()
                 .unwrap(),
         );
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let restorer = 0u64;
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let mask_offset = 24;
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let mask_offset = 16;
 
         let mask = u64::from_ne_bytes(
@@ -7659,16 +7699,16 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         unsafe { core::slice::from_raw_parts_mut((addr + 8) as *mut u8, 8) }
             .copy_from_slice(&action.flags.to_ne_bytes());
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         {
             // Write sa_restorer at offset 16.
             unsafe { core::slice::from_raw_parts_mut((addr + 16) as *mut u8, 8) }
                 .copy_from_slice(&action.restorer.to_ne_bytes());
         }
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let mask_offset = 24;
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let mask_offset = 16;
 
         unsafe { core::slice::from_raw_parts_mut((addr + mask_offset) as *mut u8, 8) }
@@ -17370,7 +17410,7 @@ mod integration_tests {
     // ── setup_signal_frame tests ────────────────────────────────────
 
     /// Helper: install a signal handler with SA_RESTORER set, including the
-    /// restorer address at bytes 16..24 of the sigaction buffer (x86_64 layout).
+    /// restorer address at bytes 16..24 of the sigaction buffer (x86_64/aarch64 layout).
     fn install_handler_with_restorer(
         lx: &mut Linuxulator<MockBackend>,
         signum: i32,
@@ -17380,10 +17420,11 @@ mod integration_tests {
         restorer: u64,
     ) {
         let mut act = make_sigaction(handler, flags, mask);
-        // On x86_64, sa_restorer lives at bytes 16..24.
-        #[cfg(target_arch = "x86_64")]
+        // On x86_64 and aarch64, sa_restorer lives at bytes 16..24.
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         act[16..24].copy_from_slice(&restorer.to_ne_bytes());
-        let _ = restorer; // suppress unused warning on non-x86_64
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let _ = restorer;
         lx.dispatch_syscall(LinuxSyscall::RtSigaction {
             signum,
             act: act.as_ptr() as u64,
