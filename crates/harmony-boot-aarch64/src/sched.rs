@@ -399,50 +399,47 @@ pub unsafe fn spawn_task_runtime(
 ) -> Option<usize> {
     use harmony_microkernel::vm::PAGE_SIZE;
 
-    // Mask IRQs to prevent race with scheduler.
+    // Mask IRQs defensively. This function is always called from the SVC
+    // dispatch path where IRQs are already masked by hardware (PSTATE.I=1),
+    // but we mask explicitly in case that precondition ever changes.
+    // We do NOT unmask on any exit path — the SVC epilogue writes
+    // ELR_EL1/SPSR_EL1 then erets, and a timer IRQ in that window would
+    // clobber those registers. The eret restores userspace PSTATE which
+    // has IRQs unmasked. Same invariant as block_current's daifset.
     core::arch::asm!("msr daifset, #2");
 
     let n = NUM_TASKS;
     if n >= MAX_TASKS {
-        core::arch::asm!("msr daifclr, #2");
         return None;
     }
 
     let bump = match BUMP_ALLOCATOR.as_mut() {
         Some(b) => b,
-        None => {
-            core::arch::asm!("msr daifclr, #2");
-            return None;
-        }
+        None => return None,
     };
 
     let page_size = PAGE_SIZE as usize;
     let pages_needed = (KERNEL_STACK_SIZE + page_size - 1) / page_size;
 
     // Allocate guard page + stack pages (same as boot-time spawn_task).
-    // On OOM, unmask IRQs and return None instead of panicking —
-    // a panic with IRQs masked leaves DAIF.I permanently set.
-    macro_rules! alloc_or_unmask {
+    // On OOM, return None instead of panicking — a panic with IRQs
+    // masked leaves DAIF.I permanently set.
+    macro_rules! alloc_or_return {
         ($bump:expr) => {
             match $bump.alloc_frame() {
                 Some(f) => f.0 as usize,
-                None => {
-                    core::arch::asm!("msr daifclr, #2");
-                    return None;
-                }
+                None => return None,
             }
         };
     }
-    let guard_frame = alloc_or_unmask!(bump);
-    let base = alloc_or_unmask!(bump);
+    let guard_frame = alloc_or_return!(bump);
+    let base = alloc_or_return!(bump);
     if base != guard_frame + page_size {
-        core::arch::asm!("msr daifclr, #2");
         return None;
     }
     for i in 1..pages_needed {
-        let frame = alloc_or_unmask!(bump);
+        let frame = alloc_or_return!(bump);
         if frame != base + i * page_size {
-            core::arch::asm!("msr daifclr, #2");
             return None;
         }
     }
@@ -483,9 +480,6 @@ pub unsafe fn spawn_task_runtime(
         clear_child_tid,
     });
     NUM_TASKS = n + 1;
-
-    // Unmask IRQs.
-    core::arch::asm!("msr daifclr, #2");
 
     Some(n)
 }
