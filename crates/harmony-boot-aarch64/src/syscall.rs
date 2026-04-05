@@ -192,11 +192,17 @@ pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
                 }
             }
 
-            // Main thread exit — kill any remaining threads.
-            if !result.exit_group {
-                // SYS_EXIT from main thread — also kill all threads.
-                crate::sched::kill_threads_by_pid(pid);
-            }
+            // SYS_EXIT from main thread: per Linux semantics, only the
+            // calling thread exits — other threads continue running.
+            // We do NOT call kill_threads_by_pid here (exit_group
+            // already handled that above for the exit_group case).
+            //
+            // TODO(Phase 6, harmony-os-g9i): the main thread still
+            // redirects ELR to RETURN_ADDR below, which returns
+            // control to boot code while spawned threads may still
+            // be running. Correct behavior requires last-thread-exit
+            // detection so the boot code is only notified when every
+            // thread has exited.
 
             // Record exit status (only the first exit sets the code).
             if !PROCESS_EXITED {
