@@ -162,24 +162,27 @@ pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
 
             if tid != 0 {
                 // Spawned thread exit — CLEARTID cleanup and die.
-                if result.exit_group && !PROCESS_EXITED {
-                    // exit_group from a spawned thread: record process exit.
-                    // We can't redirect the main thread's RETURN_ADDR from here
-                    // (it's a different task's TrapFrame), but marking the
-                    // process as exited ensures correct status reporting.
-                    // TODO(Phase 6, harmony-os-g9i): exit_group from a non-main
-                    // thread leaves the main thread Dead without ELR redirect.
-                    // The boot code's elf_task never sees "Binary exited". Fix
-                    // by patching the main thread's saved TrapFrame.elr to
-                    // RETURN_ADDR via its TCB kernel_sp, then marking it Ready.
+                if result.exit_group {
+                    // exit_group from a spawned thread: redirect the main
+                    // thread to boot code via its saved TrapFrame.
                     PROCESS_EXITED = true;
                     EXIT_CODE = result.exit_code;
+                    if RETURN_ADDR != 0 {
+                        crate::sched::redirect_main_thread_to_boot(
+                            pid,
+                            result.exit_code,
+                            RETURN_ADDR,
+                            RETURN_SP,
+                            RETURN_LR,
+                        );
+                    }
                 }
                 let clear_addr = crate::sched::current_task_clear_child_tid();
                 if clear_addr != 0 {
                     *(clear_addr as *mut u32) = 0;
                     crate::sched::futex_wake(clear_addr, 1);
                 }
+                crate::sched::wake_waiting_parent(pid);
                 crate::sched::mark_current_dead();
                 // Unmask IRQs and trigger SGI to switch away. Stay unmasked —
                 // the dead task never resumes, so the SVC-handler IRQ invariant
