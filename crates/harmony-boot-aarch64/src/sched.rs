@@ -68,6 +68,9 @@ pub enum WaitReason {
     Futex(u64),
     /// Pure time wait — woken by the timer IRQ when deadline_ms expires.
     Sleep,
+    /// Waiting for a child process to exit (wait4/waitpid).
+    /// -1 = any child, >0 = specific child PID.
+    WaitChild(i32),
 }
 
 /// Per-task scheduling state. Stored in a fixed-size array, indexed by task number.
@@ -708,6 +711,37 @@ pub unsafe fn futex_wake(uaddr: u64, max: u32) -> u32 {
     woken
 }
 
+/// Wake a parent task blocked in wait4 for the given child PID.
+///
+/// Scans all tasks for one that is `Blocked` with `WaitReason::WaitChild(target)`
+/// where `target == -1` (any child) or `target == child_pid as i32`. Wakes
+/// the first match only — a parent can only be blocked in one wait4 at a time.
+///
+/// Called from the exit path in syscall.rs when a child process or
+/// the last thread of a process exits.
+///
+/// O(MAX_TASKS) scan, same cost as `check_deadlines`.
+///
+/// # Safety
+///
+/// Must only be called when TASKS[0..NUM_TASKS] are initialized.
+pub unsafe fn wake_waiting_parent(child_pid: u32) {
+    let n = NUM_TASKS;
+    for i in 0..n {
+        let tcb = TASKS[i].assume_init_mut();
+        if tcb.state == TaskState::Blocked {
+            if let Some(WaitReason::WaitChild(target)) = tcb.wait_reason {
+                if target == -1 || target == child_pid as i32 {
+                    tcb.state = TaskState::Ready;
+                    tcb.wait_reason = None;
+                    tcb.deadline_ms = None;
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Get the current task's TID.
 pub unsafe fn current_task_tid() -> u32 {
     TASKS[CURRENT].assume_init_ref().tid
@@ -1294,6 +1328,84 @@ mod tests {
             assert_eq!(t0.deadline_ms, None);
             // woken_by_timeout must remain false (it was a normal wake, not timer).
             assert!(!t0.woken_by_timeout);
+
+            NUM_TASKS = 0;
+        }
+    }
+
+    // ── WaitChild / wake_waiting_parent tests ───────────────────────────────
+
+    #[test]
+    fn wake_waiting_parent_wakes_any_child() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            put_tcb(0, TaskState::Blocked, Some(WaitReason::WaitChild(-1)));
+            NUM_TASKS = 1;
+
+            wake_waiting_parent(42);
+
+            let t0 = TASKS[0].assume_init_ref();
+            assert_eq!(t0.state, TaskState::Ready);
+            assert_eq!(t0.wait_reason, None);
+            assert_eq!(t0.deadline_ms, None);
+
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn wake_waiting_parent_matches_specific_pid() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            put_tcb(0, TaskState::Blocked, Some(WaitReason::WaitChild(5)));
+            NUM_TASKS = 1;
+
+            wake_waiting_parent(3);
+            assert_eq!(TASKS[0].assume_init_ref().state, TaskState::Blocked);
+
+            wake_waiting_parent(5);
+            assert_eq!(TASKS[0].assume_init_ref().state, TaskState::Ready);
+            assert_eq!(TASKS[0].assume_init_ref().wait_reason, None);
+
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn wake_waiting_parent_ignores_non_waiting_tasks() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            put_tcb(0, TaskState::Ready, None);
+            put_tcb(1, TaskState::Dead, None);
+            put_tcb(2, TaskState::Blocked, Some(WaitReason::Futex(0x1000)));
+            NUM_TASKS = 3;
+
+            wake_waiting_parent(10);
+
+            assert_eq!(TASKS[0].assume_init_ref().state, TaskState::Ready);
+            assert_eq!(TASKS[1].assume_init_ref().state, TaskState::Dead);
+            assert_eq!(TASKS[2].assume_init_ref().state, TaskState::Blocked);
+            assert_eq!(
+                TASKS[2].assume_init_ref().wait_reason,
+                Some(WaitReason::Futex(0x1000))
+            );
+
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn wake_waiting_parent_only_wakes_first_match() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            put_tcb(0, TaskState::Blocked, Some(WaitReason::WaitChild(-1)));
+            put_tcb(1, TaskState::Blocked, Some(WaitReason::WaitChild(-1)));
+            NUM_TASKS = 2;
+
+            wake_waiting_parent(7);
+
+            assert_eq!(TASKS[0].assume_init_ref().state, TaskState::Ready);
+            assert_eq!(TASKS[1].assume_init_ref().state, TaskState::Blocked);
 
             NUM_TASKS = 0;
         }

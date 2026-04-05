@@ -1281,6 +1281,10 @@ fn check_and_wake_blocked_tasks() {
                     // Sleep waiters are woken by check_deadlines() when the deadline
                     // expires. The system task has nothing to do here.
                 }
+                sched::WaitReason::WaitChild(_) => {
+                    // WaitChild tasks are woken by wake_waiting_parent() when a
+                    // child exits. The system task has nothing to do here.
+                }
             }
         });
     }
