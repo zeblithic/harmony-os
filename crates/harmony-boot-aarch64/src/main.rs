@@ -481,15 +481,16 @@ fn main() -> Status {
 
         // Install scheduler callbacks so blocking syscalls yield the CPU
         // instead of spin-waiting.
-        linuxulator.set_block_fn(|op, fd| {
+        linuxulator.set_block_fn(|op, fd, deadline_ms| {
             let reason = match op {
                 0 => sched::WaitReason::FdReadable(fd),
                 1 => sched::WaitReason::FdWritable(fd),
                 2 => sched::WaitReason::FdConnectDone(fd),
                 3 => sched::WaitReason::PollWait,
+                4 => sched::WaitReason::Sleep,
                 _ => unreachable!(),
             };
-            unsafe { sched::block_current(reason, None) };
+            unsafe { sched::block_current(reason, deadline_ms) };
         });
 
         linuxulator.set_wake_fn(|fd, op| {
@@ -522,8 +523,8 @@ fn main() -> Status {
         });
 
         // Futex blocking callback — blocks current task on a futex word.
-        linuxulator.set_futex_block_fn(|uaddr| {
-            unsafe { sched::block_current(sched::WaitReason::Futex(uaddr), None) };
+        linuxulator.set_futex_block_fn(|uaddr, deadline_ms| {
+            unsafe { sched::block_current(sched::WaitReason::Futex(uaddr), deadline_ms) };
         });
 
         // Futex wake callback — wakes up to `max` tasks blocked on a futex.
@@ -536,6 +537,9 @@ fn main() -> Status {
         linuxulator.set_clear_child_tid_fn(|addr| {
             unsafe { sched::set_current_clear_child_tid(addr) };
         });
+
+        linuxulator.set_was_timeout_fn(|| unsafe { sched::consume_woken_by_timeout() });
+        linuxulator.set_now_ms_fn(|| timer::now_ms());
 
         // Move fully-configured Linuxulator to module-level static.
         unsafe { LINUXULATOR = Some(linuxulator) };

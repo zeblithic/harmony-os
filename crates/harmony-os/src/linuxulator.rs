@@ -92,6 +92,7 @@ pub const BLOCK_OP_READABLE: u8 = 0;
 pub const BLOCK_OP_WRITABLE: u8 = 1;
 pub const BLOCK_OP_CONNECT: u8 = 2;
 pub const BLOCK_OP_POLL: u8 = 3;
+pub const BLOCK_OP_SLEEP: u8 = 4;
 
 fn ipc_err_to_errno(e: IpcError) -> i64 {
     match e {
@@ -2506,9 +2507,9 @@ pub struct Linuxulator<
     /// time in milliseconds. Set by the kernel at init.
     poll_fn: Option<fn() -> u64>,
     /// Callback to block the current task. Called by block_until() instead
-    /// of spin-waiting. Arguments: (op: u8, fd: i32) where op is:
-    /// 0=FdReadable, 1=FdWritable, 2=FdConnectDone, 3=PollWait.
-    block_fn: Option<fn(u8, i32)>,
+    /// of spin-waiting. Arguments: (op: u8, fd: i32, deadline_ms: Option<u64>) where op is:
+    /// 0=FdReadable, 1=FdWritable, 2=FdConnectDone, 3=PollWait, 4=Sleep.
+    block_fn: Option<fn(u8, i32, Option<u64>)>,
     /// Callback to wake a task blocked on a specific fd. Called after
     /// pipe/eventfd writes for synchronous waking. Arguments: (fd: i32, op: u8)
     /// where op is 0=readable, 1=writable.
@@ -2518,9 +2519,13 @@ pub struct Linuxulator<
     #[allow(clippy::type_complexity)]
     spawn_fn: Option<fn(u32, u32, u64, u64, u64) -> Option<u32>>,
     /// Block current task on a futex address.
-    futex_block_fn: Option<fn(u64)>,
+    futex_block_fn: Option<fn(u64, Option<u64>)>,
     /// Wake up to N tasks blocked on a futex address. Returns count woken.
     futex_wake_fn: Option<fn(u64, u32) -> u32>,
+    /// Check if the current task was woken by deadline expiry.
+    was_timeout_fn: Option<fn() -> bool>,
+    /// Read current monotonic time in milliseconds.
+    now_ms_fn: Option<fn() -> u64>,
     /// Get the current task's TID.
     get_current_tid_fn: Option<fn() -> u32>,
     /// Set the current task's clear_child_tid address.
@@ -2602,6 +2607,8 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             spawn_fn: None,
             futex_block_fn: None,
             futex_wake_fn: None,
+            was_timeout_fn: None,
+            now_ms_fn: None,
             get_current_tid_fn: None,
             set_clear_child_tid_fn: None,
             next_tid: 2,
@@ -2625,7 +2632,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
     /// Set the blocking callback. Called by block_until() to yield the CPU
     /// to the scheduler instead of spin-waiting.
-    pub fn set_block_fn(&mut self, f: fn(u8, i32)) {
+    pub fn set_block_fn(&mut self, f: fn(u8, i32, Option<u64>)) {
         self.block_fn = Some(f);
     }
 
@@ -2642,13 +2649,24 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
     /// Set the futex block callback. Called by FUTEX_WAIT when the value matches,
     /// to block the current task until woken.
-    pub fn set_futex_block_fn(&mut self, f: fn(u64)) {
+    pub fn set_futex_block_fn(&mut self, f: fn(u64, Option<u64>)) {
         self.futex_block_fn = Some(f);
     }
 
     /// Set the futex wake callback. Called by FUTEX_WAKE to wake blocked tasks.
     pub fn set_futex_wake_fn(&mut self, f: fn(u64, u32) -> u32) {
         self.futex_wake_fn = Some(f);
+    }
+
+    /// Set the timeout-detection callback. Returns true if the current task was
+    /// woken by a deadline expiry rather than a normal wake event.
+    pub fn set_was_timeout_fn(&mut self, f: fn() -> bool) {
+        self.was_timeout_fn = Some(f);
+    }
+
+    /// Set the monotonic clock callback. Returns the current time in milliseconds.
+    pub fn set_now_ms_fn(&mut self, f: fn() -> u64) {
+        self.now_ms_fn = Some(f);
     }
 
     /// Set the get-current-TID callback. Called by sys_gettid and sys_set_tid_address.
@@ -2693,9 +2711,9 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     ///
     /// If `block_fn` is not set (no scheduler), returns `Interrupted` so the
     /// caller can fall back to EAGAIN.
-    fn block_until(&mut self, op: u8, fd: i32) -> BlockResult {
+    fn block_until(&mut self, op: u8, fd: i32, deadline_ms: Option<u64>) -> BlockResult {
         if let Some(block) = self.block_fn {
-            block(op, fd);
+            block(op, fd, deadline_ms);
             // Execution resumes here after wake + reschedule.
             BlockResult::Ready
         } else {
@@ -2794,7 +2812,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
             // Buffer full — block until space available.
             if self.block_fn.is_some() {
-                match self.block_until(BLOCK_OP_WRITABLE, fd) {
+                match self.block_until(BLOCK_OP_WRITABLE, fd, None) {
                     BlockResult::Ready => continue, // Retry write
                     BlockResult::Interrupted => return EINTR,
                 }
@@ -3754,7 +3772,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                             let nonblock =
                                 self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                             if !nonblock && self.block_fn.is_some() {
-                                match self.block_until(BLOCK_OP_WRITABLE, fd) {
+                                match self.block_until(BLOCK_OP_WRITABLE, fd, None) {
                                     BlockResult::Ready => {
                                         let data = unsafe {
                                             core::slice::from_raw_parts(buf_ptr as *const u8, count)
@@ -3844,7 +3862,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                             return EAGAIN;
                         }
 
-                        match self.block_until(BLOCK_OP_READABLE, fd) {
+                        match self.block_until(BLOCK_OP_READABLE, fd, None) {
                             BlockResult::Ready => {
                                 // Re-borrow after block_until releases the borrow.
                                 let buf = match self.pipes.get_mut(&pipe_id) {
@@ -3974,7 +3992,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                             let nonblock =
                                 self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                             if !nonblock && self.block_fn.is_some() {
-                                match self.block_until(BLOCK_OP_READABLE, fd) {
+                                match self.block_until(BLOCK_OP_READABLE, fd, None) {
                                     BlockResult::Ready => {
                                         let buf = unsafe {
                                             core::slice::from_raw_parts_mut(
@@ -4949,7 +4967,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                         // Spurious wakes (block_until returns Ready but
                         // tcp_accept still returns None) re-enter block_until.
                         loop {
-                            match self.block_until(BLOCK_OP_READABLE, fd) {
+                            match self.block_until(BLOCK_OP_READABLE, fd, None) {
                                 BlockResult::Ready => {
                                     match self.tcp.tcp_accept(h) {
                                         Ok(Some(accepted_handle)) => {
@@ -5058,7 +5076,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                         // Block until the handshake completes or fails.
                         // Uses BLOCK_OP_CONNECT (not BLOCK_OP_WRITABLE) so that
                         // connection failures (RST → Closed) also unblock.
-                        match self.block_until(BLOCK_OP_CONNECT, fd) {
+                        match self.block_until(BLOCK_OP_CONNECT, fd, None) {
                             BlockResult::Ready => {
                                 // Check whether the connect succeeded or failed.
                                 // CloseWait/Closing imply the connection WAS established
@@ -5143,7 +5161,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 Err(NetError::WouldBlock) => {
                     let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                     if !nonblock && self.block_fn.is_some() {
-                        match self.block_until(BLOCK_OP_WRITABLE, fd) {
+                        match self.block_until(BLOCK_OP_WRITABLE, fd, None) {
                             BlockResult::Ready => {
                                 let data =
                                     unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
@@ -5183,7 +5201,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                             let nonblock =
                                 self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                             if !nonblock && self.block_fn.is_some() {
-                                match self.block_until(BLOCK_OP_WRITABLE, fd) {
+                                match self.block_until(BLOCK_OP_WRITABLE, fd, None) {
                                     BlockResult::Ready => {
                                         let data = unsafe {
                                             core::slice::from_raw_parts(buf as *const u8, count)
@@ -5212,7 +5230,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     Err(NetError::WouldBlock) => {
                         let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                         if !nonblock && self.block_fn.is_some() {
-                            match self.block_until(BLOCK_OP_WRITABLE, fd) {
+                            match self.block_until(BLOCK_OP_WRITABLE, fd, None) {
                                 BlockResult::Ready => {
                                     let data = unsafe {
                                         core::slice::from_raw_parts(buf as *const u8, count)
@@ -5268,7 +5286,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 Err(NetError::WouldBlock) => {
                     let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                     if !nonblock && self.block_fn.is_some() {
-                        match self.block_until(BLOCK_OP_READABLE, fd) {
+                        match self.block_until(BLOCK_OP_READABLE, fd, None) {
                             BlockResult::Ready => {
                                 let data = unsafe {
                                     core::slice::from_raw_parts_mut(buf as *mut u8, count)
@@ -5312,7 +5330,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     Err(NetError::WouldBlock) => {
                         let nonblock = self.fd_table.get(&fd).map(|e| e.nonblock).unwrap_or(true);
                         if !nonblock && self.block_fn.is_some() {
-                            match self.block_until(BLOCK_OP_READABLE, fd) {
+                            match self.block_until(BLOCK_OP_READABLE, fd, None) {
                                 BlockResult::Ready => {
                                     // Retry the full UDP recv logic.
                                     let data = unsafe {
@@ -5790,7 +5808,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 u64::MAX // -1 = infinite wait
             };
 
-            while let BlockResult::Ready = self.block_until(BLOCK_OP_POLL, -1) {
+            while let BlockResult::Ready = self.block_until(BLOCK_OP_POLL, -1, None) {
                 // Drive the network stack.
                 if let Some(pf) = self.poll_fn {
                     let now = pf() as i64;
@@ -6271,6 +6289,8 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             spawn_fn: self.spawn_fn,
             futex_block_fn: self.futex_block_fn,
             futex_wake_fn: self.futex_wake_fn,
+            was_timeout_fn: self.was_timeout_fn,
+            now_ms_fn: self.now_ms_fn,
             get_current_tid_fn: self.get_current_tid_fn,
             set_clear_child_tid_fn: self.set_clear_child_tid_fn,
             // next_tid: child starts fresh from 2 (its own TID space).
@@ -8733,7 +8753,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     return EAGAIN;
                 }
                 if let Some(block) = self.futex_block_fn {
-                    block(uaddr);
+                    block(uaddr, None);
                     0 // Woken successfully
                 } else {
                     EAGAIN // No scheduler — can't block
@@ -8793,7 +8813,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             };
 
             loop {
-                match self.block_until(BLOCK_OP_POLL, -1) {
+                match self.block_until(BLOCK_OP_POLL, -1, None) {
                     BlockResult::Ready => {
                         let ready = self.poll_check_once(fds_ptr, nfds);
                         if ready > 0 {
@@ -8998,7 +9018,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     dst.copy_from_slice(&saved_exceptfds[..read_bytes]);
                 }
 
-                match self.block_until(BLOCK_OP_POLL, -1) {
+                match self.block_until(BLOCK_OP_POLL, -1, None) {
                     BlockResult::Ready => {
                         let ready = self.select_check_once(nfds, readfds, writefds, exceptfds);
                         if ready > 0 {
@@ -12080,7 +12100,7 @@ mod integration_tests {
         let mut lx = Linuxulator::new(mock);
         static BLOCKED: AtomicBool = AtomicBool::new(false);
 
-        lx.set_futex_block_fn(|_uaddr| {
+        lx.set_futex_block_fn(|_uaddr, _deadline| {
             BLOCKED.store(true, Ordering::SeqCst);
         });
 
@@ -18213,12 +18233,12 @@ mod integration_tests {
         let mut lx = Linuxulator::new(MockBackend::new());
         static BLOCK_CALLED: AtomicBool = AtomicBool::new(false);
 
-        lx.set_block_fn(|_op, _fd| {
+        lx.set_block_fn(|_op, _fd, _deadline| {
             BLOCK_CALLED.store(true, Ordering::SeqCst);
         });
 
         BLOCK_CALLED.store(false, Ordering::SeqCst);
-        let result = lx.block_until(BLOCK_OP_READABLE, 5);
+        let result = lx.block_until(BLOCK_OP_READABLE, 5, None);
         assert!(BLOCK_CALLED.load(Ordering::SeqCst));
         assert_eq!(result, BlockResult::Ready);
     }
@@ -18227,7 +18247,7 @@ mod integration_tests {
     fn block_until_returns_interrupted_without_block_fn() {
         let mut lx = Linuxulator::new(MockBackend::new());
         // No block_fn set — should return Interrupted
-        let result = lx.block_until(BLOCK_OP_READABLE, 5);
+        let result = lx.block_until(BLOCK_OP_READABLE, 5, None);
         assert_eq!(result, BlockResult::Interrupted);
     }
 
