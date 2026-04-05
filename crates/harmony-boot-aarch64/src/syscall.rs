@@ -182,7 +182,13 @@ pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
                     *(clear_addr as *mut u32) = 0;
                     crate::sched::futex_wake(clear_addr, 1);
                 }
-                crate::sched::wake_waiting_parent(pid);
+                // Only wake the parent on process exit (exit_group), not
+                // thread-only exit. Thread join uses futex (CLEARTID), not
+                // wait4 — waking the parent on every thread exit would cause
+                // spurious context switches.
+                if result.exit_group {
+                    crate::sched::wake_waiting_parent(pid);
+                }
                 crate::sched::mark_current_dead();
                 // Unmask IRQs and trigger SGI to switch away. Stay unmasked —
                 // the dead task never resumes, so the SVC-handler IRQ invariant
