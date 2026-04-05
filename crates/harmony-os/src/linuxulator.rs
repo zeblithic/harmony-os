@@ -34,6 +34,7 @@ const EPIPE: i64 = -32;
 const ERANGE: i64 = -34;
 const ENOSYS: i64 = -38;
 const EOVERFLOW: i64 = -75;
+const ETIMEDOUT: i64 = -110;
 const EAFNOSUPPORT: i64 = -97;
 const ENOTSOCK: i64 = -88;
 const ECHILD: i64 = -10;
@@ -8723,7 +8724,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     /// FUTEX_WAKE (cmd 1): wakes up to val waiters via futex_wake_fn.
     ///   Returns the count of woken tasks (0 when no scheduler).
     /// All other operations return ENOSYS.
-    fn sys_futex(&mut self, uaddr: u64, op: i32, val: u32, _timeout: u64) -> i64 {
+    fn sys_futex(&mut self, uaddr: u64, op: i32, val: u32, timeout: u64) -> i64 {
         // The op field's lower bits encode the command; upper bits are
         // flags (FUTEX_PRIVATE_FLAG, etc.).  Mask to the command bits.
         const FUTEX_CMD_MASK: i32 = 0x7f;
@@ -8736,13 +8737,24 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 if uaddr == 0 {
                     return EFAULT;
                 }
-                // TODO(harmony-os-ltv): timed futex waits are not yet
-                // supported. We block unconditionally (ignoring the timeout)
-                // and rely on FUTEX_WAKE to unblock. This is correct for the
-                // common case (callers always have a matching wake), but means
-                // the timeout safety net doesn't fire. Timer-based unblock
-                // will add real timeout support.
-                //
+                // Parse timeout: a pointer to struct timespec { i64 tv_sec; i64 tv_nsec },
+                // or 0 (null) for no timeout. FUTEX_WAIT timeouts are relative.
+                let deadline_ms: Option<u64> = if timeout != 0 && self.now_ms_fn.is_some() {
+                    let ts_bytes = unsafe { core::slice::from_raw_parts(timeout as *const u8, 16) };
+                    let tv_sec = i64::from_le_bytes(ts_bytes[0..8].try_into().unwrap());
+                    let tv_nsec = i64::from_le_bytes(ts_bytes[8..16].try_into().unwrap());
+                    if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
+                        return EINVAL;
+                    }
+                    let timeout_ms = (tv_sec as u64)
+                        .saturating_mul(1000)
+                        .saturating_add((tv_nsec as u64) / 1_000_000);
+                    let now = (self.now_ms_fn.unwrap())();
+                    Some(now.saturating_add(timeout_ms))
+                } else {
+                    None
+                };
+
                 // Atomicity note: the read-compare-block sequence is safe on
                 // single-core because SVC entry masks IRQs (PSTATE.I=1). No
                 // other task can run between the value check and block_fn
@@ -8753,8 +8765,14 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                     return EAGAIN;
                 }
                 if let Some(block) = self.futex_block_fn {
-                    block(uaddr, None);
-                    0 // Woken successfully
+                    block(uaddr, deadline_ms);
+                    // Check if we were woken by timeout expiry.
+                    if let Some(was_timeout) = self.was_timeout_fn {
+                        if was_timeout() {
+                            return ETIMEDOUT;
+                        }
+                    }
+                    0 // Woken normally
                 } else {
                     EAGAIN // No scheduler — can't block
                 }
@@ -12121,6 +12139,97 @@ mod integration_tests {
         // FUTEX_WAKE, max=5 → wake_fn returns 3
         let result = lx.sys_futex(0x1000, 1, 5, 0);
         assert_eq!(result, 3);
+    }
+
+    #[test]
+    fn futex_wait_timeout_returns_etimedout() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        static BLOCKED: AtomicBool = AtomicBool::new(false);
+        lx.set_futex_block_fn(|_uaddr, _deadline| {
+            BLOCKED.store(true, Ordering::SeqCst);
+        });
+        lx.set_was_timeout_fn(|| true);
+        lx.set_now_ms_fn(|| 1000);
+
+        let mut val: u32 = 42;
+        let uaddr = &mut val as *mut u32 as u64;
+
+        let ts = [1i64.to_le_bytes(), 0i64.to_le_bytes()].concat();
+        let timeout_ptr = ts.as_ptr() as u64;
+
+        BLOCKED.store(false, Ordering::SeqCst);
+        let result = lx.sys_futex(uaddr, 0, 42, timeout_ptr);
+        assert!(BLOCKED.load(Ordering::SeqCst));
+        assert_eq!(result, -110); // ETIMEDOUT
+    }
+
+    #[test]
+    fn futex_wait_no_timeout_returns_zero() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        static BLOCKED: AtomicBool = AtomicBool::new(false);
+        lx.set_futex_block_fn(|_uaddr, _deadline| {
+            BLOCKED.store(true, Ordering::SeqCst);
+        });
+        lx.set_was_timeout_fn(|| false);
+
+        let mut val: u32 = 42;
+        let uaddr = &mut val as *mut u32 as u64;
+
+        BLOCKED.store(false, Ordering::SeqCst);
+        let result = lx.sys_futex(uaddr, 0, 42, 0); // null timeout
+        assert!(BLOCKED.load(Ordering::SeqCst));
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn futex_wait_null_timeout_passes_none_deadline() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        static DEADLINE_SEEN: AtomicU64 = AtomicU64::new(0);
+        lx.set_futex_block_fn(|_uaddr, deadline| {
+            DEADLINE_SEEN.store(deadline.unwrap_or(u64::MAX), Ordering::SeqCst);
+        });
+        lx.set_was_timeout_fn(|| false);
+
+        let mut val: u32 = 42;
+        let uaddr = &mut val as *mut u32 as u64;
+
+        DEADLINE_SEEN.store(0, Ordering::SeqCst);
+        let _ = lx.sys_futex(uaddr, 0, 42, 0);
+        assert_eq!(DEADLINE_SEEN.load(Ordering::SeqCst), u64::MAX); // None sentinel
+    }
+
+    #[test]
+    fn futex_wait_timeout_computes_deadline() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        static DEADLINE_SEEN: AtomicU64 = AtomicU64::new(0);
+        lx.set_futex_block_fn(|_uaddr, deadline| {
+            DEADLINE_SEEN.store(deadline.unwrap_or(u64::MAX), Ordering::SeqCst);
+        });
+        lx.set_was_timeout_fn(|| false);
+        lx.set_now_ms_fn(|| 500);
+
+        let mut val: u32 = 42;
+        let uaddr = &mut val as *mut u32 as u64;
+
+        // 2 seconds + 500_000_000 nanoseconds = 2500ms
+        let ts = [2i64.to_le_bytes(), 500_000_000i64.to_le_bytes()].concat();
+        let timeout_ptr = ts.as_ptr() as u64;
+
+        DEADLINE_SEEN.store(0, Ordering::SeqCst);
+        let _ = lx.sys_futex(uaddr, 0, 42, timeout_ptr);
+        assert_eq!(DEADLINE_SEEN.load(Ordering::SeqCst), 3000); // 500 + 2500
     }
 
     #[test]
