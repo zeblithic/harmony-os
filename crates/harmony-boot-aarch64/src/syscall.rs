@@ -26,7 +26,7 @@ pub struct TrapFrame {
     /// Floating-Point Status Register.
     pub fpsr: u64,
     /// Padding to align `q` to 16 bytes (required for `stp`/`ldp` of Q regs).
-    _pad: u64,
+    pub _pad: u64,
     /// SIMD/FP registers Q0-Q31 (128 bits each).
     pub q: [u128; 32],
 }
@@ -162,23 +162,32 @@ pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
 
             if tid != 0 {
                 // Spawned thread exit — CLEARTID cleanup and die.
-                if result.exit_group && !PROCESS_EXITED {
-                    // exit_group from a spawned thread: record process exit.
-                    // We can't redirect the main thread's RETURN_ADDR from here
-                    // (it's a different task's TrapFrame), but marking the
-                    // process as exited ensures correct status reporting.
-                    // TODO(Phase 6, harmony-os-g9i): exit_group from a non-main
-                    // thread leaves the main thread Dead without ELR redirect.
-                    // The boot code's elf_task never sees "Binary exited". Fix
-                    // by patching the main thread's saved TrapFrame.elr to
-                    // RETURN_ADDR via its TCB kernel_sp, then marking it Ready.
+                if result.exit_group {
+                    // exit_group from a spawned thread: redirect the main
+                    // thread to boot code via its saved TrapFrame.
                     PROCESS_EXITED = true;
                     EXIT_CODE = result.exit_code;
+                    if RETURN_ADDR != 0 {
+                        crate::sched::redirect_main_thread_to_boot(
+                            pid,
+                            result.exit_code,
+                            RETURN_ADDR,
+                            RETURN_SP,
+                            RETURN_LR,
+                        );
+                    }
                 }
                 let clear_addr = crate::sched::current_task_clear_child_tid();
                 if clear_addr != 0 {
                     *(clear_addr as *mut u32) = 0;
                     crate::sched::futex_wake(clear_addr, 1);
+                }
+                // Only wake the parent on process exit (exit_group), not
+                // thread-only exit. Thread join uses futex (CLEARTID), not
+                // wait4 — waking the parent on every thread exit would cause
+                // spurious context switches.
+                if result.exit_group {
+                    crate::sched::wake_waiting_parent(pid);
                 }
                 crate::sched::mark_current_dead();
                 // Unmask IRQs and trigger SGI to switch away. Stay unmasked —
@@ -192,23 +201,16 @@ pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
                 }
             }
 
-            // SYS_EXIT from main thread: per Linux semantics, only the
-            // calling thread exits — other threads continue running.
-            // We do NOT call kill_threads_by_pid here (exit_group
-            // already handled that above for the exit_group case).
-            //
-            // TODO(Phase 6, harmony-os-g9i): the main thread still
-            // redirects ELR to RETURN_ADDR below, which returns
-            // control to boot code while spawned threads may still
-            // be running. Correct behavior requires last-thread-exit
-            // detection so the boot code is only notified when every
-            // thread has exited.
+            // Main thread exit: the dispatch function in main.rs promotes
+            // main-thread SYS_EXIT to exit_group, so by this point
+            // kill_threads_by_pid has already been called above.
 
             // Record exit status (only the first exit sets the code).
             if !PROCESS_EXITED {
                 PROCESS_EXITED = true;
                 EXIT_CODE = result.exit_code;
             }
+            crate::sched::wake_waiting_parent(pid);
 
             // Redirect ELR to boot code's return point. Always redirect
             // if RETURN_ADDR is set — even if a spawned thread's exit_group

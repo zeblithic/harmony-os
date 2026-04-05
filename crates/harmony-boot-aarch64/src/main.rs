@@ -482,12 +482,17 @@ fn main() -> Status {
         // Install scheduler callbacks so blocking syscalls yield the CPU
         // instead of spin-waiting.
         linuxulator.set_block_fn(|op, fd, deadline_ms| {
+            use harmony_os::linuxulator::{
+                BLOCK_OP_CONNECT, BLOCK_OP_POLL, BLOCK_OP_READABLE, BLOCK_OP_SLEEP,
+                BLOCK_OP_WAIT, BLOCK_OP_WRITABLE,
+            };
             let reason = match op {
-                0 => sched::WaitReason::FdReadable(fd),
-                1 => sched::WaitReason::FdWritable(fd),
-                2 => sched::WaitReason::FdConnectDone(fd),
-                3 => sched::WaitReason::PollWait,
-                4 => sched::WaitReason::Sleep,
+                BLOCK_OP_READABLE => sched::WaitReason::FdReadable(fd),
+                BLOCK_OP_WRITABLE => sched::WaitReason::FdWritable(fd),
+                BLOCK_OP_CONNECT => sched::WaitReason::FdConnectDone(fd),
+                BLOCK_OP_POLL => sched::WaitReason::PollWait,
+                BLOCK_OP_SLEEP => sched::WaitReason::Sleep,
+                BLOCK_OP_WAIT => sched::WaitReason::WaitChild(fd),
                 _ => unreachable!(),
             };
             unsafe { sched::block_current(reason, deadline_ms) };
@@ -553,15 +558,40 @@ fn main() -> Status {
             let is_exit = matches!(syscall, LinuxSyscall::Exit { .. });
             let is_exit_group = matches!(syscall, LinuxSyscall::ExitGroup { .. });
 
+            // Extract exit code from syscall args BEFORE dispatch. We cannot
+            // rely on lx.exit_code() because sys_exit no longer sets it (to
+            // avoid poisoning deliver_pending_signals for other threads).
+            let exit_code_from_args = match syscall {
+                LinuxSyscall::Exit { code } | LinuxSyscall::ExitGroup { code } => code,
+                _ => 0,
+            };
+
             let lx = unsafe { LINUXULATOR.as_mut().unwrap() };
             let retval = lx.dispatch_syscall(syscall);
 
             if is_exit || is_exit_group {
+                // For thread-only exit (SYS_EXIT, not exit_group), clear the
+                // process-level exit_code that sys_exit set on the shared
+                // Linuxulator. This prevents poisoning deliver_pending_signals
+                // for other threads. In the sequential fork model, this
+                // dispatch function is not involved (child runs via direct
+                // dispatch_syscall), so the child's exit_code stays set for
+                // recover_child_state.
+                if is_exit && !is_exit_group {
+                    lx.clear_exit_code();
+                }
+
+                // Promote main-thread SYS_EXIT to exit_group: when the main
+                // thread (tid=0) calls exit(), kill all sibling threads first.
+                // This matches glibc/musl behavior (they emit exit_group).
+                let promote_to_exit_group =
+                    is_exit && unsafe { crate::sched::current_task_tid() } == 0;
+
                 syscall::SyscallDispatchResult {
                     retval,
                     exited: true,
-                    exit_code: lx.exit_code().unwrap_or(0),
-                    exit_group: is_exit_group,
+                    exit_code: exit_code_from_args,
+                    exit_group: is_exit_group || promote_to_exit_group,
                 }
             } else {
                 syscall::SyscallDispatchResult {
@@ -1280,6 +1310,10 @@ fn check_and_wake_blocked_tasks() {
                 sched::WaitReason::Sleep => {
                     // Sleep waiters are woken by check_deadlines() when the deadline
                     // expires. The system task has nothing to do here.
+                }
+                sched::WaitReason::WaitChild(_) => {
+                    // WaitChild tasks are woken by wake_waiting_parent() when a
+                    // child exits. The system task has nothing to do here.
                 }
             }
         });

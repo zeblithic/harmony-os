@@ -95,6 +95,10 @@ pub const BLOCK_OP_WRITABLE: u8 = 1;
 pub const BLOCK_OP_CONNECT: u8 = 2;
 pub const BLOCK_OP_POLL: u8 = 3;
 pub const BLOCK_OP_SLEEP: u8 = 4;
+/// Block operation: waiting for child process exit (wait4/waitpid).
+/// The `fd` parameter carries the target PID (-1 = any child, >0 = specific).
+/// Decoded by the block_fn closure in main.rs to WaitReason::WaitChild(pid).
+pub const BLOCK_OP_WAIT: u8 = 5;
 
 fn ipc_err_to_errno(e: IpcError) -> i64 {
     match e {
@@ -2964,6 +2968,18 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     /// The exit code, if the process has exited.
     pub fn exit_code(&self) -> Option<i32> {
         self.exit_code
+    }
+
+    /// Clear the exit_code flag without changing any other state.
+    ///
+    /// Used by the dispatch function in main.rs to undo the exit_code
+    /// set by sys_exit for thread-only exits. This prevents poisoning
+    /// deliver_pending_signals for other threads on the shared
+    /// Linuxulator, while preserving the flag for sys_exit_group
+    /// (process-level exit) and for the sequential fork model (where
+    /// the dispatch function is not involved).
+    pub fn clear_exit_code(&mut self) {
+        self.exit_code = None;
     }
 
     /// Recover shared state (pipes/eventfds) from an exited child.
@@ -6457,8 +6473,9 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     /// - pid == 0 or pid < -1: not supported (ENOSYS)
     ///
     /// options:
-    /// - WNOHANG (1): return 0 immediately if no child has exited
-    /// - Without WNOHANG: return ECHILD if no exited children available
+    /// - WNOHANG (1): return 0 immediately if child exists but hasn't exited
+    /// - Without WNOHANG: block via BLOCK_OP_WAIT until a child exits,
+    ///   then re-check. Falls back to ECHILD in sans-I/O mode (no scheduler).
     ///
     /// wstatus format: (exit_code & 0xFF) << 8 (normal exit, no signal)
     fn sys_wait4(&mut self, pid: i32, wstatus_ptr: u64, options: i32, rusage_ptr: u64) -> i64 {
@@ -6473,68 +6490,84 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             return EINVAL;
         }
 
-        // Ensure any recently-exited child is recovered first.
-        self.recover_child_state();
+        loop {
+            // Ensure any recently-exited child is recovered first.
+            self.recover_child_state();
 
-        // Check if the requested pid is a known child (active or exited).
-        // For pid == -1 (any child), check if any children exist at all.
-        // For pid > 0, check if that specific pid is a known child.
-        let has_matching_children = if pid == -1 {
-            !self.children.is_empty() || !self.exited_children.is_empty()
-        } else {
-            self.children.iter().any(|c| c.pid == pid)
-                || self.exited_children.iter().any(|&(p, _, _)| p == pid)
-        };
-
-        let idx = if pid == -1 {
-            // Any child — return oldest exited child (FIFO, matching Linux).
-            if self.exited_children.is_empty() {
-                None
+            // Check if the requested pid is a known child (active or exited).
+            let has_matching_children = if pid == -1 {
+                !self.children.is_empty() || !self.exited_children.is_empty()
             } else {
-                Some(0)
-            }
-        } else {
-            // Specific child
-            self.exited_children.iter().position(|&(p, _, _)| p == pid)
-        };
-
-        let idx = match idx {
-            Some(i) => i,
-            None => {
-                if !has_matching_children {
-                    // Requested pid is not a known child — ECHILD.
-                    return ECHILD;
-                }
-                if options & WNOHANG != 0 {
-                    return 0; // child exists but hasn't exited yet
-                }
-                return ECHILD; // no exited children available
-            }
-        };
-
-        let (child_pid, exit_code, killed_by) = self.exited_children.remove(idx);
-
-        // Write wstatus if pointer is non-null.
-        // Linux wstatus format for normal exit: (code & 0xFF) << 8
-        // Linux wstatus format for signal death: (sig & 0x7F)
-        if wstatus_ptr != 0 {
-            let wstatus = match killed_by {
-                Some(sig) => sig & 0x7F,
-                None => ((exit_code & 0xFF) as u32) << 8,
+                self.children.iter().any(|c| c.pid == pid)
+                    || self.exited_children.iter().any(|&(p, _, _)| p == pid)
             };
-            let buf =
-                unsafe { core::slice::from_raw_parts_mut(wstatus_ptr as usize as *mut u8, 4) };
-            buf.copy_from_slice(&wstatus.to_ne_bytes());
-        }
 
-        // Zero rusage if provided — resource tracking not implemented.
-        if rusage_ptr != 0 {
-            let buf =
-                unsafe { core::slice::from_raw_parts_mut(rusage_ptr as usize as *mut u8, 144) };
-            buf.fill(0);
-        }
+            let idx = if pid == -1 {
+                // Any child — return oldest exited child (FIFO, matching Linux).
+                if self.exited_children.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                }
+            } else {
+                // Specific child
+                self.exited_children.iter().position(|&(p, _, _)| p == pid)
+            };
 
-        child_pid as i64
+            if let Some(i) = idx {
+                let (child_pid, exit_code, killed_by) = self.exited_children.remove(i);
+
+                // Write wstatus if pointer is non-null.
+                // Linux wstatus format for normal exit: (code & 0xFF) << 8
+                // Linux wstatus format for signal death: (sig & 0x7F)
+                if wstatus_ptr != 0 {
+                    let wstatus = match killed_by {
+                        Some(sig) => sig & 0x7F,
+                        None => ((exit_code & 0xFF) as u32) << 8,
+                    };
+                    let buf = unsafe {
+                        core::slice::from_raw_parts_mut(wstatus_ptr as usize as *mut u8, 4)
+                    };
+                    buf.copy_from_slice(&wstatus.to_ne_bytes());
+                }
+
+                // Zero rusage if provided — resource tracking not implemented.
+                if rusage_ptr != 0 {
+                    let buf = unsafe {
+                        core::slice::from_raw_parts_mut(rusage_ptr as usize as *mut u8, 144)
+                    };
+                    buf.fill(0);
+                }
+
+                return child_pid as i64;
+            }
+
+            // No exited child found.
+            if !has_matching_children {
+                // Requested pid is not a known child — ECHILD.
+                return ECHILD;
+            }
+            if options & WNOHANG != 0 {
+                // Child exists but hasn't exited yet — return 0.
+                return 0;
+            }
+
+            // Block until a child exits. If no scheduler is available
+            // (block_fn not set), block_until returns Interrupted and we
+            // return ECHILD. We use ECHILD (not EINTR) because EINTR would
+            // cause glibc/musl to retry, spinning forever in sans-I/O mode
+            // where the child can never exit. ECHILD signals "stop trying".
+            //
+            // NOTE: wake_waiting_parent() uses the scheduler PID, while
+            // this blocks on a Linux PID. These match for the current
+            // single-process model but will diverge when concurrent fork
+            // creates child processes with separate scheduler tasks.
+            // pid=-1 (any child) is unaffected. Tracked by harmony-os-96y.
+            match self.block_until(BLOCK_OP_WAIT, pid, None) {
+                BlockResult::Ready => continue,
+                BlockResult::Interrupted => return ECHILD,
+            }
+        }
     }
 
     /// Linux kill(2): send a signal to a process.
@@ -7069,9 +7102,14 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
     /// Linux exit(2): terminate the calling thread.
     ///
-    /// In our single-threaded model, this is equivalent to exit_group.
+    /// Sets exit_code so the sequential fork model's `recover_child_state`
+    /// and `active_process` can detect child completion. For the concurrent
+    /// thread model (shared Linuxulator), the dispatch function in main.rs
+    /// calls `clear_exit_code()` after dispatch to prevent poisoning
+    /// `deliver_pending_signals` for other threads.
     fn sys_exit(&mut self, code: i32) -> i64 {
-        self.sys_exit_group(code)
+        self.exit_code = Some(code);
+        0
     }
 
     /// Linux execve(2): replace process image with a new ELF binary.
@@ -9787,13 +9825,30 @@ mod tests {
     // ── sys_exit tests ────────────────────────────────────────────────
 
     #[test]
-    fn sys_exit_is_same_as_exit_group() {
+    fn sys_exit_sets_exit_code() {
+        // sys_exit sets exit_code for the sequential fork model (child
+        // detection via recover_child_state). In the concurrent thread
+        // model, the dispatch function in main.rs clears it after dispatch
+        // to prevent poisoning deliver_pending_signals.
         let mock = MockBackend::new();
         let mut lx = Linuxulator::new(mock);
         let result = lx.handle_syscall(60, [7, 0, 0, 0, 0, 0]);
         assert_eq!(result, 0);
         assert!(lx.exited());
         assert_eq!(lx.exit_code(), Some(7));
+    }
+
+    #[test]
+    fn clear_exit_code_undoes_sys_exit() {
+        // The dispatch function calls clear_exit_code after thread-only
+        // exit to prevent poisoning deliver_pending_signals.
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+        lx.handle_syscall(60, [7, 0, 0, 0, 0, 0]);
+        assert!(lx.exited());
+        lx.clear_exit_code();
+        assert!(!lx.exited());
+        assert_eq!(lx.exit_code(), None);
     }
 
     // ── sys_fstat tests ──────────────────────────────────────────────
@@ -15358,6 +15413,113 @@ mod integration_tests {
             rusage: 0,
         });
         assert_eq!(r, ECHILD);
+    }
+
+    // ── wait4 blocking tests ──────────────────────────────────────
+
+    #[test]
+    fn test_wait4_wnohang_returns_zero_for_running_child() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Fork a child — it sits in children with exit_code=None (running).
+        let child_pid = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
+        assert!(child_pid > 0);
+        // Do NOT call ExitGroup — child is still "running".
+
+        // WNOHANG wait for specific pid — child exists but hasn't exited → 0.
+        let r = lx.dispatch_syscall(LinuxSyscall::Wait4 {
+            pid: child_pid,
+            wstatus: 0,
+            options: 1, // WNOHANG
+            rusage: 0,
+        });
+        assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn test_wait4_any_child_wnohang_returns_zero_for_running_child() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // Fork a child — it sits in children with exit_code=None (running).
+        let child_pid = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
+        assert!(child_pid > 0);
+        // Do NOT call ExitGroup — child is still "running".
+
+        // WNOHANG wait for any child — child exists but hasn't exited → 0.
+        let r = lx.dispatch_syscall(LinuxSyscall::Wait4 {
+            pid: -1,
+            wstatus: 0,
+            options: 1, // WNOHANG
+            rusage: 0,
+        });
+        assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn test_wait4_echild_for_unknown_pid() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        // No children at all — wait for specific pid → ECHILD.
+        let r = lx.dispatch_syscall(LinuxSyscall::Wait4 {
+            pid: 999,
+            wstatus: 0,
+            options: 0,
+            rusage: 0,
+        });
+        assert_eq!(r, ECHILD);
+    }
+
+    #[test]
+    fn test_wait4_without_block_fn_returns_echild() {
+        // Without block_fn (sans-I/O mode), blocking wait on a running child
+        // returns ECHILD via the Interrupted fallback — the linuxulator can't
+        // actually block without a scheduler.
+        let mut lx = Linuxulator::new(MockBackend::new());
+        let child_pid = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
+        assert!(child_pid > 0);
+
+        let r = lx.dispatch_syscall(LinuxSyscall::Wait4 {
+            pid: -1,
+            wstatus: 0,
+            options: 0, // no WNOHANG — would block, but no block_fn → ECHILD
+            rusage: 0,
+        });
+        assert_eq!(r, ECHILD);
+    }
+
+    #[test]
+    fn test_wait4_blocking_uses_correct_op_and_pid() {
+        use core::sync::atomic::{AtomicI32, AtomicU8, Ordering};
+
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        static OP_SEEN_W: AtomicU8 = AtomicU8::new(255);
+        static FD_SEEN_W: AtomicI32 = AtomicI32::new(0);
+
+        // Install a block_fn that records op and fd, then set up a child
+        // that exits on the second iteration by using active_process().
+        // We can't mutate lx from inside block_fn, so instead we'll verify
+        // the op/fd by calling block_until directly.
+        lx.set_block_fn(|op, fd, _deadline| {
+            OP_SEEN_W.store(op, Ordering::SeqCst);
+            FD_SEEN_W.store(fd, Ordering::SeqCst);
+        });
+
+        OP_SEEN_W.store(255, Ordering::SeqCst);
+        FD_SEEN_W.store(0, Ordering::SeqCst);
+
+        // Call block_until directly to verify BLOCK_OP_WAIT encoding.
+        let _ = lx.block_until(BLOCK_OP_WAIT, 42, None);
+        assert_eq!(OP_SEEN_W.load(Ordering::SeqCst), BLOCK_OP_WAIT);
+        assert_eq!(FD_SEEN_W.load(Ordering::SeqCst), 42);
+
+        // Also verify pid=-1 is passed correctly.
+        let _ = lx.block_until(BLOCK_OP_WAIT, -1, None);
+        assert_eq!(FD_SEEN_W.load(Ordering::SeqCst), -1);
     }
 
     // ── Execve tests ──────────────────────────────────────────────
