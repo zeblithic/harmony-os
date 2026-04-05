@@ -439,6 +439,8 @@ pub enum LinuxSyscall {
         uaddr: u64,
         op: i32,
         val: u32,
+        /// Pointer to struct timespec for FUTEX_WAIT timeout. 0 = wait forever.
+        timeout: u64,
     },
     SchedGetaffinity {
         pid: i32,
@@ -1019,6 +1021,7 @@ impl LinuxSyscall {
                 uaddr: args[0],
                 op: args[1] as i32,
                 val: args[2] as u32,
+                timeout: args[3],
             },
             204 => LinuxSyscall::SchedGetaffinity {
                 pid: args[0] as i32,
@@ -1361,6 +1364,7 @@ impl LinuxSyscall {
                 uaddr: args[0],
                 op: args[1] as i32,
                 val: args[2] as u32,
+                timeout: args[3],
             },
             99 => LinuxSyscall::SetRobustList,
             101 => LinuxSyscall::Nanosleep {
@@ -3417,7 +3421,12 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             LinuxSyscall::Getgid => self.sys_getgid(),
             LinuxSyscall::Getegid => self.sys_getegid(),
             LinuxSyscall::Madvise { .. } => self.sys_madvise(),
-            LinuxSyscall::Futex { uaddr, op, val } => self.sys_futex(uaddr, op, val),
+            LinuxSyscall::Futex {
+                uaddr,
+                op,
+                val,
+                timeout,
+            } => self.sys_futex(uaddr, op, val, timeout),
             LinuxSyscall::SchedGetaffinity {
                 cpusetsize, mask, ..
             } => self.sys_sched_getaffinity(cpusetsize, mask),
@@ -8682,7 +8691,8 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     /// FUTEX_WAKE (cmd 1): wakes up to val waiters via futex_wake_fn.
     ///   Returns the count of woken tasks (0 when no scheduler).
     /// All other operations return ENOSYS.
-    fn sys_futex(&mut self, uaddr: u64, op: i32, val: u32) -> i64 {
+    fn sys_futex(&mut self, uaddr: u64, op: i32, val: u32, timeout: u64) -> i64 {
+        const ETIMEDOUT: i64 = -110;
         // The op field's lower bits encode the command; upper bits are
         // flags (FUTEX_PRIVATE_FLAG, etc.).  Mask to the command bits.
         const FUTEX_CMD_MASK: i32 = 0x7f;
@@ -8694,6 +8704,13 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             FUTEX_WAIT => {
                 if uaddr == 0 {
                     return EFAULT;
+                }
+                // Timed futex waits are not yet supported (requires timer-based
+                // unblock, tracked by harmony-os-ltv). Return ETIMEDOUT
+                // immediately so callers (e.g. pthread_cond_timedwait) don't
+                // block forever.
+                if timeout != 0 {
+                    return ETIMEDOUT;
                 }
                 // Atomicity note: the read-compare-block sequence is safe on
                 // single-core because SVC entry masks IRQs (PSTATE.I=1). No
@@ -11986,6 +12003,7 @@ mod integration_tests {
             uaddr: 0x1000,
             op: 1, // FUTEX_WAKE
             val: 1,
+            timeout: 0,
         });
         assert_eq!(result, 0);
     }
@@ -11999,6 +12017,7 @@ mod integration_tests {
             uaddr: 0x1000,
             op: 129,
             val: 1,
+            timeout: 0,
         });
         assert_eq!(result, 0);
     }
@@ -12013,6 +12032,7 @@ mod integration_tests {
             uaddr: &val as *const u32 as u64,
             op: 0,
             val: 42,
+            timeout: 0,
         });
         assert_eq!(result, EAGAIN);
     }
@@ -12026,6 +12046,7 @@ mod integration_tests {
             uaddr: 0x1000,
             op: 6,
             val: 0,
+            timeout: 0,
         });
         assert_eq!(result, ENOSYS);
     }
@@ -12037,7 +12058,7 @@ mod integration_tests {
         let mut val: u32 = 42;
         let uaddr = &mut val as *mut u32 as u64;
         // FUTEX_WAIT, expected 99 but actual is 42 → EAGAIN
-        let result = lx.sys_futex(uaddr, 0, 99);
+        let result = lx.sys_futex(uaddr, 0, 99, 0);
         assert_eq!(result, EAGAIN);
     }
 
@@ -12056,7 +12077,7 @@ mod integration_tests {
         let uaddr = &mut val as *mut u32 as u64;
         BLOCKED.store(false, Ordering::SeqCst);
         // FUTEX_WAIT, matches → calls block fn → returns 0
-        let result = lx.sys_futex(uaddr, 0, 42);
+        let result = lx.sys_futex(uaddr, 0, 42, 0);
         assert!(BLOCKED.load(Ordering::SeqCst));
         assert_eq!(result, 0);
     }
@@ -12067,7 +12088,7 @@ mod integration_tests {
         let mut lx = Linuxulator::new(mock);
         lx.set_futex_wake_fn(|_uaddr, _max| 3);
         // FUTEX_WAKE, max=5 → wake_fn returns 3
-        let result = lx.sys_futex(0x1000, 1, 5);
+        let result = lx.sys_futex(0x1000, 1, 5, 0);
         assert_eq!(result, 3);
     }
 
