@@ -557,11 +557,17 @@ fn main() -> Status {
             let retval = lx.dispatch_syscall(syscall);
 
             if is_exit || is_exit_group {
+                // Promote main-thread SYS_EXIT to exit_group: when the main
+                // thread (tid=0) calls exit(), kill all sibling threads first.
+                // This matches glibc/musl behavior (they emit exit_group).
+                let promote_to_exit_group =
+                    is_exit && unsafe { crate::sched::current_task_tid() } == 0;
+
                 syscall::SyscallDispatchResult {
                     retval,
                     exited: true,
                     exit_code: lx.exit_code().unwrap_or(0),
-                    exit_group: is_exit_group,
+                    exit_group: is_exit_group || promote_to_exit_group,
                 }
             } else {
                 syscall::SyscallDispatchResult {
