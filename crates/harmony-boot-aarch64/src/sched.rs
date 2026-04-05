@@ -526,6 +526,7 @@ pub unsafe fn block_current(reason: WaitReason, deadline_ms: Option<u64>) {
         tcb.state = TaskState::Blocked;
         tcb.wait_reason = Some(reason);
         tcb.deadline_ms = deadline_ms;
+        tcb.woken_by_timeout = false;
         #[cfg(target_arch = "aarch64")]
         {
             let tls: u64;
@@ -1142,6 +1143,27 @@ mod tests {
             assert_eq!(tcb.state, TaskState::Blocked);
             assert_eq!(tcb.wait_reason, Some(WaitReason::Sleep));
             assert_eq!(tcb.deadline_ms, Some(1234));
+            NUM_TASKS = 0;
+        }
+    }
+
+    #[test]
+    fn block_current_clears_stale_woken_by_timeout() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        unsafe {
+            put_tcb(0, TaskState::Running, None);
+            // Simulate a stale flag from a previous timeout wake.
+            TASKS[0].assume_init_mut().woken_by_timeout = true;
+            NUM_TASKS = 1;
+            CURRENT = 0;
+
+            block_current(WaitReason::Futex(0x1000), Some(500));
+
+            let tcb = TASKS[0].assume_init_ref();
+            assert_eq!(tcb.state, TaskState::Blocked);
+            // The stale flag must be cleared on entry to blocking.
+            assert!(!tcb.woken_by_timeout);
+            assert_eq!(tcb.deadline_ms, Some(500));
             NUM_TASKS = 0;
         }
     }

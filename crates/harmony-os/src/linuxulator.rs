@@ -88,7 +88,8 @@ enum BlockResult {
     Interrupted,
 }
 
-/// block_until operation types — match WaitReason encoding in sched.rs.
+/// block_until operation types — decoded by the block_fn closure in main.rs
+/// which maps each code to the corresponding WaitReason variant.
 pub const BLOCK_OP_READABLE: u8 = 0;
 pub const BLOCK_OP_WRITABLE: u8 = 1;
 pub const BLOCK_OP_CONNECT: u8 = 2;
@@ -6617,15 +6618,15 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             return EFAULT;
         }
         let req_bytes = unsafe { core::slice::from_raw_parts(req_ptr as usize as *const u8, 16) };
-        let tv_sec = i64::from_le_bytes(req_bytes[0..8].try_into().unwrap());
-        let tv_nsec = i64::from_le_bytes(req_bytes[8..16].try_into().unwrap());
+        let tv_sec = i64::from_ne_bytes(req_bytes[0..8].try_into().unwrap());
+        let tv_nsec = i64::from_ne_bytes(req_bytes[8..16].try_into().unwrap());
         if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
             return EINVAL;
         }
 
         // If scheduler + clock are available, do a real blocking sleep.
-        if self.block_fn.is_some() && self.now_ms_fn.is_some() {
-            let now_ms = (self.now_ms_fn.unwrap())();
+        if let (Some(_), Some(now_ms_fn)) = (self.block_fn, self.now_ms_fn) {
+            let now_ms = now_ms_fn();
             let deadline_ms = if flags & TIMER_ABSTIME != 0 {
                 // Absolute: convert timespec to ms directly.
                 let abs_ms = (tv_sec as u64)
@@ -8765,17 +8766,19 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 }
                 // Parse timeout: a pointer to struct timespec { i64 tv_sec; i64 tv_nsec },
                 // or 0 (null) for no timeout. FUTEX_WAIT timeouts are relative.
-                let deadline_ms: Option<u64> = if timeout != 0 && self.now_ms_fn.is_some() {
+                let deadline_ms: Option<u64> = if let (true, Some(now_ms)) =
+                    (timeout != 0, self.now_ms_fn)
+                {
                     let ts_bytes = unsafe { core::slice::from_raw_parts(timeout as *const u8, 16) };
-                    let tv_sec = i64::from_le_bytes(ts_bytes[0..8].try_into().unwrap());
-                    let tv_nsec = i64::from_le_bytes(ts_bytes[8..16].try_into().unwrap());
+                    let tv_sec = i64::from_ne_bytes(ts_bytes[0..8].try_into().unwrap());
+                    let tv_nsec = i64::from_ne_bytes(ts_bytes[8..16].try_into().unwrap());
                     if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
                         return EINVAL;
                     }
                     let timeout_ms = (tv_sec as u64)
                         .saturating_mul(1000)
                         .saturating_add((tv_nsec as u64) / 1_000_000);
-                    let now = (self.now_ms_fn.unwrap())();
+                    let now = now_ms();
                     Some(now.saturating_add(timeout_ms))
                 } else {
                     None
