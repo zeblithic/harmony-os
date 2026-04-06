@@ -214,7 +214,8 @@ pub enum NvmeError {
     },
     /// The completion queue contained no entry to harvest.
     NoCompletion,
-    /// The requested transfer exceeds the controller's MDTS.
+    /// The requested transfer size is invalid: zero blocks, exceeds the
+    /// controller's MDTS, or exceeds the single-page PRP list limit (513 pages).
     TransferTooLarge,
     /// One or more PRP addresses are not 4 KiB-aligned.
     UnalignedAddress,
@@ -337,10 +338,12 @@ impl<R: RegisterBank> NvmeDriver<R> {
         self.mdts = mdts;
     }
 
-    /// Maximum number of 4 KiB pages per transfer, or `None` if unlimited.
+    /// Maximum number of 4 KiB physical pages per transfer, or `None` if unlimited.
     ///
     /// Derived from MDTS: when non-zero, max pages = 2^mdts.
-    pub fn max_transfer_blocks(&self) -> Option<u32> {
+    /// **Unit is pages, not logical blocks.** For 512-byte sector namespaces,
+    /// max logical blocks = max_pages × (4096 / lba_size_bytes).
+    pub fn max_transfer_pages(&self) -> Option<u32> {
         if self.mdts == 0 {
             None
         } else if self.mdts >= 32 {
@@ -672,9 +675,9 @@ impl<R: RegisterBank> NvmeDriver<R> {
     /// must write the `prp_list` bytes to a 4 KiB-aligned physical address, then
     /// patch SQE bytes 32–39 with that address before submitting.
     ///
-    /// **Note:** The PRP list is returned as a single contiguous buffer. For transfers
-    /// exceeding 513 blocks, the list exceeds 4 KiB and the caller must handle
-    /// multi-page PRP list chaining per the NVMe spec.
+    /// **Limit:** Max 513 pages per command (PRP1 + 512-entry PRP list fitting
+    /// in one 4 KiB page).  Requests exceeding 513 pages return
+    /// [`NvmeError::TransferTooLarge`].
     fn io_rw_command(
         &mut self,
         opcode: u8,
@@ -693,13 +696,14 @@ impl<R: RegisterBank> NvmeDriver<R> {
                 return Err(NvmeError::UnalignedAddress);
             }
         }
-        if let Some(max) = self.max_transfer_blocks() {
+        if let Some(max) = self.max_transfer_pages() {
             if pages.len() > max as usize {
                 return Err(NvmeError::TransferTooLarge);
             }
         }
-        // NLB is bits 15:0 of CDW12, so max value is 0xFFFF (65535), meaning max 65536 blocks.
-        if pages.len() > 65536 {
+        // PRP list must fit in a single 4 KiB page: 512 entries × 8 bytes = 4096.
+        // With PRP1 holding pages[0], the list holds pages[1..], so max 513 pages total.
+        if pages.len() > 513 {
             return Err(NvmeError::TransferTooLarge);
         }
         // Check LBA + block_count doesn't overflow u64.
@@ -1988,7 +1992,7 @@ mod tests {
 
         // Set MDTS=3 → max 8 pages
         driver.set_mdts(3);
-        assert_eq!(driver.max_transfer_blocks(), Some(8));
+        assert_eq!(driver.max_transfer_pages(), Some(8));
 
         let make_cqe = |phase: bool| -> [u8; 16] {
             let mut cqe = [0u8; 16];
@@ -2052,7 +2056,7 @@ mod tests {
     #[test]
     fn mdts_defaults_to_zero() {
         let driver = ready_driver();
-        assert_eq!(driver.max_transfer_blocks(), None);
+        assert_eq!(driver.max_transfer_pages(), None);
     }
 
     #[test]
@@ -2060,21 +2064,21 @@ mod tests {
         let mut driver = ready_driver();
         driver.set_mdts(5);
         // MDTS=5 → max transfer = 2^5 = 32 pages
-        assert_eq!(driver.max_transfer_blocks(), Some(32));
+        assert_eq!(driver.max_transfer_pages(), Some(32));
     }
 
     #[test]
     fn set_mdts_one_means_two_pages() {
         let mut driver = ready_driver();
         driver.set_mdts(1);
-        assert_eq!(driver.max_transfer_blocks(), Some(2));
+        assert_eq!(driver.max_transfer_pages(), Some(2));
     }
 
     #[test]
     fn set_mdts_large_value_saturates() {
         let mut driver = ready_driver();
         driver.set_mdts(32);
-        assert_eq!(driver.max_transfer_blocks(), Some(u32::MAX));
+        assert_eq!(driver.max_transfer_pages(), Some(u32::MAX));
     }
 
     // ── PRP list tests ───────────────────────────────────────────────────
