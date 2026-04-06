@@ -205,6 +205,15 @@ pub struct IdentifyNamespace {
     pub lba_size_bytes: u32,
 }
 
+/// An LBA range for Dataset Management (TRIM/deallocate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DsmRange {
+    /// Starting logical block address.
+    pub lba: u64,
+    /// Number of logical blocks in this range.
+    pub block_count: u32,
+}
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// Errors returned by NVMe driver operations.
@@ -914,6 +923,72 @@ impl<R: RegisterBank> NvmeDriver<R> {
             .submit(sqe, self.doorbell_stride);
         cmd.prp_list = None;
         cmd.data_buffer = None;
+        Ok(cmd)
+    }
+
+    /// Build an NVM Dataset Management command (opcode 0x09) for TRIM/deallocate.
+    ///
+    /// Informs the controller that the given LBA ranges are no longer in use.
+    /// The AD (Attribute Deallocate) bit is always set.
+    ///
+    /// The serialized range descriptors are returned in
+    /// [`AdminCommand::data_buffer`].  The caller must write these bytes to a
+    /// 4 KiB-aligned physical address, then patch SQE bytes 24–31 (PRP1) with
+    /// that address before submitting.
+    ///
+    /// Requires ONCS bit 2 (Dataset Management support).  Max 256 ranges.
+    pub fn dataset_management(
+        &mut self,
+        nsid: u32,
+        ranges: &[DsmRange],
+    ) -> Result<AdminCommand, NvmeError> {
+        if self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+        if !self.supports_dataset_management() {
+            return Err(NvmeError::UnsupportedCommand);
+        }
+        if ranges.is_empty() || ranges.len() > 256 {
+            return Err(NvmeError::TransferTooLarge);
+        }
+
+        let cid = self.next_cid;
+        self.next_cid = self.next_cid.wrapping_add(1);
+
+        // Serialize range descriptors (16 bytes each).
+        let mut buf = Vec::with_capacity(ranges.len() * 16);
+        for range in ranges {
+            // Context Attributes (4 bytes) — always 0
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            // Length in LBAs (4 bytes)
+            buf.extend_from_slice(&range.block_count.to_le_bytes());
+            // Starting LBA (8 bytes)
+            buf.extend_from_slice(&range.lba.to_le_bytes());
+        }
+
+        let mut sqe = [0u8; 64];
+        // CDW0: opcode 0x09 | CID
+        let cdw0: u32 = 0x09 | ((cid as u32) << 16);
+        sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
+        // NSID
+        sqe[4..8].copy_from_slice(&nsid.to_le_bytes());
+        // PRP1 = sentinel — caller patches with DMA address of range buffer
+        sqe[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
+        // PRP2 = 0
+        // (sqe is zero-initialized, so bytes 32-39 are already 0)
+        // CDW10: NR (Number of Ranges, 0-based)
+        let nr = (ranges.len() as u32) - 1;
+        sqe[40..44].copy_from_slice(&nr.to_le_bytes());
+        // CDW11: AD bit (bit 2) = Attribute Deallocate
+        sqe[44..48].copy_from_slice(&0x04u32.to_le_bytes());
+
+        let mut cmd = self
+            .io
+            .as_mut()
+            .ok_or(NvmeError::InvalidState)?
+            .submit(sqe, self.doorbell_stride);
+        cmd.prp_list = None;
+        cmd.data_buffer = Some(buf);
         Ok(cmd)
     }
 }
@@ -2519,5 +2594,195 @@ mod tests {
         let cid1 = u32::from_le_bytes(cmd1.sqe[0..4].try_into().unwrap()) >> 16;
         let cid2 = u32::from_le_bytes(cmd2.sqe[0..4].try_into().unwrap()) >> 16;
         assert_eq!(cid2, cid1 + 1);
+    }
+
+    // ── Dataset Management (TRIM) tests ──────────────────────────────────────
+
+    #[test]
+    fn dataset_management_builds_correct_sqe() {
+        let mut driver = ready_driver();
+        driver.set_oncs(0x04); // bit 2 = Dataset Management
+        let ranges = [DsmRange { lba: 100, block_count: 16 }];
+        let cmd = driver.dataset_management(1, &ranges).unwrap();
+
+        // Opcode = 0x09
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x09);
+
+        // NSID
+        let nsid = u32::from_le_bytes(cmd.sqe[4..8].try_into().unwrap());
+        assert_eq!(nsid, 1);
+
+        // PRP1 = sentinel (caller patches with DMA address)
+        let prp1 = u64::from_le_bytes(cmd.sqe[24..32].try_into().unwrap());
+        assert_eq!(prp1, u64::MAX);
+
+        // PRP2 = 0
+        let prp2 = u64::from_le_bytes(cmd.sqe[32..40].try_into().unwrap());
+        assert_eq!(prp2, 0);
+
+        // CDW10 = NR (0-based) = 0
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10, 0);
+
+        // CDW11 = 0x04 (AD bit)
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11, 0x04);
+
+        // data_buffer present, prp_list absent
+        assert!(cmd.data_buffer.is_some());
+        assert!(cmd.prp_list.is_none());
+    }
+
+    #[test]
+    fn dataset_management_rejects_unsupported() {
+        let mut driver = ready_driver();
+        // ONCS = 0 — Dataset Management not supported
+        let ranges = [DsmRange { lba: 0, block_count: 1 }];
+        assert_eq!(
+            driver.dataset_management(1, &ranges).unwrap_err(),
+            NvmeError::UnsupportedCommand
+        );
+    }
+
+    #[test]
+    fn dataset_management_single_range_serialization() {
+        let mut driver = ready_driver();
+        driver.set_oncs(0x04);
+        let ranges = [DsmRange { lba: 0x0000_DEAD_BEEF_0000, block_count: 42 }];
+        let cmd = driver.dataset_management(1, &ranges).unwrap();
+        let buf = cmd.data_buffer.unwrap();
+
+        assert_eq!(buf.len(), 16);
+        // Context attributes: bytes 0-3 = 0
+        assert_eq!(&buf[0..4], &[0, 0, 0, 0]);
+        // Length in LBAs: bytes 4-7 = 42 LE
+        assert_eq!(&buf[4..8], &42u32.to_le_bytes());
+        // Starting LBA: bytes 8-15 = 0x0000_DEAD_BEEF_0000 LE
+        assert_eq!(&buf[8..16], &0x0000_DEAD_BEEF_0000u64.to_le_bytes());
+    }
+
+    #[test]
+    fn dataset_management_multiple_ranges() {
+        let mut driver = ready_driver();
+        driver.set_oncs(0x04);
+        let ranges = [
+            DsmRange { lba: 100, block_count: 10 },
+            DsmRange { lba: 500, block_count: 20 },
+            DsmRange { lba: 1000, block_count: 30 },
+        ];
+        let cmd = driver.dataset_management(1, &ranges).unwrap();
+
+        // CDW10 = NR = 2 (3 ranges, 0-based)
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10, 2);
+
+        let buf = cmd.data_buffer.unwrap();
+        assert_eq!(buf.len(), 48); // 3 * 16
+
+        // Range 0
+        assert_eq!(&buf[4..8], &10u32.to_le_bytes());
+        assert_eq!(&buf[8..16], &100u64.to_le_bytes());
+
+        // Range 1
+        assert_eq!(&buf[20..24], &20u32.to_le_bytes());
+        assert_eq!(&buf[24..32], &500u64.to_le_bytes());
+
+        // Range 2
+        assert_eq!(&buf[36..40], &30u32.to_le_bytes());
+        assert_eq!(&buf[40..48], &1000u64.to_le_bytes());
+    }
+
+    #[test]
+    fn dataset_management_max_ranges() {
+        let mut driver = ready_driver();
+        driver.set_oncs(0x04);
+        let ranges: Vec<DsmRange> = (0..256)
+            .map(|i| DsmRange { lba: i as u64 * 100, block_count: 1 })
+            .collect();
+        let cmd = driver.dataset_management(1, &ranges).unwrap();
+
+        // CDW10 = NR = 255
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10, 255);
+
+        let buf = cmd.data_buffer.unwrap();
+        assert_eq!(buf.len(), 256 * 16);
+    }
+
+    #[test]
+    fn dataset_management_rejects_too_many_ranges() {
+        let mut driver = ready_driver();
+        driver.set_oncs(0x04);
+        let ranges: Vec<DsmRange> = (0..257)
+            .map(|i| DsmRange { lba: i as u64, block_count: 1 })
+            .collect();
+        assert_eq!(
+            driver.dataset_management(1, &ranges).unwrap_err(),
+            NvmeError::TransferTooLarge
+        );
+    }
+
+    #[test]
+    fn dataset_management_rejects_empty_ranges() {
+        let mut driver = ready_driver();
+        driver.set_oncs(0x04);
+        assert_eq!(
+            driver.dataset_management(1, &[]).unwrap_err(),
+            NvmeError::TransferTooLarge
+        );
+    }
+
+    #[test]
+    fn dataset_management_rejects_non_ready_state() {
+        let mut driver = enabled_driver();
+        let ranges = [DsmRange { lba: 0, block_count: 1 }];
+        assert_eq!(
+            driver.dataset_management(1, &ranges).unwrap_err(),
+            NvmeError::InvalidState
+        );
+    }
+
+    #[test]
+    fn dataset_management_increments_cid() {
+        let mut driver = ready_driver();
+        driver.set_oncs(0x04);
+        let ranges = [DsmRange { lba: 0, block_count: 1 }];
+        let cmd1 = driver.dataset_management(1, &ranges).unwrap();
+        let cmd2 = driver.dataset_management(1, &ranges).unwrap();
+        let cid1 = u32::from_le_bytes(cmd1.sqe[0..4].try_into().unwrap()) >> 16;
+        let cid2 = u32::from_le_bytes(cmd2.sqe[0..4].try_into().unwrap()) >> 16;
+        assert_eq!(cid2, cid1 + 1);
+    }
+
+    #[test]
+    fn dataset_management_range_serialization_byte_layout() {
+        let mut driver = ready_driver();
+        driver.set_oncs(0x04);
+        let ranges = [DsmRange { lba: 0x0102_0304_0506_0708, block_count: 0x0A0B_0C0D }];
+        let cmd = driver.dataset_management(1, &ranges).unwrap();
+        let buf = cmd.data_buffer.unwrap();
+
+        // 16 bytes total
+        assert_eq!(buf.len(), 16);
+        // Context attributes: 4 zero bytes
+        assert_eq!(buf[0], 0);
+        assert_eq!(buf[1], 0);
+        assert_eq!(buf[2], 0);
+        assert_eq!(buf[3], 0);
+        // Length (LE u32): 0x0A0B0C0D → [0x0D, 0x0C, 0x0B, 0x0A]
+        assert_eq!(buf[4], 0x0D);
+        assert_eq!(buf[5], 0x0C);
+        assert_eq!(buf[6], 0x0B);
+        assert_eq!(buf[7], 0x0A);
+        // Starting LBA (LE u64): 0x0102030405060708 → [08, 07, 06, 05, 04, 03, 02, 01]
+        assert_eq!(buf[8], 0x08);
+        assert_eq!(buf[9], 0x07);
+        assert_eq!(buf[10], 0x06);
+        assert_eq!(buf[11], 0x05);
+        assert_eq!(buf[12], 0x04);
+        assert_eq!(buf[13], 0x03);
+        assert_eq!(buf[14], 0x02);
+        assert_eq!(buf[15], 0x01);
     }
 }
