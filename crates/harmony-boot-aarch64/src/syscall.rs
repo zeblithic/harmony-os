@@ -41,6 +41,10 @@ pub struct SyscallDispatchResult {
     pub exit_code: i32,
     /// True for exit_group (kill all threads), false for thread-only exit.
     pub exit_group: bool,
+    /// Signal handler to invoke — svc_handler patches TrapFrame to jump here.
+    pub signal_setup: Option<harmony_os::linuxulator::SignalHandlerSetup>,
+    /// Register state to restore after rt_sigreturn.
+    pub signal_return: Option<harmony_os::linuxulator::SavedRegisters>,
 }
 
 /// Global dispatch function pointer. Set during boot before SVC is possible.
@@ -74,6 +78,26 @@ static mut CURRENT_TRAPFRAME: *const TrapFrame = core::ptr::null();
 /// the duration of that dispatch.
 pub unsafe fn current_trapframe() -> *const TrapFrame {
     CURRENT_TRAPFRAME
+}
+
+/// Read the user-space stack pointer (SP_EL0).
+///
+/// # Safety
+/// Must only be called from within the SVC handler path (EL1, IRQs masked).
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn read_sp_el0() -> u64 {
+    let sp: u64;
+    core::arch::asm!("mrs {}, sp_el0", out(reg) sp);
+    sp
+}
+
+/// Write the user-space stack pointer (SP_EL0).
+///
+/// # Safety
+/// Must only be called from within the SVC handler path (EL1, IRQs masked).
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn write_sp_el0(val: u64) {
+    core::arch::asm!("msr sp_el0, {}", in(reg) val);
 }
 
 /// Install the syscall dispatch function.
@@ -147,7 +171,15 @@ pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
         frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
     ];
 
-    let syscall = LinuxSyscall::from_aarch64(nr, args);
+    let syscall = if nr == 139 {
+        // rt_sigreturn takes no register arguments — the kernel reads SP
+        // from the saved process state. Construct the variant manually.
+        LinuxSyscall::RtSigreturn {
+            rsp: read_sp_el0(),
+        }
+    } else {
+        LinuxSyscall::from_aarch64(nr, args)
+    };
 
     if let Some(dispatch) = DISPATCH_FN {
         let result = dispatch(syscall);
@@ -229,7 +261,25 @@ pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
                 core::arch::asm!("wfe");
             }
         }
-        frame.x[0] = result.retval as u64;
+        // ── Signal delivery ──────────────────────────────────────
+        if let Some(setup) = result.signal_setup {
+            frame.elr = setup.handler_pc;
+            frame.x[0] = setup.x0; // signum
+            frame.x[1] = setup.x1; // siginfo_t pointer
+            frame.x[2] = setup.x2; // ucontext_t pointer
+            frame.x[30] = setup.x30; // LR = restorer
+            write_sp_el0(setup.handler_sp);
+        } else if let Some(regs) = result.signal_return {
+            frame.x = regs.x;
+            frame.elr = regs.pc;
+            frame.spsr = regs.pstate;
+            frame.fpcr = regs.fpcr;
+            frame.fpsr = regs.fpsr;
+            frame.q = regs.q;
+            write_sp_el0(regs.sp);
+        } else {
+            frame.x[0] = result.retval as u64;
+        }
     } else {
         // No dispatch function installed — return ENOSYS
         frame.x[0] = (-38i64) as u64;

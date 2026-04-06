@@ -592,13 +592,66 @@ fn main() -> Status {
                     exited: true,
                     exit_code: exit_code_from_args,
                     exit_group: is_exit_group || promote_to_exit_group,
+                    signal_setup: None,
+                    signal_return: None,
                 }
             } else {
+                // ── Signal delivery check ───────────────────────────
+                // After each syscall, check if rt_sigreturn restored
+                // registers or if a signal handler needs invocation.
+
+                // Check signal return first (rt_sigreturn restores registers).
+                let signal_return_regs = lx.pending_signal_return().map(|sr| sr.regs);
+
+                // Check for pending signal handler.
+                let signal_setup = if let Some(signum) = lx.pending_handler_signal() {
+                    let siginfo = lx.pending_siginfo();
+                    // Build SavedRegisters from the current state. If sigreturn
+                    // just happened, use restored regs (not TrapFrame, which
+                    // still has the pre-sigreturn state).
+                    let saved = if let Some(ref regs) = signal_return_regs {
+                        *regs
+                    } else {
+                        // Snapshot current TrapFrame.
+                        let frame = unsafe { &*syscall::current_trapframe() };
+                        let sp = unsafe { syscall::read_sp_el0() };
+                        use harmony_os::linuxulator::SavedRegisters;
+                        let mut r = SavedRegisters {
+                            x: frame.x,
+                            sp,
+                            pc: frame.elr,
+                            pstate: frame.spsr,
+                            fpcr: frame.fpcr,
+                            fpsr: frame.fpsr,
+                            q: frame.q,
+                        };
+                        // Include syscall return value in x[0] — this is
+                        // what the interrupted code would see if there were
+                        // no signal. The signal frame saves it, and sigreturn
+                        // restores it when the handler finishes.
+                        r.x[0] = retval as u64;
+                        r
+                    };
+                    Some(lx.setup_signal_frame(signum, &saved, siginfo.as_ref()))
+                } else {
+                    None
+                };
+
+                // If both signal_return and signal_setup, only setup matters —
+                // restored regs were consumed as input to setup_signal_frame.
+                let signal_return = if signal_setup.is_some() {
+                    None
+                } else {
+                    signal_return_regs
+                };
+
                 syscall::SyscallDispatchResult {
                     retval,
                     exited: false,
                     exit_code: 0,
                     exit_group: false,
+                    signal_setup,
+                    signal_return,
                 }
             }
         }
