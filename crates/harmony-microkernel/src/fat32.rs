@@ -106,8 +106,11 @@ impl<D: BlockDevice> Fat32<D> {
             sector[entry_offset + 3],
         ]) & 0x0FFFFFFF;
 
-        if raw >= 0x0FFFFFF7 {
-            // 0x0FFFFFF7 = bad cluster, >= 0x0FFFFFF8 = end of chain
+        if raw == 0x0FFFFFF7 {
+            // Bad cluster marker — report corruption rather than silently truncating.
+            Err(IpcError::InvalidArgument)
+        } else if raw >= 0x0FFFFFF8 {
+            // End of chain (0x0FFFFFF8–0x0FFFFFFF).
             Ok(None)
         } else if raw < 2 {
             Err(IpcError::InvalidArgument)
@@ -277,10 +280,10 @@ fn reassemble_lfn(lfn_buf: &mut Vec<(u8, [u16; 13])>) -> String {
     lfn_buf.sort_by_key(|(seq, _)| seq & 0x1F);
 
     let mut utf16: Vec<u16> = Vec::new();
-    for (_, chars) in lfn_buf.iter() {
+    'outer: for (_, chars) in lfn_buf.iter() {
         for &c in chars {
             if c == 0x0000 || c == 0xFFFF {
-                break;
+                break 'outer;
             }
             utf16.push(c);
         }
@@ -562,6 +565,16 @@ mod tests {
         let mut fat = Fat32::new(dev).unwrap();
         // Cluster 2 (root dir) → EOC
         assert_eq!(fat.next_cluster(2).unwrap(), None);
+    }
+
+    #[test]
+    fn bad_cluster_marker_returns_error() {
+        let mut dev = build_fat32_image();
+        // Overwrite FAT entry for cluster 4 with bad-cluster marker (0x0FFFFFF7).
+        // Cluster 4 is at FAT byte offset 16 in sector 2.
+        dev.sectors[2][16..20].copy_from_slice(&0x0FFFFFF7u32.to_le_bytes());
+        let mut fat = Fat32::new(dev).unwrap();
+        assert_eq!(fat.next_cluster(4), Err(IpcError::InvalidArgument));
     }
 
     #[test]

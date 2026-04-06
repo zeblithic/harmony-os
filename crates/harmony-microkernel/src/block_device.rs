@@ -133,6 +133,8 @@ impl<B: RegisterBank> SdhciBlockDevice<B> {
 }
 
 impl<B: RegisterBank> BlockDevice for SdhciBlockDevice<B> {
+    /// Note: all SDHCI driver errors (DMA timeout, CRC, card removal) map to
+    /// `IpcError::NotFound` to match the existing SdServer I/O error convention.
     fn read_block(&mut self, lba: u32, buf: &mut [u8; 512]) -> Result<(), IpcError> {
         self.driver
             .read_single_block(&mut self.bank, lba, buf)
