@@ -179,6 +179,9 @@ pub struct IdentifyController {
     pub firmware_rev: [u8; 8],
     pub max_data_transfer: u8,
     pub num_namespaces: u32,
+    /// Optional NVM Command Support (bytes 256-257).
+    /// Bit 2 = Dataset Management, Bit 3 = Write Zeroes.
+    pub oncs: u16,
 }
 
 /// Parsed fields from the 4 KiB Identify Namespace data structure.
@@ -219,6 +222,8 @@ pub enum NvmeError {
     TransferTooLarge,
     /// One or more PRP addresses are not 4 KiB-aligned.
     UnalignedAddress,
+    /// The command requires an optional NVM feature (ONCS) not supported by this controller.
+    UnsupportedCommand,
 }
 
 // ── Driver state ──────────────────────────────────────────────────────────────
@@ -264,6 +269,9 @@ pub struct NvmeDriver<R: RegisterBank> {
     /// Maximum Data Transfer Size exponent from Identify Controller.
     /// 0 = no controller-imposed limit. >0 = max transfer is 2^mdts pages.
     mdts: u8,
+    /// Optional NVM Command Support from Identify Controller.
+    /// 0 = no optional commands. Bit 2 = Dataset Management, Bit 3 = Write Zeroes.
+    oncs: u16,
 }
 
 // ── Helper methods ────────────────────────────────────────────────────────────
@@ -352,6 +360,23 @@ impl<R: RegisterBank> NvmeDriver<R> {
             Some(1u32 << self.mdts)
         }
     }
+
+    /// Set the ONCS value from Identify Controller bytes 256-257.
+    ///
+    /// Call this after parsing the Identify Controller response.
+    pub fn set_oncs(&mut self, oncs: u16) {
+        self.oncs = oncs;
+    }
+
+    /// Whether the controller supports Write Zeroes (ONCS bit 3).
+    pub fn supports_write_zeroes(&self) -> bool {
+        (self.oncs >> 3) & 1 == 1
+    }
+
+    /// Whether the controller supports Dataset Management (ONCS bit 2).
+    pub fn supports_dataset_management(&self) -> bool {
+        (self.oncs >> 2) & 1 == 1
+    }
 }
 
 // ── Initialisation ────────────────────────────────────────────────────────────
@@ -414,6 +439,7 @@ impl<R: RegisterBank> NvmeDriver<R> {
             next_cid: 0,
             state: NvmeState::Disabled,
             mdts: 0,
+            oncs: 0,
         };
 
         // Poll CSTS.RDY=0.
@@ -888,6 +914,7 @@ impl<R: RegisterBank> NvmeDriver<R> {
 /// | 24-63   | Model Number (MN)  |
 /// | 64-71   | Firmware Revision  |
 /// | 77      | MDTS               |
+/// | 256-257 | ONCS               |
 /// | 516-519 | NN (num namespaces)|
 pub fn parse_identify_controller(data: &[u8; 4096]) -> IdentifyController {
     let mut serial_number = [0u8; 20];
@@ -903,12 +930,15 @@ pub fn parse_identify_controller(data: &[u8; 4096]) -> IdentifyController {
 
     let num_namespaces = u32::from_le_bytes([data[516], data[517], data[518], data[519]]);
 
+    let oncs = u16::from_le_bytes([data[256], data[257]]);
+
     IdentifyController {
         serial_number,
         model_number,
         firmware_rev,
         max_data_transfer,
         num_namespaces,
+        oncs,
     }
 }
 
@@ -2281,5 +2311,40 @@ mod tests {
             driver.read_blocks(1, 0, &[0x1000]).unwrap_err(),
             NvmeError::InvalidState
         );
+    }
+
+    // ── ONCS tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn oncs_defaults_to_zero() {
+        let driver = ready_driver();
+        assert!(!driver.supports_write_zeroes());
+        assert!(!driver.supports_dataset_management());
+    }
+
+    #[test]
+    fn set_oncs_stores_value() {
+        let mut driver = ready_driver();
+        driver.set_oncs(0x0C); // bits 2 + 3
+        assert!(driver.supports_write_zeroes());
+        assert!(driver.supports_dataset_management());
+    }
+
+    #[test]
+    fn oncs_partial_support() {
+        let mut driver = ready_driver();
+        driver.set_oncs(0x04); // bit 2 only
+        assert!(!driver.supports_write_zeroes());
+        assert!(driver.supports_dataset_management());
+    }
+
+    #[test]
+    fn parse_identify_controller_extracts_oncs() {
+        let mut data = [0u8; 4096];
+        // ONCS: bytes 256-257 (LE u16), set bits 2 and 3
+        data[256] = 0x0C;
+        data[257] = 0x00;
+        let ic = parse_identify_controller(&data);
+        assert_eq!(ic.oncs, 0x000C);
     }
 }
