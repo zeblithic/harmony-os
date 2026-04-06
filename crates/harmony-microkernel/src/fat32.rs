@@ -127,6 +127,9 @@ impl<D: BlockDevice> Fat32<D> {
         if buf.len() != cluster_size {
             return Err(IpcError::InvalidArgument);
         }
+        if cluster < 2 {
+            return Err(IpcError::InvalidArgument);
+        }
 
         let start_lba = self.data_start_lba + (cluster - 2) * self.sectors_per_cluster as u32;
         let mut sector_buf = [0u8; 512];
@@ -575,6 +578,22 @@ mod tests {
         dev.sectors[2][16..20].copy_from_slice(&0x0FFFFFF7u32.to_le_bytes());
         let mut fat = Fat32::new(dev).unwrap();
         assert_eq!(fat.next_cluster(4), Err(IpcError::InvalidArgument));
+    }
+
+    #[test]
+    fn read_cluster_rejects_cluster_below_2() {
+        let dev = build_fat32_image();
+        let mut fat = Fat32::new(dev).unwrap();
+        let cluster_size = fat.sectors_per_cluster as usize * 512;
+        let mut buf = vec![0u8; cluster_size];
+        assert_eq!(
+            fat.read_cluster(0, &mut buf),
+            Err(IpcError::InvalidArgument)
+        );
+        assert_eq!(
+            fat.read_cluster(1, &mut buf),
+            Err(IpcError::InvalidArgument)
+        );
     }
 
     #[test]
