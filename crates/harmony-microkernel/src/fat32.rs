@@ -36,8 +36,6 @@ pub struct Fat32<D: BlockDevice> {
     num_fats: u8,
     #[allow(dead_code)]
     fat_size_32: u32,
-    // read by FatServer (Task 3); suppress until fat_server.rs is added
-    #[allow(dead_code)]
     pub(crate) root_cluster: u32,
     pub(crate) data_start_lba: u32,
 }
