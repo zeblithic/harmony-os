@@ -1971,6 +1971,78 @@ mod tests {
         assert_eq!(flush_cr.completion.status, 0);
     }
 
+    #[test]
+    fn full_multi_block_lifecycle() {
+        let bank = mock_nvme_bank();
+        let mut driver = NvmeDriver::init(bank).unwrap();
+
+        driver.bank.on_read(REG_CSTS, vec![CSTS_RDY]);
+        driver.setup_admin_queue(0x1_0000, 0x2_0000, 32).unwrap();
+
+        let _ = driver.create_io_queues(0x3_0000, 0x4_0000, 32).unwrap();
+        driver.activate_io_queues().unwrap();
+
+        // Set MDTS=3 → max 8 pages
+        driver.set_mdts(3);
+        assert_eq!(driver.max_transfer_blocks(), Some(8));
+
+        let make_cqe = |phase: bool| -> [u8; 16] {
+            let mut cqe = [0u8; 16];
+            let status_word: u16 = if phase { 0x0001 } else { 0x0000 };
+            cqe[14..16].copy_from_slice(&status_word.to_le_bytes());
+            cqe
+        };
+
+        // Multi-block read: 4 pages
+        let pages: Vec<u64> = (0..4).map(|i| (i + 1) * 0x1000).collect();
+        let read_cmd = driver.read_blocks(1, 0, &pages).unwrap();
+
+        // Verify SQE
+        let cdw0 = u32::from_le_bytes(read_cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x02); // Read opcode
+        let cdw12 = u32::from_le_bytes(read_cmd.sqe[48..52].try_into().unwrap());
+        assert_eq!(cdw12, 3); // NLB = 4-1
+        let prp1 = u64::from_le_bytes(read_cmd.sqe[24..32].try_into().unwrap());
+        assert_eq!(prp1, 0x1000);
+        // 4 pages → PRP list with 3 entries
+        let list = read_cmd.prp_list.as_ref().expect("4 pages needs PRP list");
+        assert_eq!(list.len(), 24); // 3 × 8 bytes
+
+        // Complete the read
+        let cr = driver
+            .check_io_completion(&make_cqe(true))
+            .unwrap()
+            .expect("read completion");
+        assert_eq!(cr.completion.status, 0);
+
+        // Multi-block write: 2 pages (no PRP list needed)
+        let write_cmd = driver.write_blocks(1, 100, &[0x5000, 0x6000]).unwrap();
+        let cdw0 = u32::from_le_bytes(write_cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x01); // Write opcode
+        let cdw12 = u32::from_le_bytes(write_cmd.sqe[48..52].try_into().unwrap());
+        assert_eq!(cdw12, 1); // NLB = 2-1
+        assert!(write_cmd.prp_list.is_none());
+
+        let cr = driver
+            .check_io_completion(&make_cqe(true))
+            .unwrap()
+            .expect("write completion");
+        assert_eq!(cr.completion.status, 0);
+
+        // Single-block via wrapper still works
+        let single_cmd = driver.read_block(1, 42, 0x7000).unwrap();
+        let cdw12 = u32::from_le_bytes(single_cmd.sqe[48..52].try_into().unwrap());
+        assert_eq!(cdw12, 0); // NLB = 1-1 = 0
+        assert!(single_cmd.prp_list.is_none());
+
+        // MDTS enforcement
+        let too_many: Vec<u64> = (0..9).map(|i| (i + 1) * 0x1000).collect();
+        assert_eq!(
+            driver.read_blocks(1, 0, &too_many).unwrap_err(),
+            NvmeError::TransferTooLarge
+        );
+    }
+
     // ── MDTS tests ───────────────────────────────────────────────────────
 
     #[test]
