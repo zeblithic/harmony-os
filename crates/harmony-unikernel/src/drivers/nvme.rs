@@ -335,6 +335,8 @@ impl<R: RegisterBank> NvmeDriver<R> {
     pub fn max_transfer_blocks(&self) -> Option<u32> {
         if self.mdts == 0 {
             None
+        } else if self.mdts >= 32 {
+            Some(u32::MAX)
         } else {
             Some(1u32 << self.mdts)
         }
@@ -1897,9 +1899,16 @@ mod tests {
     }
 
     #[test]
-    fn set_mdts_one_means_one_page() {
+    fn set_mdts_one_means_two_pages() {
         let mut driver = ready_driver();
         driver.set_mdts(1);
         assert_eq!(driver.max_transfer_blocks(), Some(2));
+    }
+
+    #[test]
+    fn set_mdts_large_value_saturates() {
+        let mut driver = ready_driver();
+        driver.set_mdts(32);
+        assert_eq!(driver.max_transfer_blocks(), Some(u32::MAX));
     }
 }
