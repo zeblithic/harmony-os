@@ -240,6 +240,8 @@ pub enum NvmeError {
     UnalignedAddress,
     /// The command requires an optional NVM feature (ONCS) not supported by this controller.
     UnsupportedCommand,
+    /// The specified I/O queue index is out of range.
+    InvalidQueueIndex,
 }
 
 // ── Driver state ──────────────────────────────────────────────────────────────
@@ -273,11 +275,12 @@ pub struct NvmeDriver<R: RegisterBank> {
     timeout_ms: u32,
     /// Admin submission/completion queue pair.
     admin: QueuePair,
-    /// I/O submission/completion queue pair (None until created).
-    io: Option<QueuePair>,
-    /// Pending I/O queue params cached by create_io_queues(), consumed by
-    /// activate_io_queues().  Ensures software QueuePair matches hardware.
-    pending_io: Option<(u64, u64, u16)>,
+    /// Active I/O submission/completion queue pairs (indexed by creation order).
+    io_queues: Vec<QueuePair>,
+    /// Pending I/O queue params cached by create_io_queue_pair(), consumed by
+    /// activate_io_queue_pair().  Each entry is (qid, sq_phys, cq_phys, size).
+    /// Ensures software QueuePair matches hardware.
+    pending_io: Vec<(u16, u64, u64, u16)>,
     /// Monotonically increasing command identifier.
     next_cid: u16,
     /// Current lifecycle state of the driver.
@@ -450,8 +453,8 @@ impl<R: RegisterBank> NvmeDriver<R> {
             doorbell_stride,
             timeout_ms,
             admin: QueuePair::new(0, 0, 0, 0),
-            io: None,
-            pending_io: None,
+            io_queues: Vec::new(),
+            pending_io: Vec::new(),
             next_cid: 0,
             state: NvmeState::Disabled,
             mdts: 0,
