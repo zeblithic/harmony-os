@@ -352,6 +352,11 @@ impl<R: RegisterBank> NvmeDriver<R> {
         self.doorbell_stride
     }
 
+    /// Return the number of active I/O queue pairs.
+    pub fn io_queue_count(&self) -> usize {
+        self.io_queues.len()
+    }
+
     /// Return the controller timeout in milliseconds.
     pub fn timeout_ms(&self) -> u32 {
         self.timeout_ms
@@ -607,8 +612,13 @@ impl<R: RegisterBank> NvmeDriver<R> {
 
 impl<R: RegisterBank> NvmeDriver<R> {
     /// Build a Create I/O Completion Queue admin command (opcode 0x05).
-    pub fn create_io_cq(&mut self, cq_phys: u64, size: u16) -> Result<AdminCommand, NvmeError> {
+    ///
+    /// `qid` is the queue identifier to assign to this CQ (must be ≥ 1).
+    pub fn create_io_cq(&mut self, qid: u16, cq_phys: u64, size: u16) -> Result<AdminCommand, NvmeError> {
         if self.state != NvmeState::Enabled && self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+        if qid == 0 {
             return Err(NvmeError::InvalidState);
         }
 
@@ -624,7 +634,7 @@ impl<R: RegisterBank> NvmeDriver<R> {
         let cdw0: u32 = 0x05 | ((cid as u32) << 16);
         sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
         sqe[24..32].copy_from_slice(&cq_phys.to_le_bytes());
-        let cdw10: u32 = 1 | (((size - 1) as u32) << 16);
+        let cdw10: u32 = (qid as u32) | (((size - 1) as u32) << 16);
         sqe[40..44].copy_from_slice(&cdw10.to_le_bytes());
         let cdw11: u32 = 0x0000_0003;
         sqe[44..48].copy_from_slice(&cdw11.to_le_bytes());
@@ -633,8 +643,13 @@ impl<R: RegisterBank> NvmeDriver<R> {
     }
 
     /// Build a Create I/O Submission Queue admin command (opcode 0x01).
-    pub fn create_io_sq(&mut self, sq_phys: u64, size: u16) -> Result<AdminCommand, NvmeError> {
+    ///
+    /// `qid` is the queue identifier to assign to this SQ (must be ≥ 1).
+    pub fn create_io_sq(&mut self, qid: u16, sq_phys: u64, size: u16) -> Result<AdminCommand, NvmeError> {
         if self.state != NvmeState::Enabled && self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+        if qid == 0 {
             return Err(NvmeError::InvalidState);
         }
 
@@ -650,53 +665,64 @@ impl<R: RegisterBank> NvmeDriver<R> {
         let cdw0: u32 = 0x01 | ((cid as u32) << 16);
         sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
         sqe[24..32].copy_from_slice(&sq_phys.to_le_bytes());
-        let cdw10: u32 = 1 | (((size - 1) as u32) << 16);
+        let cdw10: u32 = (qid as u32) | (((size - 1) as u32) << 16);
         sqe[40..44].copy_from_slice(&cdw10.to_le_bytes());
-        let cdw11: u32 = 0x0001_0001;
+        let cdw11: u32 = 0x0001 | ((qid as u32) << 16);
         sqe[44..48].copy_from_slice(&cdw11.to_le_bytes());
 
         Ok(self.admin.submit(sqe, self.doorbell_stride))
     }
 
-    /// Build admin commands to create one I/O CQ+SQ pair (qid=1).
+    /// Build admin commands to create one I/O CQ+SQ pair for the given `qid`.
     ///
-    /// Returns `[create_cq_cmd, create_sq_cmd]`.  The caller must execute
-    /// them in order, confirm both completions succeed, then call
-    /// [`activate_io_queues`] to record the result.
-    pub fn create_io_queues(
+    /// `qid` must be ≥ 1.  Returns `[create_cq_cmd, create_sq_cmd]`.  The
+    /// caller must execute them in order, confirm both completions succeed,
+    /// then call [`activate_io_queue_pair`] to record the result.
+    ///
+    /// Both [`NvmeState::Enabled`] and [`NvmeState::Ready`] are accepted so
+    /// that additional queue pairs can be created after the first is active.
+    pub fn create_io_queue_pair(
         &mut self,
+        qid: u16,
         sq_phys: u64,
         cq_phys: u64,
         size: u16,
     ) -> Result<[AdminCommand; 2], NvmeError> {
-        // Only allow in Enabled state — not Ready (queues already exist)
-        // or Disabled (admin queue not active).
-        if self.state != NvmeState::Enabled {
+        if self.state != NvmeState::Enabled && self.state != NvmeState::Ready {
             return Err(NvmeError::InvalidState);
         }
         let size = size.min(self.max_queue_entries);
-        let cq_cmd = self.create_io_cq(cq_phys, size)?;
-        let sq_cmd = self.create_io_sq(sq_phys, size)?;
-        // Cache the effective (post-clamp) params so activate_io_queues
+        let cq_cmd = self.create_io_cq(qid, cq_phys, size)?;
+        let sq_cmd = self.create_io_sq(qid, sq_phys, size)?;
+        // Cache the effective (post-clamp) params so activate_io_queue_pair
         // creates a QueuePair that matches what the hardware was programmed with.
-        self.pending_io = Some((sq_phys, cq_phys, size));
+        self.pending_io.push((qid, sq_phys, cq_phys, size));
         Ok([cq_cmd, sq_cmd])
     }
 
-    /// Record that the I/O queues were successfully created on the
-    /// controller.
+    /// Record that the I/O queue pair identified by `qid` was successfully
+    /// created on the controller.
     ///
-    /// Call this after executing both commands from [`create_io_queues`]
+    /// Call this after executing both commands from [`create_io_queue_pair`]
     /// and confirming successful completions.  Uses the params cached by
-    /// `create_io_queues` to ensure the software QueuePair matches the
-    /// hardware.  Transitions the driver to [`NvmeState::Ready`].
-    pub fn activate_io_queues(&mut self) -> Result<(), NvmeError> {
-        if self.state != NvmeState::Enabled {
+    /// `create_io_queue_pair` to ensure the software [`QueuePair`] matches
+    /// the hardware.  Transitions the driver to [`NvmeState::Ready`] if not
+    /// already there.
+    ///
+    /// Both [`NvmeState::Enabled`] and [`NvmeState::Ready`] are accepted so
+    /// that additional queue pairs can be activated after the first.
+    pub fn activate_io_queue_pair(&mut self, qid: u16) -> Result<(), NvmeError> {
+        if self.state != NvmeState::Enabled && self.state != NvmeState::Ready {
             return Err(NvmeError::InvalidState);
         }
 
-        let (sq_phys, cq_phys, size) = self.pending_io.take().ok_or(NvmeError::InvalidState)?;
-        self.io = Some(QueuePair::new(1, sq_phys, cq_phys, size));
+        let idx = self
+            .pending_io
+            .iter()
+            .position(|&(q, _, _, _)| q == qid)
+            .ok_or(NvmeError::InvalidState)?;
+        let (_, sq_phys, cq_phys, size) = self.pending_io.remove(idx);
+        self.io_queues.push(QueuePair::new(qid, sq_phys, cq_phys, size));
         self.state = NvmeState::Ready;
         Ok(())
     }
@@ -705,6 +731,16 @@ impl<R: RegisterBank> NvmeDriver<R> {
 // ── Block I/O commands ───────────────────────────────────────────────────────
 
 impl<R: RegisterBank> NvmeDriver<R> {
+    /// Return a mutable reference to the I/O queue pair at `queue_index`.
+    ///
+    /// `queue_index` is the zero-based index into the ordered list of active
+    /// I/O queue pairs (i.e., the order in which
+    /// [`activate_io_queue_pair`](Self::activate_io_queue_pair) was called).
+    /// Returns [`NvmeError::InvalidQueueIndex`] if the index is out of range.
+    fn io_queue_mut(&mut self, queue_index: usize) -> Result<&mut QueuePair, NvmeError> {
+        self.io_queues.get_mut(queue_index).ok_or(NvmeError::InvalidQueueIndex)
+    }
+
     /// Build an NVM I/O command (Read or Write) and submit via the I/O queue.
     ///
     /// `pages` is a slice of 4 KiB-aligned physical addresses, one per logical
