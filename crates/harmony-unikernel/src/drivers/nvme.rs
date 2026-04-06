@@ -59,6 +59,11 @@ pub struct AdminCommand {
     /// physical address, then patch SQE bytes 32–39 (PRP2) with that address
     /// before submitting the command.
     pub prp_list: Option<Vec<u8>>,
+    /// Optional data buffer for commands that need a host-memory descriptor
+    /// (e.g., Dataset Management range list).  The caller must write these bytes
+    /// to a 4 KiB-aligned physical address, then patch SQE bytes 24–31 (PRP1)
+    /// with that address before submitting.
+    pub data_buffer: Option<Vec<u8>>,
 }
 
 /// A parsed completion queue entry.
@@ -167,6 +172,7 @@ impl QueuePair {
             doorbell_offset,
             doorbell_value,
             prp_list: None,
+            data_buffer: None,
         }
     }
 }
