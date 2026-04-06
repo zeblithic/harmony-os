@@ -657,62 +657,139 @@ impl<R: RegisterBank> NvmeDriver<R> {
 // ── Block I/O commands ───────────────────────────────────────────────────────
 
 impl<R: RegisterBank> NvmeDriver<R> {
-    /// Build a single-block NVM I/O command (Read or Write) and submit
-    /// via the I/O queue.
+    /// Build an NVM I/O command (Read or Write) and submit via the I/O queue.
+    ///
+    /// `pages` is a slice of 4 KiB-aligned physical addresses, one per logical
+    /// block to transfer.  PRP1/PRP2/PRP-list are set according to the NVMe spec:
+    ///
+    /// | Pages | PRP1       | PRP2       | prp_list                    |
+    /// |-------|------------|------------|-----------------------------|
+    /// | 1     | pages[0]   | 0          | None                        |
+    /// | 2     | pages[0]   | pages[1]   | None                        |
+    /// | 3+    | pages[0]   | u64::MAX   | Some(pages[1..] as LE u64s) |
+    ///
+    /// For the 3+ case, PRP2 is set to `u64::MAX` as a sentinel.  The caller
+    /// must write the `prp_list` bytes to a 4 KiB-aligned physical address, then
+    /// patch SQE bytes 32–39 with that address before submitting.
     fn io_rw_command(
         &mut self,
         opcode: u8,
         nsid: u32,
         lba: u64,
-        data_phys: u64,
+        pages: &[u64],
     ) -> Result<AdminCommand, NvmeError> {
         if self.state != NvmeState::Ready {
             return Err(NvmeError::InvalidState);
+        }
+        if pages.is_empty() {
+            return Err(NvmeError::TransferTooLarge);
+        }
+        for &addr in pages {
+            if addr & 0xFFF != 0 {
+                return Err(NvmeError::UnalignedAddress);
+            }
+        }
+        if let Some(max) = self.max_transfer_blocks() {
+            if pages.len() as u32 > max {
+                return Err(NvmeError::TransferTooLarge);
+            }
+        }
+        // Check LBA + block_count doesn't overflow u64.
+        let block_count = pages.len() as u64;
+        if lba.checked_add(block_count).is_none() {
+            return Err(NvmeError::TransferTooLarge);
         }
 
         let cid = self.next_cid;
         self.next_cid = self.next_cid.wrapping_add(1);
 
+        let nlb = (pages.len() as u32) - 1; // NLB is 0-based
+
         let mut sqe = [0u8; 64];
         let cdw0: u32 = (opcode as u32) | ((cid as u32) << 16);
         sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
         sqe[4..8].copy_from_slice(&nsid.to_le_bytes());
-        sqe[24..32].copy_from_slice(&data_phys.to_le_bytes());
+        // PRP1 = first page
+        sqe[24..32].copy_from_slice(&pages[0].to_le_bytes());
+        // PRP2 depends on page count
+        let prp_list = if pages.len() == 1 {
+            sqe[32..40].copy_from_slice(&0u64.to_le_bytes());
+            None
+        } else if pages.len() == 2 {
+            sqe[32..40].copy_from_slice(&pages[1].to_le_bytes());
+            None
+        } else {
+            // 3+ pages: PRP2 = sentinel, build PRP list from pages[1..]
+            sqe[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+            let mut list = Vec::with_capacity((pages.len() - 1) * 8);
+            for &addr in &pages[1..] {
+                list.extend_from_slice(&addr.to_le_bytes());
+            }
+            Some(list)
+        };
+        // LBA
         sqe[40..44].copy_from_slice(&(lba as u32).to_le_bytes());
         sqe[44..48].copy_from_slice(&((lba >> 32) as u32).to_le_bytes());
-        sqe[48..52].copy_from_slice(&0u32.to_le_bytes());
+        // CDW12: NLB (0-based block count)
+        sqe[48..52].copy_from_slice(&nlb.to_le_bytes());
 
-        Ok(self
+        let mut cmd = self
             .io
             .as_mut()
             .ok_or(NvmeError::InvalidState)?
-            .submit(sqe, self.doorbell_stride))
+            .submit(sqe, self.doorbell_stride);
+        cmd.prp_list = prp_list;
+        Ok(cmd)
+    }
+
+    /// Build an NVM Read command for multiple logical blocks.
+    ///
+    /// `pages` contains one 4 KiB-aligned physical address per block.
+    pub fn read_blocks(
+        &mut self,
+        nsid: u32,
+        lba: u64,
+        pages: &[u64],
+    ) -> Result<AdminCommand, NvmeError> {
+        self.io_rw_command(0x02, nsid, lba, pages)
+    }
+
+    /// Build an NVM Write command for multiple logical blocks.
+    ///
+    /// `pages` contains one 4 KiB-aligned physical address per block.
+    pub fn write_blocks(
+        &mut self,
+        nsid: u32,
+        lba: u64,
+        pages: &[u64],
+    ) -> Result<AdminCommand, NvmeError> {
+        self.io_rw_command(0x01, nsid, lba, pages)
     }
 
     /// Build an NVM Read command (opcode 0x02) for one logical block.
     ///
-    /// Submits via the I/O queue (qid=1).  `data_phys` must be 4 KiB
-    /// aligned (CC.MPS=0).
+    /// Thin wrapper around [`read_blocks`](Self::read_blocks) with a
+    /// single-element page slice.
     pub fn read_block(
         &mut self,
         nsid: u32,
         lba: u64,
         data_phys: u64,
     ) -> Result<AdminCommand, NvmeError> {
-        self.io_rw_command(0x02, nsid, lba, data_phys)
+        self.read_blocks(nsid, lba, &[data_phys])
     }
 
     /// Build an NVM Write command (opcode 0x01) for one logical block.
     ///
-    /// Submits via the I/O queue (qid=1).  `data_phys` must be 4 KiB
-    /// aligned (CC.MPS=0).
+    /// Thin wrapper around [`write_blocks`](Self::write_blocks) with a
+    /// single-element page slice.
     pub fn write_block(
         &mut self,
         nsid: u32,
         lba: u64,
         data_phys: u64,
     ) -> Result<AdminCommand, NvmeError> {
-        self.io_rw_command(0x01, nsid, lba, data_phys)
+        self.write_blocks(nsid, lba, &[data_phys])
     }
 
     /// Build an NVM Flush command (opcode 0x00).
@@ -1927,5 +2004,116 @@ mod tests {
         let mut driver = ready_driver();
         let cmd = driver.read_block(1, 0, 0x1000).unwrap();
         assert!(cmd.prp_list.is_none());
+    }
+
+    #[test]
+    fn read_blocks_two_pages_uses_prp2() {
+        let mut driver = ready_driver();
+        let pages = [0x1_0000u64, 0x2_0000u64];
+        let cmd = driver.read_blocks(1, 0, &pages).unwrap();
+
+        // PRP1 = pages[0]
+        let prp1 = u64::from_le_bytes(cmd.sqe[24..32].try_into().unwrap());
+        assert_eq!(prp1, 0x1_0000);
+
+        // PRP2 = pages[1]
+        let prp2 = u64::from_le_bytes(cmd.sqe[32..40].try_into().unwrap());
+        assert_eq!(prp2, 0x2_0000);
+
+        // NLB = 1 (0-based: 2 blocks - 1)
+        let cdw12 = u32::from_le_bytes(cmd.sqe[48..52].try_into().unwrap());
+        assert_eq!(cdw12, 1);
+
+        // No PRP list needed for 2 pages
+        assert!(cmd.prp_list.is_none());
+    }
+
+    #[test]
+    fn read_blocks_three_pages_builds_prp_list() {
+        let mut driver = ready_driver();
+        let pages = [0x1_0000u64, 0x2_0000u64, 0x3_0000u64];
+        let cmd = driver.read_blocks(1, 0, &pages).unwrap();
+
+        // PRP1 = pages[0]
+        let prp1 = u64::from_le_bytes(cmd.sqe[24..32].try_into().unwrap());
+        assert_eq!(prp1, 0x1_0000);
+
+        // PRP2 = sentinel (u64::MAX) — caller replaces with list phys addr
+        let prp2 = u64::from_le_bytes(cmd.sqe[32..40].try_into().unwrap());
+        assert_eq!(prp2, u64::MAX);
+
+        // NLB = 2 (0-based: 3 blocks - 1)
+        let cdw12 = u32::from_le_bytes(cmd.sqe[48..52].try_into().unwrap());
+        assert_eq!(cdw12, 2);
+
+        // PRP list contains pages[1] and pages[2] as LE u64s
+        let list = cmd.prp_list.as_ref().expect("3 pages needs PRP list");
+        assert_eq!(list.len(), 16); // 2 entries × 8 bytes
+        let entry0 = u64::from_le_bytes(list[0..8].try_into().unwrap());
+        let entry1 = u64::from_le_bytes(list[8..16].try_into().unwrap());
+        assert_eq!(entry0, 0x2_0000);
+        assert_eq!(entry1, 0x3_0000);
+    }
+
+    #[test]
+    fn read_blocks_eight_pages_prp_list_has_seven_entries() {
+        let mut driver = ready_driver();
+        let pages: Vec<u64> = (0..8).map(|i| (i + 1) * 0x1000).collect();
+        let cmd = driver.read_blocks(1, 0, &pages).unwrap();
+
+        // NLB = 7 (0-based: 8 blocks - 1)
+        let cdw12 = u32::from_le_bytes(cmd.sqe[48..52].try_into().unwrap());
+        assert_eq!(cdw12, 7);
+
+        let list = cmd.prp_list.as_ref().expect("8 pages needs PRP list");
+        // 7 entries × 8 bytes = 56 bytes
+        assert_eq!(list.len(), 56);
+        for i in 0..7 {
+            let entry = u64::from_le_bytes(list[i * 8..(i + 1) * 8].try_into().unwrap());
+            assert_eq!(entry, (i as u64 + 2) * 0x1000);
+        }
+    }
+
+    #[test]
+    fn write_blocks_two_pages_uses_prp2() {
+        let mut driver = ready_driver();
+        let pages = [0x1_0000u64, 0x2_0000u64];
+        let cmd = driver.write_blocks(1, 0, &pages).unwrap();
+
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x01); // Write opcode
+
+        let prp2 = u64::from_le_bytes(cmd.sqe[32..40].try_into().unwrap());
+        assert_eq!(prp2, 0x2_0000);
+
+        let cdw12 = u32::from_le_bytes(cmd.sqe[48..52].try_into().unwrap());
+        assert_eq!(cdw12, 1);
+    }
+
+    #[test]
+    fn single_block_wrapper_still_works() {
+        let mut driver = ready_driver();
+        let cmd = driver.read_block(1, 100, 0xBEEF_0000).unwrap();
+
+        // Same assertions as the existing read_block_builds_correct_sqe test
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x02);
+        let prp1 = u64::from_le_bytes(cmd.sqe[24..32].try_into().unwrap());
+        assert_eq!(prp1, 0xBEEF_0000);
+        let prp2 = u64::from_le_bytes(cmd.sqe[32..40].try_into().unwrap());
+        assert_eq!(prp2, 0);
+        let cdw12 = u32::from_le_bytes(cmd.sqe[48..52].try_into().unwrap());
+        assert_eq!(cdw12, 0);
+        assert!(cmd.prp_list.is_none());
+    }
+
+    #[test]
+    fn read_blocks_cid_increments() {
+        let mut driver = ready_driver();
+        let cmd1 = driver.read_blocks(1, 0, &[0x1000, 0x2000]).unwrap();
+        let cmd2 = driver.read_blocks(1, 10, &[0x3000, 0x4000]).unwrap();
+        let cid1 = u32::from_le_bytes(cmd1.sqe[0..4].try_into().unwrap()) >> 16;
+        let cid2 = u32::from_le_bytes(cmd2.sqe[0..4].try_into().unwrap()) >> 16;
+        assert_eq!(cid2, cid1 + 1);
     }
 }
