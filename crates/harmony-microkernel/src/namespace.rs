@@ -141,6 +141,18 @@ impl Namespace {
 
         best
     }
+
+    /// Reset all `Swapping` mounts to `Active`.
+    ///
+    /// Used after cloning a namespace for a forked child process —
+    /// the child should not inherit in-progress hot-swap state.
+    pub fn normalize_mount_states(&mut self) {
+        for mount in self.mounts.values_mut() {
+            if mount.state == MountState::Swapping {
+                mount.state = MountState::Active;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -291,5 +303,49 @@ mod tests {
             ns.set_mount_state("/nonexistent", MountState::Active),
             Err(crate::IpcError::NotFound)
         );
+    }
+
+    #[test]
+    fn normalize_mount_states_resets_swapping() {
+        let mut ns = Namespace::new();
+        ns.mount("/srv", 1, 0).unwrap();
+        ns.set_mount_state("/srv", MountState::Swapping).unwrap();
+
+        ns.normalize_mount_states();
+
+        let (mp, _) = ns.resolve("/srv").unwrap();
+        assert_eq!(mp.state, MountState::Active);
+    }
+
+    #[test]
+    fn normalize_mount_states_preserves_active() {
+        let mut ns = Namespace::new();
+        ns.mount("/data", 2, 0).unwrap();
+
+        ns.normalize_mount_states();
+
+        let (mp, _) = ns.resolve("/data").unwrap();
+        assert_eq!(mp.state, MountState::Active);
+    }
+
+    #[test]
+    fn clone_is_deep_copy() {
+        let mut ns = Namespace::new();
+        ns.mount("/echo", 1, 0).unwrap();
+        ns.mount("/data", 2, 5).unwrap();
+
+        let mut cloned = ns.clone();
+
+        // Modify clone — add a new mount
+        cloned.mount("/extra", 3, 0).unwrap();
+
+        // Original must be unchanged
+        assert!(ns.resolve("/extra").is_none());
+        // Clone has all original mounts
+        let (mp, _) = cloned.resolve("/echo").unwrap();
+        assert_eq!(mp.target_pid, 1);
+        let (mp, _) = cloned.resolve("/data").unwrap();
+        assert_eq!(mp.target_pid, 2);
+        assert_eq!(mp.root_fid, 5);
     }
 }

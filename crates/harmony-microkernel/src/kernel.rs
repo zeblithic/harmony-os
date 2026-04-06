@@ -327,6 +327,92 @@ impl<P: PageTable> Kernel<P> {
         Ok(())
     }
 
+    /// Fork a process: create a child with inherited namespace and
+    /// kernel capabilities from the parent.
+    ///
+    /// The child gets a deep copy of the parent's namespace (all mounts
+    /// normalized to `Active`). For each non-expired kernel capability,
+    /// a fresh root token is minted with the child's address as audience.
+    ///
+    /// User capabilities are NOT inherited (they require session re-binding).
+    /// No VM address space is created — the caller handles VM setup separately.
+    ///
+    /// Returns the child's PID on success.
+    pub fn fork_process(
+        &mut self,
+        entropy: &mut (impl EntropySource + CryptoRngCore),
+        parent_pid: u32,
+        name: &str,
+        server: Box<dyn FileServer>,
+        now: u64,
+    ) -> Result<u32, IpcError> {
+        // Look up parent and clone its inheritable state.
+        let parent = self.processes.get(&parent_pid).ok_or(IpcError::NotFound)?;
+        let mut child_namespace = parent.namespace.clone();
+        child_namespace.normalize_mount_states();
+
+        // Collect non-expired parent capabilities for delegation.
+        // We need to collect before borrowing self mutably for token minting.
+        // Note: expires_at >= now matches verify_pq_token semantics (expires_at == now is valid).
+        let parent_caps: Vec<(CapabilityType, Vec<u8>, u64)> = parent
+            .kernel_capabilities
+            .iter()
+            .filter(|cap| cap.expires_at == 0 || cap.expires_at >= now)
+            .map(|cap| (cap.capability, cap.resource.clone(), cap.expires_at))
+            .collect();
+
+        // Allocate child PID.
+        let child_pid = self.next_pid;
+        self.next_pid = self
+            .next_pid
+            .checked_add(1)
+            .ok_or(IpcError::ResourceExhausted)?;
+
+        // Derive child address hash from PID (same placeholder as spawn_process).
+        let mut address_hash = [0u8; 16];
+        address_hash[..4].copy_from_slice(&child_pid.to_be_bytes());
+
+        // Mint fresh kernel capabilities for the child.
+        // Bound child's expires_at by parent's remaining TTL to prevent
+        // indefinite capability extension through repeated forks.
+        let mut child_caps = Vec::with_capacity(parent_caps.len());
+        for (capability, resource, parent_expires_at) in &parent_caps {
+            let child_expires_at = if *parent_expires_at == 0 {
+                // Non-expiring parent cap → child gets default TTL.
+                now.saturating_add(DEFAULT_CAP_TTL)
+            } else {
+                (*parent_expires_at).min(now.saturating_add(DEFAULT_CAP_TTL))
+            };
+            let cap = self
+                .session_identity
+                .issue_pq_root_token(
+                    entropy,
+                    &address_hash,
+                    *capability,
+                    resource,
+                    now,
+                    child_expires_at,
+                )
+                .map_err(|_| IpcError::PermissionDenied)?;
+            child_caps.push(cap);
+        }
+
+        self.processes.insert(
+            child_pid,
+            Process {
+                pid: child_pid,
+                name: Arc::from(name),
+                namespace: child_namespace,
+                kernel_capabilities: child_caps,
+                user_capabilities: Vec::new(),
+                address_hash,
+                server,
+            },
+        );
+
+        Ok(child_pid)
+    }
+
     /// Check whether `process` holds a valid endpoint capability for `target_pid`.
     ///
     /// Scans both `kernel_capabilities` (session-key-signed, no binding)
@@ -3301,5 +3387,357 @@ mod tests {
             !kernel.processes.contains_key(&old_pid),
             "old NullServer process should be destroyed after hot_swap"
         );
+    }
+
+    // ── fork_process tests ──────────────────────────────────────────
+
+    #[test]
+    fn fork_inherits_namespace() {
+        let (mut kernel, client, server) = setup_kernel_with_echo();
+        let mut entropy = make_test_entropy();
+
+        // client has mount at "/echo" → server
+        let child = kernel
+            .fork_process(
+                &mut entropy,
+                client,
+                "child",
+                Box::new(EchoServer::new()),
+                100,
+            )
+            .unwrap();
+
+        // Child should have the same mount
+        let child_proc = kernel.processes.get(&child).unwrap();
+        let (mp, remainder) = child_proc.namespace.resolve("/echo/hello").unwrap();
+        assert_eq!(mp.target_pid, server);
+        assert_eq!(remainder, "hello");
+        assert_eq!(mp.state, crate::namespace::MountState::Active);
+    }
+
+    #[test]
+    fn fork_namespace_is_independent() {
+        let (mut kernel, client, _server) = setup_kernel_with_echo();
+        let mut entropy = make_test_entropy();
+
+        let child = kernel
+            .fork_process(
+                &mut entropy,
+                client,
+                "child",
+                Box::new(EchoServer::new()),
+                100,
+            )
+            .unwrap();
+
+        // Add a mount to parent — child must not see it
+        let extra = kernel
+            .spawn_process("extra", Box::new(EchoServer::new()), &[], None)
+            .unwrap();
+        kernel
+            .processes
+            .get_mut(&client)
+            .unwrap()
+            .namespace
+            .mount("/extra", extra, 0)
+            .unwrap();
+
+        let child_proc = kernel.processes.get(&child).unwrap();
+        assert!(child_proc.namespace.resolve("/extra").is_none());
+    }
+
+    #[test]
+    fn fork_normalizes_swapping_mounts() {
+        let mut kernel = make_kernel();
+        let mut entropy = make_test_entropy();
+
+        let server = kernel
+            .spawn_process("server", Box::new(EchoServer::new()), &[], None)
+            .unwrap();
+        let parent = kernel
+            .spawn_process(
+                "parent",
+                Box::new(EchoServer::new()),
+                &[("/srv", server, 0)],
+                None,
+            )
+            .unwrap();
+        // Set mount to Swapping
+        kernel
+            .processes
+            .get_mut(&parent)
+            .unwrap()
+            .namespace
+            .set_mount_state("/srv", crate::namespace::MountState::Swapping)
+            .unwrap();
+
+        kernel
+            .grant_endpoint_cap(&mut entropy, parent, server, 0)
+            .unwrap();
+
+        let child = kernel
+            .fork_process(
+                &mut entropy,
+                parent,
+                "child",
+                Box::new(EchoServer::new()),
+                100,
+            )
+            .unwrap();
+
+        let child_proc = kernel.processes.get(&child).unwrap();
+        let (mp, _) = child_proc.namespace.resolve("/srv").unwrap();
+        assert_eq!(mp.state, crate::namespace::MountState::Active);
+    }
+
+    #[test]
+    fn fork_inherits_kernel_capabilities() {
+        let (mut kernel, client, server) = setup_kernel_with_echo();
+        let mut entropy = make_test_entropy();
+
+        // client already has 1 endpoint cap for server (from setup_kernel_with_echo)
+        let child = kernel
+            .fork_process(
+                &mut entropy,
+                client,
+                "child",
+                Box::new(EchoServer::new()),
+                100,
+            )
+            .unwrap();
+
+        let child_proc = kernel.processes.get(&child).unwrap();
+        assert_eq!(child_proc.kernel_capabilities.len(), 1);
+
+        let cap = &child_proc.kernel_capabilities[0];
+        assert_eq!(cap.capability, CapabilityType::Endpoint);
+        assert_eq!(cap.audience, child_proc.address_hash);
+        let resource_str = core::str::from_utf8(&cap.resource).unwrap();
+        assert_eq!(resource_str, &alloc::format!("pid:{}", server));
+    }
+
+    #[test]
+    fn fork_child_caps_verify() {
+        let (mut kernel, client, server) = setup_kernel_with_echo();
+        let mut entropy = make_test_entropy();
+
+        let child = kernel
+            .fork_process(
+                &mut entropy,
+                client,
+                "child",
+                Box::new(EchoServer::new()),
+                100,
+            )
+            .unwrap();
+
+        // check_endpoint_cap should succeed for the child
+        let child_proc = kernel.processes.get(&child).unwrap();
+        let result = kernel.check_endpoint_cap(child_proc, server, 100);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn fork_filters_expired_capabilities() {
+        let mut kernel = make_kernel();
+        let mut entropy = make_test_entropy();
+
+        let server = kernel
+            .spawn_process("server", Box::new(EchoServer::new()), &[], None)
+            .unwrap();
+        let parent = kernel
+            .spawn_process(
+                "parent",
+                Box::new(EchoServer::new()),
+                &[("/srv", server, 0)],
+                None,
+            )
+            .unwrap();
+
+        // Grant cap at time 0 with default TTL
+        kernel
+            .grant_endpoint_cap(&mut entropy, parent, server, 0)
+            .unwrap();
+
+        // Fork at a time WAY past expiry (DEFAULT_CAP_TTL = 1_000_000_000)
+        let child = kernel
+            .fork_process(
+                &mut entropy,
+                parent,
+                "child",
+                Box::new(EchoServer::new()),
+                2_000_000_000,
+            )
+            .unwrap();
+
+        let child_proc = kernel.processes.get(&child).unwrap();
+        assert_eq!(child_proc.kernel_capabilities.len(), 0);
+    }
+
+    #[test]
+    fn fork_empty_parent() {
+        let mut kernel = make_kernel();
+        let mut entropy = make_test_entropy();
+
+        // Parent with no mounts and no caps
+        let parent = kernel
+            .spawn_process("parent", Box::new(EchoServer::new()), &[], None)
+            .unwrap();
+
+        let child = kernel
+            .fork_process(
+                &mut entropy,
+                parent,
+                "child",
+                Box::new(EchoServer::new()),
+                100,
+            )
+            .unwrap();
+
+        let child_proc = kernel.processes.get(&child).unwrap();
+        assert!(child_proc.kernel_capabilities.is_empty());
+        assert!(child_proc.namespace.resolve("/anything").is_none());
+    }
+
+    #[test]
+    fn fork_nonexistent_parent() {
+        let mut kernel = make_kernel();
+        let mut entropy = make_test_entropy();
+
+        let result = kernel.fork_process(
+            &mut entropy,
+            999,
+            "orphan",
+            Box::new(EchoServer::new()),
+            100,
+        );
+        assert_eq!(result, Err(IpcError::NotFound));
+    }
+
+    #[test]
+    fn fork_user_caps_not_inherited() {
+        let (mut kernel, client, server) = setup_kernel_with_echo();
+        let mut entropy = make_test_entropy();
+
+        // Manually push a user capability to the parent
+        let audience = kernel.processes.get(&client).unwrap().address_hash;
+        let token = kernel
+            .session_identity
+            .issue_pq_root_token(
+                &mut entropy,
+                &audience,
+                CapabilityType::Endpoint,
+                alloc::format!("pid:{}", server).as_bytes(),
+                0,
+                DEFAULT_CAP_TTL,
+            )
+            .unwrap();
+        let binding = SessionBinding {
+            session_address: kernel.session_identity.public_identity().address_hash,
+            hardware_address: kernel.hardware_identity.public_identity().address_hash,
+            user_address: audience,
+            user_token_hash: token.content_hash(),
+            bound_at: 0,
+            nonce: [0xAA; 16],
+            signature: [0u8; 3309],
+        };
+        kernel
+            .processes
+            .get_mut(&client)
+            .unwrap()
+            .user_capabilities
+            .push(BoundCapability { token, binding });
+
+        let child = kernel
+            .fork_process(
+                &mut entropy,
+                client,
+                "child",
+                Box::new(EchoServer::new()),
+                100,
+            )
+            .unwrap();
+
+        let child_proc = kernel.processes.get(&child).unwrap();
+        assert!(child_proc.user_capabilities.is_empty());
+    }
+
+    #[test]
+    fn fork_caps_bounded_by_parent_ttl() {
+        let mut kernel = make_kernel();
+        let mut entropy = make_test_entropy();
+
+        let server = kernel
+            .spawn_process("server", Box::new(EchoServer::new()), &[], None)
+            .unwrap();
+        let parent = kernel
+            .spawn_process(
+                "parent",
+                Box::new(EchoServer::new()),
+                &[("/srv", server, 0)],
+                None,
+            )
+            .unwrap();
+
+        // Grant cap at time 0 — expires at DEFAULT_CAP_TTL (1_000_000_000)
+        kernel
+            .grant_endpoint_cap(&mut entropy, parent, server, 0)
+            .unwrap();
+
+        // Fork at time 999_999_900 — parent cap has 100ms left.
+        // Child's expires_at should be min(1_000_000_000, 999_999_900 + 1_000_000_000)
+        //   = 1_000_000_000 (parent's expiry, NOT fork_time + DEFAULT_CAP_TTL)
+        let child = kernel
+            .fork_process(
+                &mut entropy,
+                parent,
+                "child",
+                Box::new(EchoServer::new()),
+                999_999_900,
+            )
+            .unwrap();
+
+        let child_proc = kernel.processes.get(&child).unwrap();
+        assert_eq!(child_proc.kernel_capabilities.len(), 1);
+        // Child cap must expire at parent's original expiry, not fork_time + TTL
+        assert_eq!(child_proc.kernel_capabilities[0].expires_at, 1_000_000_000);
+    }
+
+    #[test]
+    fn fork_includes_cap_expiring_at_now() {
+        let mut kernel = make_kernel();
+        let mut entropy = make_test_entropy();
+
+        let server = kernel
+            .spawn_process("server", Box::new(EchoServer::new()), &[], None)
+            .unwrap();
+        let parent = kernel
+            .spawn_process(
+                "parent",
+                Box::new(EchoServer::new()),
+                &[("/srv", server, 0)],
+                None,
+            )
+            .unwrap();
+
+        // Grant cap at time 0 — expires at DEFAULT_CAP_TTL (1_000_000_000)
+        kernel
+            .grant_endpoint_cap(&mut entropy, parent, server, 0)
+            .unwrap();
+
+        // Fork at exactly the expiry time — cap should still be inherited
+        // (verify_pq_token treats expires_at == now as valid)
+        let child = kernel
+            .fork_process(
+                &mut entropy,
+                parent,
+                "child",
+                Box::new(EchoServer::new()),
+                1_000_000_000,
+            )
+            .unwrap();
+
+        let child_proc = kernel.processes.get(&child).unwrap();
+        assert_eq!(child_proc.kernel_capabilities.len(), 1);
     }
 }
