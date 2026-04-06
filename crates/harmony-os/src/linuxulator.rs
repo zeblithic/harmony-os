@@ -100,6 +100,21 @@ pub const BLOCK_OP_SLEEP: u8 = 4;
 /// Decoded by the block_fn closure in main.rs to WaitReason::WaitChild(pid).
 pub const BLOCK_OP_WAIT: u8 = 5;
 
+// siginfo si_code values for SIGCHLD
+const CLD_EXITED: i32 = 1;
+const CLD_KILLED: i32 = 2;
+/// si_code for signals sent by kill()/tgkill().
+const SI_USER: i32 = 0;
+
+/// Signal-specific information passed to setup_signal_frame for siginfo_t population.
+/// Architecture-neutral — both x86_64 and aarch64 use the same si_code/si_pid/si_status fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SigInfo {
+    pub si_code: i32,
+    pub si_pid: i32,
+    pub si_status: i32,
+}
+
 fn ipc_err_to_errno(e: IpcError) -> i64 {
     match e {
         IpcError::NotFound => ENOENT,
@@ -2297,6 +2312,7 @@ struct TimerFdState {
 
 /// Register state the caller provides for signal frame construction.
 /// Matches the x86_64 GPR set needed for Linux sigcontext.
+#[cfg(target_arch = "x86_64")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SavedRegisters {
     pub r8: u64,
@@ -2321,6 +2337,7 @@ pub struct SavedRegisters {
 
 /// Returned by `setup_signal_frame` — tells the caller where to jump
 /// and what register values to set for signal handler invocation.
+#[cfg(target_arch = "x86_64")]
 #[derive(Debug, Clone, Copy)]
 pub struct SignalHandlerSetup {
     /// Handler function address (set RIP to this).
@@ -2342,14 +2359,55 @@ pub struct SignalReturn {
     pub regs: SavedRegisters,
 }
 
+/// Register state for aarch64 signal frame construction.
+/// Matches the aarch64 Linux sigcontext layout (regs[31], sp, pc, pstate)
+/// plus FPSIMD state (fpcr, fpsr, q[0-31]).
+#[cfg(target_arch = "aarch64")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SavedRegisters {
+    /// General-purpose registers x0-x30.
+    pub x: [u64; 31],
+    /// User stack pointer (SP_EL0).
+    pub sp: u64,
+    /// Program counter (ELR_EL1 at exception time).
+    pub pc: u64,
+    /// Processor state (SPSR_EL1 at exception time).
+    pub pstate: u64,
+    /// Floating-point control register.
+    pub fpcr: u64,
+    /// Floating-point status register.
+    pub fpsr: u64,
+    /// SIMD/FP registers Q0-Q31 (128 bits each).
+    pub q: [u128; 32],
+}
+
+/// Returned by `setup_signal_frame` — tells the caller where to jump
+/// and what register values to set for signal handler invocation.
+#[cfg(target_arch = "aarch64")]
+#[derive(Debug, Clone, Copy)]
+pub struct SignalHandlerSetup {
+    /// Handler function address (set ELR to this).
+    pub handler_pc: u64,
+    /// Signal frame base on user stack (set SP_EL0 to this).
+    pub handler_sp: u64,
+    /// First argument: signal number (set x0).
+    pub x0: u64,
+    /// Second argument: pointer to siginfo_t (set x1). 0 if !SA_SIGINFO.
+    pub x1: u64,
+    /// Third argument: pointer to ucontext_t (set x2). 0 if !SA_SIGINFO.
+    pub x2: u64,
+    /// Link register: sa_restorer trampoline (set x30).
+    pub x30: u64,
+}
+
 /// Per-signal handler disposition, stored in a 64-element array.
 #[derive(Clone, Copy)]
 struct SignalAction {
     handler: u64,
     mask: u64,
     flags: u64,
-    /// sa_restorer (x86_64 only; 0 on other arches). Needed for
-    /// signal stack frame construction in the delivery bead.
+    /// sa_restorer (x86_64 and aarch64; 0 on other arches). Used for
+    /// signal stack frame construction — points to the sigreturn trampoline.
     restorer: u64,
 }
 
@@ -2482,6 +2540,8 @@ pub struct Linuxulator<
     pending_signals: u64,
     /// Signal with custom handler pending for caller invocation.
     pending_handler_signal: Option<u32>,
+    /// Signal-specific info for the pending handler signal, tagged with signal number.
+    pending_siginfo: Option<(u32, SigInfo)>,
     /// If set, process was killed by this signal (for wstatus encoding).
     killed_by_signal: Option<u32>,
     /// Process name set by prctl(PR_SET_NAME). 16 bytes max (including null).
@@ -2594,6 +2654,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             signal_mask: 0,
             pending_signals: 0,
             pending_handler_signal: None,
+            pending_siginfo: None,
             killed_by_signal: None,
             process_name: [0u8; 16],
             signalfds: BTreeMap::new(),
@@ -2996,6 +3057,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         let child = self.children.pop().unwrap();
         let exit_code = child.linuxulator.exit_code.unwrap_or(0);
         let killed_by = child.linuxulator.killed_by_signal;
+        let child_pid = child.pid;
         self.exited_children.push((child.pid, exit_code, killed_by));
 
         // Swap pipes/eventfds back from the (now dropped) child.
@@ -3015,6 +3077,22 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         self.next_child_pid = self.next_child_pid.max(c.next_child_pid);
         // Auto-deliver SIGCHLD to parent (Linux does this on child exit).
         self.pending_signals |= 1u64 << (SIGCHLD_NUM - 1);
+        self.pending_siginfo = Some((
+            SIGCHLD_NUM,
+            SigInfo {
+                si_code: if killed_by.is_some() {
+                    CLD_KILLED
+                } else {
+                    CLD_EXITED
+                },
+                si_pid: child_pid,
+                si_status: if let Some(sig) = killed_by {
+                    sig as i32
+                } else {
+                    exit_code
+                },
+            },
+        ));
     }
 
     /// Return the deepest actively-running Linuxulator in the process tree.
@@ -3064,6 +3142,11 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         self.pending_handler_signal.take()
     }
 
+    /// Consume the pending signal info (set alongside pending_handler_signal).
+    pub fn pending_siginfo(&mut self) -> Option<(u32, SigInfo)> {
+        self.pending_siginfo.take()
+    }
+
     /// Consume the pending signal return (set by rt_sigreturn).
     /// If Some, the caller should restore registers from the returned state.
     ///
@@ -3093,7 +3176,13 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     /// 2. Apply action's sa_mask
     /// 3. Unless SA_NODEFER, block the signal being handled
     /// 4. SIGKILL/SIGSTOP always remain unblockable
-    pub fn setup_signal_frame(&mut self, signum: u32, regs: &SavedRegisters) -> SignalHandlerSetup {
+    #[cfg(target_arch = "x86_64")]
+    pub fn setup_signal_frame(
+        &mut self,
+        signum: u32,
+        regs: &SavedRegisters,
+        siginfo: Option<&SigInfo>,
+    ) -> SignalHandlerSetup {
         assert!(
             (1..=64).contains(&signum),
             "signum {signum} out of range [1, 64]"
@@ -3101,10 +3190,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         let idx = (signum - 1) as usize;
         let action = self.signal_handlers[idx];
 
-        assert!(
-            action.flags & SA_RESTORER != 0,
-            "SA_RESTORER must be set on x86_64"
-        );
+        assert!(action.flags & SA_RESTORER != 0, "SA_RESTORER must be set");
 
         // ── Choose stack base ────────────────────────────────────────
         // Save on_alt_stack BEFORE modification — this is written into the
@@ -3156,6 +3242,13 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         // si_signo at offset 0 of siginfo_t (i32).
         unsafe {
             core::ptr::write_unaligned(siginfo_ptr as *mut i32, signum as i32);
+        }
+        if let Some(info) = siginfo {
+            unsafe {
+                core::ptr::write_unaligned((siginfo_ptr + 8) as *mut i32, info.si_code);
+                core::ptr::write_unaligned((siginfo_ptr + 16) as *mut i32, info.si_pid);
+                core::ptr::write_unaligned((siginfo_ptr + 24) as *mut i32, info.si_status);
+            }
         }
 
         // ucontext header: uc_flags(u64)=0, uc_link(u64)=0, uc_stack(24 bytes)
@@ -3239,6 +3332,155 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             rdi: signum as u64,
             rsi,
             rdx,
+        }
+    }
+
+    /// Build an aarch64 Linux-compatible signal frame on the user stack.
+    ///
+    /// Frame layout: siginfo_t(128) + ucontext_t (with sigcontext + FPSIMD).
+    /// Restorer goes in x30 (LR), not on the stack.
+    /// No red zone on aarch64. SP aligned to 16 bytes.
+    #[cfg(target_arch = "aarch64")]
+    pub fn setup_signal_frame(
+        &mut self,
+        signum: u32,
+        regs: &SavedRegisters,
+        siginfo: Option<&SigInfo>,
+    ) -> SignalHandlerSetup {
+        assert!(
+            (1..=64).contains(&signum),
+            "signum {signum} out of range [1, 64]"
+        );
+        let idx = (signum - 1) as usize;
+        let action = self.signal_handlers[idx];
+
+        assert!(
+            action.flags & SA_RESTORER != 0,
+            "SA_RESTORER must be set for signal handler invocation"
+        );
+
+        // ── Choose stack base ────────────────────────────────────────
+        let was_on_alt_stack = self.on_alt_stack;
+        let stack_top = if action.flags & SA_ONSTACK != 0
+            && self.alt_stack_flags != SS_DISABLE
+            && !self.on_alt_stack
+        {
+            self.on_alt_stack = true;
+            self.alt_stack_sp + self.alt_stack_size
+        } else {
+            // No red zone on aarch64.
+            regs.sp
+        };
+
+        // ── Compute frame pointer ───────────────────────────────────
+        // Frame: 128 (siginfo) + 168 (ucontext header) + 280 (sigcontext regs)
+        //      + 8 (alignment padding) + 528 (fpsimd) + 8 (end marker) = 1120 bytes.
+        const FRAME_SIZE: u64 = 1120;
+        let frame_base = stack_top - FRAME_SIZE;
+        // Align down to 16 bytes (aarch64 ABI requirement).
+        let handler_sp = frame_base & !0xF;
+
+        let saved_mask = self.signal_mask;
+
+        // ── Zero the frame ──────────────────────────────────────────
+        unsafe {
+            core::ptr::write_bytes(handler_sp as *mut u8, 0, FRAME_SIZE as usize);
+        }
+
+        // ── Offsets from handler_sp ─────────────────────────────────
+        let siginfo_ptr = handler_sp;
+        let ucontext_ptr = handler_sp + 128;
+        let uc_stack_ptr = ucontext_ptr + 16;
+        let uc_sigmask_ptr = ucontext_ptr + 40;
+        let sc_ptr = ucontext_ptr + 168; // sigcontext
+        let sc_regs_ptr = sc_ptr + 8; // regs[31] after fault_address
+        let sc_sp_ptr = sc_ptr + 256;
+        let sc_pc_ptr = sc_ptr + 264;
+        let sc_pstate_ptr = sc_ptr + 272;
+        // __reserved at sc_ptr + 288 (8-byte padding for __aligned__(16))
+        let reserved_ptr = sc_ptr + 288;
+
+        // ── Write siginfo_t ─────────────────────────────────────────
+        unsafe {
+            core::ptr::write_unaligned(siginfo_ptr as *mut i32, signum as i32);
+            if let Some(info) = siginfo {
+                core::ptr::write_unaligned((siginfo_ptr + 8) as *mut i32, info.si_code);
+                core::ptr::write_unaligned((siginfo_ptr + 16) as *mut i32, info.si_pid);
+                core::ptr::write_unaligned((siginfo_ptr + 24) as *mut i32, info.si_status);
+            }
+        }
+
+        // ── Write ucontext header ───────────────────────────────────
+        unsafe {
+            core::ptr::write_unaligned(uc_stack_ptr as *mut u64, self.alt_stack_sp);
+            core::ptr::write_unaligned(
+                (uc_stack_ptr + 8) as *mut i32,
+                self.alt_stack_flags | if was_on_alt_stack { SS_ONSTACK } else { 0 },
+            );
+            core::ptr::write_unaligned((uc_stack_ptr + 16) as *mut u64, self.alt_stack_size);
+        }
+        unsafe {
+            core::ptr::write_unaligned(uc_sigmask_ptr as *mut u64, saved_mask);
+        }
+
+        // ── Write sigcontext ────────────────────────────────────────
+        unsafe {
+            for i in 0..31 {
+                core::ptr::write_unaligned((sc_regs_ptr + i as u64 * 8) as *mut u64, regs.x[i]);
+            }
+            core::ptr::write_unaligned(sc_sp_ptr as *mut u64, regs.sp);
+            core::ptr::write_unaligned(sc_pc_ptr as *mut u64, regs.pc);
+            core::ptr::write_unaligned(sc_pstate_ptr as *mut u64, regs.pstate);
+        }
+
+        // ── Write FPSIMD context in __reserved ──────────────────────
+        const FPSIMD_MAGIC: u32 = 0x46508001;
+        const FPSIMD_SIZE: u32 = 528;
+        unsafe {
+            core::ptr::write_unaligned(reserved_ptr as *mut u32, FPSIMD_MAGIC);
+            core::ptr::write_unaligned((reserved_ptr + 4) as *mut u32, FPSIMD_SIZE);
+            core::ptr::write_unaligned((reserved_ptr + 8) as *mut u32, regs.fpsr as u32);
+            core::ptr::write_unaligned((reserved_ptr + 12) as *mut u32, regs.fpcr as u32);
+            for i in 0..32 {
+                core::ptr::write_unaligned(
+                    (reserved_ptr + 16 + i as u64 * 16) as *mut u128,
+                    regs.q[i],
+                );
+            }
+            let end_ptr = reserved_ptr + FPSIMD_SIZE as u64;
+            core::ptr::write_unaligned(end_ptr as *mut u32, 0);
+            core::ptr::write_unaligned((end_ptr + 4) as *mut u32, 0);
+        }
+
+        // ── Update signal mask for handler execution ────────────────
+        self.signal_mask |= action.mask;
+        if action.flags & SA_NODEFER == 0 {
+            self.signal_mask |= 1u64 << (signum - 1);
+        }
+        self.signal_mask &= !(1u64 << (SIGKILL - 1));
+        self.signal_mask &= !(1u64 << (SIGSTOP - 1));
+
+        // ── SA_RESETHAND ────────────────────────────────────────────
+        if action.flags & SA_RESETHAND != 0 {
+            self.signal_handlers[idx].handler = SIG_DFL;
+            self.signal_handlers[idx].flags = 0;
+            self.signal_handlers[idx].mask = 0;
+        }
+
+        // ── Build return value ──────────────────────────────────────
+        let (x1, x2) = if action.flags & SA_SIGINFO != 0 {
+            (siginfo_ptr, ucontext_ptr)
+        } else {
+            (0, 0)
+        };
+
+        SignalHandlerSetup {
+            handler_pc: action.handler,
+            handler_sp,
+            x0: signum as u64,
+            x1,
+            x2,
+            x30: action.restorer,
         }
     }
 
@@ -4333,6 +4575,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         }
         // pending_signals preserved across exec (Linux semantics).
         self.pending_handler_signal = None;
+        self.pending_siginfo = None;
         self.killed_by_signal = None;
         // Reset process name — Linux sets comm to the new binary's basename.
         self.process_name = [0u8; 16];
@@ -6289,6 +6532,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             signal_mask: self.signal_mask,
             pending_signals: 0,
             pending_handler_signal: None,
+            pending_siginfo: None,
             killed_by_signal: None,
             process_name: self.process_name,
             signalfds: self.signalfds.clone(),
@@ -6591,6 +6835,14 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         if sig == 0 {
             return 0; // null signal — process exists check
         }
+        self.pending_siginfo = Some((
+            sig as u32,
+            SigInfo {
+                si_code: SI_USER,
+                si_pid: self.pid,
+                si_status: 0,
+            },
+        ));
         self.queue_signal(sig as u32);
         0
     }
@@ -6609,6 +6861,14 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         if sig == 0 {
             return 0;
         }
+        self.pending_siginfo = Some((
+            sig as u32,
+            SigInfo {
+                si_code: SI_USER,
+                si_pid: self.pid,
+                si_status: 0,
+            },
+        ));
         self.queue_signal(sig as u32);
         0
     }
@@ -7623,18 +7883,18 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
                 .unwrap(),
         );
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let restorer = u64::from_ne_bytes(
             unsafe { core::slice::from_raw_parts((addr + 16) as *const u8, 8) }
                 .try_into()
                 .unwrap(),
         );
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let restorer = 0u64;
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let mask_offset = 24;
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let mask_offset = 16;
 
         let mask = u64::from_ne_bytes(
@@ -7659,16 +7919,16 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         unsafe { core::slice::from_raw_parts_mut((addr + 8) as *mut u8, 8) }
             .copy_from_slice(&action.flags.to_ne_bytes());
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         {
             // Write sa_restorer at offset 16.
             unsafe { core::slice::from_raw_parts_mut((addr + 16) as *mut u8, 8) }
                 .copy_from_slice(&action.restorer.to_ne_bytes());
         }
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let mask_offset = 24;
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let mask_offset = 16;
 
         unsafe { core::slice::from_raw_parts_mut((addr + mask_offset) as *mut u8, 8) }
@@ -7731,6 +7991,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     ///
     /// RSP passed to us = handler_rsp + 8 (retaddr already popped).
     /// ucontext at rsp, siginfo at rsp + 304.
+    #[cfg(target_arch = "x86_64")]
     fn sys_rt_sigreturn(&mut self, rsp: u64) -> i64 {
         let ucontext_ptr = rsp as usize; // ucontext is right after retaddr (which was popped)
         let sc = ucontext_ptr + 40; // sigcontext within ucontext
@@ -7775,6 +8036,84 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
 
         // Return value is meaningless — caller uses pending_signal_return().
         regs.rax as i64
+    }
+
+    /// aarch64 rt_sigreturn: restore register state and signal mask from the
+    /// aarch64 signal frame on the user stack.
+    ///
+    /// Frame layout from SP (no retaddr pop on aarch64):
+    ///   +0:   siginfo_t (128 bytes)
+    ///   +128: ucontext_t:
+    ///         ├─ uc_flags/uc_link/uc_stack (40 bytes)
+    ///         ├─ uc_sigmask (8 bytes)
+    ///         ├─ __unused (120 bytes)
+    ///         └─ sigcontext at +168:
+    ///            ├─ fault_address(8), regs[31](248), sp(8), pc(8), pstate(8)
+    ///            └─ __reserved at +288: fpsimd_context(528) + end_marker(8)
+    #[cfg(target_arch = "aarch64")]
+    fn sys_rt_sigreturn(&mut self, rsp: u64) -> i64 {
+        // On aarch64, SP points directly at the signal frame (no retaddr pop).
+        let frame = rsp;
+        let ucontext_ptr = frame + 128;
+        let sc_ptr = ucontext_ptr + 168;
+        let sc_regs_ptr = sc_ptr + 8;
+
+        // Restore GPRs.
+        let mut x = [0u64; 31];
+        unsafe {
+            for i in 0..31 {
+                x[i] = core::ptr::read_unaligned((sc_regs_ptr + i as u64 * 8) as *const u64);
+            }
+        }
+
+        let sp = unsafe { core::ptr::read_unaligned((sc_ptr + 256) as *const u64) };
+        let pc = unsafe { core::ptr::read_unaligned((sc_ptr + 264) as *const u64) };
+        let pstate = unsafe { core::ptr::read_unaligned((sc_ptr + 272) as *const u64) };
+
+        // Restore FPSIMD from __reserved (at sigcontext + 288).
+        let reserved_ptr = sc_ptr + 288;
+        let magic = unsafe { core::ptr::read_unaligned(reserved_ptr as *const u32) };
+        let (fpsr, fpcr, q) = if magic == 0x46508001 {
+            let fpsr =
+                unsafe { core::ptr::read_unaligned((reserved_ptr + 8) as *const u32) } as u64;
+            let fpcr =
+                unsafe { core::ptr::read_unaligned((reserved_ptr + 12) as *const u32) } as u64;
+            let mut q = [0u128; 32];
+            unsafe {
+                for i in 0..32 {
+                    q[i] = core::ptr::read_unaligned(
+                        (reserved_ptr + 16 + i as u64 * 16) as *const u128,
+                    );
+                }
+            }
+            (fpsr, fpcr, q)
+        } else {
+            (0, 0, [0u128; 32])
+        };
+
+        let regs = SavedRegisters {
+            x,
+            sp,
+            pc,
+            pstate,
+            fpcr,
+            fpsr,
+            q,
+        };
+
+        // Restore signal mask from uc_sigmask (at ucontext + 40).
+        let uc_sigmask = unsafe { core::ptr::read_unaligned((ucontext_ptr + 40) as *const u64) };
+        self.signal_mask = uc_sigmask;
+        self.signal_mask &= !(1u64 << (SIGKILL - 1) | 1u64 << (SIGSTOP - 1));
+
+        // Restore on_alt_stack from saved uc_stack.ss_flags.
+        let saved_ss_flags =
+            unsafe { core::ptr::read_unaligned((ucontext_ptr + 24) as *const i32) };
+        self.on_alt_stack = saved_ss_flags & SS_ONSTACK != 0;
+
+        self.pending_signal_return = Some(SignalReturn { regs });
+
+        regs.x[0] as i64
     }
 
     /// Linux sigaltstack(2): get/set alternate signal stack configuration.
@@ -17370,7 +17709,7 @@ mod integration_tests {
     // ── setup_signal_frame tests ────────────────────────────────────
 
     /// Helper: install a signal handler with SA_RESTORER set, including the
-    /// restorer address at bytes 16..24 of the sigaction buffer (x86_64 layout).
+    /// restorer address at bytes 16..24 of the sigaction buffer (x86_64/aarch64 layout).
     fn install_handler_with_restorer(
         lx: &mut Linuxulator<MockBackend>,
         signum: i32,
@@ -17380,10 +17719,11 @@ mod integration_tests {
         restorer: u64,
     ) {
         let mut act = make_sigaction(handler, flags, mask);
-        // On x86_64, sa_restorer lives at bytes 16..24.
-        #[cfg(target_arch = "x86_64")]
+        // On x86_64 and aarch64, sa_restorer lives at bytes 16..24.
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         act[16..24].copy_from_slice(&restorer.to_ne_bytes());
-        let _ = restorer; // suppress unused warning on non-x86_64
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let _ = restorer;
         lx.dispatch_syscall(LinuxSyscall::RtSigaction {
             signum,
             act: act.as_ptr() as u64,
@@ -17404,6 +17744,7 @@ mod integration_tests {
         u64::from_ne_bytes(oldset)
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_setup_signal_frame_basic() {
         let mock = MockBackend::new();
@@ -17445,7 +17786,7 @@ mod integration_tests {
             eflags: 0x202,
         };
 
-        let setup = lx.setup_signal_frame(10, &regs);
+        let setup = lx.setup_signal_frame(10, &regs, None);
 
         // handler_rip must equal the installed handler address.
         assert_eq!(setup.handler_rip, handler_addr);
@@ -17471,6 +17812,7 @@ mod integration_tests {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_signal_mask_blocks_during_handler() {
         let mock = MockBackend::new();
@@ -17511,7 +17853,7 @@ mod integration_tests {
             eflags: 0x202,
         };
 
-        let _setup = lx.setup_signal_frame(10, &regs);
+        let _setup = lx.setup_signal_frame(10, &regs, None);
 
         let mask = read_signal_mask(&mut lx);
 
@@ -17530,6 +17872,7 @@ mod integration_tests {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_sa_nodefer() {
         let mock = MockBackend::new();
@@ -17568,7 +17911,7 @@ mod integration_tests {
             eflags: 0x202,
         };
 
-        let _setup = lx.setup_signal_frame(10, &regs);
+        let _setup = lx.setup_signal_frame(10, &regs, None);
 
         let mask = read_signal_mask(&mut lx);
 
@@ -17580,6 +17923,7 @@ mod integration_tests {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_sa_resethand() {
         let mock = MockBackend::new();
@@ -17618,7 +17962,7 @@ mod integration_tests {
             eflags: 0x202,
         };
 
-        let _setup = lx.setup_signal_frame(10, &regs);
+        let _setup = lx.setup_signal_frame(10, &regs, None);
 
         // After SA_RESETHAND, the handler should be reset to SIG_DFL.
         let mut oldact = [0u8; 32];
@@ -17635,6 +17979,7 @@ mod integration_tests {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_sigreturn_restores_registers() {
         let mock = MockBackend::new();
@@ -17676,7 +18021,7 @@ mod integration_tests {
             eflags: 0x202,
         };
 
-        let setup = lx.setup_signal_frame(10, &regs);
+        let setup = lx.setup_signal_frame(10, &regs, None);
 
         // Simulate handler executing `ret` which pops sa_restorer,
         // then sa_restorer does syscall with RSP = handler_rsp + 8.
@@ -17711,6 +18056,7 @@ mod integration_tests {
         assert_eq!(restored.eflags, 0x202);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_sigreturn_restores_signal_mask() {
         let mock = MockBackend::new();
@@ -17758,7 +18104,7 @@ mod integration_tests {
             ..SavedRegisters::default()
         };
 
-        let setup = lx.setup_signal_frame(10, &regs);
+        let setup = lx.setup_signal_frame(10, &regs, None);
 
         // After setup_signal_frame, mask should have 10+12+13+14 blocked.
         let mask_during = read_signal_mask(&mut lx);
@@ -17804,6 +18150,7 @@ mod integration_tests {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_sigreturn_delivers_unblocked() {
         let mock = MockBackend::new();
@@ -17826,7 +18173,7 @@ mod integration_tests {
             ..SavedRegisters::default()
         };
 
-        let setup = lx.setup_signal_frame(10, &regs);
+        let setup = lx.setup_signal_frame(10, &regs, None);
 
         // Signal 10 is now blocked during the handler (no SA_NODEFER).
         let mask_during = read_signal_mask(&mut lx);
@@ -17954,6 +18301,7 @@ mod integration_tests {
         assert_eq!(r, ENOMEM, "undersized stack should return ENOMEM");
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_sigaltstack_eperm_on_altstack() {
         let mock = MockBackend::new();
@@ -17991,7 +18339,7 @@ mod integration_tests {
             rsp,
             ..SavedRegisters::default()
         };
-        let _setup = lx.setup_signal_frame(10, &regs);
+        let _setup = lx.setup_signal_frame(10, &regs, None);
 
         // Now trying to reconfigure sigaltstack should return EPERM.
         let ss2 = make_stack_t(alt_sp, 0, alt_size);
@@ -18005,6 +18353,7 @@ mod integration_tests {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_sigaltstack_onstack() {
         let mock = MockBackend::new();
@@ -18039,7 +18388,7 @@ mod integration_tests {
             ..SavedRegisters::default()
         };
 
-        let setup = lx.setup_signal_frame(10, &regs);
+        let setup = lx.setup_signal_frame(10, &regs, None);
 
         // handler_rsp must lie within the alt stack range [alt_sp, alt_sp + alt_size).
         assert!(
@@ -18056,6 +18405,7 @@ mod integration_tests {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_sigreturn_clears_on_alt_stack() {
         let mock = MockBackend::new();
@@ -18086,7 +18436,7 @@ mod integration_tests {
             rsp,
             ..SavedRegisters::default()
         };
-        let setup = lx.setup_signal_frame(10, &regs);
+        let setup = lx.setup_signal_frame(10, &regs, None);
 
         // After setup_signal_frame, SS_ONSTACK should be reported in old_ss flags.
         let mut old = [0u8; 24];
@@ -18120,6 +18470,7 @@ mod integration_tests {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_restorer_as_return_addr() {
         let mock = MockBackend::new();
@@ -18139,7 +18490,7 @@ mod integration_tests {
             ..SavedRegisters::default()
         };
 
-        let setup = lx.setup_signal_frame(10, &regs);
+        let setup = lx.setup_signal_frame(10, &regs, None);
 
         // The u64 at handler_rsp is the return address — must equal sa_restorer.
         let retaddr = unsafe { core::ptr::read_unaligned(setup.handler_rsp as *const u64) };
@@ -18149,6 +18500,7 @@ mod integration_tests {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_frame_rsp_alignment() {
         // For each initial RSP value, verify handler_rsp ≡ 8 (mod 16).
@@ -18175,7 +18527,7 @@ mod integration_tests {
                 ..SavedRegisters::default()
             };
 
-            let setup = lx.setup_signal_frame(10, &regs);
+            let setup = lx.setup_signal_frame(10, &regs, None);
             assert_eq!(
                 setup.handler_rsp % 16,
                 8,
@@ -18186,6 +18538,7 @@ mod integration_tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_sa_siginfo_three_arg() {
         let mock = MockBackend::new();
@@ -18206,12 +18559,439 @@ mod integration_tests {
             ..SavedRegisters::default()
         };
 
-        let setup = lx.setup_signal_frame(10, &regs);
+        let setup = lx.setup_signal_frame(10, &regs, None);
 
         // Without SA_SIGINFO: rsi and rdx must be 0; rdi is the signal number.
         assert_eq!(setup.rdi, 10, "rdi must be the signal number");
         assert_eq!(setup.rsi, 0, "rsi must be 0 without SA_SIGINFO");
         assert_eq!(setup.rdx, 0, "rdx must be 0 without SA_SIGINFO");
+    }
+
+    // ── aarch64 setup_signal_frame tests ────────────────────────────────
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_setup_signal_frame_basic_aarch64() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let handler_addr: u64 = 0x400000;
+        let restorer_addr: u64 = 0x401000;
+        let flags = SA_RESTORER | SA_SIGINFO;
+
+        install_handler_with_restorer(&mut lx, 10, handler_addr, flags, 0, restorer_addr);
+
+        lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+        let sig = lx.pending_handler_signal();
+        assert_eq!(sig, Some(10));
+        let _ = lx.pending_siginfo(); // consume
+
+        let sp = (lx.arena_base() + 0x50000) as u64;
+        let mut x = [0u64; 31];
+        x[0] = 0xA0;
+        x[1] = 0xA1;
+        x[29] = 0xFB;
+        x[30] = 0xAE;
+        let mut q = [0u128; 32];
+        q[0] = 0xDEAD_BEEF;
+        q[31] = 0xCAFE_BABE;
+
+        let regs = SavedRegisters {
+            x,
+            sp,
+            pc: 0x1000,
+            pstate: 0x600003C5,
+            fpcr: 0x42,
+            fpsr: 0x43,
+            q,
+        };
+
+        let info = SigInfo {
+            si_code: CLD_EXITED,
+            si_pid: 5,
+            si_status: 42,
+        };
+        let setup = lx.setup_signal_frame(10, &regs, Some(&info));
+
+        assert_eq!(setup.handler_pc, handler_addr);
+        assert_eq!(setup.x0, 10);
+        assert_eq!(setup.x30, restorer_addr);
+        assert_ne!(
+            setup.x1, 0,
+            "x1 (siginfo_t) must be non-zero for SA_SIGINFO"
+        );
+        assert_ne!(
+            setup.x2, 0,
+            "x2 (ucontext_t) must be non-zero for SA_SIGINFO"
+        );
+        assert_eq!(
+            setup.handler_sp % 16,
+            0,
+            "handler_sp must be 16-byte aligned"
+        );
+
+        // Verify siginfo_t fields.
+        let frame = setup.handler_sp;
+        unsafe {
+            assert_eq!(
+                core::ptr::read_unaligned(frame as *const i32),
+                10,
+                "si_signo"
+            );
+            assert_eq!(
+                core::ptr::read_unaligned((frame + 8) as *const i32),
+                CLD_EXITED,
+                "si_code"
+            );
+            assert_eq!(
+                core::ptr::read_unaligned((frame + 16) as *const i32),
+                5,
+                "si_pid"
+            );
+            assert_eq!(
+                core::ptr::read_unaligned((frame + 24) as *const i32),
+                42,
+                "si_status"
+            );
+        }
+
+        // Verify sigcontext regs.
+        let sc_regs = frame + 296 + 8;
+        unsafe {
+            assert_eq!(
+                core::ptr::read_unaligned(sc_regs as *const u64),
+                0xA0,
+                "regs[0]"
+            );
+            assert_eq!(
+                core::ptr::read_unaligned((sc_regs + 8) as *const u64),
+                0xA1,
+                "regs[1]"
+            );
+        }
+
+        // Verify sp/pc/pstate.
+        unsafe {
+            assert_eq!(
+                core::ptr::read_unaligned((frame + 296 + 256) as *const u64),
+                sp,
+                "sc.sp"
+            );
+            assert_eq!(
+                core::ptr::read_unaligned((frame + 296 + 264) as *const u64),
+                0x1000,
+                "sc.pc"
+            );
+            assert_eq!(
+                core::ptr::read_unaligned((frame + 296 + 272) as *const u64),
+                0x600003C5,
+                "sc.pstate"
+            );
+        }
+
+        // Verify FPSIMD context.
+        let reserved = frame + 296 + 288;
+        unsafe {
+            assert_eq!(
+                core::ptr::read_unaligned(reserved as *const u32),
+                0x46508001,
+                "FPSIMD_MAGIC"
+            );
+            assert_eq!(
+                core::ptr::read_unaligned((reserved + 4) as *const u32),
+                528,
+                "FPSIMD size"
+            );
+            assert_eq!(
+                core::ptr::read_unaligned((reserved + 8) as *const u32),
+                0x43,
+                "fpsr"
+            );
+            assert_eq!(
+                core::ptr::read_unaligned((reserved + 12) as *const u32),
+                0x42,
+                "fpcr"
+            );
+            assert_eq!(
+                core::ptr::read_unaligned((reserved + 16) as *const u128),
+                0xDEAD_BEEF,
+                "vregs[0]"
+            );
+            assert_eq!(
+                core::ptr::read_unaligned((reserved + 16 + 31 * 16) as *const u128),
+                0xCAFE_BABE,
+                "vregs[31]"
+            );
+        }
+
+        // Verify end marker.
+        unsafe {
+            let end = reserved + 528;
+            assert_eq!(core::ptr::read_unaligned(end as *const u32), 0, "end magic");
+            assert_eq!(
+                core::ptr::read_unaligned((end + 4) as *const u32),
+                0,
+                "end size"
+            );
+        }
+
+        // Verify uc_sigmask.
+        unsafe {
+            assert_eq!(
+                core::ptr::read_unaligned((frame + 128 + 40) as *const u64),
+                0,
+                "saved mask (was 0)"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_signal_mask_blocks_during_handler_aarch64() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let handler_addr: u64 = 0x400000;
+        let restorer_addr: u64 = 0x401000;
+        let flags = SA_RESTORER | SA_SIGINFO;
+        let sa_mask: u64 = 1u64 << 11;
+
+        install_handler_with_restorer(&mut lx, 10, handler_addr, flags, sa_mask, restorer_addr);
+
+        lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+        let sig = lx.pending_handler_signal();
+        assert_eq!(sig, Some(10));
+        let _ = lx.pending_siginfo();
+
+        let sp = (lx.arena_base() + 0x50000) as u64;
+        let regs = SavedRegisters {
+            sp,
+            ..SavedRegisters::default()
+        };
+        let _setup = lx.setup_signal_frame(10, &regs, None);
+
+        let mask = read_signal_mask(&mut lx);
+        assert_ne!(
+            mask & (1u64 << 9),
+            0,
+            "signal 10 should be blocked during handler"
+        );
+        assert_ne!(
+            mask & (1u64 << 11),
+            0,
+            "signal 12 should be blocked via sa_mask"
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_sa_resethand_aarch64() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let handler_addr: u64 = 0x400000;
+        let restorer_addr: u64 = 0x401000;
+        let flags = SA_RESTORER | SA_SIGINFO | SA_RESETHAND;
+
+        install_handler_with_restorer(&mut lx, 10, handler_addr, flags, 0, restorer_addr);
+
+        lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+        let _ = lx.pending_handler_signal();
+        let _ = lx.pending_siginfo();
+
+        let sp = (lx.arena_base() + 0x50000) as u64;
+        let regs = SavedRegisters {
+            sp,
+            ..SavedRegisters::default()
+        };
+        let _setup = lx.setup_signal_frame(10, &regs, None);
+
+        let mut oldact = [0u8; 32];
+        lx.dispatch_syscall(LinuxSyscall::RtSigaction {
+            signum: 10,
+            act: 0,
+            oldact: oldact.as_mut_ptr() as u64,
+            sigsetsize: 8,
+        });
+        assert_eq!(
+            read_handler(&oldact),
+            SIG_DFL,
+            "handler must be reset after SA_RESETHAND"
+        );
+    }
+
+    // ── aarch64 rt_sigreturn tests ───────────────────────────────────────
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_sigreturn_restores_registers_aarch64() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let handler_addr: u64 = 0x400000;
+        let restorer_addr: u64 = 0x401000;
+        let flags = SA_RESTORER | SA_SIGINFO;
+        install_handler_with_restorer(&mut lx, 10, handler_addr, flags, 0, restorer_addr);
+
+        lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+        let _ = lx.pending_handler_signal();
+        let _ = lx.pending_siginfo();
+
+        let sp = (lx.arena_base() + 0x50000) as u64;
+        let mut x = [0u64; 31];
+        x[0] = 0x0A0A_0A0A;
+        x[1] = 0x0B0B_0B0B;
+        x[29] = 0xFBFB_FBFB;
+        x[30] = 0xAEAE_AEAE;
+        let mut q = [0u128; 32];
+        q[0] = 0xDEAD;
+        q[31] = 0xBEEF;
+
+        let regs = SavedRegisters {
+            x,
+            sp,
+            pc: 0x1000_2000,
+            pstate: 0x600003C5,
+            fpcr: 0x42,
+            fpsr: 0x43,
+            q,
+        };
+
+        let setup = lx.setup_signal_frame(10, &regs, None);
+
+        // On aarch64: SP at handler_sp, no retaddr pop.
+        let sigreturn_sp = setup.handler_sp;
+        lx.dispatch_syscall(LinuxSyscall::RtSigreturn { rsp: sigreturn_sp });
+
+        let sr = lx.pending_signal_return();
+        assert!(
+            sr.is_some(),
+            "pending_signal_return must be Some after sigreturn"
+        );
+        let restored = sr.unwrap().regs;
+
+        assert_eq!(restored.x[0], 0x0A0A_0A0A, "x0");
+        assert_eq!(restored.x[1], 0x0B0B_0B0B, "x1");
+        assert_eq!(restored.x[29], 0xFBFB_FBFB, "x29");
+        assert_eq!(restored.sp, sp, "SP");
+        assert_eq!(restored.pc, 0x1000_2000, "PC");
+        assert_eq!(restored.pstate, 0x600003C5, "PSTATE");
+        assert_eq!(restored.fpcr, 0x42, "FPCR");
+        assert_eq!(restored.fpsr, 0x43, "FPSR");
+        assert_eq!(restored.q[0], 0xDEAD, "Q0");
+        assert_eq!(restored.q[31], 0xBEEF, "Q31");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_sigreturn_restores_signal_mask_aarch64() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let handler_addr: u64 = 0x400000;
+        let restorer_addr: u64 = 0x401000;
+        let flags = SA_RESTORER | SA_SIGINFO;
+        let sa_mask: u64 = 1u64 << 13; // Block signal 14 during handler.
+
+        install_handler_with_restorer(&mut lx, 10, handler_addr, flags, sa_mask, restorer_addr);
+
+        // Pre-block signal 12 (bit 11).
+        let pre_block: u64 = 1u64 << 11;
+        let pre_block_bytes = pre_block.to_ne_bytes();
+        lx.dispatch_syscall(LinuxSyscall::RtSigprocmask {
+            how: SIG_SETMASK,
+            set: pre_block_bytes.as_ptr() as u64,
+            oldset: 0,
+            sigsetsize: 8,
+        });
+
+        lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+        let _ = lx.pending_handler_signal();
+        let _ = lx.pending_siginfo();
+
+        let sp = (lx.arena_base() + 0x50000) as u64;
+        let regs = SavedRegisters {
+            sp,
+            ..SavedRegisters::default()
+        };
+        let setup = lx.setup_signal_frame(10, &regs, None);
+
+        // During handler: 10 (bit 9) + 12 (bit 11) + 14 (bit 13) blocked.
+        let mask_during = read_signal_mask(&mut lx);
+        assert_ne!(
+            mask_during & (1u64 << 9),
+            0,
+            "signal 10 blocked during handler"
+        );
+        assert_ne!(mask_during & (1u64 << 11), 0, "signal 12 still blocked");
+        assert_ne!(
+            mask_during & (1u64 << 13),
+            0,
+            "signal 14 blocked via sa_mask"
+        );
+
+        // Sigreturn.
+        lx.dispatch_syscall(LinuxSyscall::RtSigreturn {
+            rsp: setup.handler_sp,
+        });
+        let _ = lx.pending_signal_return();
+
+        // After: only 12 (bit 11) should be blocked.
+        let mask_after = read_signal_mask(&mut lx);
+        assert_eq!(
+            mask_after & (1u64 << 9),
+            0,
+            "signal 10 unblocked after sigreturn"
+        );
+        assert_ne!(
+            mask_after & (1u64 << 11),
+            0,
+            "signal 12 still blocked (was pre-blocked)"
+        );
+        assert_eq!(
+            mask_after & (1u64 << 13),
+            0,
+            "signal 14 unblocked (was only in sa_mask)"
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_sigreturn_delivers_unblocked_aarch64() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let handler_addr: u64 = 0x400000;
+        let restorer_addr: u64 = 0x401000;
+        let flags = SA_RESTORER | SA_SIGINFO;
+        install_handler_with_restorer(&mut lx, 10, handler_addr, flags, 0, restorer_addr);
+
+        lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+        let _ = lx.pending_handler_signal();
+        let _ = lx.pending_siginfo();
+
+        let sp = (lx.arena_base() + 0x50000) as u64;
+        let regs = SavedRegisters {
+            sp,
+            ..SavedRegisters::default()
+        };
+        let setup = lx.setup_signal_frame(10, &regs, None);
+
+        // Signal 10 blocked during handler. Queue another.
+        lx.dispatch_syscall(LinuxSyscall::Kill { pid: 1, sig: 10 });
+
+        // Sigreturn unblocks 10 → deliver_pending_signals fires.
+        lx.dispatch_syscall(LinuxSyscall::RtSigreturn {
+            rsp: setup.handler_sp,
+        });
+        let _ = lx.pending_signal_return();
+
+        let sig = lx.pending_handler_signal();
+        assert_eq!(
+            sig,
+            Some(10),
+            "queued signal must be delivered after sigreturn unblocks it"
+        );
     }
 
     #[test]
@@ -18830,5 +19610,120 @@ mod integration_tests {
         assert_eq!(result, 0);
         // monotonic_ns should have advanced by 500ms = 500_000_000ns
         assert_eq!(lx.monotonic_ns, 500_000_000);
+    }
+
+    #[test]
+    fn test_sigchld_siginfo_normal_exit() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let child_pid = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
+        assert!(child_pid > 0);
+
+        // Install SIGCHLD handler.
+        let handler_addr: u64 = 0x400000;
+        let restorer_addr: u64 = 0x401000;
+        let flags = SA_RESTORER | SA_SIGINFO;
+        install_handler_with_restorer(
+            &mut lx,
+            SIGCHLD_NUM as i32,
+            handler_addr,
+            flags,
+            0,
+            restorer_addr,
+        );
+
+        // Child exits with code 42.
+        if let Some((_pid, child_lx)) = lx.pending_fork_child() {
+            child_lx.dispatch_syscall(LinuxSyscall::Exit { code: 42 });
+        }
+
+        // active_process() triggers recover_child_state which queues SIGCHLD and
+        // sets pending_siginfo, then dispatch_syscall triggers deliver_pending_signals.
+        {
+            let _ = lx.active_process();
+        }
+        lx.dispatch_syscall(LinuxSyscall::Getpid);
+
+        let sig = lx.pending_handler_signal();
+        assert_eq!(sig, Some(SIGCHLD_NUM));
+
+        let tagged = lx.pending_siginfo();
+        assert!(tagged.is_some());
+        let (sig_tag, info) = tagged.unwrap();
+        assert_eq!(sig_tag, SIGCHLD_NUM);
+        assert_eq!(info.si_code, CLD_EXITED);
+        assert_eq!(info.si_pid, child_pid);
+        assert_eq!(info.si_status, 42);
+    }
+
+    #[test]
+    fn test_sigchld_siginfo_killed_by_signal() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let child_pid = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
+        assert!(child_pid > 0);
+
+        let handler_addr: u64 = 0x400000;
+        let restorer_addr: u64 = 0x401000;
+        let flags = SA_RESTORER | SA_SIGINFO;
+        install_handler_with_restorer(
+            &mut lx,
+            SIGCHLD_NUM as i32,
+            handler_addr,
+            flags,
+            0,
+            restorer_addr,
+        );
+
+        // Kill child with SIGKILL.
+        if let Some((_pid, child_lx)) = lx.pending_fork_child() {
+            child_lx.dispatch_syscall(LinuxSyscall::Kill {
+                pid: 0,
+                sig: SIGKILL as i32,
+            });
+        }
+
+        // active_process() triggers recover_child_state (child exited due to SIGKILL).
+        {
+            let _ = lx.active_process();
+        }
+        lx.dispatch_syscall(LinuxSyscall::Getpid);
+
+        let sig = lx.pending_handler_signal();
+        assert_eq!(sig, Some(SIGCHLD_NUM));
+
+        let tagged = lx.pending_siginfo();
+        assert!(tagged.is_some());
+        let (sig_tag, info) = tagged.unwrap();
+        assert_eq!(sig_tag, SIGCHLD_NUM);
+        assert_eq!(info.si_code, CLD_KILLED);
+        assert_eq!(info.si_pid, child_pid);
+        assert_eq!(info.si_status, SIGKILL as i32);
+    }
+
+    #[test]
+    fn test_kill_siginfo_si_user() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let handler_addr: u64 = 0x400000;
+        let restorer_addr: u64 = 0x401000;
+        let flags = SA_RESTORER | SA_SIGINFO;
+        install_handler_with_restorer(&mut lx, 10, handler_addr, flags, 0, restorer_addr);
+
+        lx.dispatch_syscall(LinuxSyscall::Kill { pid: 0, sig: 10 });
+
+        let sig = lx.pending_handler_signal();
+        assert_eq!(sig, Some(10));
+
+        let tagged = lx.pending_siginfo();
+        assert!(tagged.is_some());
+        let (sig_tag, info) = tagged.unwrap();
+        assert_eq!(sig_tag, 10);
+        assert_eq!(info.si_code, SI_USER);
+        assert_eq!(info.si_pid, 1); // default PID
+        assert_eq!(info.si_status, 0);
     }
 }
