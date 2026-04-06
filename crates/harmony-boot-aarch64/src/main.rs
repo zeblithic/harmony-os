@@ -605,7 +605,8 @@ fn main() -> Status {
 
                 // Check for pending signal handler.
                 let signal_setup = if let Some(signum) = lx.pending_handler_signal() {
-                    let siginfo = lx.pending_siginfo();
+                    let siginfo = lx.pending_siginfo()
+                        .and_then(|(tag, info)| if tag == signum { Some(info) } else { None });
                     // Build SavedRegisters from the current state. If sigreturn
                     // just happened, use restored regs (not TrapFrame, which
                     // still has the pre-sigreturn state).

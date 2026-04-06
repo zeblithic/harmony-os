@@ -2540,8 +2540,8 @@ pub struct Linuxulator<
     pending_signals: u64,
     /// Signal with custom handler pending for caller invocation.
     pending_handler_signal: Option<u32>,
-    /// Signal-specific info for the pending handler signal (SIGCHLD: child exit info).
-    pending_siginfo: Option<SigInfo>,
+    /// Signal-specific info for the pending handler signal, tagged with signal number.
+    pending_siginfo: Option<(u32, SigInfo)>,
     /// If set, process was killed by this signal (for wstatus encoding).
     killed_by_signal: Option<u32>,
     /// Process name set by prctl(PR_SET_NAME). 16 bytes max (including null).
@@ -3077,19 +3077,22 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         self.next_child_pid = self.next_child_pid.max(c.next_child_pid);
         // Auto-deliver SIGCHLD to parent (Linux does this on child exit).
         self.pending_signals |= 1u64 << (SIGCHLD_NUM - 1);
-        self.pending_siginfo = Some(SigInfo {
-            si_code: if killed_by.is_some() {
-                CLD_KILLED
-            } else {
-                CLD_EXITED
+        self.pending_siginfo = Some((
+            SIGCHLD_NUM,
+            SigInfo {
+                si_code: if killed_by.is_some() {
+                    CLD_KILLED
+                } else {
+                    CLD_EXITED
+                },
+                si_pid: child_pid,
+                si_status: if let Some(sig) = killed_by {
+                    sig as i32
+                } else {
+                    exit_code
+                },
             },
-            si_pid: child_pid,
-            si_status: if let Some(sig) = killed_by {
-                sig as i32
-            } else {
-                exit_code
-            },
-        });
+        ));
     }
 
     /// Return the deepest actively-running Linuxulator in the process tree.
@@ -3140,7 +3143,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     }
 
     /// Consume the pending signal info (set alongside pending_handler_signal).
-    pub fn pending_siginfo(&mut self) -> Option<SigInfo> {
+    pub fn pending_siginfo(&mut self) -> Option<(u32, SigInfo)> {
         self.pending_siginfo.take()
     }
 
@@ -3242,9 +3245,9 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         }
         if let Some(info) = siginfo {
             unsafe {
-                core::ptr::write_unaligned((siginfo_ptr + 4) as *mut i32, info.si_code);
-                core::ptr::write_unaligned((siginfo_ptr + 12) as *mut i32, info.si_pid);
-                core::ptr::write_unaligned((siginfo_ptr + 16) as *mut i32, info.si_status);
+                core::ptr::write_unaligned((siginfo_ptr + 8) as *mut i32, info.si_code);
+                core::ptr::write_unaligned((siginfo_ptr + 16) as *mut i32, info.si_pid);
+                core::ptr::write_unaligned((siginfo_ptr + 24) as *mut i32, info.si_status);
             }
         }
 
@@ -3401,9 +3404,9 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         unsafe {
             core::ptr::write_unaligned(siginfo_ptr as *mut i32, signum as i32);
             if let Some(info) = siginfo {
-                core::ptr::write_unaligned((siginfo_ptr + 4) as *mut i32, info.si_code);
-                core::ptr::write_unaligned((siginfo_ptr + 12) as *mut i32, info.si_pid);
-                core::ptr::write_unaligned((siginfo_ptr + 16) as *mut i32, info.si_status);
+                core::ptr::write_unaligned((siginfo_ptr + 8) as *mut i32, info.si_code);
+                core::ptr::write_unaligned((siginfo_ptr + 16) as *mut i32, info.si_pid);
+                core::ptr::write_unaligned((siginfo_ptr + 24) as *mut i32, info.si_status);
             }
         }
 
@@ -6832,11 +6835,14 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         if sig == 0 {
             return 0; // null signal — process exists check
         }
-        self.pending_siginfo = Some(SigInfo {
-            si_code: SI_USER,
-            si_pid: self.pid,
-            si_status: 0,
-        });
+        self.pending_siginfo = Some((
+            sig as u32,
+            SigInfo {
+                si_code: SI_USER,
+                si_pid: self.pid,
+                si_status: 0,
+            },
+        ));
         self.queue_signal(sig as u32);
         0
     }
@@ -6855,11 +6861,14 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         if sig == 0 {
             return 0;
         }
-        self.pending_siginfo = Some(SigInfo {
-            si_code: SI_USER,
-            si_pid: self.pid,
-            si_status: 0,
-        });
+        self.pending_siginfo = Some((
+            sig as u32,
+            SigInfo {
+                si_code: SI_USER,
+                si_pid: self.pid,
+                si_status: 0,
+            },
+        ));
         self.queue_signal(sig as u32);
         0
     }
@@ -18630,17 +18639,17 @@ mod integration_tests {
                 "si_signo"
             );
             assert_eq!(
-                core::ptr::read_unaligned((frame + 4) as *const i32),
+                core::ptr::read_unaligned((frame + 8) as *const i32),
                 CLD_EXITED,
                 "si_code"
             );
             assert_eq!(
-                core::ptr::read_unaligned((frame + 12) as *const i32),
+                core::ptr::read_unaligned((frame + 16) as *const i32),
                 5,
                 "si_pid"
             );
             assert_eq!(
-                core::ptr::read_unaligned((frame + 16) as *const i32),
+                core::ptr::read_unaligned((frame + 24) as *const i32),
                 42,
                 "si_status"
             );
@@ -19639,9 +19648,10 @@ mod integration_tests {
         let sig = lx.pending_handler_signal();
         assert_eq!(sig, Some(SIGCHLD_NUM));
 
-        let info = lx.pending_siginfo();
-        assert!(info.is_some());
-        let info = info.unwrap();
+        let tagged = lx.pending_siginfo();
+        assert!(tagged.is_some());
+        let (sig_tag, info) = tagged.unwrap();
+        assert_eq!(sig_tag, SIGCHLD_NUM);
         assert_eq!(info.si_code, CLD_EXITED);
         assert_eq!(info.si_pid, child_pid);
         assert_eq!(info.si_status, 42);
@@ -19684,9 +19694,10 @@ mod integration_tests {
         let sig = lx.pending_handler_signal();
         assert_eq!(sig, Some(SIGCHLD_NUM));
 
-        let info = lx.pending_siginfo();
-        assert!(info.is_some());
-        let info = info.unwrap();
+        let tagged = lx.pending_siginfo();
+        assert!(tagged.is_some());
+        let (sig_tag, info) = tagged.unwrap();
+        assert_eq!(sig_tag, SIGCHLD_NUM);
         assert_eq!(info.si_code, CLD_KILLED);
         assert_eq!(info.si_pid, child_pid);
         assert_eq!(info.si_status, SIGKILL as i32);
@@ -19707,9 +19718,10 @@ mod integration_tests {
         let sig = lx.pending_handler_signal();
         assert_eq!(sig, Some(10));
 
-        let info = lx.pending_siginfo();
-        assert!(info.is_some());
-        let info = info.unwrap();
+        let tagged = lx.pending_siginfo();
+        assert!(tagged.is_some());
+        let (sig_tag, info) = tagged.unwrap();
+        assert_eq!(sig_tag, 10);
         assert_eq!(info.si_code, SI_USER);
         assert_eq!(info.si_pid, 1); // default PID
         assert_eq!(info.si_status, 0);
