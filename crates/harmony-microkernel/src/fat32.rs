@@ -76,7 +76,10 @@ impl<D: BlockDevice> Fat32<D> {
             return Err(IpcError::InvalidArgument);
         }
 
-        let data_start_lba = reserved_sectors as u32 + num_fats as u32 * fat_size_32;
+        let data_start_lba = (num_fats as u32)
+            .checked_mul(fat_size_32)
+            .and_then(|v| v.checked_add(reserved_sectors as u32))
+            .ok_or(IpcError::InvalidArgument)?;
 
         Ok(Self {
             block_dev,
@@ -93,7 +96,9 @@ impl<D: BlockDevice> Fat32<D> {
     /// or `None` if this is the end of the chain (>= 0x0FFFFFF8).
     pub fn next_cluster(&mut self, cluster: u32) -> Result<Option<u32>, IpcError> {
         let fat_offset = cluster as u64 * 4;
-        let fat_sector = self.reserved_sectors as u32 + (fat_offset / 512) as u32;
+        let fat_sector = (self.reserved_sectors as u32)
+            .checked_add((fat_offset / 512) as u32)
+            .ok_or(IpcError::InvalidArgument)?;
         let entry_offset = (fat_offset % 512) as usize;
 
         let mut sector = [0u8; 512];
@@ -131,10 +136,14 @@ impl<D: BlockDevice> Fat32<D> {
             return Err(IpcError::InvalidArgument);
         }
 
-        let start_lba = self.data_start_lba + (cluster - 2) * self.sectors_per_cluster as u32;
+        let start_lba = (cluster - 2)
+            .checked_mul(self.sectors_per_cluster as u32)
+            .and_then(|v| v.checked_add(self.data_start_lba))
+            .ok_or(IpcError::InvalidArgument)?;
         let mut sector_buf = [0u8; 512];
         for i in 0..self.sectors_per_cluster as u32 {
-            self.block_dev.read_block(start_lba + i, &mut sector_buf)?;
+            let lba = start_lba.checked_add(i).ok_or(IpcError::InvalidArgument)?;
+            self.block_dev.read_block(lba, &mut sector_buf)?;
             let offset = i as usize * 512;
             buf[offset..offset + 512].copy_from_slice(&sector_buf);
         }
