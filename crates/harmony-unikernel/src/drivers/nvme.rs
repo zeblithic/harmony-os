@@ -2120,4 +2120,86 @@ mod tests {
         let cid2 = u32::from_le_bytes(cmd2.sqe[0..4].try_into().unwrap()) >> 16;
         assert_eq!(cid2, cid1 + 1);
     }
+
+    // ── Validation tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn read_blocks_rejects_empty_pages() {
+        let mut driver = ready_driver();
+        assert_eq!(
+            driver.read_blocks(1, 0, &[]).unwrap_err(),
+            NvmeError::TransferTooLarge
+        );
+    }
+
+    #[test]
+    fn read_blocks_rejects_unaligned_address() {
+        let mut driver = ready_driver();
+        // 0x1001 is not 4 KiB-aligned
+        assert_eq!(
+            driver.read_blocks(1, 0, &[0x1001]).unwrap_err(),
+            NvmeError::UnalignedAddress
+        );
+    }
+
+    #[test]
+    fn read_blocks_rejects_unaligned_in_middle() {
+        let mut driver = ready_driver();
+        // First page aligned, second is not
+        assert_eq!(
+            driver.read_blocks(1, 0, &[0x1000, 0x2001]).unwrap_err(),
+            NvmeError::UnalignedAddress
+        );
+    }
+
+    #[test]
+    fn read_blocks_enforces_mdts() {
+        let mut driver = ready_driver();
+        driver.set_mdts(2); // max 4 pages
+        let pages: Vec<u64> = (0..5).map(|i| (i + 1) * 0x1000).collect();
+        assert_eq!(
+            driver.read_blocks(1, 0, &pages).unwrap_err(),
+            NvmeError::TransferTooLarge
+        );
+    }
+
+    #[test]
+    fn read_blocks_at_mdts_limit_succeeds() {
+        let mut driver = ready_driver();
+        driver.set_mdts(2); // max 4 pages
+        let pages: Vec<u64> = (0..4).map(|i| (i + 1) * 0x1000).collect();
+        let cmd = driver.read_blocks(1, 0, &pages).unwrap();
+        let cdw12 = u32::from_le_bytes(cmd.sqe[48..52].try_into().unwrap());
+        assert_eq!(cdw12, 3); // NLB = 4-1 = 3
+    }
+
+    #[test]
+    fn read_blocks_mdts_zero_allows_large_transfer() {
+        let mut driver = ready_driver();
+        // mdts=0 by default, no limit
+        let pages: Vec<u64> = (0..64).map(|i| (i + 1) * 0x1000).collect();
+        let cmd = driver.read_blocks(1, 0, &pages).unwrap();
+        let cdw12 = u32::from_le_bytes(cmd.sqe[48..52].try_into().unwrap());
+        assert_eq!(cdw12, 63); // NLB = 64-1
+    }
+
+    #[test]
+    fn read_blocks_lba_overflow_rejected() {
+        let mut driver = ready_driver();
+        assert_eq!(
+            driver
+                .read_blocks(1, u64::MAX, &[0x1000, 0x2000])
+                .unwrap_err(),
+            NvmeError::TransferTooLarge
+        );
+    }
+
+    #[test]
+    fn read_blocks_rejects_non_ready_state() {
+        let mut driver = enabled_driver();
+        assert_eq!(
+            driver.read_blocks(1, 0, &[0x1000]).unwrap_err(),
+            NvmeError::InvalidState
+        );
+    }
 }
