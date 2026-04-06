@@ -2602,7 +2602,10 @@ mod tests {
     fn dataset_management_builds_correct_sqe() {
         let mut driver = ready_driver();
         driver.set_oncs(0x04); // bit 2 = Dataset Management
-        let ranges = [DsmRange { lba: 100, block_count: 16 }];
+        let ranges = [DsmRange {
+            lba: 100,
+            block_count: 16,
+        }];
         let cmd = driver.dataset_management(1, &ranges).unwrap();
 
         // Opcode = 0x09
@@ -2638,7 +2641,10 @@ mod tests {
     fn dataset_management_rejects_unsupported() {
         let mut driver = ready_driver();
         // ONCS = 0 — Dataset Management not supported
-        let ranges = [DsmRange { lba: 0, block_count: 1 }];
+        let ranges = [DsmRange {
+            lba: 0,
+            block_count: 1,
+        }];
         assert_eq!(
             driver.dataset_management(1, &ranges).unwrap_err(),
             NvmeError::UnsupportedCommand
@@ -2649,7 +2655,10 @@ mod tests {
     fn dataset_management_single_range_serialization() {
         let mut driver = ready_driver();
         driver.set_oncs(0x04);
-        let ranges = [DsmRange { lba: 0x0000_DEAD_BEEF_0000, block_count: 42 }];
+        let ranges = [DsmRange {
+            lba: 0x0000_DEAD_BEEF_0000,
+            block_count: 42,
+        }];
         let cmd = driver.dataset_management(1, &ranges).unwrap();
         let buf = cmd.data_buffer.unwrap();
 
@@ -2667,9 +2676,18 @@ mod tests {
         let mut driver = ready_driver();
         driver.set_oncs(0x04);
         let ranges = [
-            DsmRange { lba: 100, block_count: 10 },
-            DsmRange { lba: 500, block_count: 20 },
-            DsmRange { lba: 1000, block_count: 30 },
+            DsmRange {
+                lba: 100,
+                block_count: 10,
+            },
+            DsmRange {
+                lba: 500,
+                block_count: 20,
+            },
+            DsmRange {
+                lba: 1000,
+                block_count: 30,
+            },
         ];
         let cmd = driver.dataset_management(1, &ranges).unwrap();
 
@@ -2698,7 +2716,10 @@ mod tests {
         let mut driver = ready_driver();
         driver.set_oncs(0x04);
         let ranges: Vec<DsmRange> = (0..256)
-            .map(|i| DsmRange { lba: i as u64 * 100, block_count: 1 })
+            .map(|i| DsmRange {
+                lba: i as u64 * 100,
+                block_count: 1,
+            })
             .collect();
         let cmd = driver.dataset_management(1, &ranges).unwrap();
 
@@ -2715,7 +2736,10 @@ mod tests {
         let mut driver = ready_driver();
         driver.set_oncs(0x04);
         let ranges: Vec<DsmRange> = (0..257)
-            .map(|i| DsmRange { lba: i as u64, block_count: 1 })
+            .map(|i| DsmRange {
+                lba: i as u64,
+                block_count: 1,
+            })
             .collect();
         assert_eq!(
             driver.dataset_management(1, &ranges).unwrap_err(),
@@ -2736,7 +2760,10 @@ mod tests {
     #[test]
     fn dataset_management_rejects_non_ready_state() {
         let mut driver = enabled_driver();
-        let ranges = [DsmRange { lba: 0, block_count: 1 }];
+        let ranges = [DsmRange {
+            lba: 0,
+            block_count: 1,
+        }];
         assert_eq!(
             driver.dataset_management(1, &ranges).unwrap_err(),
             NvmeError::InvalidState
@@ -2747,7 +2774,10 @@ mod tests {
     fn dataset_management_increments_cid() {
         let mut driver = ready_driver();
         driver.set_oncs(0x04);
-        let ranges = [DsmRange { lba: 0, block_count: 1 }];
+        let ranges = [DsmRange {
+            lba: 0,
+            block_count: 1,
+        }];
         let cmd1 = driver.dataset_management(1, &ranges).unwrap();
         let cmd2 = driver.dataset_management(1, &ranges).unwrap();
         let cid1 = u32::from_le_bytes(cmd1.sqe[0..4].try_into().unwrap()) >> 16;
@@ -2759,7 +2789,10 @@ mod tests {
     fn dataset_management_range_serialization_byte_layout() {
         let mut driver = ready_driver();
         driver.set_oncs(0x04);
-        let ranges = [DsmRange { lba: 0x0102_0304_0506_0708, block_count: 0x0A0B_0C0D }];
+        let ranges = [DsmRange {
+            lba: 0x0102_0304_0506_0708,
+            block_count: 0x0A0B_0C0D,
+        }];
         let cmd = driver.dataset_management(1, &ranges).unwrap();
         let buf = cmd.data_buffer.unwrap();
 
