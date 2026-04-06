@@ -108,7 +108,8 @@ impl<D: BlockDevice> Fat32<D> {
             sector[entry_offset + 3],
         ]) & 0x0FFFFFFF;
 
-        if raw >= 0x0FFFFFF8 {
+        if raw >= 0x0FFFFFF7 {
+            // 0x0FFFFFF7 = bad cluster, >= 0x0FFFFFF8 = end of chain
             Ok(None)
         } else if raw < 2 {
             Err(IpcError::InvalidArgument)
