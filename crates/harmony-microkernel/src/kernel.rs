@@ -353,11 +353,12 @@ impl<P: PageTable> Kernel<P> {
 
         // Collect non-expired parent capabilities for delegation.
         // We need to collect before borrowing self mutably for token minting.
-        let parent_caps: Vec<(CapabilityType, Vec<u8>)> = parent
+        // Note: expires_at >= now matches verify_pq_token semantics (expires_at == now is valid).
+        let parent_caps: Vec<(CapabilityType, Vec<u8>, u64)> = parent
             .kernel_capabilities
             .iter()
-            .filter(|cap| cap.expires_at == 0 || cap.expires_at > now)
-            .map(|cap| (cap.capability, cap.resource.clone()))
+            .filter(|cap| cap.expires_at == 0 || cap.expires_at >= now)
+            .map(|cap| (cap.capability, cap.resource.clone(), cap.expires_at))
             .collect();
 
         // Allocate child PID.
@@ -372,8 +373,16 @@ impl<P: PageTable> Kernel<P> {
         address_hash[..4].copy_from_slice(&child_pid.to_be_bytes());
 
         // Mint fresh kernel capabilities for the child.
+        // Bound child's expires_at by parent's remaining TTL to prevent
+        // indefinite capability extension through repeated forks.
         let mut child_caps = Vec::with_capacity(parent_caps.len());
-        for (capability, resource) in &parent_caps {
+        for (capability, resource, parent_expires_at) in &parent_caps {
+            let child_expires_at = if *parent_expires_at == 0 {
+                // Non-expiring parent cap → child gets default TTL.
+                now.saturating_add(DEFAULT_CAP_TTL)
+            } else {
+                (*parent_expires_at).min(now.saturating_add(DEFAULT_CAP_TTL))
+            };
             let cap = self
                 .session_identity
                 .issue_pq_root_token(
@@ -382,7 +391,7 @@ impl<P: PageTable> Kernel<P> {
                     *capability,
                     resource,
                     now,
-                    now.saturating_add(DEFAULT_CAP_TTL),
+                    child_expires_at,
                 )
                 .map_err(|_| IpcError::PermissionDenied)?;
             child_caps.push(cap);
@@ -3651,5 +3660,84 @@ mod tests {
 
         let child_proc = kernel.processes.get(&child).unwrap();
         assert!(child_proc.user_capabilities.is_empty());
+    }
+
+    #[test]
+    fn fork_caps_bounded_by_parent_ttl() {
+        let mut kernel = make_kernel();
+        let mut entropy = make_test_entropy();
+
+        let server = kernel
+            .spawn_process("server", Box::new(EchoServer::new()), &[], None)
+            .unwrap();
+        let parent = kernel
+            .spawn_process(
+                "parent",
+                Box::new(EchoServer::new()),
+                &[("/srv", server, 0)],
+                None,
+            )
+            .unwrap();
+
+        // Grant cap at time 0 — expires at DEFAULT_CAP_TTL (1_000_000_000)
+        kernel
+            .grant_endpoint_cap(&mut entropy, parent, server, 0)
+            .unwrap();
+
+        // Fork at time 999_999_900 — parent cap has 100ms left.
+        // Child's expires_at should be min(1_000_000_000, 999_999_900 + 1_000_000_000)
+        //   = 1_000_000_000 (parent's expiry, NOT fork_time + DEFAULT_CAP_TTL)
+        let child = kernel
+            .fork_process(
+                &mut entropy,
+                parent,
+                "child",
+                Box::new(EchoServer::new()),
+                999_999_900,
+            )
+            .unwrap();
+
+        let child_proc = kernel.processes.get(&child).unwrap();
+        assert_eq!(child_proc.kernel_capabilities.len(), 1);
+        // Child cap must expire at parent's original expiry, not fork_time + TTL
+        assert_eq!(child_proc.kernel_capabilities[0].expires_at, 1_000_000_000);
+    }
+
+    #[test]
+    fn fork_includes_cap_expiring_at_now() {
+        let mut kernel = make_kernel();
+        let mut entropy = make_test_entropy();
+
+        let server = kernel
+            .spawn_process("server", Box::new(EchoServer::new()), &[], None)
+            .unwrap();
+        let parent = kernel
+            .spawn_process(
+                "parent",
+                Box::new(EchoServer::new()),
+                &[("/srv", server, 0)],
+                None,
+            )
+            .unwrap();
+
+        // Grant cap at time 0 — expires at DEFAULT_CAP_TTL (1_000_000_000)
+        kernel
+            .grant_endpoint_cap(&mut entropy, parent, server, 0)
+            .unwrap();
+
+        // Fork at exactly the expiry time — cap should still be inherited
+        // (verify_pq_token treats expires_at == now as valid)
+        let child = kernel
+            .fork_process(
+                &mut entropy,
+                parent,
+                "child",
+                Box::new(EchoServer::new()),
+                1_000_000_000,
+            )
+            .unwrap();
+
+        let child_proc = kernel.processes.get(&child).unwrap();
+        assert_eq!(child_proc.kernel_capabilities.len(), 1);
     }
 }
