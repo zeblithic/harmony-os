@@ -859,6 +859,63 @@ impl<R: RegisterBank> NvmeDriver<R> {
             .ok_or(NvmeError::InvalidState)?
             .submit(sqe, self.doorbell_stride))
     }
+
+    /// Build an NVM Write Zeroes command (opcode 0x08).
+    ///
+    /// Zeros the LBA range `[lba, lba + block_count)` without data transfer.
+    /// The controller generates zeros internally; no PRPs are used.
+    /// DEAC (Deallocate) is always 0 — reads after Write Zeroes return
+    /// deterministic zero bytes.
+    ///
+    /// Requires ONCS bit 3 (Write Zeroes support).
+    pub fn write_zeroes(
+        &mut self,
+        nsid: u32,
+        lba: u64,
+        block_count: u32,
+    ) -> Result<AdminCommand, NvmeError> {
+        if self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+        if !self.supports_write_zeroes() {
+            return Err(NvmeError::UnsupportedCommand);
+        }
+        if block_count == 0 || block_count > 65536 {
+            return Err(NvmeError::TransferTooLarge);
+        }
+        if lba.checked_add(block_count as u64).is_none() {
+            return Err(NvmeError::TransferTooLarge);
+        }
+
+        let cid = self.next_cid;
+        self.next_cid = self.next_cid.wrapping_add(1);
+
+        let nlb = (block_count - 1) & 0xFFFF;
+
+        let mut sqe = [0u8; 64];
+        // CDW0: opcode 0x08 | CID
+        let cdw0: u32 = 0x08 | ((cid as u32) << 16);
+        sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
+        // NSID
+        sqe[4..8].copy_from_slice(&nsid.to_le_bytes());
+        // PRP1 = 0, PRP2 = 0 (no data transfer)
+        // (sqe is zero-initialized, so bytes 24-39 are already 0)
+        // CDW10: LBA bits 31:0
+        sqe[40..44].copy_from_slice(&(lba as u32).to_le_bytes());
+        // CDW11: LBA bits 63:32
+        sqe[44..48].copy_from_slice(&((lba >> 32) as u32).to_le_bytes());
+        // CDW12: NLB (bits 15:0), DEAC=0 (bit 25)
+        sqe[48..52].copy_from_slice(&nlb.to_le_bytes());
+
+        let mut cmd = self
+            .io
+            .as_mut()
+            .ok_or(NvmeError::InvalidState)?
+            .submit(sqe, self.doorbell_stride);
+        cmd.prp_list = None;
+        cmd.data_buffer = None;
+        Ok(cmd)
+    }
 }
 
 // ── Completion checking ───────────────────────────────────────────────────────
@@ -2352,5 +2409,115 @@ mod tests {
         data[257] = 0x00;
         let ic = parse_identify_controller(&data);
         assert_eq!(ic.oncs, 0x000C);
+    }
+
+    // ── Write Zeroes tests ───────────────────────────────────────────────
+
+    #[test]
+    fn write_zeroes_builds_correct_sqe() {
+        let mut driver = ready_driver();
+        driver.set_oncs(0x08); // bit 3 = Write Zeroes
+        let cmd = driver.write_zeroes(1, 100, 16).unwrap();
+
+        // Opcode = 0x08
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x08);
+
+        // NSID
+        let nsid = u32::from_le_bytes(cmd.sqe[4..8].try_into().unwrap());
+        assert_eq!(nsid, 1);
+
+        // PRP1 = 0 (no data transfer)
+        let prp1 = u64::from_le_bytes(cmd.sqe[24..32].try_into().unwrap());
+        assert_eq!(prp1, 0);
+
+        // PRP2 = 0 (no data transfer)
+        let prp2 = u64::from_le_bytes(cmd.sqe[32..40].try_into().unwrap());
+        assert_eq!(prp2, 0);
+
+        // CDW10 = LBA low bits
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10, 100);
+
+        // CDW11 = LBA high bits
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11, 0);
+
+        // CDW12 = NLB (0-based) = 15, DEAC=0
+        let cdw12 = u32::from_le_bytes(cmd.sqe[48..52].try_into().unwrap());
+        assert_eq!(cdw12, 15);
+
+        // No data buffers
+        assert!(cmd.prp_list.is_none());
+        assert!(cmd.data_buffer.is_none());
+    }
+
+    #[test]
+    fn write_zeroes_rejects_unsupported() {
+        let mut driver = ready_driver();
+        // ONCS = 0 — Write Zeroes not supported
+        assert_eq!(
+            driver.write_zeroes(1, 0, 1).unwrap_err(),
+            NvmeError::UnsupportedCommand
+        );
+    }
+
+    #[test]
+    fn write_zeroes_rejects_zero_blocks() {
+        let mut driver = ready_driver();
+        driver.set_oncs(0x08);
+        assert_eq!(
+            driver.write_zeroes(1, 0, 0).unwrap_err(),
+            NvmeError::TransferTooLarge
+        );
+    }
+
+    #[test]
+    fn write_zeroes_accepts_max_blocks() {
+        let mut driver = ready_driver();
+        driver.set_oncs(0x08);
+        let cmd = driver.write_zeroes(1, 0, 65536).unwrap();
+        let cdw12 = u32::from_le_bytes(cmd.sqe[48..52].try_into().unwrap());
+        assert_eq!(cdw12, 65535); // NLB = 65536 - 1
+    }
+
+    #[test]
+    fn write_zeroes_rejects_too_many_blocks() {
+        let mut driver = ready_driver();
+        driver.set_oncs(0x08);
+        assert_eq!(
+            driver.write_zeroes(1, 0, 65537).unwrap_err(),
+            NvmeError::TransferTooLarge
+        );
+    }
+
+    #[test]
+    fn write_zeroes_rejects_lba_overflow() {
+        let mut driver = ready_driver();
+        driver.set_oncs(0x08);
+        assert_eq!(
+            driver.write_zeroes(1, u64::MAX, 2).unwrap_err(),
+            NvmeError::TransferTooLarge
+        );
+    }
+
+    #[test]
+    fn write_zeroes_rejects_non_ready_state() {
+        let mut driver = enabled_driver();
+        assert_eq!(
+            driver.write_zeroes(1, 0, 1).unwrap_err(),
+            NvmeError::InvalidState
+        );
+    }
+
+    #[test]
+    fn write_zeroes_increments_cid() {
+        let mut driver = ready_driver();
+        driver.set_oncs(0x08);
+        let cmd1 = driver.write_zeroes(1, 0, 1).unwrap();
+        let cmd2 = driver.write_zeroes(1, 0, 1).unwrap();
+        let cid1 = u32::from_le_bytes(cmd1.sqe[0..4].try_into().unwrap()) >> 16;
+        let cid2 = u32::from_le_bytes(cmd2.sqe[0..4].try_into().unwrap()) >> 16;
+        assert_eq!(cid2, cid1 + 1);
     }
 }
