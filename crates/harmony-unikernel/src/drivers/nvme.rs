@@ -206,6 +206,10 @@ pub enum NvmeError {
     },
     /// The completion queue contained no entry to harvest.
     NoCompletion,
+    /// The requested transfer exceeds the controller's MDTS.
+    TransferTooLarge,
+    /// One or more PRP addresses are not 4 KiB-aligned.
+    UnalignedAddress,
 }
 
 // ── Driver state ──────────────────────────────────────────────────────────────
@@ -248,6 +252,9 @@ pub struct NvmeDriver<R: RegisterBank> {
     next_cid: u16,
     /// Current lifecycle state of the driver.
     state: NvmeState,
+    /// Maximum Data Transfer Size exponent from Identify Controller.
+    /// 0 = no controller-imposed limit. >0 = max transfer is 2^mdts pages.
+    mdts: u8,
 }
 
 // ── Helper methods ────────────────────────────────────────────────────────────
@@ -313,6 +320,25 @@ impl<R: RegisterBank> NvmeDriver<R> {
     pub fn timeout_ms(&self) -> u32 {
         self.timeout_ms
     }
+
+    /// Set the MDTS value from Identify Controller byte 77.
+    ///
+    /// Call this after parsing the Identify Controller response.
+    /// `mdts = 0` means no controller-imposed limit.
+    pub fn set_mdts(&mut self, mdts: u8) {
+        self.mdts = mdts;
+    }
+
+    /// Maximum number of 4 KiB pages per transfer, or `None` if unlimited.
+    ///
+    /// Derived from MDTS: when non-zero, max pages = 2^mdts.
+    pub fn max_transfer_blocks(&self) -> Option<u32> {
+        if self.mdts == 0 {
+            None
+        } else {
+            Some(1u32 << self.mdts)
+        }
+    }
 }
 
 // ── Initialisation ────────────────────────────────────────────────────────────
@@ -374,6 +400,7 @@ impl<R: RegisterBank> NvmeDriver<R> {
             pending_io: None,
             next_cid: 0,
             state: NvmeState::Disabled,
+            mdts: 0,
         };
 
         // Poll CSTS.RDY=0.
@@ -1851,5 +1878,28 @@ mod tests {
             .unwrap()
             .expect("flush completion");
         assert_eq!(flush_cr.completion.status, 0);
+    }
+
+    // ── MDTS tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn mdts_defaults_to_zero() {
+        let driver = ready_driver();
+        assert_eq!(driver.max_transfer_blocks(), None);
+    }
+
+    #[test]
+    fn set_mdts_stores_value() {
+        let mut driver = ready_driver();
+        driver.set_mdts(5);
+        // MDTS=5 → max transfer = 2^5 = 32 pages
+        assert_eq!(driver.max_transfer_blocks(), Some(32));
+    }
+
+    #[test]
+    fn set_mdts_one_means_one_page() {
+        let mut driver = ready_driver();
+        driver.set_mdts(1);
+        assert_eq!(driver.max_transfer_blocks(), Some(2));
     }
 }
