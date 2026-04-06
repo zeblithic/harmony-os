@@ -102,7 +102,11 @@ impl<D: BlockDevice> BlockDevice for PartitionBlockDevice<D> {
         if lba >= self.partition_size {
             return Err(IpcError::InvalidArgument);
         }
-        self.inner.read_block(self.base_lba + lba, buf)
+        let physical_lba = self
+            .base_lba
+            .checked_add(lba)
+            .ok_or(IpcError::InvalidArgument)?;
+        self.inner.read_block(physical_lba, buf)
     }
 
     fn capacity_blocks(&self) -> u32 {
