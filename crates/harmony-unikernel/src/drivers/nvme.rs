@@ -232,8 +232,9 @@ pub enum NvmeError {
     },
     /// The completion queue contained no entry to harvest.
     NoCompletion,
-    /// The requested transfer size is invalid: zero blocks, exceeds the
-    /// controller's MDTS, or exceeds the single-page PRP list limit (513 pages).
+    /// The requested transfer size is invalid: zero blocks, empty range list,
+    /// exceeds the controller's MDTS, exceeds the single-page PRP list limit
+    /// (513 pages), or exceeds the maximum range count (256).
     TransferTooLarge,
     /// One or more PRP addresses are not 4 KiB-aligned.
     UnalignedAddress,
@@ -747,9 +748,9 @@ impl<R: RegisterBank> NvmeDriver<R> {
         if pages.len() > 513 {
             return Err(NvmeError::TransferTooLarge);
         }
-        // Check LBA + block_count doesn't overflow u64.
+        // Check that the last LBA (lba + block_count - 1) fits in u64.
         let block_count = pages.len() as u64;
-        if lba.checked_add(block_count).is_none() {
+        if lba.checked_add(block_count - 1).is_none() {
             return Err(NvmeError::TransferTooLarge);
         }
 
@@ -892,7 +893,7 @@ impl<R: RegisterBank> NvmeDriver<R> {
         if block_count == 0 || block_count > 65536 {
             return Err(NvmeError::TransferTooLarge);
         }
-        if lba.checked_add(block_count as u64).is_none() {
+        if lba.checked_add((block_count as u64) - 1).is_none() {
             return Err(NvmeError::TransferTooLarge);
         }
 
@@ -2443,6 +2444,19 @@ mod tests {
     }
 
     #[test]
+    fn read_blocks_accepts_range_ending_at_u64_max() {
+        let mut driver = ready_driver();
+        // Range [u64::MAX - 1, u64::MAX] — last LBA fits in u64
+        let cmd = driver
+            .read_blocks(1, u64::MAX - 1, &[0x1000, 0x2000])
+            .unwrap();
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        let lba = (cdw10 as u64) | ((cdw11 as u64) << 32);
+        assert_eq!(lba, u64::MAX - 1);
+    }
+
+    #[test]
     fn read_blocks_rejects_non_ready_state() {
         let mut driver = enabled_driver();
         assert_eq!(
@@ -2574,6 +2588,18 @@ mod tests {
             driver.write_zeroes(1, u64::MAX, 2).unwrap_err(),
             NvmeError::TransferTooLarge
         );
+    }
+
+    #[test]
+    fn write_zeroes_accepts_range_ending_at_u64_max() {
+        let mut driver = ready_driver();
+        driver.set_oncs(0x08);
+        // Range [u64::MAX - 1, u64::MAX] — last LBA fits in u64
+        let cmd = driver.write_zeroes(1, u64::MAX - 1, 2).unwrap();
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        let lba = (cdw10 as u64) | ((cdw11 as u64) << 32);
+        assert_eq!(lba, u64::MAX - 1);
     }
 
     #[test]
