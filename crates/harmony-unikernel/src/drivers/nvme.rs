@@ -694,6 +694,10 @@ impl<R: RegisterBank> NvmeDriver<R> {
                 return Err(NvmeError::TransferTooLarge);
             }
         }
+        // NLB is bits 15:0 of CDW12, so max value is 0xFFFF (65535), meaning max 65536 blocks.
+        if pages.len() > 65536 {
+            return Err(NvmeError::TransferTooLarge);
+        }
         // Check LBA + block_count doesn't overflow u64.
         let block_count = pages.len() as u64;
         if lba.checked_add(block_count).is_none() {
@@ -703,7 +707,7 @@ impl<R: RegisterBank> NvmeDriver<R> {
         let cid = self.next_cid;
         self.next_cid = self.next_cid.wrapping_add(1);
 
-        let nlb = (pages.len() as u32) - 1; // NLB is 0-based
+        let nlb = ((pages.len() as u32) - 1) & 0xFFFF; // NLB is 0-based; mask to bits 15:0
 
         let mut sqe = [0u8; 64];
         let cdw0: u32 = (opcode as u32) | ((cid as u32) << 16);
