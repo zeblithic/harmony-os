@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+pub mod block_device;
 #[cfg(feature = "kernel")]
 pub mod config_server;
 #[cfg(feature = "kernel")]
