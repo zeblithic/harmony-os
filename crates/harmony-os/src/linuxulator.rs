@@ -100,6 +100,21 @@ pub const BLOCK_OP_SLEEP: u8 = 4;
 /// Decoded by the block_fn closure in main.rs to WaitReason::WaitChild(pid).
 pub const BLOCK_OP_WAIT: u8 = 5;
 
+// siginfo si_code values for SIGCHLD
+const CLD_EXITED: i32 = 1;
+const CLD_KILLED: i32 = 2;
+/// si_code for signals sent by kill()/tgkill().
+const SI_USER: i32 = 0;
+
+/// Signal-specific information passed to setup_signal_frame for siginfo_t population.
+/// Architecture-neutral — both x86_64 and aarch64 use the same si_code/si_pid/si_status fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SigInfo {
+    pub si_code: i32,
+    pub si_pid: i32,
+    pub si_status: i32,
+}
+
 fn ipc_err_to_errno(e: IpcError) -> i64 {
     match e {
         IpcError::NotFound => ENOENT,
@@ -2525,6 +2540,8 @@ pub struct Linuxulator<
     pending_signals: u64,
     /// Signal with custom handler pending for caller invocation.
     pending_handler_signal: Option<u32>,
+    /// Signal-specific info for the pending handler signal (SIGCHLD: child exit info).
+    pending_siginfo: Option<SigInfo>,
     /// If set, process was killed by this signal (for wstatus encoding).
     killed_by_signal: Option<u32>,
     /// Process name set by prctl(PR_SET_NAME). 16 bytes max (including null).
@@ -2637,6 +2654,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             signal_mask: 0,
             pending_signals: 0,
             pending_handler_signal: None,
+            pending_siginfo: None,
             killed_by_signal: None,
             process_name: [0u8; 16],
             signalfds: BTreeMap::new(),
@@ -3039,6 +3057,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         let child = self.children.pop().unwrap();
         let exit_code = child.linuxulator.exit_code.unwrap_or(0);
         let killed_by = child.linuxulator.killed_by_signal;
+        let child_pid = child.pid;
         self.exited_children.push((child.pid, exit_code, killed_by));
 
         // Swap pipes/eventfds back from the (now dropped) child.
@@ -3058,6 +3077,19 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         self.next_child_pid = self.next_child_pid.max(c.next_child_pid);
         // Auto-deliver SIGCHLD to parent (Linux does this on child exit).
         self.pending_signals |= 1u64 << (SIGCHLD_NUM - 1);
+        self.pending_siginfo = Some(SigInfo {
+            si_code: if killed_by.is_some() {
+                CLD_KILLED
+            } else {
+                CLD_EXITED
+            },
+            si_pid: child_pid,
+            si_status: if let Some(sig) = killed_by {
+                sig as i32
+            } else {
+                exit_code
+            },
+        });
     }
 
     /// Return the deepest actively-running Linuxulator in the process tree.
@@ -3105,6 +3137,11 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
     /// Consume the pending handler signal.
     pub fn pending_handler_signal(&mut self) -> Option<u32> {
         self.pending_handler_signal.take()
+    }
+
+    /// Consume the pending signal info (set alongside pending_handler_signal).
+    pub fn pending_siginfo(&mut self) -> Option<SigInfo> {
+        self.pending_siginfo.take()
     }
 
     /// Consume the pending signal return (set by rt_sigreturn).
@@ -4373,6 +4410,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         }
         // pending_signals preserved across exec (Linux semantics).
         self.pending_handler_signal = None;
+        self.pending_siginfo = None;
         self.killed_by_signal = None;
         // Reset process name — Linux sets comm to the new binary's basename.
         self.process_name = [0u8; 16];
@@ -6329,6 +6367,7 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
             signal_mask: self.signal_mask,
             pending_signals: 0,
             pending_handler_signal: None,
+            pending_siginfo: None,
             killed_by_signal: None,
             process_name: self.process_name,
             signalfds: self.signalfds.clone(),
@@ -6631,6 +6670,11 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         if sig == 0 {
             return 0; // null signal — process exists check
         }
+        self.pending_siginfo = Some(SigInfo {
+            si_code: SI_USER,
+            si_pid: self.pid,
+            si_status: 0,
+        });
         self.queue_signal(sig as u32);
         0
     }
@@ -6649,6 +6693,11 @@ impl<B: SyscallBackend, T: TcpProvider + harmony_netstack::udp::UdpProvider> Lin
         if sig == 0 {
             return 0;
         }
+        self.pending_siginfo = Some(SigInfo {
+            si_code: SI_USER,
+            si_pid: self.pid,
+            si_status: 0,
+        });
         self.queue_signal(sig as u32);
         0
     }
@@ -18871,5 +18920,117 @@ mod integration_tests {
         assert_eq!(result, 0);
         // monotonic_ns should have advanced by 500ms = 500_000_000ns
         assert_eq!(lx.monotonic_ns, 500_000_000);
+    }
+
+    #[test]
+    fn test_sigchld_siginfo_normal_exit() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let child_pid = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
+        assert!(child_pid > 0);
+
+        // Install SIGCHLD handler.
+        let handler_addr: u64 = 0x400000;
+        let restorer_addr: u64 = 0x401000;
+        let flags = SA_RESTORER | SA_SIGINFO;
+        install_handler_with_restorer(
+            &mut lx,
+            SIGCHLD_NUM as i32,
+            handler_addr,
+            flags,
+            0,
+            restorer_addr,
+        );
+
+        // Child exits with code 42.
+        if let Some((_pid, child_lx)) = lx.pending_fork_child() {
+            child_lx.dispatch_syscall(LinuxSyscall::Exit { code: 42 });
+        }
+
+        // active_process() triggers recover_child_state which queues SIGCHLD and
+        // sets pending_siginfo, then dispatch_syscall triggers deliver_pending_signals.
+        {
+            let _ = lx.active_process();
+        }
+        lx.dispatch_syscall(LinuxSyscall::Getpid);
+
+        let sig = lx.pending_handler_signal();
+        assert_eq!(sig, Some(SIGCHLD_NUM));
+
+        let info = lx.pending_siginfo();
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.si_code, CLD_EXITED);
+        assert_eq!(info.si_pid, child_pid);
+        assert_eq!(info.si_status, 42);
+    }
+
+    #[test]
+    fn test_sigchld_siginfo_killed_by_signal() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let child_pid = lx.dispatch_syscall(LinuxSyscall::Fork) as i32;
+        assert!(child_pid > 0);
+
+        let handler_addr: u64 = 0x400000;
+        let restorer_addr: u64 = 0x401000;
+        let flags = SA_RESTORER | SA_SIGINFO;
+        install_handler_with_restorer(
+            &mut lx,
+            SIGCHLD_NUM as i32,
+            handler_addr,
+            flags,
+            0,
+            restorer_addr,
+        );
+
+        // Kill child with SIGKILL.
+        if let Some((_pid, child_lx)) = lx.pending_fork_child() {
+            child_lx.dispatch_syscall(LinuxSyscall::Kill {
+                pid: 0,
+                sig: SIGKILL as i32,
+            });
+        }
+
+        // active_process() triggers recover_child_state (child exited due to SIGKILL).
+        {
+            let _ = lx.active_process();
+        }
+        lx.dispatch_syscall(LinuxSyscall::Getpid);
+
+        let sig = lx.pending_handler_signal();
+        assert_eq!(sig, Some(SIGCHLD_NUM));
+
+        let info = lx.pending_siginfo();
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.si_code, CLD_KILLED);
+        assert_eq!(info.si_pid, child_pid);
+        assert_eq!(info.si_status, SIGKILL as i32);
+    }
+
+    #[test]
+    fn test_kill_siginfo_si_user() {
+        let mock = MockBackend::new();
+        let mut lx = Linuxulator::new(mock);
+
+        let handler_addr: u64 = 0x400000;
+        let restorer_addr: u64 = 0x401000;
+        let flags = SA_RESTORER | SA_SIGINFO;
+        install_handler_with_restorer(&mut lx, 10, handler_addr, flags, 0, restorer_addr);
+
+        lx.dispatch_syscall(LinuxSyscall::Kill { pid: 0, sig: 10 });
+
+        let sig = lx.pending_handler_signal();
+        assert_eq!(sig, Some(10));
+
+        let info = lx.pending_siginfo();
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.si_code, SI_USER);
+        assert_eq!(info.si_pid, 1); // default PID
+        assert_eq!(info.si_status, 0);
     }
 }
