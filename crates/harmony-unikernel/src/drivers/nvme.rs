@@ -671,6 +671,10 @@ impl<R: RegisterBank> NvmeDriver<R> {
     /// For the 3+ case, PRP2 is set to `u64::MAX` as a sentinel.  The caller
     /// must write the `prp_list` bytes to a 4 KiB-aligned physical address, then
     /// patch SQE bytes 32–39 with that address before submitting.
+    ///
+    /// **Note:** The PRP list is returned as a single contiguous buffer. For transfers
+    /// exceeding 513 blocks, the list exceeds 4 KiB and the caller must handle
+    /// multi-page PRP list chaining per the NVMe spec.
     fn io_rw_command(
         &mut self,
         opcode: u8,
@@ -690,7 +694,7 @@ impl<R: RegisterBank> NvmeDriver<R> {
             }
         }
         if let Some(max) = self.max_transfer_blocks() {
-            if pages.len() as u32 > max {
+            if pages.len() > max as usize {
                 return Err(NvmeError::TransferTooLarge);
             }
         }
