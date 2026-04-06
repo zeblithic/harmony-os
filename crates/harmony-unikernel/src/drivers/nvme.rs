@@ -614,7 +614,12 @@ impl<R: RegisterBank> NvmeDriver<R> {
     /// Build a Create I/O Completion Queue admin command (opcode 0x05).
     ///
     /// `qid` is the queue identifier to assign to this CQ (must be ≥ 1).
-    pub fn create_io_cq(&mut self, qid: u16, cq_phys: u64, size: u16) -> Result<AdminCommand, NvmeError> {
+    pub fn create_io_cq(
+        &mut self,
+        qid: u16,
+        cq_phys: u64,
+        size: u16,
+    ) -> Result<AdminCommand, NvmeError> {
         if self.state != NvmeState::Enabled && self.state != NvmeState::Ready {
             return Err(NvmeError::InvalidState);
         }
@@ -645,7 +650,12 @@ impl<R: RegisterBank> NvmeDriver<R> {
     /// Build a Create I/O Submission Queue admin command (opcode 0x01).
     ///
     /// `qid` is the queue identifier to assign to this SQ (must be ≥ 1).
-    pub fn create_io_sq(&mut self, qid: u16, sq_phys: u64, size: u16) -> Result<AdminCommand, NvmeError> {
+    pub fn create_io_sq(
+        &mut self,
+        qid: u16,
+        sq_phys: u64,
+        size: u16,
+    ) -> Result<AdminCommand, NvmeError> {
         if self.state != NvmeState::Enabled && self.state != NvmeState::Ready {
             return Err(NvmeError::InvalidState);
         }
@@ -722,7 +732,8 @@ impl<R: RegisterBank> NvmeDriver<R> {
             .position(|&(q, _, _, _)| q == qid)
             .ok_or(NvmeError::InvalidState)?;
         let (_, sq_phys, cq_phys, size) = self.pending_io.remove(idx);
-        self.io_queues.push(QueuePair::new(qid, sq_phys, cq_phys, size));
+        self.io_queues
+            .push(QueuePair::new(qid, sq_phys, cq_phys, size));
         self.state = NvmeState::Ready;
         Ok(())
     }
@@ -738,11 +749,14 @@ impl<R: RegisterBank> NvmeDriver<R> {
     /// [`activate_io_queue_pair`](Self::activate_io_queue_pair) was called).
     /// Returns [`NvmeError::InvalidQueueIndex`] if the index is out of range.
     fn io_queue_mut(&mut self, queue_index: usize) -> Result<&mut QueuePair, NvmeError> {
-        self.io_queues.get_mut(queue_index).ok_or(NvmeError::InvalidQueueIndex)
+        self.io_queues
+            .get_mut(queue_index)
+            .ok_or(NvmeError::InvalidQueueIndex)
     }
 
     /// Build an NVM I/O command (Read or Write) and submit via the I/O queue.
     ///
+    /// `queue_index` is the zero-based index into the active I/O queue pairs.
     /// `pages` is a slice of 4 KiB-aligned physical addresses, one per logical
     /// block to transfer.  PRP1/PRP2/PRP-list are set according to the NVMe spec:
     ///
@@ -761,6 +775,7 @@ impl<R: RegisterBank> NvmeDriver<R> {
     /// [`NvmeError::TransferTooLarge`].
     fn io_rw_command(
         &mut self,
+        queue_index: usize,
         opcode: u8,
         nsid: u32,
         lba: u64,
@@ -826,70 +841,76 @@ impl<R: RegisterBank> NvmeDriver<R> {
         // CDW12: NLB (0-based block count)
         sqe[48..52].copy_from_slice(&nlb.to_le_bytes());
 
-        let mut cmd = self
-            .io
-            .as_mut()
-            .ok_or(NvmeError::InvalidState)?
-            .submit(sqe, self.doorbell_stride);
+        let doorbell_stride = self.doorbell_stride;
+        let mut cmd = self.io_queue_mut(queue_index)?.submit(sqe, doorbell_stride);
         cmd.prp_list = prp_list;
         Ok(cmd)
     }
 
     /// Build an NVM Read command for multiple logical blocks.
     ///
+    /// `queue_index` is the zero-based index into the active I/O queue pairs.
     /// `pages` contains one 4 KiB-aligned physical address per block.
     pub fn read_blocks(
         &mut self,
+        queue_index: usize,
         nsid: u32,
         lba: u64,
         pages: &[u64],
     ) -> Result<AdminCommand, NvmeError> {
-        self.io_rw_command(0x02, nsid, lba, pages)
+        self.io_rw_command(queue_index, 0x02, nsid, lba, pages)
     }
 
     /// Build an NVM Write command for multiple logical blocks.
     ///
+    /// `queue_index` is the zero-based index into the active I/O queue pairs.
     /// `pages` contains one 4 KiB-aligned physical address per block.
     pub fn write_blocks(
         &mut self,
+        queue_index: usize,
         nsid: u32,
         lba: u64,
         pages: &[u64],
     ) -> Result<AdminCommand, NvmeError> {
-        self.io_rw_command(0x01, nsid, lba, pages)
+        self.io_rw_command(queue_index, 0x01, nsid, lba, pages)
     }
 
     /// Build an NVM Read command (opcode 0x02) for one logical block.
     ///
+    /// `queue_index` is the zero-based index into the active I/O queue pairs.
     /// Thin wrapper around [`read_blocks`](Self::read_blocks) with a
     /// single-element page slice.
     pub fn read_block(
         &mut self,
+        queue_index: usize,
         nsid: u32,
         lba: u64,
         data_phys: u64,
     ) -> Result<AdminCommand, NvmeError> {
-        self.read_blocks(nsid, lba, &[data_phys])
+        self.read_blocks(queue_index, nsid, lba, &[data_phys])
     }
 
     /// Build an NVM Write command (opcode 0x01) for one logical block.
     ///
+    /// `queue_index` is the zero-based index into the active I/O queue pairs.
     /// Thin wrapper around [`write_blocks`](Self::write_blocks) with a
     /// single-element page slice.
     pub fn write_block(
         &mut self,
+        queue_index: usize,
         nsid: u32,
         lba: u64,
         data_phys: u64,
     ) -> Result<AdminCommand, NvmeError> {
-        self.write_blocks(nsid, lba, &[data_phys])
+        self.write_blocks(queue_index, nsid, lba, &[data_phys])
     }
 
     /// Build an NVM Flush command (opcode 0x00).
     ///
-    /// Submits via the I/O queue (qid=1).  Flushes all pending writes
-    /// for `nsid` to non-volatile media.  No data transfer.
-    pub fn flush(&mut self, nsid: u32) -> Result<AdminCommand, NvmeError> {
+    /// `queue_index` is the zero-based index into the active I/O queue pairs.
+    /// Flushes all pending writes for `nsid` to non-volatile media.
+    /// No data transfer.
+    pub fn flush(&mut self, queue_index: usize, nsid: u32) -> Result<AdminCommand, NvmeError> {
         if self.state != NvmeState::Ready {
             return Err(NvmeError::InvalidState);
         }
@@ -902,11 +923,8 @@ impl<R: RegisterBank> NvmeDriver<R> {
         sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
         sqe[4..8].copy_from_slice(&nsid.to_le_bytes());
 
-        Ok(self
-            .io
-            .as_mut()
-            .ok_or(NvmeError::InvalidState)?
-            .submit(sqe, self.doorbell_stride))
+        let doorbell_stride = self.doorbell_stride;
+        Ok(self.io_queue_mut(queue_index)?.submit(sqe, doorbell_stride))
     }
 
     /// Build an NVM Write Zeroes command (opcode 0x08).
@@ -916,9 +934,11 @@ impl<R: RegisterBank> NvmeDriver<R> {
     /// DEAC (Deallocate) is always 0 — reads after Write Zeroes return
     /// deterministic zero bytes.
     ///
+    /// `queue_index` is the zero-based index into the active I/O queue pairs.
     /// Requires ONCS bit 3 (Write Zeroes support).
     pub fn write_zeroes(
         &mut self,
+        queue_index: usize,
         nsid: u32,
         lba: u64,
         block_count: u32,
@@ -956,11 +976,8 @@ impl<R: RegisterBank> NvmeDriver<R> {
         // CDW12: NLB (bits 15:0), DEAC=0 (bit 25)
         sqe[48..52].copy_from_slice(&nlb.to_le_bytes());
 
-        let mut cmd = self
-            .io
-            .as_mut()
-            .ok_or(NvmeError::InvalidState)?
-            .submit(sqe, self.doorbell_stride);
+        let doorbell_stride = self.doorbell_stride;
+        let mut cmd = self.io_queue_mut(queue_index)?.submit(sqe, doorbell_stride);
         cmd.prp_list = None;
         cmd.data_buffer = None;
         Ok(cmd)
@@ -976,9 +993,11 @@ impl<R: RegisterBank> NvmeDriver<R> {
     /// 4 KiB-aligned physical address, then patch SQE bytes 24–31 (PRP1) with
     /// that address before submitting.
     ///
+    /// `queue_index` is the zero-based index into the active I/O queue pairs.
     /// Requires ONCS bit 2 (Dataset Management support).  Max 256 ranges.
     pub fn dataset_management(
         &mut self,
+        queue_index: usize,
         nsid: u32,
         ranges: &[DsmRange],
     ) -> Result<AdminCommand, NvmeError> {
@@ -1022,11 +1041,8 @@ impl<R: RegisterBank> NvmeDriver<R> {
         // CDW11: AD bit (bit 2) = Attribute Deallocate
         sqe[44..48].copy_from_slice(&0x04u32.to_le_bytes());
 
-        let mut cmd = self
-            .io
-            .as_mut()
-            .ok_or(NvmeError::InvalidState)?
-            .submit(sqe, self.doorbell_stride);
+        let doorbell_stride = self.doorbell_stride;
+        let mut cmd = self.io_queue_mut(queue_index)?.submit(sqe, doorbell_stride);
         cmd.prp_list = None;
         cmd.data_buffer = Some(buf);
         Ok(cmd)
@@ -1065,20 +1081,21 @@ impl<R: RegisterBank> NvmeDriver<R> {
 
     /// Parse a raw 16-byte I/O completion queue entry.
     ///
-    /// Delegates to the I/O [`QueuePair`]'s completion checking.
+    /// `queue_index` is the zero-based index into the active I/O queue pairs.
+    /// Delegates to the selected I/O [`QueuePair`]'s completion checking.
     /// Requires [`NvmeState::Ready`].
     pub fn check_io_completion(
         &mut self,
+        queue_index: usize,
         cqe_bytes: &[u8; 16],
     ) -> Result<Option<CompletionResult>, NvmeError> {
         if self.state != NvmeState::Ready {
             return Err(NvmeError::InvalidState);
         }
+        let doorbell_stride = self.doorbell_stride;
         Ok(self
-            .io
-            .as_mut()
-            .ok_or(NvmeError::InvalidState)?
-            .check_completion(cqe_bytes, self.doorbell_stride))
+            .io_queue_mut(queue_index)?
+            .check_completion(cqe_bytes, doorbell_stride))
     }
 }
 
