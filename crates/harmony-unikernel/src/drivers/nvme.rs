@@ -9,6 +9,7 @@
 //! performed internally.
 
 use super::register_bank::RegisterBank;
+use alloc::vec::Vec;
 
 // ── NVMe register offsets (all 32-bit aligned) ───────────────────────────────
 // All offsets are pre-declared per the NVMe base spec §3.1 register map.
@@ -52,6 +53,12 @@ pub struct AdminCommand {
     pub doorbell_offset: usize,
     /// Value to write to the SQ tail doorbell.
     pub doorbell_value: u32,
+    /// Optional PRP list bytes for multi-block transfers.
+    ///
+    /// When `Some`, the caller must write these bytes to a 4 KiB-aligned
+    /// physical address, then patch SQE bytes 32–39 (PRP2) with that address
+    /// before submitting the command.
+    pub prp_list: Option<Vec<u8>>,
 }
 
 /// A parsed completion queue entry.
@@ -159,6 +166,7 @@ impl QueuePair {
             sq_offset,
             doorbell_offset,
             doorbell_value,
+            prp_list: None,
         }
     }
 }
@@ -1910,5 +1918,14 @@ mod tests {
         let mut driver = ready_driver();
         driver.set_mdts(32);
         assert_eq!(driver.max_transfer_blocks(), Some(u32::MAX));
+    }
+
+    // ── PRP list tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn read_block_has_no_prp_list() {
+        let mut driver = ready_driver();
+        let cmd = driver.read_block(1, 0, 0x1000).unwrap();
+        assert!(cmd.prp_list.is_none());
     }
 }
