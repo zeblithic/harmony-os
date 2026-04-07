@@ -366,7 +366,7 @@ mod tests {
         // Can read up to 256 events
         let data = s.read(1, 0, 5 * 256).unwrap();
         assert!(data.len() <= 5 * 256);
-        assert!(data.len() > 0);
+        assert!(!data.is_empty());
     }
 
     // ── Write rejected ──────────────────────────────────────────
