@@ -52,7 +52,7 @@ impl From<MassStorageError> for MsError {
 // ── Actions ──────────────────────────────────────────────────────
 
 /// Actions emitted by [`MassStorageBus`] for the caller to perform.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MsAction {
     /// Perform a bulk-OUT transfer of `data` on `endpoint`.
     BulkOut {
@@ -148,6 +148,9 @@ impl MassStorageBus {
     ///
     /// Emits [`MsAction::BulkOut`] with the INQUIRY CBW.
     pub fn start_init(&mut self) -> Result<MsAction, MsError> {
+        if self.state != BusState::Uninitialized {
+            return Err(MsError::InvalidState);
+        }
         let (cbw, _dir, data_len) = self.device.build_inquiry_cbw();
         self.state = BusState::InitInquiry;
         self.phase = TransferPhase::SendingCbw;
@@ -182,20 +185,23 @@ impl MassStorageBus {
     /// If the current command has a data phase, returns
     /// [`MsAction::BulkIn`] for the data. Otherwise, goes directly
     /// to the CSW phase.
-    pub fn handle_bulk_out_complete(&mut self) -> MsAction {
+    pub fn handle_bulk_out_complete(&mut self) -> Result<MsAction, MsError> {
+        if self.phase != TransferPhase::SendingCbw {
+            return Err(MsError::InvalidState);
+        }
         if self.pending_data_len == 0 {
             // No data phase — go straight to CSW.
             self.phase = TransferPhase::ReceivingCsw;
-            MsAction::BulkIn {
+            Ok(MsAction::BulkIn {
                 endpoint: self.device.bulk_in_ep,
                 length: 13,
-            }
+            })
         } else {
             self.phase = TransferPhase::ReceivingData;
-            MsAction::BulkIn {
+            Ok(MsAction::BulkIn {
                 endpoint: self.device.bulk_in_ep,
                 length: self.pending_data_len as u16,
-            }
+            })
         }
     }
 
@@ -203,10 +209,10 @@ impl MassStorageBus {
     ///
     /// Handles both the data phase and the CSW phase, advancing
     /// the state machine and returning the next action.
-    pub fn handle_bulk_in_complete(&mut self, data: Vec<u8>) -> Result<MsAction, MsError> {
+    pub fn handle_bulk_in_complete(&mut self, data: &[u8]) -> Result<MsAction, MsError> {
         match self.phase {
             TransferPhase::ReceivingData => {
-                self.stashed_data = data;
+                self.stashed_data = data.to_vec();
                 self.phase = TransferPhase::ReceivingCsw;
                 Ok(MsAction::BulkIn {
                     endpoint: self.device.bulk_in_ep,
@@ -214,7 +220,7 @@ impl MassStorageBus {
                 })
             }
             TransferPhase::ReceivingCsw => {
-                let csw = parse_csw(&data)?;
+                let csw = parse_csw(data)?;
                 if csw.status != 0 {
                     return Err(MsError::CommandFailed { status: csw.status });
                 }
@@ -339,43 +345,43 @@ mod tests {
         // INQUIRY
         let cbw_action = bus.start_init().unwrap();
         let inquiry_tag = extract_tag(&cbw_action);
-        let bulk_in = bus.handle_bulk_out_complete();
+        let bulk_in = bus.handle_bulk_out_complete().unwrap();
         let MsAction::BulkIn { length: 36, .. } = bulk_in else {
             panic!("expected BulkIn(36)");
         };
         // receive inquiry data
         let csw_req = bus
-            .handle_bulk_in_complete(make_inquiry_response())
+            .handle_bulk_in_complete(&make_inquiry_response())
             .unwrap();
         let MsAction::BulkIn { length: 13, .. } = csw_req else {
             panic!("expected BulkIn(13) for CSW");
         };
         // receive CSW → next CBW (TUR)
-        let tur_cbw = bus.handle_bulk_in_complete(make_csw(inquiry_tag)).unwrap();
+        let tur_cbw = bus.handle_bulk_in_complete(&make_csw(inquiry_tag)).unwrap();
         assert_eq!(extract_opcode(&tur_cbw), 0x00, "TUR opcode");
 
         // TEST UNIT READY (no data phase)
         let tur_tag = extract_tag(&tur_cbw);
-        let csw_req = bus.handle_bulk_out_complete();
+        let csw_req = bus.handle_bulk_out_complete().unwrap();
         let MsAction::BulkIn { length: 13, .. } = csw_req else {
             panic!("expected BulkIn(13) for TUR CSW");
         };
-        let rc_cbw = bus.handle_bulk_in_complete(make_csw(tur_tag)).unwrap();
+        let rc_cbw = bus.handle_bulk_in_complete(&make_csw(tur_tag)).unwrap();
         assert_eq!(extract_opcode(&rc_cbw), 0x25, "READ_CAPACITY opcode");
 
         // READ CAPACITY
         let rc_tag = extract_tag(&rc_cbw);
-        let bulk_in = bus.handle_bulk_out_complete();
+        let bulk_in = bus.handle_bulk_out_complete().unwrap();
         let MsAction::BulkIn { length: 8, .. } = bulk_in else {
             panic!("expected BulkIn(8)");
         };
         let csw_req = bus
-            .handle_bulk_in_complete(make_read_capacity_response())
+            .handle_bulk_in_complete(&make_read_capacity_response())
             .unwrap();
         let MsAction::BulkIn { length: 13, .. } = csw_req else {
             panic!("expected BulkIn(13) for RC CSW");
         };
-        let init_complete = bus.handle_bulk_in_complete(make_csw(rc_tag)).unwrap();
+        let init_complete = bus.handle_bulk_in_complete(&make_csw(rc_tag)).unwrap();
         let MsAction::InitComplete {
             block_size: 512,
             capacity_blocks: 1000,
@@ -407,7 +413,7 @@ mod tests {
         let inquiry_tag = extract_tag(&cbw_action);
 
         // After CBW out, expect BulkIn(36) for inquiry data.
-        let bulk_in = bus.handle_bulk_out_complete();
+        let bulk_in = bus.handle_bulk_out_complete().unwrap();
         let MsAction::BulkIn { endpoint, length } = bulk_in else {
             panic!("expected BulkIn");
         };
@@ -416,14 +422,14 @@ mod tests {
 
         // After inquiry data, expect BulkIn(13) for CSW.
         let csw_req = bus
-            .handle_bulk_in_complete(make_inquiry_response())
+            .handle_bulk_in_complete(&make_inquiry_response())
             .unwrap();
         let MsAction::BulkIn { length: 13, .. } = csw_req else {
             panic!("expected BulkIn(13) for CSW");
         };
 
         // After CSW, expect next CBW — TUR with opcode 0x00.
-        let tur_cbw = bus.handle_bulk_in_complete(make_csw(inquiry_tag)).unwrap();
+        let tur_cbw = bus.handle_bulk_in_complete(&make_csw(inquiry_tag)).unwrap();
         assert_eq!(extract_opcode(&tur_cbw), 0x00, "TUR opcode");
     }
 
@@ -435,20 +441,20 @@ mod tests {
         // Advance through INQUIRY.
         let cbw_action = bus.start_init().unwrap();
         let inquiry_tag = extract_tag(&cbw_action);
-        bus.handle_bulk_out_complete();
-        bus.handle_bulk_in_complete(make_inquiry_response())
+        bus.handle_bulk_out_complete().unwrap();
+        bus.handle_bulk_in_complete(&make_inquiry_response())
             .unwrap();
-        let tur_cbw = bus.handle_bulk_in_complete(make_csw(inquiry_tag)).unwrap();
+        let tur_cbw = bus.handle_bulk_in_complete(&make_csw(inquiry_tag)).unwrap();
         let tur_tag = extract_tag(&tur_cbw);
 
         // TUR has no data phase: handle_bulk_out_complete goes straight to CSW.
-        let csw_req = bus.handle_bulk_out_complete();
+        let csw_req = bus.handle_bulk_out_complete().unwrap();
         let MsAction::BulkIn { length: 13, .. } = csw_req else {
             panic!("expected BulkIn(13) for TUR CSW, no data phase");
         };
 
         // After TUR CSW, expect READ CAPACITY CBW (opcode 0x25).
-        let rc_cbw = bus.handle_bulk_in_complete(make_csw(tur_tag)).unwrap();
+        let rc_cbw = bus.handle_bulk_in_complete(&make_csw(tur_tag)).unwrap();
         assert_eq!(extract_opcode(&rc_cbw), 0x25, "READ_CAPACITY opcode");
     }
 
@@ -460,27 +466,27 @@ mod tests {
         // Drive through INQUIRY and TUR.
         let cbw_action = bus.start_init().unwrap();
         let inquiry_tag = extract_tag(&cbw_action);
-        bus.handle_bulk_out_complete();
-        bus.handle_bulk_in_complete(make_inquiry_response())
+        bus.handle_bulk_out_complete().unwrap();
+        bus.handle_bulk_in_complete(&make_inquiry_response())
             .unwrap();
-        let tur_cbw = bus.handle_bulk_in_complete(make_csw(inquiry_tag)).unwrap();
+        let tur_cbw = bus.handle_bulk_in_complete(&make_csw(inquiry_tag)).unwrap();
         let tur_tag = extract_tag(&tur_cbw);
-        bus.handle_bulk_out_complete();
-        let rc_cbw = bus.handle_bulk_in_complete(make_csw(tur_tag)).unwrap();
+        bus.handle_bulk_out_complete().unwrap();
+        let rc_cbw = bus.handle_bulk_in_complete(&make_csw(tur_tag)).unwrap();
         let rc_tag = extract_tag(&rc_cbw);
 
         // READ CAPACITY: CBW → BulkIn(8) → data → BulkIn(13) → CSW → InitComplete.
-        let data_req = bus.handle_bulk_out_complete();
+        let data_req = bus.handle_bulk_out_complete().unwrap();
         let MsAction::BulkIn { length: 8, .. } = data_req else {
             panic!("expected BulkIn(8)");
         };
         let csw_req = bus
-            .handle_bulk_in_complete(make_read_capacity_response())
+            .handle_bulk_in_complete(&make_read_capacity_response())
             .unwrap();
         let MsAction::BulkIn { length: 13, .. } = csw_req else {
             panic!("expected BulkIn(13)");
         };
-        let action = bus.handle_bulk_in_complete(make_csw(rc_tag)).unwrap();
+        let action = bus.handle_bulk_in_complete(&make_csw(rc_tag)).unwrap();
 
         match action {
             MsAction::InitComplete {
@@ -534,20 +540,20 @@ mod tests {
         let read_tag = extract_tag(&cbw_action);
 
         // After CBW, expect BulkIn(512).
-        let data_req = bus.handle_bulk_out_complete();
+        let data_req = bus.handle_bulk_out_complete().unwrap();
         let MsAction::BulkIn { length: 512, .. } = data_req else {
             panic!("expected BulkIn(512)");
         };
 
         // Provide fake sector data.
         let sector_data: Vec<u8> = (0u8..=255).cycle().take(512).collect();
-        let csw_req = bus.handle_bulk_in_complete(sector_data.clone()).unwrap();
+        let csw_req = bus.handle_bulk_in_complete(&sector_data).unwrap();
         let MsAction::BulkIn { length: 13, .. } = csw_req else {
             panic!("expected BulkIn(13) for CSW");
         };
 
         // Provide CSW → expect ReadComplete.
-        let result = bus.handle_bulk_in_complete(make_csw(read_tag)).unwrap();
+        let result = bus.handle_bulk_in_complete(&make_csw(read_tag)).unwrap();
         match result {
             MsAction::ReadComplete(data) => assert_eq!(data, sector_data),
             _ => panic!("expected ReadComplete, got {result:?}"),
@@ -563,12 +569,12 @@ mod tests {
 
         let cbw_action = bus.start_read(0).unwrap();
         let read_tag = extract_tag(&cbw_action);
-        bus.handle_bulk_out_complete();
+        bus.handle_bulk_out_complete().unwrap();
         let sector_data = vec![0u8; 512];
-        bus.handle_bulk_in_complete(sector_data).unwrap();
+        bus.handle_bulk_in_complete(&sector_data).unwrap();
 
         let err = bus
-            .handle_bulk_in_complete(make_csw_with_status(read_tag, 1))
+            .handle_bulk_in_complete(&make_csw_with_status(read_tag, 1))
             .unwrap_err();
         assert_eq!(err, MsError::CommandFailed { status: 1 });
     }
@@ -581,12 +587,12 @@ mod tests {
         init_bus(&mut bus);
 
         bus.start_read(0).unwrap();
-        bus.handle_bulk_out_complete();
-        bus.handle_bulk_in_complete(vec![0u8; 512]).unwrap();
+        bus.handle_bulk_out_complete().unwrap();
+        bus.handle_bulk_in_complete(&[0u8; 512]).unwrap();
 
         // Garbage CSW.
-        let garbage = vec![0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let err = bus.handle_bulk_in_complete(garbage).unwrap_err();
+        let garbage = [0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let err = bus.handle_bulk_in_complete(&garbage).unwrap_err();
         assert_eq!(err, MsError::InvalidCsw);
     }
 
@@ -600,10 +606,10 @@ mod tests {
         for i in 0u32..2 {
             let cbw_action = bus.start_read(i * 10).unwrap();
             let read_tag = extract_tag(&cbw_action);
-            bus.handle_bulk_out_complete();
+            bus.handle_bulk_out_complete().unwrap();
             let data = vec![i as u8; 512];
-            bus.handle_bulk_in_complete(data.clone()).unwrap();
-            let result = bus.handle_bulk_in_complete(make_csw(read_tag)).unwrap();
+            bus.handle_bulk_in_complete(&data).unwrap();
+            let result = bus.handle_bulk_in_complete(&make_csw(read_tag)).unwrap();
             match result {
                 MsAction::ReadComplete(d) => assert_eq!(d, data),
                 _ => panic!("expected ReadComplete"),
@@ -614,9 +620,9 @@ mod tests {
         let action1 = bus.start_read(0).unwrap();
         let tag1 = extract_tag(&action1);
         // Reset state by driving to completion.
-        bus.handle_bulk_out_complete();
-        bus.handle_bulk_in_complete(vec![0u8; 512]).unwrap();
-        bus.handle_bulk_in_complete(make_csw(tag1)).unwrap();
+        bus.handle_bulk_out_complete().unwrap();
+        bus.handle_bulk_in_complete(&[0u8; 512]).unwrap();
+        bus.handle_bulk_in_complete(&make_csw(tag1)).unwrap();
 
         let action2 = bus.start_read(0).unwrap();
         let tag2 = extract_tag(&action2);
