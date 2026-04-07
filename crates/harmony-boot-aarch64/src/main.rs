@@ -273,20 +273,6 @@ fn main() -> Status {
         harmony_unikernel::SerialWriter::new(|byte| unsafe { pl011::write_byte(byte) });
     let _ = writeln!(serial, "[PL011] Serial initialized: 115200 8N1");
 
-    // ── Parse device tree (if present) ──
-    let hw_config = dtb_ptr.map(|ptr| {
-        let _ = writeln!(serial, "[FDT] Parsing device tree at {:p}", ptr);
-        unsafe { fdt_parse::parse_fdt(ptr) }
-    });
-    if hw_config.is_none() {
-        let _ = writeln!(serial, "[FDT] No device tree found, using platform defaults");
-    } else if hw_config.as_ref().and_then(|c| c.network.as_ref()).is_none() {
-        let _ = writeln!(
-            serial,
-            "[FDT] Device tree found but no GENET MAC, using platform defaults"
-        );
-    }
-
     // ── Collect UEFI memory map into fixed-size array ──
     let mut regions = [MemoryRegion {
         base: 0,
@@ -446,6 +432,21 @@ fn main() -> Status {
         "[Heap] Initialized: {} bytes at {:#x}",
         heap_size, heap_base
     );
+
+    // ── Parse device tree (if present) ──
+    // Must happen after heap init: HardwareConfig uses Vec and String.
+    let hw_config = dtb_ptr.map(|ptr| {
+        let _ = writeln!(serial, "[FDT] Parsing device tree at {:p}", ptr);
+        unsafe { fdt_parse::parse_fdt(ptr) }
+    });
+    if hw_config.is_none() {
+        let _ = writeln!(serial, "[FDT] No device tree found, using platform defaults");
+    } else if hw_config.as_ref().and_then(|c| c.network.as_ref()).is_none() {
+        let _ = writeln!(
+            serial,
+            "[FDT] Device tree found but no GENET MAC, using platform defaults"
+        );
+    }
 
     // ── Generate Ed25519 identity for Reticulum wire compat ──
     //    PQ identity is generated lazily by the runtime — PQ keygen's
