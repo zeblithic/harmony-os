@@ -32,6 +32,8 @@ pub mod hv_server;
 pub mod kernel;
 #[cfg(feature = "kernel")]
 pub mod library_server;
+pub mod mass_storage_block;
+pub mod mass_storage_bus;
 pub mod namespace;
 pub mod nar;
 pub mod net_device;
