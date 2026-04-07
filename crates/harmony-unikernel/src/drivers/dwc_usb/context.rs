@@ -260,18 +260,15 @@ fn interval_to_xhci_exponent(binterval: u8, speed: UsbSpeed, transfer_type: u8) 
         UsbSpeed::FullSpeed | UsbSpeed::LowSpeed | UsbSpeed::Unknown(_) => {
             // bInterval is in milliseconds. Convert to 125us microframes.
             // microframes = bInterval * 8 (1ms = 8 microframes at 125us each)
-            // Find smallest exponent n where 2^n >= microframes
+            // Use floor(log2(microframes)) — poll at least as fast as requested.
+            // Matches Linux kernel xhci_parse_frame_interval: fls(8 * bInterval) - 1.
             if binterval == 0 {
-                return 1; // minimum valid interval
+                return 0;
             }
             let microframes = (binterval as u32) * 8;
-            let mut exponent: u8 = 0;
-            let mut val: u32 = 1;
-            while val < microframes && exponent < 16 {
-                exponent += 1;
-                val <<= 1;
-            }
-            exponent.clamp(1, 16)
+            // floor(log2(n)) = position of highest set bit = 31 - leading_zeros
+            let exponent = 31u8.saturating_sub(microframes.leading_zeros() as u8);
+            exponent.clamp(0, 15)
         }
     }
 }
@@ -708,8 +705,9 @@ mod tests {
 
     #[test]
     fn interval_to_xhci_exponent_fs_interrupt_conversion() {
-        // FS bInterval=10 (10ms) → 80 microframes → exponent 7 (2^7=128 >= 80)
-        assert_eq!(interval_to_xhci_exponent(10, UsbSpeed::FullSpeed, 3), 7);
+        // FS bInterval=10 (10ms) → 80 microframes → floor(log2(80)) = 6
+        // Polls at 2^6=64 microframes (8ms) — faster than requested, always safe
+        assert_eq!(interval_to_xhci_exponent(10, UsbSpeed::FullSpeed, 3), 6);
     }
 
     #[test]
