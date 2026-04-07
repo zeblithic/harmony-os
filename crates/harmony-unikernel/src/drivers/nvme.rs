@@ -608,6 +608,73 @@ impl<R: RegisterBank> NvmeDriver<R> {
     }
 }
 
+// ── Get/Set Features commands ────────────────────────────────────────────────
+
+impl<R: RegisterBank> NvmeDriver<R> {
+    /// Build a Get Features admin command (opcode 0x0A).
+    ///
+    /// `fid` is the Feature Identifier (byte, bits 7:0 of CDW10).
+    /// `cdw11` is the feature-specific dword passed through to CDW11.
+    /// SEL is always 0 (current value).
+    ///
+    /// The controller's response is returned in `Completion.result` (DW0).
+    /// No data transfer — PRP1 and PRP2 are zero.
+    pub fn get_features(&mut self, fid: u8, cdw11: u32) -> Result<AdminCommand, NvmeError> {
+        if self.state != NvmeState::Enabled && self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+
+        let cid = self.next_cid;
+        self.next_cid = self.next_cid.wrapping_add(1);
+
+        let mut sqe = [0u8; 64];
+
+        // CDW0: opcode=0x0A | (CID << 16)
+        let cdw0: u32 = 0x0A | ((cid as u32) << 16);
+        sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
+
+        // CDW10: FID in bits 7:0, SEL=0 in bits 10:8
+        let cdw10: u32 = fid as u32;
+        sqe[40..44].copy_from_slice(&cdw10.to_le_bytes());
+
+        // CDW11: feature-specific
+        sqe[44..48].copy_from_slice(&cdw11.to_le_bytes());
+
+        Ok(self.admin.submit(sqe, self.doorbell_stride))
+    }
+
+    /// Build a Set Features admin command (opcode 0x09).
+    ///
+    /// `fid` is the Feature Identifier (byte, bits 7:0 of CDW10).
+    /// `cdw11` is the feature-specific dword passed through to CDW11.
+    ///
+    /// The controller's response is returned in `Completion.result` (DW0).
+    /// No data transfer — PRP1 and PRP2 are zero.
+    pub fn set_features(&mut self, fid: u8, cdw11: u32) -> Result<AdminCommand, NvmeError> {
+        if self.state != NvmeState::Enabled && self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+
+        let cid = self.next_cid;
+        self.next_cid = self.next_cid.wrapping_add(1);
+
+        let mut sqe = [0u8; 64];
+
+        // CDW0: opcode=0x09 | (CID << 16)
+        let cdw0: u32 = 0x09 | ((cid as u32) << 16);
+        sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
+
+        // CDW10: FID in bits 7:0
+        let cdw10: u32 = fid as u32;
+        sqe[40..44].copy_from_slice(&cdw10.to_le_bytes());
+
+        // CDW11: feature-specific
+        sqe[44..48].copy_from_slice(&cdw11.to_le_bytes());
+
+        Ok(self.admin.submit(sqe, self.doorbell_stride))
+    }
+}
+
 // ── I/O queue creation ───────────────────────────────────────────────────────
 
 impl<R: RegisterBank> NvmeDriver<R> {
@@ -3120,5 +3187,112 @@ mod tests {
             .unwrap();
         driver.activate_io_queue_pair(2).unwrap();
         assert_eq!(driver.state(), NvmeState::Ready);
+    }
+
+    // ── Get/Set Features tests ──────────────────────────────────────────────
+
+    #[test]
+    fn get_features_builds_correct_sqe() {
+        let mut driver = enabled_driver();
+        let cmd = driver.get_features(0x07, 0x0003_0003).unwrap();
+
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x0A, "opcode must be 0x0A (Get Features)");
+        assert_eq!((cdw0 >> 16) as u16, 0, "CID must be 0 for first command");
+
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10 & 0xFF, 0x07, "FID must be 0x07");
+        assert_eq!((cdw10 >> 8) & 0x07, 0, "SEL must be 0 (current value)");
+
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11, 0x0003_0003, "CDW11 must be passed through");
+
+        let prp1 = u64::from_le_bytes(cmd.sqe[24..32].try_into().unwrap());
+        let prp2 = u64::from_le_bytes(cmd.sqe[32..40].try_into().unwrap());
+        assert_eq!(prp1, 0, "PRP1 must be 0");
+        assert_eq!(prp2, 0, "PRP2 must be 0");
+
+        assert!(cmd.prp_list.is_none(), "no PRP list");
+        assert!(cmd.data_buffer.is_none(), "no data buffer");
+    }
+
+    #[test]
+    fn get_features_cdw11_passthrough() {
+        let mut driver = enabled_driver();
+        let cmd = driver.get_features(0x04, 0xCAFE_BABE).unwrap();
+
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11, 0xCAFE_BABE, "CDW11 must be passed through exactly");
+
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10 & 0xFF, 0x04, "FID must be 0x04");
+    }
+
+    #[test]
+    fn get_features_rejects_wrong_state() {
+        let bank = mock_nvme_bank();
+        let mut driver = NvmeDriver::init(bank).unwrap();
+        match driver.get_features(0x07, 0) {
+            Err(NvmeError::InvalidState) => {}
+            other => panic!("expected InvalidState, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn get_features_increments_cid() {
+        let mut driver = enabled_driver();
+        let cmd0 = driver.get_features(0x07, 0).unwrap();
+        let cid0 = (u32::from_le_bytes(cmd0.sqe[0..4].try_into().unwrap()) >> 16) as u16;
+
+        let cmd1 = driver.get_features(0x07, 0).unwrap();
+        let cid1 = (u32::from_le_bytes(cmd1.sqe[0..4].try_into().unwrap()) >> 16) as u16;
+
+        assert_eq!(cid1, cid0 + 1, "CID must increment");
+    }
+
+    #[test]
+    fn set_features_builds_correct_sqe() {
+        let mut driver = enabled_driver();
+        let cmd = driver.set_features(0x07, 0x0003_0003).unwrap();
+
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x09, "opcode must be 0x09 (Set Features)");
+        assert_eq!((cdw0 >> 16) as u16, 0, "CID must be 0 for first command");
+
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10 & 0xFF, 0x07, "FID must be 0x07");
+
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11, 0x0003_0003, "CDW11 must be passed through");
+
+        let prp1 = u64::from_le_bytes(cmd.sqe[24..32].try_into().unwrap());
+        let prp2 = u64::from_le_bytes(cmd.sqe[32..40].try_into().unwrap());
+        assert_eq!(prp1, 0, "PRP1 must be 0");
+        assert_eq!(prp2, 0, "PRP2 must be 0");
+
+        assert!(cmd.prp_list.is_none(), "no PRP list");
+        assert!(cmd.data_buffer.is_none(), "no data buffer");
+    }
+
+    #[test]
+    fn set_features_rejects_wrong_state() {
+        let bank = mock_nvme_bank();
+        let mut driver = NvmeDriver::init(bank).unwrap();
+        match driver.set_features(0x07, 0) {
+            Err(NvmeError::InvalidState) => {}
+            other => panic!("expected InvalidState, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn set_features_increments_cid() {
+        let mut driver = enabled_driver();
+        let cmd0 = driver.set_features(0x07, 0).unwrap();
+        let cid0 = (u32::from_le_bytes(cmd0.sqe[0..4].try_into().unwrap()) >> 16) as u16;
+
+        let cmd1 = driver.set_features(0x07, 0).unwrap();
+        let cid1 = (u32::from_le_bytes(cmd1.sqe[0..4].try_into().unwrap()) >> 16) as u16;
+
+        assert_eq!(cid1, cid0 + 1, "CID must increment");
     }
 }
