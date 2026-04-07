@@ -701,6 +701,13 @@ impl<R: RegisterBank> NvmeDriver<R> {
         if self.state != NvmeState::Enabled && self.state != NvmeState::Ready {
             return Err(NvmeError::InvalidState);
         }
+        // Reject duplicate qid — two QueuePairs with the same qid would share
+        // hardware doorbell offsets but track independent software state.
+        if self.io_queues.iter().any(|q| q.qid == qid)
+            || self.pending_io.iter().any(|&(q, _, _, _)| q == qid)
+        {
+            return Err(NvmeError::InvalidState);
+        }
         let size = size.min(self.max_queue_entries);
         let cq_cmd = self.create_io_cq(qid, cq_phys, size)?;
         let sq_cmd = self.create_io_sq(qid, sq_phys, size)?;
@@ -3035,6 +3042,34 @@ mod tests {
         assert_eq!(
             driver
                 .create_io_queue_pair(0, 0x1000, 0x2000, 16)
+                .unwrap_err(),
+            NvmeError::InvalidState
+        );
+    }
+
+    #[test]
+    fn duplicate_qid_active_rejected() {
+        let mut driver = ready_driver(); // has qid=1
+                                         // Attempting to create qid=1 again should fail — already active
+        assert_eq!(
+            driver
+                .create_io_queue_pair(1, 0x5_0000, 0x6_0000, 32)
+                .unwrap_err(),
+            NvmeError::InvalidState
+        );
+    }
+
+    #[test]
+    fn duplicate_qid_pending_rejected() {
+        let mut driver = enabled_driver();
+        // Create qid=1 but don't activate yet
+        let _ = driver
+            .create_io_queue_pair(1, 0x3_0000, 0x4_0000, 32)
+            .unwrap();
+        // Attempting to create qid=1 again should fail — already pending
+        assert_eq!(
+            driver
+                .create_io_queue_pair(1, 0x5_0000, 0x6_0000, 32)
                 .unwrap_err(),
             NvmeError::InvalidState
         );
