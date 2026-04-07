@@ -1907,6 +1907,20 @@ mod tests {
         driver
     }
 
+    fn ready_driver_multi(n: usize) -> NvmeDriver<MockRegisterBank> {
+        let mut driver = enabled_driver();
+        for i in 1..=n {
+            let qid = i as u16;
+            let sq_phys = 0x10_0000 + (i as u64) * 0x1_0000;
+            let cq_phys = 0x20_0000 + (i as u64) * 0x1_0000;
+            let _ = driver
+                .create_io_queue_pair(qid, sq_phys, cq_phys, 32)
+                .unwrap();
+            driver.activate_io_queue_pair(qid).unwrap();
+        }
+        driver
+    }
+
     // ── Read command tests ────────────────────────────────────────────────────
 
     #[test]
@@ -2887,5 +2901,189 @@ mod tests {
         assert_eq!(buf[13], 0x03);
         assert_eq!(buf[14], 0x02);
         assert_eq!(buf[15], 0x01);
+    }
+
+    // ── Multi-queue tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn create_second_queue_pair_in_ready_state() {
+        let mut driver = ready_driver();
+        let cmds = driver
+            .create_io_queue_pair(2, 0x5_0000, 0x6_0000, 32)
+            .unwrap();
+
+        // CDW10 of CQ command: QID in lower 16 bits should be 2
+        let cdw10_cq = u32::from_le_bytes(cmds[0].sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10_cq & 0xFFFF, 2, "CQ CDW10 QID must be 2");
+
+        // CDW10 of SQ command: QID in lower 16 bits should be 2
+        let cdw10_sq = u32::from_le_bytes(cmds[1].sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10_sq & 0xFFFF, 2, "SQ CDW10 QID must be 2");
+
+        // CDW11 of SQ command: CQID in bits 31:16 should be 2
+        let cdw11_sq = u32::from_le_bytes(cmds[1].sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11_sq >> 16, 2, "SQ CDW11 CQID must be 2");
+    }
+
+    #[test]
+    fn activate_second_queue_pair() {
+        let mut driver = ready_driver();
+        let _ = driver
+            .create_io_queue_pair(2, 0x5_0000, 0x6_0000, 32)
+            .unwrap();
+        driver.activate_io_queue_pair(2).unwrap();
+
+        assert_eq!(driver.io_queue_count(), 2);
+        assert_eq!(driver.state(), NvmeState::Ready);
+    }
+
+    #[test]
+    fn three_queue_pairs() {
+        let driver = ready_driver_multi(3);
+        assert_eq!(driver.io_queue_count(), 3);
+        assert_eq!(driver.state(), NvmeState::Ready);
+    }
+
+    #[test]
+    fn queue_pair_ordering() {
+        let driver = ready_driver_multi(3);
+        assert_eq!(driver.io_queues[0].qid, 1);
+        assert_eq!(driver.io_queues[1].qid, 2);
+        assert_eq!(driver.io_queues[2].qid, 3);
+    }
+
+    #[test]
+    fn doorbell_offsets_per_qid() {
+        let mut driver = ready_driver_multi(3);
+
+        // queue_index=0 → qid=1 → SQ doorbell = 0x1000 + (2*1)*4 = 0x1008
+        let cmd0 = driver.read_block(0, 1, 0, 0x1000).unwrap();
+        assert_eq!(cmd0.doorbell_offset, 0x1008);
+
+        // queue_index=1 → qid=2 → SQ doorbell = 0x1000 + (2*2)*4 = 0x1010
+        let cmd1 = driver.read_block(1, 1, 0, 0x1000).unwrap();
+        assert_eq!(cmd1.doorbell_offset, 0x1010);
+
+        // queue_index=2 → qid=3 → SQ doorbell = 0x1000 + (2*3)*4 = 0x1018
+        let cmd2 = driver.read_block(2, 1, 0, 0x1000).unwrap();
+        assert_eq!(cmd2.doorbell_offset, 0x1018);
+    }
+
+    #[test]
+    fn io_commands_target_correct_queue() {
+        let mut driver = ready_driver_multi(2);
+
+        let cmd0 = driver.read_block(0, 1, 0, 0x1000).unwrap();
+        let cmd1 = driver.read_block(1, 1, 0, 0x1000).unwrap();
+
+        // qid=1 → 0x1008, qid=2 → 0x1010
+        assert_eq!(cmd0.doorbell_offset, 0x1008);
+        assert_eq!(cmd1.doorbell_offset, 0x1010);
+        assert_ne!(cmd0.doorbell_offset, cmd1.doorbell_offset);
+    }
+
+    #[test]
+    fn cid_shared_across_queues() {
+        let mut driver = ready_driver_multi(2);
+
+        let cmd0 = driver.read_block(0, 1, 0, 0x1000).unwrap();
+        let cmd1 = driver.read_block(1, 1, 0, 0x1000).unwrap();
+
+        // CID is in bytes 2-3 of the SQE (upper 16 bits of CDW0)
+        let cid1 = u16::from_le_bytes(cmd0.sqe[2..4].try_into().unwrap());
+        let cid2 = u16::from_le_bytes(cmd1.sqe[2..4].try_into().unwrap());
+        assert_eq!(cid2, cid1 + 1);
+    }
+
+    #[test]
+    fn invalid_queue_index_rejected() {
+        let mut driver = ready_driver_multi(2);
+        assert_eq!(
+            driver.read_block(5, 1, 0, 0x1000).unwrap_err(),
+            NvmeError::InvalidQueueIndex
+        );
+    }
+
+    #[test]
+    fn completion_on_independent_queues() {
+        let mut driver = ready_driver_multi(2);
+
+        // Build CQEs with phase bit = 1 (byte 14 bit 0 = 1)
+        let mut cqe0 = [0u8; 16];
+        cqe0[14] = 0x01;
+        let mut cqe1 = [0u8; 16];
+        cqe1[14] = 0x01;
+
+        // queue_index=0 → qid=1 → CQ doorbell = 0x1000 + (2*1+1)*4 = 0x100C
+        let cr0 = driver
+            .check_io_completion(0, &cqe0)
+            .unwrap()
+            .expect("phase matches");
+        assert_eq!(cr0.cq_doorbell_offset, 0x100C);
+
+        // queue_index=1 → qid=2 → CQ doorbell = 0x1000 + (2*2+1)*4 = 0x1014
+        let cr1 = driver
+            .check_io_completion(1, &cqe1)
+            .unwrap()
+            .expect("phase matches");
+        assert_eq!(cr1.cq_doorbell_offset, 0x1014);
+    }
+
+    #[test]
+    fn qid_zero_rejected() {
+        let mut driver = enabled_driver();
+        assert_eq!(
+            driver
+                .create_io_queue_pair(0, 0x1000, 0x2000, 16)
+                .unwrap_err(),
+            NvmeError::InvalidState
+        );
+    }
+
+    #[test]
+    fn activate_without_create_rejected() {
+        let mut driver = enabled_driver();
+        assert_eq!(
+            driver.activate_io_queue_pair(2).unwrap_err(),
+            NvmeError::InvalidState
+        );
+    }
+
+    #[test]
+    fn io_queue_count_tracks_activations() {
+        let mut driver = enabled_driver();
+        assert_eq!(driver.io_queue_count(), 0);
+
+        let _ = driver
+            .create_io_queue_pair(1, 0x3_0000, 0x4_0000, 32)
+            .unwrap();
+        // Count is still 0 before activation
+        assert_eq!(driver.io_queue_count(), 0);
+        driver.activate_io_queue_pair(1).unwrap();
+        assert_eq!(driver.io_queue_count(), 1);
+
+        let _ = driver
+            .create_io_queue_pair(2, 0x5_0000, 0x6_0000, 32)
+            .unwrap();
+        driver.activate_io_queue_pair(2).unwrap();
+        assert_eq!(driver.io_queue_count(), 2);
+    }
+
+    #[test]
+    fn first_activation_transitions_enabled_to_ready() {
+        let mut driver = enabled_driver();
+        assert_eq!(driver.state(), NvmeState::Enabled);
+
+        let _ = driver
+            .create_io_queue_pair(1, 0x3_0000, 0x4_0000, 32)
+            .unwrap();
+        driver.activate_io_queue_pair(1).unwrap();
+        assert_eq!(driver.state(), NvmeState::Ready);
+
+        let _ = driver
+            .create_io_queue_pair(2, 0x5_0000, 0x6_0000, 32)
+            .unwrap();
+        driver.activate_io_queue_pair(2).unwrap();
+        assert_eq!(driver.state(), NvmeState::Ready);
     }
 }
