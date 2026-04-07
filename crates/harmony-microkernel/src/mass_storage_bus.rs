@@ -200,7 +200,7 @@ impl MassStorageBus {
             self.phase = TransferPhase::ReceivingData;
             Ok(MsAction::BulkIn {
                 endpoint: self.device.bulk_in_ep,
-                length: self.pending_data_len as u16,
+                length: u16::try_from(self.pending_data_len).map_err(|_| MsError::InvalidState)?,
             })
         }
     }

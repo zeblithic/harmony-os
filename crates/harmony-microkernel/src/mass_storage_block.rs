@@ -116,8 +116,10 @@ impl<T: BulkTransport> MassStorageBlockDevice<T> {
                     self.bus.handle_bulk_in_complete(&recv).map_err(ms_to_ipc)?
                 }
                 MsAction::ReadComplete(data) => {
-                    let copy_len = data.len().min(512);
-                    buf[..copy_len].copy_from_slice(&data[..copy_len]);
+                    if data.len() != 512 {
+                        return Err(IpcError::InvalidArgument);
+                    }
+                    buf.copy_from_slice(&data);
                     return Ok(());
                 }
                 MsAction::InitComplete { .. } => {
