@@ -375,12 +375,37 @@ pub fn build_configure_endpoint_input_context(
 
         // DWord 4: Average TRB Length
         let avg_trb = match transfer_type {
-            2 => 512u32,  // Bulk
-            3 => 1024,    // Interrupt
-            _ => 8,       // Control and others
+            2 => 512u32, // Bulk
+            3 => 1024,   // Interrupt
+            _ => 8,      // Control and others
         };
         ctx[ep_offset + 16..ep_offset + 20].copy_from_slice(&avg_trb.to_le_bytes());
     }
+
+    ctx
+}
+
+/// Build a 96-byte Input Context for Evaluate Context (EP0 MPS update).
+///
+/// Layout: Input Control Context (32B) + Slot Context (32B) + EP0 Context (32B).
+///
+/// Per xHCI §4.6.7, only Max Packet Size is evaluatable for EP0.
+/// The Slot Context is zeroed (not evaluated). Add flags = 0x02 (EP0 only).
+pub fn build_evaluate_context_ep0(max_packet_size: u16) -> [u8; 96] {
+    let mut ctx = [0u8; 96];
+
+    // Input Control Context DWord 1 (offset 4): Add Context Flags = 0x02 (EP0 only)
+    // Bit 0 (Slot) is NOT set — Evaluate Context for EP0 MPS doesn't need slot updates.
+    ctx[4..8].copy_from_slice(&0x02u32.to_le_bytes());
+
+    // Slot Context (bytes 32..63): zeroed — not evaluated.
+
+    // EP0 Context (bytes 64..95):
+    // DWord 1: EP Type=4 (Control Bidir, bits 5:3), Max Packet Size (bits 31:16)
+    let ep_type: u32 = 4 << 3;
+    let mps: u32 = (max_packet_size as u32) << 16;
+    let ep_dw1 = ep_type | mps;
+    ctx[68..72].copy_from_slice(&ep_dw1.to_le_bytes());
 
     ctx
 }
@@ -640,7 +665,8 @@ mod tests {
         slot_ctx[0..4].copy_from_slice(&slot_dw0_orig.to_le_bytes());
         slot_ctx[4..8].copy_from_slice(&(1u32 << 16).to_le_bytes());
 
-        let ctx = build_configure_endpoint_input_context(&slot_ctx, &eps, &rings, UsbSpeed::HighSpeed);
+        let ctx =
+            build_configure_endpoint_input_context(&slot_ctx, &eps, &rings, UsbSpeed::HighSpeed);
 
         // Add flags: bit 0 (Slot) + bit 4 (EP2 OUT) + bit 5 (EP2 IN)
         let flags = u32::from_le_bytes(ctx[4..8].try_into().unwrap());
@@ -720,12 +746,35 @@ mod tests {
         slot_ctx[0..4].copy_from_slice(&slot_dw0.to_le_bytes());
         slot_ctx[4..8].copy_from_slice(&(1u32 << 16).to_le_bytes());
 
-        let ctx = build_configure_endpoint_input_context(&slot_ctx, &eps, &rings, UsbSpeed::HighSpeed);
+        let ctx =
+            build_configure_endpoint_input_context(&slot_ctx, &eps, &rings, UsbSpeed::HighSpeed);
 
         // EP3 (Interrupt IN at DCI 3) context starts at byte offset 32 * (1 + 3) = 128
         let ep_offset = 32 * (1 + 3);
         // DWord 4 (offset 16 within EP context): Average TRB Length
         let avg_trb = u32::from_le_bytes(ctx[ep_offset + 16..ep_offset + 20].try_into().unwrap());
-        assert_eq!(avg_trb, 1024, "interrupt endpoint should have avg TRB length 1024");
+        assert_eq!(
+            avg_trb, 1024,
+            "interrupt endpoint should have avg TRB length 1024"
+        );
+    }
+
+    #[test]
+    fn evaluate_context_ep0_layout() {
+        let ctx = build_evaluate_context_ep0(64);
+
+        // Input Control Context DWord 1 (bytes 4..8): Add flags = 0x02 (EP0 only)
+        let flags = u32::from_le_bytes(ctx[4..8].try_into().unwrap());
+        assert_eq!(flags, 0x02, "Add flags: bit 1 (EP0) only, not bit 0 (Slot)");
+
+        // Slot Context (bytes 32..63): should be all zeros (not evaluated)
+        assert_eq!(&ctx[32..64], &[0u8; 32], "Slot Context should be zeroed");
+
+        // EP0 Context DWord 1 (bytes 68..72): EP Type=4 (Control Bidir), MPS=64
+        let ep_dw1 = u32::from_le_bytes(ctx[68..72].try_into().unwrap());
+        let ep_type = (ep_dw1 >> 3) & 0x7;
+        assert_eq!(ep_type, 4, "EP Type should be 4 (Control Bidir)");
+        let mps = (ep_dw1 >> 16) & 0xFFFF;
+        assert_eq!(mps, 64, "Max Packet Size should be 64");
     }
 }

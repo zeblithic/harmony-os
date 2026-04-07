@@ -21,6 +21,8 @@ pub const TRB_ENABLE_SLOT: u8 = 9;
 pub const TRB_ADDRESS_DEVICE: u8 = 11;
 /// Configure Endpoint Command TRB — sets up non-zero endpoints.
 pub const TRB_CONFIGURE_ENDPOINT: u8 = 12;
+/// Evaluate Context Command TRB — updates endpoint parameters without reconfigure.
+pub const TRB_EVALUATE_CONTEXT: u8 = 13;
 
 // ── Transfer TRB types ───────────────────────────────────────────
 
