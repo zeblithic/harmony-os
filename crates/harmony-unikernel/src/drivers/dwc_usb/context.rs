@@ -238,6 +238,41 @@ pub fn set_configuration_setup_packet(config_value: u8) -> [u8; 8] {
     pkt
 }
 
+/// Convert USB bInterval to xHCI endpoint context Interval field.
+///
+/// xHCI §6.2.3.6: Interval = exponent where polling period = 2^Interval * 125us.
+/// - Bulk/Control: always 0 (interval not used)
+/// - HS/SS/SSP interrupt/isoch: bInterval is already an exponent, clamp to 1..=16
+/// - FS/LS interrupt: bInterval is milliseconds, convert to 125us microframes
+fn interval_to_xhci_exponent(binterval: u8, speed: UsbSpeed, transfer_type: u8) -> u8 {
+    // Bulk (2) and Control (0): interval not used
+    if transfer_type != 1 && transfer_type != 3 {
+        return 0;
+    }
+
+    match speed {
+        UsbSpeed::HighSpeed | UsbSpeed::SuperSpeed | UsbSpeed::SuperSpeedPlus => {
+            // USB bInterval is 1-based: period = 2^(bInterval-1) × 125us.
+            // xHCI Interval is 0-based: period = 2^Interval × 125us.
+            // Therefore: Interval = bInterval - 1 (matches Linux xhci_parse_exponent_interval).
+            binterval.saturating_sub(1).clamp(0, 15)
+        }
+        UsbSpeed::FullSpeed | UsbSpeed::LowSpeed | UsbSpeed::Unknown(_) => {
+            // bInterval is in milliseconds. Convert to 125us microframes.
+            // microframes = bInterval * 8 (1ms = 8 microframes at 125us each)
+            // Use floor(log2(microframes)) — poll at least as fast as requested.
+            // Matches Linux kernel xhci_parse_frame_interval: fls(8 * bInterval) - 1.
+            if binterval == 0 {
+                return 0;
+            }
+            let microframes = (binterval as u32) * 8;
+            // floor(log2(n)) = position of highest set bit = 31 - leading_zeros
+            let exponent = 31u8.saturating_sub(microframes.leading_zeros() as u8);
+            exponent.clamp(0, 15)
+        }
+    }
+}
+
 /// Build Input Context for Configure Endpoint command.
 ///
 /// Layout: Input Control Context (32B) + Slot Context (32B) + EP Contexts (32B each).
@@ -250,6 +285,7 @@ pub fn build_configure_endpoint_input_context(
     slot_context: &[u8],
     endpoints: &[EndpointDescriptor],
     xfer_ring_phys: &[(u8, u64)], // (endpoint_id, ring_phys)
+    speed: UsbSpeed,
 ) -> alloc::vec::Vec<u8> {
     // Find max DCI to size the context
     let max_dci = endpoints
@@ -316,14 +352,10 @@ pub fn build_configure_endpoint_input_context(
             _ => 2,          // fallback to Bulk OUT
         };
 
-        // DWord 0: Interval (bits 23:16) — only relevant for interrupt/isoch.
-        // For bulk, Interval must be 0 (already zeroed). For interrupt/isoch,
-        // write the USB descriptor's bInterval directly. Note: xHCI §6.2.3.1
-        // defines speed-specific exponent encoding; this direct assignment is
-        // correct for FS/LS linear encoding but may need conversion for HS/SS.
-        // Full conversion deferred to Phase 3b (harmony-os-ho8).
-        if transfer_type == 1 || transfer_type == 3 {
-            let interval_dw0: u32 = (ep.interval as u32) << 16;
+        // DWord 0: Interval (bits 23:16) — speed-correct exponent encoding.
+        let interval = interval_to_xhci_exponent(ep.interval, speed, transfer_type);
+        if interval > 0 {
+            let interval_dw0: u32 = (interval as u32) << 16;
             ctx[ep_offset..ep_offset + 4].copy_from_slice(&interval_dw0.to_le_bytes());
         }
 
@@ -340,10 +372,42 @@ pub fn build_configure_endpoint_input_context(
         ctx[ep_offset + 8..ep_offset + 12].copy_from_slice(&(tr_ptr as u32).to_le_bytes());
         ctx[ep_offset + 12..ep_offset + 16].copy_from_slice(&((tr_ptr >> 32) as u32).to_le_bytes());
 
-        // DWord 4: Average TRB Length (512 for bulk, 8 for control)
-        let avg_trb = if transfer_type == 2 { 512u32 } else { 8u32 };
+        // DWord 4: Average TRB Length
+        let avg_trb = match transfer_type {
+            2 => 512u32, // Bulk
+            3 => 1024,   // Interrupt
+            _ => 8,      // Control and others
+        };
         ctx[ep_offset + 16..ep_offset + 20].copy_from_slice(&avg_trb.to_le_bytes());
     }
+
+    ctx
+}
+
+/// Build a 96-byte Input Context for Evaluate Context (EP0 MPS update).
+///
+/// Layout: Input Control Context (32B) + Slot Context (32B) + EP0 Context (32B).
+///
+/// Per xHCI §4.6.7, only Max Packet Size is evaluatable for EP0.
+/// The Slot Context is zeroed (not evaluated). Add flags = 0x02 (EP0 only).
+pub fn build_evaluate_context_ep0(max_packet_size: u16) -> [u8; 96] {
+    let mut ctx = [0u8; 96];
+
+    // Input Control Context DWord 1 (offset 4): Add Context Flags = 0x02 (EP0 only)
+    // Bit 0 (Slot) is NOT set — Evaluate Context for EP0 MPS doesn't need slot updates.
+    ctx[4..8].copy_from_slice(&0x02u32.to_le_bytes());
+
+    // Slot Context (bytes 32..63): zeroed — not evaluated.
+
+    // EP0 Context (bytes 64..95):
+    // DWord 1: CErr=3 (bits 2:1), EP Type=4 (Control Bidir, bits 5:3), Max Packet Size (bits 31:16)
+    // CErr=3 included defensively — xHCI §4.6.7 says only MPS is evaluatable for EP0,
+    // but some controllers may copy the entire EP context from the input.
+    let cerr: u32 = 3 << 1;
+    let ep_type: u32 = 4 << 3;
+    let mps: u32 = (max_packet_size as u32) << 16;
+    let ep_dw1 = cerr | ep_type | mps;
+    ctx[68..72].copy_from_slice(&ep_dw1.to_le_bytes());
 
     ctx
 }
@@ -603,7 +667,8 @@ mod tests {
         slot_ctx[0..4].copy_from_slice(&slot_dw0_orig.to_le_bytes());
         slot_ctx[4..8].copy_from_slice(&(1u32 << 16).to_le_bytes());
 
-        let ctx = build_configure_endpoint_input_context(&slot_ctx, &eps, &rings);
+        let ctx =
+            build_configure_endpoint_input_context(&slot_ctx, &eps, &rings, UsbSpeed::HighSpeed);
 
         // Add flags: bit 0 (Slot) + bit 4 (EP2 OUT) + bit 5 (EP2 IN)
         let flags = u32::from_le_bytes(ctx[4..8].try_into().unwrap());
@@ -629,5 +694,98 @@ mod tests {
             1,
             "Port should be preserved from original"
         );
+    }
+
+    #[test]
+    fn interval_to_xhci_exponent_hs_interrupt() {
+        // HS interrupt: bInterval is 1-based, xHCI Interval is 0-based
+        // bInterval=4 → period = 2^(4-1) × 125us = 1ms → Interval=3
+        assert_eq!(interval_to_xhci_exponent(4, UsbSpeed::HighSpeed, 3), 3);
+    }
+
+    #[test]
+    fn interval_to_xhci_exponent_fs_interrupt_conversion() {
+        // FS bInterval=10 (10ms) → 80 microframes → floor(log2(80)) = 6
+        // Polls at 2^6=64 microframes (8ms) — faster than requested, always safe
+        assert_eq!(interval_to_xhci_exponent(10, UsbSpeed::FullSpeed, 3), 6);
+    }
+
+    #[test]
+    fn interval_to_xhci_exponent_ls_interrupt_conversion() {
+        // LS bInterval=8 (8ms) → 64 microframes → exponent 6 (2^6=64 >= 64)
+        assert_eq!(interval_to_xhci_exponent(8, UsbSpeed::LowSpeed, 3), 6);
+    }
+
+    #[test]
+    fn interval_to_xhci_exponent_ss_interrupt() {
+        // SS interrupt: bInterval is 1-based, xHCI Interval is 0-based
+        // bInterval=3 → period = 2^(3-1) × 125us = 0.5ms → Interval=2
+        assert_eq!(interval_to_xhci_exponent(3, UsbSpeed::SuperSpeed, 3), 2);
+    }
+
+    #[test]
+    fn interval_to_xhci_exponent_hs_minimum() {
+        // HS bInterval=1 → Interval = 1-1 = 0 → clamped to 0 (minimum valid)
+        assert_eq!(interval_to_xhci_exponent(1, UsbSpeed::HighSpeed, 3), 0);
+    }
+
+    #[test]
+    fn interval_to_xhci_exponent_bulk_stays_zero() {
+        // Bulk endpoints always get interval=0 regardless of speed
+        assert_eq!(interval_to_xhci_exponent(0, UsbSpeed::HighSpeed, 2), 0);
+        assert_eq!(interval_to_xhci_exponent(5, UsbSpeed::FullSpeed, 2), 0);
+    }
+
+    #[test]
+    fn interval_to_xhci_exponent_fs_minimum() {
+        // FS bInterval=1 (1ms) → 8 microframes → exponent 3 (2^3=8 >= 8)
+        assert_eq!(interval_to_xhci_exponent(1, UsbSpeed::FullSpeed, 3), 3);
+    }
+
+    #[test]
+    fn interrupt_endpoint_avg_trb_length() {
+        // Interrupt endpoint (attributes=0x03) should get avg TRB length 1024
+        let eps = alloc::vec![EndpointDescriptor {
+            endpoint_address: 0x81,
+            attributes: 0x03,
+            max_packet_size: 64,
+            interval: 4,
+        }];
+        let rings = alloc::vec![(3u8, 0xA000_0000u64)];
+        let mut slot_ctx = [0u8; 32];
+        let slot_dw0: u32 = (1 << 27) | (3 << 20);
+        slot_ctx[0..4].copy_from_slice(&slot_dw0.to_le_bytes());
+        slot_ctx[4..8].copy_from_slice(&(1u32 << 16).to_le_bytes());
+
+        let ctx =
+            build_configure_endpoint_input_context(&slot_ctx, &eps, &rings, UsbSpeed::HighSpeed);
+
+        // EP3 (Interrupt IN at DCI 3) context starts at byte offset 32 * (1 + 3) = 128
+        let ep_offset = 32 * (1 + 3);
+        // DWord 4 (offset 16 within EP context): Average TRB Length
+        let avg_trb = u32::from_le_bytes(ctx[ep_offset + 16..ep_offset + 20].try_into().unwrap());
+        assert_eq!(
+            avg_trb, 1024,
+            "interrupt endpoint should have avg TRB length 1024"
+        );
+    }
+
+    #[test]
+    fn evaluate_context_ep0_layout() {
+        let ctx = build_evaluate_context_ep0(64);
+
+        // Input Control Context DWord 1 (bytes 4..8): Add flags = 0x02 (EP0 only)
+        let flags = u32::from_le_bytes(ctx[4..8].try_into().unwrap());
+        assert_eq!(flags, 0x02, "Add flags: bit 1 (EP0) only, not bit 0 (Slot)");
+
+        // Slot Context (bytes 32..63): should be all zeros (not evaluated)
+        assert_eq!(&ctx[32..64], &[0u8; 32], "Slot Context should be zeroed");
+
+        // EP0 Context DWord 1 (bytes 68..72): EP Type=4 (Control Bidir), MPS=64
+        let ep_dw1 = u32::from_le_bytes(ctx[68..72].try_into().unwrap());
+        let ep_type = (ep_dw1 >> 3) & 0x7;
+        assert_eq!(ep_type, 4, "EP Type should be 4 (Control Bidir)");
+        let mps = (ep_dw1 >> 16) & 0xFFFF;
+        assert_eq!(mps, 64, "Max Packet Size should be 64");
     }
 }
