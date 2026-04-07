@@ -981,6 +981,91 @@ impl XhciDriver {
 
         Ok(actions)
     }
+
+    // ── Interrupt data transfers ───────────────────────────────────────
+
+    /// Enqueue an interrupt IN (device-to-host) transfer.
+    ///
+    /// Used for HID reports (keyboard, mouse, gamepad). `endpoint_id` must
+    /// be an odd DCI (IN endpoint). Variable-length reports are expected,
+    /// so ISP (Interrupt on Short Packet) is always set.
+    pub fn interrupt_transfer_in(
+        &mut self,
+        slot_id: u8,
+        endpoint_id: u8,
+        data_buf_phys: u64,
+        data_len: u16,
+    ) -> Result<Vec<XhciAction>, XhciError> {
+        if endpoint_id % 2 == 0 || endpoint_id < 2 {
+            return Err(XhciError::InvalidState);
+        }
+        self.enqueue_interrupt_with_flags(
+            slot_id,
+            endpoint_id,
+            data_buf_phys,
+            data_len as u32,
+            trb::IOC | trb::ISP,
+        )
+    }
+
+    /// Enqueue an interrupt OUT (host-to-device) transfer.
+    ///
+    /// Used for HID output reports (e.g., keyboard LEDs). `endpoint_id`
+    /// must be an even DCI (OUT endpoint).
+    pub fn interrupt_transfer_out(
+        &mut self,
+        slot_id: u8,
+        endpoint_id: u8,
+        data_buf_phys: u64,
+        data_len: u16,
+    ) -> Result<Vec<XhciAction>, XhciError> {
+        if endpoint_id % 2 != 0 || endpoint_id < 2 {
+            return Err(XhciError::InvalidState);
+        }
+        self.enqueue_interrupt_with_flags(
+            slot_id,
+            endpoint_id,
+            data_buf_phys,
+            data_len as u32,
+            trb::IOC,
+        )
+    }
+
+    /// Shared interrupt transfer enqueue logic.
+    fn enqueue_interrupt_with_flags(
+        &mut self,
+        slot_id: u8,
+        endpoint_id: u8,
+        data_buf_phys: u64,
+        data_len: u32,
+        flags: u32,
+    ) -> Result<Vec<XhciAction>, XhciError> {
+        if self.state != XhciState::Running || slot_id == 0 || slot_id > self.max_slots_enabled {
+            return Err(XhciError::InvalidState);
+        }
+        if data_buf_phys & 0x3 != 0 {
+            return Err(XhciError::InvalidState);
+        }
+
+        let xfer_ring = self
+            .transfer_rings
+            .get_mut(&ring_key(slot_id, endpoint_id))
+            .ok_or(XhciError::NoTransferRing)?;
+
+        let entries = xfer_ring.enqueue_interrupt(data_buf_phys, data_len, flags)?;
+
+        let mut actions: Vec<XhciAction> = entries
+            .into_iter()
+            .map(|(phys, t)| XhciAction::WriteTrb { phys, trb: t })
+            .collect();
+
+        actions.push(XhciAction::RingDoorbell {
+            offset: self.db_offset as usize + 4 * (slot_id as usize),
+            value: endpoint_id as u32,
+        });
+
+        Ok(actions)
+    }
 }
 
 #[cfg(test)]
@@ -1878,6 +1963,132 @@ mod tests {
         assert_eq!(
             driver.bulk_transfer_out(1, 4, 0xD000_0001, 512),
             Err(XhciError::InvalidState)
+        );
+    }
+
+    // ── Interrupt transfer tests ────────────────────────────────────
+
+    /// Helper: create a driver with slot 1 addressed + interrupt IN endpoint configured.
+    fn make_driver_with_interrupt_endpoint() -> XhciDriver {
+        let mut driver = make_running_driver_with_slot(1);
+        let eps = alloc::vec![EndpointDescriptor {
+            endpoint_address: 0x81, // Interrupt IN, EP1
+            attributes: 0x03,       // Interrupt transfer type
+            max_packet_size: 64,
+            interval: 4,
+        }];
+        let mut slot_ctx = [0u8; 32];
+        let slot_dw0: u32 = (1 << 27) | (3 << 20); // Context Entries=1, speed=HS
+        slot_ctx[0..4].copy_from_slice(&slot_dw0.to_le_bytes());
+        slot_ctx[4..8].copy_from_slice(&(1u32 << 16).to_le_bytes()); // port 1
+        let rings = alloc::vec![(3u8, 0xA000_0000u64)]; // DCI 3 = EP1 IN
+        driver
+            .configure_endpoint(1, &slot_ctx, &eps, 0xC000_0000, &rings)
+            .unwrap();
+        driver
+    }
+
+    #[test]
+    fn interrupt_transfer_in_produces_trb_and_doorbell() {
+        let mut driver = make_driver_with_interrupt_endpoint();
+        let actions = driver
+            .interrupt_transfer_in(1, 3, 0xD000_0000, 64)
+            .unwrap();
+
+        let trb_count = actions
+            .iter()
+            .filter(|a| matches!(a, XhciAction::WriteTrb { .. }))
+            .count();
+        assert_eq!(trb_count, 1, "should produce 1 Normal TRB");
+
+        // Doorbell target = endpoint_id (3 for interrupt IN EP1)
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            XhciAction::RingDoorbell {
+                offset: _,
+                value: 3,
+            }
+        )));
+    }
+
+    #[test]
+    fn interrupt_transfer_out_produces_trb_and_doorbell() {
+        // Set up an interrupt OUT endpoint (DCI 2 = EP1 OUT)
+        let mut driver = make_running_driver_with_slot(1);
+        let eps = alloc::vec![EndpointDescriptor {
+            endpoint_address: 0x01, // Interrupt OUT, EP1
+            attributes: 0x03,
+            max_packet_size: 64,
+            interval: 4,
+        }];
+        let mut slot_ctx = [0u8; 32];
+        let slot_dw0: u32 = (1 << 27) | (3 << 20);
+        slot_ctx[0..4].copy_from_slice(&slot_dw0.to_le_bytes());
+        slot_ctx[4..8].copy_from_slice(&(1u32 << 16).to_le_bytes());
+        let rings = alloc::vec![(2u8, 0xA000_0000u64)]; // DCI 2 = EP1 OUT
+        driver
+            .configure_endpoint(1, &slot_ctx, &eps, 0xC000_0000, &rings)
+            .unwrap();
+
+        let actions = driver
+            .interrupt_transfer_out(1, 2, 0xD000_0000, 64)
+            .unwrap();
+
+        let trb_count = actions
+            .iter()
+            .filter(|a| matches!(a, XhciAction::WriteTrb { .. }))
+            .count();
+        assert_eq!(trb_count, 1);
+
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            XhciAction::RingDoorbell {
+                offset: _,
+                value: 2,
+            }
+        )));
+    }
+
+    #[test]
+    fn interrupt_transfer_in_has_isp_flag() {
+        let mut driver = make_driver_with_interrupt_endpoint();
+        let actions = driver
+            .interrupt_transfer_in(1, 3, 0xD000_0000, 64)
+            .unwrap();
+
+        // Find the WriteTrb action and check ISP flag
+        let trb_action = actions
+            .iter()
+            .find(|a| matches!(a, XhciAction::WriteTrb { .. }))
+            .unwrap();
+        if let XhciAction::WriteTrb { trb: t, .. } = trb_action {
+            assert_ne!(
+                t.control & trb::ISP,
+                0,
+                "interrupt IN should have ISP for short packet handling"
+            );
+            assert_ne!(t.control & trb::IOC, 0, "should have IOC");
+        }
+    }
+
+    #[test]
+    fn interrupt_transfer_wrong_state() {
+        let mut bank = mock_init_success();
+        let mut driver = XhciDriver::init(&mut bank).unwrap();
+        // Driver is Ready, not Running
+        assert_eq!(
+            driver.interrupt_transfer_in(1, 3, 0xD000_0000, 64),
+            Err(XhciError::InvalidState)
+        );
+    }
+
+    #[test]
+    fn interrupt_transfer_no_ring() {
+        let mut driver = make_running_driver_with_slot(1);
+        // No interrupt endpoint configured — only EP0 ring exists
+        assert_eq!(
+            driver.interrupt_transfer_in(1, 3, 0xD000_0000, 64),
+            Err(XhciError::NoTransferRing)
         );
     }
 }

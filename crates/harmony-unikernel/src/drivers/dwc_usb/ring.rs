@@ -214,16 +214,12 @@ impl TransferRing {
         Ok(all_entries)
     }
 
-    /// Enqueue a bulk data transfer (single Normal TRB).
+    /// Enqueue a Normal TRB for data transfer (bulk or interrupt).
     ///
-    /// `data_buf_phys` is the DMA buffer physical address.
-    /// `data_len` is the transfer length in bytes.
-    /// `flags` is caller-provided TRB control flags (e.g. `IOC` for OUT,
-    /// `IOC | ISP` for IN transfers).
-    ///
-    /// Returns `Err(TransferTooLarge)` if `data_len` exceeds the 17-bit
-    /// TRB field limit (131,071 bytes).
-    pub fn enqueue_bulk(
+    /// Shared implementation for `enqueue_bulk` and `enqueue_interrupt`.
+    /// `data_buf_phys` must be DWORD-aligned. `data_len` must fit in
+    /// 17 bits (max 131071 bytes).
+    fn enqueue_normal(
         &mut self,
         data_buf_phys: u64,
         data_len: u32,
@@ -239,6 +235,37 @@ impl TransferRing {
             return Err(XhciError::TransferTooLarge);
         }
         self.enqueue_one(TRB_NORMAL, data_buf_phys, data_len, flags)
+    }
+
+    /// Enqueue a bulk data transfer (single Normal TRB).
+    ///
+    /// `data_buf_phys` is the DMA buffer physical address.
+    /// `data_len` is the transfer length in bytes.
+    /// `flags` is caller-provided TRB control flags (e.g. `IOC` for OUT,
+    /// `IOC | ISP` for IN transfers).
+    ///
+    /// Returns `Err(TransferTooLarge)` if `data_len` exceeds the 17-bit
+    /// TRB field limit (131,071 bytes).
+    pub fn enqueue_bulk(
+        &mut self,
+        data_buf_phys: u64,
+        data_len: u32,
+        flags: u32,
+    ) -> Result<Vec<(u64, Trb)>, XhciError> {
+        self.enqueue_normal(data_buf_phys, data_len, flags)
+    }
+
+    /// Enqueue an interrupt data transfer (single Normal TRB).
+    ///
+    /// Mechanically identical to bulk — both use Normal TRBs. Separate
+    /// entry point for API clarity (interrupt vs bulk semantics).
+    pub fn enqueue_interrupt(
+        &mut self,
+        data_buf_phys: u64,
+        data_len: u32,
+        flags: u32,
+    ) -> Result<Vec<(u64, Trb)>, XhciError> {
+        self.enqueue_normal(data_buf_phys, data_len, flags)
     }
 }
 
@@ -549,5 +576,18 @@ mod tests {
         assert_eq!(entries[0].1.status, 512);
         // Parameter = buffer physical address
         assert_eq!(entries[0].1.parameter, 0xD000_0000);
+    }
+
+    #[test]
+    fn enqueue_interrupt_produces_normal_trb() {
+        let mut ring = TransferRing::new(0x9000_0000);
+        let entries = ring.enqueue_interrupt(0xD000_0000, 64, IOC | ISP).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.trb_type(), TRB_NORMAL);
+        assert_eq!(entries[0].1.parameter, 0xD000_0000);
+        assert_eq!(entries[0].1.status, 64);
+        let flags = entries[0].1.control & 0xFF;
+        assert_ne!(flags & (1 << 5), 0, "IOC should be set");
+        assert_ne!(flags & (1 << 2), 0, "ISP should be set");
     }
 }
