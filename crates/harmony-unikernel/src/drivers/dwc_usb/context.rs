@@ -401,10 +401,13 @@ pub fn build_evaluate_context_ep0(max_packet_size: u16) -> [u8; 96] {
     // Slot Context (bytes 32..63): zeroed — not evaluated.
 
     // EP0 Context (bytes 64..95):
-    // DWord 1: EP Type=4 (Control Bidir, bits 5:3), Max Packet Size (bits 31:16)
+    // DWord 1: CErr=3 (bits 2:1), EP Type=4 (Control Bidir, bits 5:3), Max Packet Size (bits 31:16)
+    // CErr=3 included defensively — xHCI §4.6.7 says only MPS is evaluatable for EP0,
+    // but some controllers may copy the entire EP context from the input.
+    let cerr: u32 = 3 << 1;
     let ep_type: u32 = 4 << 3;
     let mps: u32 = (max_packet_size as u32) << 16;
-    let ep_dw1 = ep_type | mps;
+    let ep_dw1 = cerr | ep_type | mps;
     ctx[68..72].copy_from_slice(&ep_dw1.to_le_bytes());
 
     ctx
