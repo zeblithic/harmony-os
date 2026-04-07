@@ -214,6 +214,18 @@ pub struct DsmRange {
     pub block_count: u32,
 }
 
+/// Parsed result from Set Features — Number of Queues (FID 0x07).
+///
+/// Both fields are 1-based: a value of 1 means one queue.
+/// The controller may allocate fewer queues than requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NumberOfQueues {
+    /// Number of I/O submission queues allocated (1-based).
+    pub nsqr: u16,
+    /// Number of I/O completion queues allocated (1-based).
+    pub ncqr: u16,
+}
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// Errors returned by NVMe driver operations.
@@ -605,6 +617,88 @@ impl<R: RegisterBank> NvmeDriver<R> {
         sqe[40..44].copy_from_slice(&0u32.to_le_bytes());
 
         Ok(self.admin.submit(sqe, self.doorbell_stride))
+    }
+}
+
+// ── Get/Set Features commands ────────────────────────────────────────────────
+
+impl<R: RegisterBank> NvmeDriver<R> {
+    /// Build a Get Features admin command (opcode 0x0A).
+    ///
+    /// `fid` is the Feature Identifier (byte, bits 7:0 of CDW10).
+    /// `cdw11` is the feature-specific dword passed through to CDW11.
+    /// SEL is always 0 (current value).
+    ///
+    /// The controller's response is returned in `Completion.result` (DW0).
+    /// No data transfer — PRP1 and PRP2 are zero.
+    pub fn get_features(&mut self, fid: u8, cdw11: u32) -> Result<AdminCommand, NvmeError> {
+        if self.state != NvmeState::Enabled && self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+
+        let cid = self.next_cid;
+        self.next_cid = self.next_cid.wrapping_add(1);
+
+        let mut sqe = [0u8; 64];
+
+        // CDW0: opcode=0x0A | (CID << 16)
+        let cdw0: u32 = 0x0A | ((cid as u32) << 16);
+        sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
+
+        // CDW10: FID in bits 7:0, SEL=0 in bits 10:8
+        let cdw10: u32 = fid as u32;
+        sqe[40..44].copy_from_slice(&cdw10.to_le_bytes());
+
+        // CDW11: feature-specific
+        sqe[44..48].copy_from_slice(&cdw11.to_le_bytes());
+
+        Ok(self.admin.submit(sqe, self.doorbell_stride))
+    }
+
+    /// Build a Set Features admin command (opcode 0x09).
+    ///
+    /// `fid` is the Feature Identifier (byte, bits 7:0 of CDW10).
+    /// `cdw11` is the feature-specific dword passed through to CDW11.
+    ///
+    /// The controller's response is returned in `Completion.result` (DW0).
+    /// No data transfer — PRP1 and PRP2 are zero.
+    pub fn set_features(&mut self, fid: u8, cdw11: u32) -> Result<AdminCommand, NvmeError> {
+        if self.state != NvmeState::Enabled && self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+
+        let cid = self.next_cid;
+        self.next_cid = self.next_cid.wrapping_add(1);
+
+        let mut sqe = [0u8; 64];
+
+        // CDW0: opcode=0x09 | (CID << 16)
+        let cdw0: u32 = 0x09 | ((cid as u32) << 16);
+        sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
+
+        // CDW10: FID in bits 7:0
+        let cdw10: u32 = fid as u32;
+        sqe[40..44].copy_from_slice(&cdw10.to_le_bytes());
+
+        // CDW11: feature-specific
+        sqe[44..48].copy_from_slice(&cdw11.to_le_bytes());
+
+        Ok(self.admin.submit(sqe, self.doorbell_stride))
+    }
+
+    /// Build a Set Features — Number of Queues command (FID 0x07).
+    ///
+    /// `nsqr` is the number of I/O submission queues requested (1-based, min 1).
+    /// `ncqr` is the number of I/O completion queues requested (1-based, min 1).
+    ///
+    /// The controller may allocate fewer than requested. Parse the completion
+    /// with [`parse_num_queues`] to get the actual allocation.
+    pub fn set_num_queues(&mut self, nsqr: u16, ncqr: u16) -> Result<AdminCommand, NvmeError> {
+        if nsqr == 0 || ncqr == 0 {
+            return Err(NvmeError::InvalidState);
+        }
+        let cdw11 = ((ncqr - 1) as u32) << 16 | (nsqr - 1) as u32;
+        self.set_features(0x07, cdw11)
     }
 }
 
@@ -1173,6 +1267,21 @@ pub fn parse_identify_namespace(data: &[u8; 4096]) -> IdentifyNamespace {
         flbas,
         lba_size_bytes,
     }
+}
+
+/// Parse the Number of Queues result from a Set Features or Get Features
+/// completion (FID 0x07).
+///
+/// The completion's DW0 (`completion.result`) encodes:
+/// - Bits 15:0 — NSQR: allocated I/O submission queues (0-based)
+/// - Bits 31:16 — NCQR: allocated I/O completion queues (0-based)
+///
+/// This function converts both to 1-based values.
+/// Saturates at `u16::MAX` to avoid overflow when a controller returns 0xFFFF.
+pub fn parse_num_queues(completion: &Completion) -> NumberOfQueues {
+    let nsqr = ((completion.result & 0xFFFF) as u16).saturating_add(1);
+    let ncqr = ((completion.result >> 16) as u16).saturating_add(1);
+    NumberOfQueues { nsqr, ncqr }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -3120,5 +3229,205 @@ mod tests {
             .unwrap();
         driver.activate_io_queue_pair(2).unwrap();
         assert_eq!(driver.state(), NvmeState::Ready);
+    }
+
+    // ── Get/Set Features tests ──────────────────────────────────────────────
+
+    #[test]
+    fn get_features_builds_correct_sqe() {
+        let mut driver = enabled_driver();
+        let cmd = driver.get_features(0x07, 0x0003_0003).unwrap();
+
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x0A, "opcode must be 0x0A (Get Features)");
+        assert_eq!((cdw0 >> 16) as u16, 0, "CID must be 0 for first command");
+
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10 & 0xFF, 0x07, "FID must be 0x07");
+        assert_eq!((cdw10 >> 8) & 0x07, 0, "SEL must be 0 (current value)");
+
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11, 0x0003_0003, "CDW11 must be passed through");
+
+        let prp1 = u64::from_le_bytes(cmd.sqe[24..32].try_into().unwrap());
+        let prp2 = u64::from_le_bytes(cmd.sqe[32..40].try_into().unwrap());
+        assert_eq!(prp1, 0, "PRP1 must be 0");
+        assert_eq!(prp2, 0, "PRP2 must be 0");
+
+        assert!(cmd.prp_list.is_none(), "no PRP list");
+        assert!(cmd.data_buffer.is_none(), "no data buffer");
+    }
+
+    #[test]
+    fn get_features_cdw11_passthrough() {
+        let mut driver = enabled_driver();
+        let cmd = driver.get_features(0x04, 0xCAFE_BABE).unwrap();
+
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11, 0xCAFE_BABE, "CDW11 must be passed through exactly");
+
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10 & 0xFF, 0x04, "FID must be 0x04");
+    }
+
+    #[test]
+    fn get_features_rejects_wrong_state() {
+        let bank = mock_nvme_bank();
+        let mut driver = NvmeDriver::init(bank).unwrap();
+        match driver.get_features(0x07, 0) {
+            Err(NvmeError::InvalidState) => {}
+            other => panic!("expected InvalidState, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn get_features_increments_cid() {
+        let mut driver = enabled_driver();
+        let cmd0 = driver.get_features(0x07, 0).unwrap();
+        let cid0 = (u32::from_le_bytes(cmd0.sqe[0..4].try_into().unwrap()) >> 16) as u16;
+
+        let cmd1 = driver.get_features(0x07, 0).unwrap();
+        let cid1 = (u32::from_le_bytes(cmd1.sqe[0..4].try_into().unwrap()) >> 16) as u16;
+
+        assert_eq!(cid1, cid0 + 1, "CID must increment");
+    }
+
+    #[test]
+    fn set_features_builds_correct_sqe() {
+        let mut driver = enabled_driver();
+        let cmd = driver.set_features(0x07, 0x0003_0003).unwrap();
+
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x09, "opcode must be 0x09 (Set Features)");
+        assert_eq!((cdw0 >> 16) as u16, 0, "CID must be 0 for first command");
+
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10 & 0xFF, 0x07, "FID must be 0x07");
+
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11, 0x0003_0003, "CDW11 must be passed through");
+
+        let prp1 = u64::from_le_bytes(cmd.sqe[24..32].try_into().unwrap());
+        let prp2 = u64::from_le_bytes(cmd.sqe[32..40].try_into().unwrap());
+        assert_eq!(prp1, 0, "PRP1 must be 0");
+        assert_eq!(prp2, 0, "PRP2 must be 0");
+
+        assert!(cmd.prp_list.is_none(), "no PRP list");
+        assert!(cmd.data_buffer.is_none(), "no data buffer");
+    }
+
+    #[test]
+    fn set_features_rejects_wrong_state() {
+        let bank = mock_nvme_bank();
+        let mut driver = NvmeDriver::init(bank).unwrap();
+        match driver.set_features(0x07, 0) {
+            Err(NvmeError::InvalidState) => {}
+            other => panic!("expected InvalidState, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn set_features_increments_cid() {
+        let mut driver = enabled_driver();
+        let cmd0 = driver.set_features(0x07, 0).unwrap();
+        let cid0 = (u32::from_le_bytes(cmd0.sqe[0..4].try_into().unwrap()) >> 16) as u16;
+
+        let cmd1 = driver.set_features(0x07, 0).unwrap();
+        let cid1 = (u32::from_le_bytes(cmd1.sqe[0..4].try_into().unwrap()) >> 16) as u16;
+
+        assert_eq!(cid1, cid0 + 1, "CID must increment");
+    }
+
+    // ── Number of Queues (FID 0x07) tests ───────────────────────────────────
+
+    #[test]
+    fn set_num_queues_basic() {
+        let mut driver = enabled_driver();
+        let cmd = driver.set_num_queues(4, 4).unwrap();
+
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x09, "opcode must be 0x09 (Set Features)");
+
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10 & 0xFF, 0x07, "FID must be 0x07 (Number of Queues)");
+
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11, 0x0003_0003, "CDW11 = (ncqr-1)<<16 | (nsqr-1)");
+    }
+
+    #[test]
+    fn set_num_queues_asymmetric() {
+        let mut driver = enabled_driver();
+        let cmd = driver.set_num_queues(2, 8).unwrap();
+
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11, 0x0007_0001, "CDW11 for nsqr=2, ncqr=8");
+    }
+
+    #[test]
+    fn set_num_queues_minimum() {
+        let mut driver = enabled_driver();
+        let cmd = driver.set_num_queues(1, 1).unwrap();
+
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11, 0x0000_0000, "CDW11 for nsqr=1, ncqr=1");
+    }
+
+    #[test]
+    fn set_num_queues_zero_nsqr_rejected() {
+        let mut driver = enabled_driver();
+        match driver.set_num_queues(0, 4) {
+            Err(NvmeError::InvalidState) => {}
+            other => panic!("expected InvalidState for nsqr=0, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn set_num_queues_zero_ncqr_rejected() {
+        let mut driver = enabled_driver();
+        match driver.set_num_queues(4, 0) {
+            Err(NvmeError::InvalidState) => {}
+            other => panic!("expected InvalidState for ncqr=0, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_num_queues_basic() {
+        let completion = Completion {
+            cid: 0,
+            status: 0,
+            result: 0x0003_0007,
+        };
+        let nq = parse_num_queues(&completion);
+        assert_eq!(nq.nsqr, 8, "NSQR 0-based 7 → 1-based 8");
+        assert_eq!(nq.ncqr, 4, "NCQR 0-based 3 → 1-based 4");
+    }
+
+    #[test]
+    fn parse_num_queues_minimum() {
+        let completion = Completion {
+            cid: 0,
+            status: 0,
+            result: 0x0000_0000,
+        };
+        let nq = parse_num_queues(&completion);
+        assert_eq!(nq.nsqr, 1);
+        assert_eq!(nq.ncqr, 1);
+    }
+
+    #[test]
+    fn get_set_features_use_admin_queue_doorbell() {
+        let mut driver = enabled_driver();
+        let get_cmd = driver.get_features(0x07, 0).unwrap();
+        let set_cmd = driver.set_features(0x07, 0).unwrap();
+
+        assert_eq!(
+            get_cmd.doorbell_offset, 0x1000,
+            "Get Features must use admin SQ doorbell"
+        );
+        assert_eq!(
+            set_cmd.doorbell_offset, 0x1000,
+            "Set Features must use admin SQ doorbell"
+        );
     }
 }
