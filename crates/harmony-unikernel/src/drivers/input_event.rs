@@ -196,7 +196,7 @@ pub const HID_USAGE_TO_LINUX: [u16; 98] = [
     KEY_LEFTBRACE,  // 0x2F
     KEY_RIGHTBRACE, // 0x30
     KEY_BACKSLASH,  // 0x31
-    0,              // 0x32 — Non-US # (rare, no standard Linux mapping)
+    KEY_BACKSLASH,  // 0x32 — Non-US # and ~ (Linux maps to KEY_BACKSLASH)
     KEY_SEMICOLON,  // 0x33
     KEY_APOSTROPHE, // 0x34
     KEY_GRAVE,      // 0x35
@@ -393,9 +393,9 @@ mod tests {
     }
 
     #[test]
-    fn usage_to_keycode_non_us_hash_unmapped() {
-        // Usage 0x32 (Non-US #) has no standard Linux mapping
-        assert_eq!(usage_to_keycode(0x32), None);
+    fn usage_to_keycode_non_us_hash() {
+        // Usage 0x32 (Non-US # and ~) maps to KEY_BACKSLASH per Linux kernel
+        assert_eq!(usage_to_keycode(0x32), Some(KEY_BACKSLASH));
     }
 
     #[test]

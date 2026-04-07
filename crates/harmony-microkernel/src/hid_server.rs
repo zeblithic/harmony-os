@@ -154,6 +154,10 @@ impl crate::FileServer for HidServer {
 
     fn open(&mut self, fid: Fid, mode: OpenMode) -> Result<(), IpcError> {
         let entry = self.tracker.begin_open(fid)?;
+        // Reject opening directories.
+        if entry.qpath == QPATH_ROOT {
+            return Err(IpcError::IsDirectory);
+        }
         // All files are read-only.
         if mode != OpenMode::Read {
             return Err(IpcError::ReadOnly);
@@ -383,6 +387,12 @@ mod tests {
         let mut s = make_keyboard_server();
         s.walk(0, 1, "events").unwrap();
         assert_eq!(s.open(1, OpenMode::Write), Err(IpcError::ReadOnly));
+    }
+
+    #[test]
+    fn open_root_directory_rejected() {
+        let mut s = make_keyboard_server();
+        assert_eq!(s.open(0, OpenMode::Read), Err(IpcError::IsDirectory));
     }
 
     // ── Stat tests ──────────────────────────────────────────────
