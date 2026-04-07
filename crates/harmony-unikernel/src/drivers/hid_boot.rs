@@ -141,9 +141,7 @@ impl HidBootDriver {
             }
             other => return Err(HidError::UnsupportedProtocol(other)),
         }
-        Ok(alloc::vec![HidAction::SendSetProtocol {
-            interface_number,
-        }])
+        Ok(alloc::vec![HidAction::SendSetProtocol { interface_number }])
     }
 
     /// Notify that SET_PROTOCOL completed successfully.
@@ -302,16 +300,10 @@ impl HidBootDriver {
 
         // Relative axes.
         if dx != 0 {
-            actions.push(HidAction::EmitInputEvent(InputEvent::rel(
-                REL_X,
-                dx as i16,
-            )));
+            actions.push(HidAction::EmitInputEvent(InputEvent::rel(REL_X, dx as i16)));
         }
         if dy != 0 {
-            actions.push(HidAction::EmitInputEvent(InputEvent::rel(
-                REL_Y,
-                dy as i16,
-            )));
+            actions.push(HidAction::EmitInputEvent(InputEvent::rel(REL_Y, dy as i16)));
         }
 
         // Optional wheel (byte 3).
@@ -433,7 +425,9 @@ mod tests {
     fn keyboard_single_key_press() {
         let mut d = make_keyboard();
         // Usage 0x04 = KEY_A
-        let actions = d.handle_interrupt_data(&[0, 0, 0x04, 0, 0, 0, 0, 0]).unwrap();
+        let actions = d
+            .handle_interrupt_data(&[0, 0, 0x04, 0, 0, 0, 0, 0])
+            .unwrap();
         let evts = events(&actions);
         assert_eq!(evts[0], InputEvent::key(KEY_A, true));
         assert_eq!(evts[1], InputEvent::syn());
@@ -442,7 +436,8 @@ mod tests {
     #[test]
     fn keyboard_key_release() {
         let mut d = make_keyboard();
-        d.handle_interrupt_data(&[0, 0, 0x04, 0, 0, 0, 0, 0]).unwrap();
+        d.handle_interrupt_data(&[0, 0, 0x04, 0, 0, 0, 0, 0])
+            .unwrap();
         let actions = d.handle_interrupt_data(&[0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
         let evts = events(&actions);
         assert_eq!(evts[0], InputEvent::key(KEY_A, false));
@@ -453,7 +448,9 @@ mod tests {
     fn keyboard_modifier_press() {
         let mut d = make_keyboard();
         // Bit 1 = Left Shift
-        let actions = d.handle_interrupt_data(&[0x02, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        let actions = d
+            .handle_interrupt_data(&[0x02, 0, 0, 0, 0, 0, 0, 0])
+            .unwrap();
         let evts = events(&actions);
         assert_eq!(evts[0], InputEvent::key(KEY_LEFTSHIFT, true));
         assert_eq!(evts[1], InputEvent::syn());
@@ -478,7 +475,8 @@ mod tests {
     fn keyboard_rollover_only_emits_deltas() {
         let mut d = make_keyboard();
         // Press A
-        d.handle_interrupt_data(&[0, 0, 0x04, 0, 0, 0, 0, 0]).unwrap();
+        d.handle_interrupt_data(&[0, 0, 0x04, 0, 0, 0, 0, 0])
+            .unwrap();
         // Press B while A held
         let actions = d
             .handle_interrupt_data(&[0, 0, 0x04, 0x05, 0, 0, 0, 0])
@@ -572,7 +570,9 @@ mod tests {
     fn every_handle_interrupt_data_requeues() {
         let mut d = make_keyboard();
         // Normal report
-        let actions = d.handle_interrupt_data(&[0, 0, 0x04, 0, 0, 0, 0, 0]).unwrap();
+        let actions = d
+            .handle_interrupt_data(&[0, 0, 0x04, 0, 0, 0, 0, 0])
+            .unwrap();
         assert!(actions
             .iter()
             .any(|a| matches!(a, HidAction::QueueInterruptIn { .. })));
