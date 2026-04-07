@@ -252,8 +252,10 @@ fn interval_to_xhci_exponent(binterval: u8, speed: UsbSpeed, transfer_type: u8) 
 
     match speed {
         UsbSpeed::HighSpeed | UsbSpeed::SuperSpeed | UsbSpeed::SuperSpeedPlus => {
-            // bInterval is already an exponent per USB 2.0 §9.6.6 / USB 3.x §9.6.6
-            binterval.clamp(1, 16)
+            // USB bInterval is 1-based: period = 2^(bInterval-1) × 125us.
+            // xHCI Interval is 0-based: period = 2^Interval × 125us.
+            // Therefore: Interval = bInterval - 1 (matches Linux xhci_parse_exponent_interval).
+            binterval.saturating_sub(1).clamp(0, 15)
         }
         UsbSpeed::FullSpeed | UsbSpeed::LowSpeed | UsbSpeed::Unknown(_) => {
             // bInterval is in milliseconds. Convert to 125us microframes.
@@ -698,9 +700,10 @@ mod tests {
     }
 
     #[test]
-    fn interval_to_xhci_exponent_hs_interrupt_passthrough() {
-        // HS interrupt: bInterval is already an exponent, pass through
-        assert_eq!(interval_to_xhci_exponent(4, UsbSpeed::HighSpeed, 3), 4);
+    fn interval_to_xhci_exponent_hs_interrupt() {
+        // HS interrupt: bInterval is 1-based, xHCI Interval is 0-based
+        // bInterval=4 → period = 2^(4-1) × 125us = 1ms → Interval=3
+        assert_eq!(interval_to_xhci_exponent(4, UsbSpeed::HighSpeed, 3), 3);
     }
 
     #[test]
@@ -716,9 +719,16 @@ mod tests {
     }
 
     #[test]
-    fn interval_to_xhci_exponent_ss_interrupt_passthrough() {
-        // SS interrupt: bInterval is already an exponent, pass through
-        assert_eq!(interval_to_xhci_exponent(3, UsbSpeed::SuperSpeed, 3), 3);
+    fn interval_to_xhci_exponent_ss_interrupt() {
+        // SS interrupt: bInterval is 1-based, xHCI Interval is 0-based
+        // bInterval=3 → period = 2^(3-1) × 125us = 0.5ms → Interval=2
+        assert_eq!(interval_to_xhci_exponent(3, UsbSpeed::SuperSpeed, 3), 2);
+    }
+
+    #[test]
+    fn interval_to_xhci_exponent_hs_minimum() {
+        // HS bInterval=1 → Interval = 1-1 = 0 → clamped to 0 (minimum valid)
+        assert_eq!(interval_to_xhci_exponent(1, UsbSpeed::HighSpeed, 3), 0);
     }
 
     #[test]
