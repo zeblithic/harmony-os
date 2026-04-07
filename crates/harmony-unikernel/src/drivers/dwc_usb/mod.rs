@@ -994,7 +994,7 @@ impl XhciDriver {
         slot_id: u8,
         endpoint_id: u8,
         data_buf_phys: u64,
-        data_len: u16,
+        data_len: u32,
     ) -> Result<Vec<XhciAction>, XhciError> {
         if endpoint_id % 2 == 0 || endpoint_id < 2 {
             return Err(XhciError::InvalidState);
@@ -1003,7 +1003,7 @@ impl XhciDriver {
             slot_id,
             endpoint_id,
             data_buf_phys,
-            data_len as u32,
+            data_len,
             trb::IOC | trb::ISP,
         )
     }
@@ -1017,7 +1017,7 @@ impl XhciDriver {
         slot_id: u8,
         endpoint_id: u8,
         data_buf_phys: u64,
-        data_len: u16,
+        data_len: u32,
     ) -> Result<Vec<XhciAction>, XhciError> {
         if endpoint_id % 2 != 0 || endpoint_id < 2 {
             return Err(XhciError::InvalidState);
@@ -1026,7 +1026,7 @@ impl XhciDriver {
             slot_id,
             endpoint_id,
             data_buf_phys,
-            data_len as u32,
+            data_len,
             trb::IOC,
         )
     }
