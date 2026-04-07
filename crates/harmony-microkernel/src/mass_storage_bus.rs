@@ -208,10 +208,11 @@ impl MassStorageBus {
                 length: 13,
             })
         } else {
+            let length = u16::try_from(self.pending_data_len).map_err(|_| MsError::InvalidState)?;
             self.phase = TransferPhase::ReceivingData;
             Ok(MsAction::BulkIn {
                 endpoint: self.device.bulk_in_ep,
-                length: u16::try_from(self.pending_data_len).map_err(|_| MsError::InvalidState)?,
+                length,
             })
         }
     }
@@ -231,12 +232,15 @@ impl MassStorageBus {
                 })
             }
             TransferPhase::ReceivingCsw => {
-                let result = self.parse_and_validate_csw(data);
-                if result.is_err() {
+                if let Err(e) = self.parse_and_validate_csw(data) {
+                    self.recover_from_error();
+                    return Err(e);
+                }
+                let advance = self.advance_after_csw();
+                if advance.is_err() {
                     self.recover_from_error();
                 }
-                result?;
-                self.advance_after_csw()
+                advance
             }
             TransferPhase::SendingCbw => Err(MsError::InvalidState),
         }
