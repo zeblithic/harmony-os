@@ -840,6 +840,67 @@ impl<R: RegisterBank> NvmeDriver<R> {
     }
 }
 
+// ── I/O queue deletion ─────────────────────────────────────────────────────
+
+impl<R: RegisterBank> NvmeDriver<R> {
+    /// Build a Delete I/O Submission Queue admin command (opcode 0x00).
+    ///
+    /// `qid` is the queue identifier of the SQ to delete (must be ≥ 1).
+    /// The NVMe spec requires deleting all SQs associated with a CQ before
+    /// deleting that CQ (§5.4).
+    pub fn delete_io_sq(&mut self, qid: u16) -> Result<AdminCommand, NvmeError> {
+        if self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+        if qid == 0 {
+            return Err(NvmeError::InvalidState);
+        }
+
+        let cid = self.next_cid;
+        self.next_cid = self.next_cid.wrapping_add(1);
+
+        let mut sqe = [0u8; 64];
+
+        // CDW0: opcode=0x00 (Delete I/O SQ) | (CID << 16)
+        let cdw0: u32 = (cid as u32) << 16;
+        sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
+
+        // CDW10: QID in bits 15:0
+        let cdw10: u32 = qid as u32;
+        sqe[40..44].copy_from_slice(&cdw10.to_le_bytes());
+
+        Ok(self.admin.submit(sqe, self.doorbell_stride))
+    }
+
+    /// Build a Delete I/O Completion Queue admin command (opcode 0x04).
+    ///
+    /// `qid` is the queue identifier of the CQ to delete (must be ≥ 1).
+    /// All associated SQs must be deleted first (NVMe spec §5.4).
+    pub fn delete_io_cq(&mut self, qid: u16) -> Result<AdminCommand, NvmeError> {
+        if self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+        if qid == 0 {
+            return Err(NvmeError::InvalidState);
+        }
+
+        let cid = self.next_cid;
+        self.next_cid = self.next_cid.wrapping_add(1);
+
+        let mut sqe = [0u8; 64];
+
+        // CDW0: opcode=0x04 | (CID << 16)
+        let cdw0: u32 = 0x04 | ((cid as u32) << 16);
+        sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
+
+        // CDW10: QID in bits 15:0
+        let cdw10: u32 = qid as u32;
+        sqe[40..44].copy_from_slice(&cdw10.to_le_bytes());
+
+        Ok(self.admin.submit(sqe, self.doorbell_stride))
+    }
+}
+
 // ── Block I/O commands ───────────────────────────────────────────────────────
 
 impl<R: RegisterBank> NvmeDriver<R> {
@@ -3429,5 +3490,102 @@ mod tests {
             set_cmd.doorbell_offset, 0x1000,
             "Set Features must use admin SQ doorbell"
         );
+    }
+
+    // ── Delete I/O Queue tests ──────────────────────────────────────────────
+
+    #[test]
+    fn delete_io_sq_builds_correct_sqe() {
+        let mut driver = ready_driver();
+        let cmd = driver.delete_io_sq(1).unwrap();
+
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x00, "opcode must be 0x00 (Delete I/O SQ)");
+
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10 & 0xFFFF, 1, "QID must be 1 in CDW10 bits 15:0");
+
+        // All other SQE fields must be zero.
+        let prp1 = u64::from_le_bytes(cmd.sqe[24..32].try_into().unwrap());
+        let prp2 = u64::from_le_bytes(cmd.sqe[32..40].try_into().unwrap());
+        assert_eq!(prp1, 0, "PRP1 must be 0");
+        assert_eq!(prp2, 0, "PRP2 must be 0");
+
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11, 0, "CDW11 must be 0");
+
+        assert!(cmd.prp_list.is_none(), "no PRP list");
+        assert!(cmd.data_buffer.is_none(), "no data buffer");
+    }
+
+    #[test]
+    fn delete_io_sq_rejects_wrong_state() {
+        let mut driver = enabled_driver();
+        match driver.delete_io_sq(1) {
+            Err(NvmeError::InvalidState) => {}
+            other => panic!("expected InvalidState in Enabled state, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn delete_io_sq_rejects_qid_zero() {
+        let mut driver = ready_driver();
+        match driver.delete_io_sq(0) {
+            Err(NvmeError::InvalidState) => {}
+            other => panic!("expected InvalidState for qid=0, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn delete_io_sq_increments_cid() {
+        let mut driver = ready_driver();
+        let cmd0 = driver.delete_io_sq(1).unwrap();
+        let cid0 = (u32::from_le_bytes(cmd0.sqe[0..4].try_into().unwrap()) >> 16) as u16;
+
+        let cmd1 = driver.delete_io_sq(1).unwrap();
+        let cid1 = (u32::from_le_bytes(cmd1.sqe[0..4].try_into().unwrap()) >> 16) as u16;
+
+        assert_eq!(cid1, cid0 + 1, "CID must increment");
+    }
+
+    #[test]
+    fn delete_io_cq_builds_correct_sqe() {
+        let mut driver = ready_driver();
+        let cmd = driver.delete_io_cq(1).unwrap();
+
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x04, "opcode must be 0x04 (Delete I/O CQ)");
+
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10 & 0xFFFF, 1, "QID must be 1 in CDW10 bits 15:0");
+
+        let prp1 = u64::from_le_bytes(cmd.sqe[24..32].try_into().unwrap());
+        let prp2 = u64::from_le_bytes(cmd.sqe[32..40].try_into().unwrap());
+        assert_eq!(prp1, 0, "PRP1 must be 0");
+        assert_eq!(prp2, 0, "PRP2 must be 0");
+
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11, 0, "CDW11 must be 0");
+
+        assert!(cmd.prp_list.is_none(), "no PRP list");
+        assert!(cmd.data_buffer.is_none(), "no data buffer");
+    }
+
+    #[test]
+    fn delete_io_cq_rejects_wrong_state() {
+        let mut driver = enabled_driver();
+        match driver.delete_io_cq(1) {
+            Err(NvmeError::InvalidState) => {}
+            other => panic!("expected InvalidState in Enabled state, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn delete_io_cq_rejects_qid_zero() {
+        let mut driver = ready_driver();
+        match driver.delete_io_cq(0) {
+            Err(NvmeError::InvalidState) => {}
+            other => panic!("expected InvalidState for qid=0, got {:?}", other),
+        }
     }
 }
