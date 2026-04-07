@@ -100,6 +100,13 @@ enum TransferPhase {
     ReceivingCsw,
 }
 
+// ── Helpers ──────────────────────────────────────────────────────
+
+/// Extract the CBW tag (bytes 4–7, little-endian) from a 31-byte CBW.
+fn cbw_tag(cbw: &[u8; 31]) -> u32 {
+    u32::from_le_bytes([cbw[4], cbw[5], cbw[6], cbw[7]])
+}
+
 // ── MassStorageBus ───────────────────────────────────────────────
 
 /// Sans-I/O state machine for USB Mass Storage Bulk-Only Transport.
@@ -113,6 +120,7 @@ pub struct MassStorageBus {
     block_size: u32,
     capacity_blocks: u32,
     pending_data_len: u32,
+    pending_tag: u32,
     stashed_data: Vec<u8>,
 }
 
@@ -129,6 +137,7 @@ impl MassStorageBus {
             block_size: 0,
             capacity_blocks: 0,
             pending_data_len: 0,
+            pending_tag: 0,
             stashed_data: Vec::new(),
         }
     }
@@ -155,6 +164,7 @@ impl MassStorageBus {
         self.state = BusState::InitInquiry;
         self.phase = TransferPhase::SendingCbw;
         self.pending_data_len = data_len;
+        self.pending_tag = cbw_tag(&cbw);
         self.stashed_data.clear();
         Ok(MsAction::BulkOut {
             endpoint: self.device.bulk_out_ep,
@@ -173,6 +183,7 @@ impl MassStorageBus {
         self.state = BusState::Reading;
         self.phase = TransferPhase::SendingCbw;
         self.pending_data_len = data_len;
+        self.pending_tag = cbw_tag(&cbw);
         self.stashed_data.clear();
         Ok(MsAction::BulkOut {
             endpoint: self.device.bulk_out_ep,
@@ -220,21 +231,33 @@ impl MassStorageBus {
                 })
             }
             TransferPhase::ReceivingCsw => {
-                let csw = parse_csw(data)?;
-                if csw.status != 0 {
-                    // Reset to Ready so the caller can retry. Without
-                    // this the bus is permanently stuck in Reading/ReceivingCsw.
-                    if self.state == BusState::Reading {
-                        self.state = BusState::Ready;
-                        self.phase = TransferPhase::SendingCbw;
-                        self.stashed_data.clear();
-                    }
-                    return Err(MsError::CommandFailed { status: csw.status });
+                let result = self.parse_and_validate_csw(data);
+                if result.is_err() && self.state == BusState::Reading {
+                    // Reset to Ready so the caller can retry after any
+                    // CSW error — parse failure, tag mismatch, or command
+                    // failure. Without this the bus is permanently stuck.
+                    self.state = BusState::Ready;
+                    self.phase = TransferPhase::SendingCbw;
+                    self.stashed_data.clear();
                 }
+                result?;
                 self.advance_after_csw()
             }
             TransferPhase::SendingCbw => Err(MsError::InvalidState),
         }
+    }
+
+    /// Parse a CSW, validate tag matches the outstanding CBW, and
+    /// check command status. Returns `Ok(())` only if all checks pass.
+    fn parse_and_validate_csw(&self, data: &[u8]) -> Result<(), MsError> {
+        let csw = parse_csw(data)?;
+        if csw.tag != self.pending_tag {
+            return Err(MsError::InvalidCsw);
+        }
+        if csw.status != 0 {
+            return Err(MsError::CommandFailed { status: csw.status });
+        }
+        Ok(())
     }
 
     /// Advance the high-level state after a successful CSW.
@@ -246,6 +269,7 @@ impl MassStorageBus {
                 self.state = BusState::InitTestUnitReady;
                 self.phase = TransferPhase::SendingCbw;
                 self.pending_data_len = data_len;
+                self.pending_tag = cbw_tag(&cbw);
                 self.stashed_data.clear();
                 Ok(MsAction::BulkOut {
                     endpoint: self.device.bulk_out_ep,
@@ -258,6 +282,7 @@ impl MassStorageBus {
                 self.state = BusState::InitReadCapacity;
                 self.phase = TransferPhase::SendingCbw;
                 self.pending_data_len = data_len;
+                self.pending_tag = cbw_tag(&cbw);
                 self.stashed_data.clear();
                 Ok(MsAction::BulkOut {
                     endpoint: self.device.bulk_out_ep,
@@ -674,5 +699,44 @@ mod tests {
         bus.handle_bulk_in_complete(&vec![0xAAu8; 512]).unwrap();
         let result = bus.handle_bulk_in_complete(&make_csw(tag2)).unwrap();
         assert_eq!(result, MsAction::ReadComplete(vec![0xAAu8; 512]));
+    }
+
+    // ── Test 13 ──────────────────────────────────────────────────
+
+    #[test]
+    fn read_csw_tag_mismatch() {
+        let mut bus = MassStorageBus::new(1, BULK_IN_EP, BULK_OUT_EP);
+        init_bus(&mut bus);
+
+        bus.start_read(0).unwrap();
+        bus.handle_bulk_out_complete().unwrap();
+        bus.handle_bulk_in_complete(&vec![0u8; 512]).unwrap();
+
+        // CSW with wrong tag (0xDEAD instead of the actual CBW tag).
+        let result = bus.handle_bulk_in_complete(&make_csw(0xDEAD));
+        assert_eq!(result, Err(MsError::InvalidCsw));
+    }
+
+    // ── Test 14 ──────────────────────────────────────────────────
+
+    #[test]
+    fn read_recovers_after_csw_parse_failure() {
+        let mut bus = MassStorageBus::new(1, BULK_IN_EP, BULK_OUT_EP);
+        init_bus(&mut bus);
+
+        // First read — CSW is garbage (parse failure).
+        bus.start_read(0).unwrap();
+        bus.handle_bulk_out_complete().unwrap();
+        bus.handle_bulk_in_complete(&vec![0u8; 512]).unwrap();
+        let err = bus.handle_bulk_in_complete(&[0xFFu8; 13]).unwrap_err();
+        assert_eq!(err, MsError::InvalidCsw);
+
+        // Bus should have recovered — second read succeeds.
+        let cbw = bus.start_read(10).unwrap();
+        let tag = extract_tag(&cbw);
+        bus.handle_bulk_out_complete().unwrap();
+        bus.handle_bulk_in_complete(&vec![0xBBu8; 512]).unwrap();
+        let result = bus.handle_bulk_in_complete(&make_csw(tag)).unwrap();
+        assert_eq!(result, MsAction::ReadComplete(vec![0xBBu8; 512]));
     }
 }
