@@ -283,7 +283,7 @@ In `crates/harmony-boot-aarch64/src/main.rs`, add the DTB pointer lookup after t
         use uefi::table::cfg::ConfigTableEntry;
         // EFI_DTB_TABLE_GUID per UEFI spec 2.10, Table 4-6.
         // Not defined in the uefi crate as of 0.36.
-        const DTB_GUID: uefi::Guid = uefi::guid!("b1b621d5-f19c-41a0-9382-b6784040483e");
+        const DTB_GUID: uefi::Guid = uefi::guid!("b1b621d5-f19c-41a5-830b-d9152c69aae0");
         uefi::system::with_config_table(|entries: &[ConfigTableEntry]| {
             entries
                 .iter()

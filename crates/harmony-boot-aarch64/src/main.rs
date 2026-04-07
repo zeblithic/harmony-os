@@ -235,9 +235,9 @@ fn main() -> Status {
     // remains in memory after ExitBootServices; we just save the pointer.
     let dtb_ptr: Option<*const u8> = {
         use uefi::table::cfg::ConfigTableEntry;
-        // EFI_DTB_TABLE_GUID per UEFI spec 2.10, Table 4-6.
+        // EFI_DTB_TABLE_GUID per UEFI spec 2.10, Table 4-6 / EBBR § 4.2.
         // Not defined in the uefi crate as of 0.36.
-        const DTB_GUID: uefi::Guid = uefi::guid!("b1b621d5-f19c-41a0-9382-b6784040483e");
+        const DTB_GUID: uefi::Guid = uefi::guid!("b1b621d5-f19c-41a5-830b-d9152c69aae0");
         uefi::system::with_config_table(|entries: &[ConfigTableEntry]| {
             entries
                 .iter()
@@ -280,6 +280,11 @@ fn main() -> Status {
     });
     if hw_config.is_none() {
         let _ = writeln!(serial, "[FDT] No device tree found, using platform defaults");
+    } else if hw_config.as_ref().and_then(|c| c.network.as_ref()).is_none() {
+        let _ = writeln!(
+            serial,
+            "[FDT] Device tree found but no GENET MAC, using platform defaults"
+        );
     }
 
     // ── Collect UEFI memory map into fixed-size array ──
