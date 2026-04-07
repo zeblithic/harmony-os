@@ -895,7 +895,8 @@ impl<R: RegisterBank> NvmeDriver<R> {
         let mut sqe = [0u8; 64];
 
         // CDW0: opcode=0x00 (Delete I/O SQ) | (CID << 16)
-        let cdw0: u32 = (cid as u32) << 16;
+        #[allow(clippy::identity_op)]
+        let cdw0: u32 = 0x00 | ((cid as u32) << 16);
         sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
 
         // CDW10: QID in bits 15:0
