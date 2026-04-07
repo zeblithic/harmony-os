@@ -899,6 +899,52 @@ impl<R: RegisterBank> NvmeDriver<R> {
 
         Ok(self.admin.submit(sqe, self.doorbell_stride))
     }
+
+    /// Build admin commands to delete one I/O CQ+SQ pair for the given `qid`.
+    ///
+    /// Returns `[delete_sq_cmd, delete_cq_cmd]` — SQ is deleted first per
+    /// NVMe spec §5.4 ("the host shall delete all associated Submission Queues
+    /// prior to deleting a Completion Queue").
+    ///
+    /// The caller must execute them in order, confirm both completions succeed,
+    /// then call [`deactivate_io_queue_pair`] to remove the software state.
+    pub fn delete_io_queue_pair(&mut self, qid: u16) -> Result<[AdminCommand; 2], NvmeError> {
+        if self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+        // Validate that this qid exists in io_queues.
+        if !self.io_queues.iter().any(|q| q.qid == qid) {
+            return Err(NvmeError::InvalidState);
+        }
+        let sq_cmd = self.delete_io_sq(qid)?;
+        let cq_cmd = self.delete_io_cq(qid)?;
+        Ok([sq_cmd, cq_cmd])
+    }
+
+    /// Record that the I/O queue pair identified by `qid` was successfully
+    /// deleted on the controller.
+    ///
+    /// Call this after executing both commands from [`delete_io_queue_pair`]
+    /// and confirming successful completions.  Removes the [`QueuePair`] from
+    /// `io_queues`.  If no I/O queues remain, transitions back to
+    /// [`NvmeState::Enabled`].
+    pub fn deactivate_io_queue_pair(&mut self, qid: u16) -> Result<(), NvmeError> {
+        if self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+
+        let idx = self
+            .io_queues
+            .iter()
+            .position(|q| q.qid == qid)
+            .ok_or(NvmeError::InvalidState)?;
+        self.io_queues.remove(idx);
+
+        if self.io_queues.is_empty() {
+            self.state = NvmeState::Enabled;
+        }
+        Ok(())
+    }
 }
 
 // ── Block I/O commands ───────────────────────────────────────────────────────
@@ -3586,6 +3632,99 @@ mod tests {
         match driver.delete_io_cq(0) {
             Err(NvmeError::InvalidState) => {}
             other => panic!("expected InvalidState for qid=0, got {:?}", other),
+        }
+    }
+
+    // ── Delete/Deactivate Queue Pair tests ──────────────────────────────────
+
+    #[test]
+    fn delete_io_queue_pair_basic() {
+        let mut driver = ready_driver();
+        let cmds = driver.delete_io_queue_pair(1).unwrap();
+
+        // First command: Delete I/O SQ (opcode 0x00)
+        let cdw0_sq = u32::from_le_bytes(cmds[0].sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0_sq & 0xFF, 0x00, "first command must be Delete SQ");
+        let cdw10_sq = u32::from_le_bytes(cmds[0].sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10_sq & 0xFFFF, 1, "SQ delete must target qid=1");
+
+        // Second command: Delete I/O CQ (opcode 0x04)
+        let cdw0_cq = u32::from_le_bytes(cmds[1].sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0_cq & 0xFF, 0x04, "second command must be Delete CQ");
+        let cdw10_cq = u32::from_le_bytes(cmds[1].sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10_cq & 0xFFFF, 1, "CQ delete must target qid=1");
+    }
+
+    #[test]
+    fn delete_io_queue_pair_unknown_qid() {
+        let mut driver = ready_driver();
+        match driver.delete_io_queue_pair(99) {
+            Err(NvmeError::InvalidState) => {}
+            other => panic!("expected InvalidState for unknown qid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn delete_io_queue_pair_ordering() {
+        let mut driver = ready_driver();
+        let cmds = driver.delete_io_queue_pair(1).unwrap();
+
+        let opcode0 = u32::from_le_bytes(cmds[0].sqe[0..4].try_into().unwrap()) & 0xFF;
+        let opcode1 = u32::from_le_bytes(cmds[1].sqe[0..4].try_into().unwrap()) & 0xFF;
+        assert_eq!(opcode0, 0x00, "index 0 = Delete SQ");
+        assert_eq!(opcode1, 0x04, "index 1 = Delete CQ");
+    }
+
+    #[test]
+    fn deactivate_io_queue_pair_basic() {
+        let mut driver = ready_driver_multi(2);
+        assert_eq!(driver.io_queue_count(), 2);
+
+        driver.deactivate_io_queue_pair(1).unwrap();
+        assert_eq!(driver.io_queue_count(), 1, "one queue removed");
+        assert_eq!(
+            driver.state(),
+            NvmeState::Ready,
+            "still Ready with one queue"
+        );
+    }
+
+    #[test]
+    fn deactivate_last_queue_transitions_to_enabled() {
+        let mut driver = ready_driver();
+        assert_eq!(driver.io_queue_count(), 1);
+        assert_eq!(driver.state(), NvmeState::Ready);
+
+        driver.deactivate_io_queue_pair(1).unwrap();
+        assert_eq!(driver.io_queue_count(), 0);
+        assert_eq!(driver.state(), NvmeState::Enabled, "no queues → Enabled");
+    }
+
+    #[test]
+    fn deactivate_one_of_many() {
+        let mut driver = ready_driver_multi(3);
+        assert_eq!(driver.io_queue_count(), 3);
+
+        driver.deactivate_io_queue_pair(2).unwrap();
+        assert_eq!(driver.io_queue_count(), 2);
+        assert_eq!(driver.state(), NvmeState::Ready);
+    }
+
+    #[test]
+    fn deactivate_unknown_qid() {
+        let mut driver = ready_driver();
+        match driver.deactivate_io_queue_pair(99) {
+            Err(NvmeError::InvalidState) => {}
+            other => panic!("expected InvalidState for unknown qid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn deactivate_wrong_state() {
+        let mut driver = enabled_driver();
+        match driver.deactivate_io_queue_pair(1) {
+            Err(NvmeError::InvalidState) => {}
+            other => panic!("expected InvalidState in Enabled state, got {:?}", other),
         }
     }
 }
