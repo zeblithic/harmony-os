@@ -440,6 +440,7 @@ impl XhciDriver {
     pub fn remove_transfer_ring(&mut self, slot_id: u8) {
         let prefix = (slot_id as u16) << 8;
         self.transfer_rings.retain(|&k, _| k & 0xFF00 != prefix);
+        self.slot_speeds.remove(&slot_id);
     }
 
     /// Enqueue a GET_DESCRIPTOR(Device) control transfer on a slot's EP0.

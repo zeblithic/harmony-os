@@ -253,7 +253,7 @@ fn interval_to_xhci_exponent(binterval: u8, speed: UsbSpeed, transfer_type: u8) 
     match speed {
         UsbSpeed::HighSpeed | UsbSpeed::SuperSpeed | UsbSpeed::SuperSpeedPlus => {
             // bInterval is already an exponent per USB 2.0 §9.6.6 / USB 3.x §9.6.6
-            binterval.max(1).min(16)
+            binterval.clamp(1, 16)
         }
         UsbSpeed::FullSpeed | UsbSpeed::LowSpeed | UsbSpeed::Unknown(_) => {
             // bInterval is in milliseconds. Convert to 125us microframes.
@@ -269,7 +269,7 @@ fn interval_to_xhci_exponent(binterval: u8, speed: UsbSpeed, transfer_type: u8) 
                 exponent += 1;
                 val <<= 1;
             }
-            exponent.max(1).min(16)
+            exponent.clamp(1, 16)
         }
     }
 }
