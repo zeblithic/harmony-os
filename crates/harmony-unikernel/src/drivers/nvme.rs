@@ -214,6 +214,18 @@ pub struct DsmRange {
     pub block_count: u32,
 }
 
+/// Parsed result from Set Features — Number of Queues (FID 0x07).
+///
+/// Both fields are 1-based: a value of 1 means one queue.
+/// The controller may allocate fewer queues than requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NumberOfQueues {
+    /// Number of I/O submission queues allocated (1-based).
+    pub nsqr: u16,
+    /// Number of I/O completion queues allocated (1-based).
+    pub ncqr: u16,
+}
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// Errors returned by NVMe driver operations.
@@ -672,6 +684,21 @@ impl<R: RegisterBank> NvmeDriver<R> {
         sqe[44..48].copy_from_slice(&cdw11.to_le_bytes());
 
         Ok(self.admin.submit(sqe, self.doorbell_stride))
+    }
+
+    /// Build a Set Features — Number of Queues command (FID 0x07).
+    ///
+    /// `nsqr` is the number of I/O submission queues requested (1-based, min 1).
+    /// `ncqr` is the number of I/O completion queues requested (1-based, min 1).
+    ///
+    /// The controller may allocate fewer than requested. Parse the completion
+    /// with [`parse_num_queues`] to get the actual allocation.
+    pub fn set_num_queues(&mut self, nsqr: u16, ncqr: u16) -> Result<AdminCommand, NvmeError> {
+        if nsqr == 0 || ncqr == 0 {
+            return Err(NvmeError::InvalidState);
+        }
+        let cdw11 = ((ncqr - 1) as u32) << 16 | (nsqr - 1) as u32;
+        self.set_features(0x07, cdw11)
     }
 }
 
@@ -1240,6 +1267,20 @@ pub fn parse_identify_namespace(data: &[u8; 4096]) -> IdentifyNamespace {
         flbas,
         lba_size_bytes,
     }
+}
+
+/// Parse the Number of Queues result from a Set Features or Get Features
+/// completion (FID 0x07).
+///
+/// The completion's DW0 (`completion.result`) encodes:
+/// - Bits 15:0 — NSQR: allocated I/O submission queues (0-based)
+/// - Bits 31:16 — NCQR: allocated I/O completion queues (0-based)
+///
+/// This function converts both to 1-based values.
+pub fn parse_num_queues(completion: &Completion) -> NumberOfQueues {
+    let nsqr = (completion.result & 0xFFFF) as u16 + 1;
+    let ncqr = (completion.result >> 16) as u16 + 1;
+    NumberOfQueues { nsqr, ncqr }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -3294,5 +3335,98 @@ mod tests {
         let cid1 = (u32::from_le_bytes(cmd1.sqe[0..4].try_into().unwrap()) >> 16) as u16;
 
         assert_eq!(cid1, cid0 + 1, "CID must increment");
+    }
+
+    // ── Number of Queues (FID 0x07) tests ───────────────────────────────────
+
+    #[test]
+    fn set_num_queues_basic() {
+        let mut driver = enabled_driver();
+        let cmd = driver.set_num_queues(4, 4).unwrap();
+
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x09, "opcode must be 0x09 (Set Features)");
+
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10 & 0xFF, 0x07, "FID must be 0x07 (Number of Queues)");
+
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11, 0x0003_0003, "CDW11 = (ncqr-1)<<16 | (nsqr-1)");
+    }
+
+    #[test]
+    fn set_num_queues_asymmetric() {
+        let mut driver = enabled_driver();
+        let cmd = driver.set_num_queues(2, 8).unwrap();
+
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11, 0x0007_0001, "CDW11 for nsqr=2, ncqr=8");
+    }
+
+    #[test]
+    fn set_num_queues_minimum() {
+        let mut driver = enabled_driver();
+        let cmd = driver.set_num_queues(1, 1).unwrap();
+
+        let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11, 0x0000_0000, "CDW11 for nsqr=1, ncqr=1");
+    }
+
+    #[test]
+    fn set_num_queues_zero_nsqr_rejected() {
+        let mut driver = enabled_driver();
+        match driver.set_num_queues(0, 4) {
+            Err(NvmeError::InvalidState) => {}
+            other => panic!("expected InvalidState for nsqr=0, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn set_num_queues_zero_ncqr_rejected() {
+        let mut driver = enabled_driver();
+        match driver.set_num_queues(4, 0) {
+            Err(NvmeError::InvalidState) => {}
+            other => panic!("expected InvalidState for ncqr=0, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_num_queues_basic() {
+        let completion = Completion {
+            cid: 0,
+            status: 0,
+            result: 0x0003_0007,
+        };
+        let nq = parse_num_queues(&completion);
+        assert_eq!(nq.nsqr, 8, "NSQR 0-based 7 → 1-based 8");
+        assert_eq!(nq.ncqr, 4, "NCQR 0-based 3 → 1-based 4");
+    }
+
+    #[test]
+    fn parse_num_queues_minimum() {
+        let completion = Completion {
+            cid: 0,
+            status: 0,
+            result: 0x0000_0000,
+        };
+        let nq = parse_num_queues(&completion);
+        assert_eq!(nq.nsqr, 1);
+        assert_eq!(nq.ncqr, 1);
+    }
+
+    #[test]
+    fn get_set_features_use_admin_queue_doorbell() {
+        let mut driver = enabled_driver();
+        let get_cmd = driver.get_features(0x07, 0).unwrap();
+        let set_cmd = driver.set_features(0x07, 0).unwrap();
+
+        assert_eq!(
+            get_cmd.doorbell_offset, 0x1000,
+            "Get Features must use admin SQ doorbell"
+        );
+        assert_eq!(
+            set_cmd.doorbell_offset, 0x1000,
+            "Set Features must use admin SQ doorbell"
+        );
     }
 }
