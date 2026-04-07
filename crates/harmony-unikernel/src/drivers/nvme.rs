@@ -240,6 +240,8 @@ pub enum NvmeError {
     UnalignedAddress,
     /// The command requires an optional NVM feature (ONCS) not supported by this controller.
     UnsupportedCommand,
+    /// The specified I/O queue index is out of range.
+    InvalidQueueIndex,
 }
 
 // ── Driver state ──────────────────────────────────────────────────────────────
@@ -273,11 +275,12 @@ pub struct NvmeDriver<R: RegisterBank> {
     timeout_ms: u32,
     /// Admin submission/completion queue pair.
     admin: QueuePair,
-    /// I/O submission/completion queue pair (None until created).
-    io: Option<QueuePair>,
-    /// Pending I/O queue params cached by create_io_queues(), consumed by
-    /// activate_io_queues().  Ensures software QueuePair matches hardware.
-    pending_io: Option<(u64, u64, u16)>,
+    /// Active I/O submission/completion queue pairs (indexed by creation order).
+    io_queues: Vec<QueuePair>,
+    /// Pending I/O queue params cached by create_io_queue_pair(), consumed by
+    /// activate_io_queue_pair().  Each entry is (qid, sq_phys, cq_phys, size).
+    /// Ensures software QueuePair matches hardware.
+    pending_io: Vec<(u16, u64, u64, u16)>,
     /// Monotonically increasing command identifier.
     next_cid: u16,
     /// Current lifecycle state of the driver.
@@ -347,6 +350,11 @@ impl<R: RegisterBank> NvmeDriver<R> {
     /// Return the doorbell stride exponent.
     pub fn doorbell_stride(&self) -> u8 {
         self.doorbell_stride
+    }
+
+    /// Return the number of active I/O queue pairs.
+    pub fn io_queue_count(&self) -> usize {
+        self.io_queues.len()
     }
 
     /// Return the controller timeout in milliseconds.
@@ -450,8 +458,8 @@ impl<R: RegisterBank> NvmeDriver<R> {
             doorbell_stride,
             timeout_ms,
             admin: QueuePair::new(0, 0, 0, 0),
-            io: None,
-            pending_io: None,
+            io_queues: Vec::new(),
+            pending_io: Vec::new(),
             next_cid: 0,
             state: NvmeState::Disabled,
             mdts: 0,
@@ -604,8 +612,18 @@ impl<R: RegisterBank> NvmeDriver<R> {
 
 impl<R: RegisterBank> NvmeDriver<R> {
     /// Build a Create I/O Completion Queue admin command (opcode 0x05).
-    pub fn create_io_cq(&mut self, cq_phys: u64, size: u16) -> Result<AdminCommand, NvmeError> {
+    ///
+    /// `qid` is the queue identifier to assign to this CQ (must be ≥ 1).
+    pub fn create_io_cq(
+        &mut self,
+        qid: u16,
+        cq_phys: u64,
+        size: u16,
+    ) -> Result<AdminCommand, NvmeError> {
         if self.state != NvmeState::Enabled && self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+        if qid == 0 {
             return Err(NvmeError::InvalidState);
         }
 
@@ -621,7 +639,7 @@ impl<R: RegisterBank> NvmeDriver<R> {
         let cdw0: u32 = 0x05 | ((cid as u32) << 16);
         sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
         sqe[24..32].copy_from_slice(&cq_phys.to_le_bytes());
-        let cdw10: u32 = 1 | (((size - 1) as u32) << 16);
+        let cdw10: u32 = (qid as u32) | (((size - 1) as u32) << 16);
         sqe[40..44].copy_from_slice(&cdw10.to_le_bytes());
         let cdw11: u32 = 0x0000_0003;
         sqe[44..48].copy_from_slice(&cdw11.to_le_bytes());
@@ -630,8 +648,18 @@ impl<R: RegisterBank> NvmeDriver<R> {
     }
 
     /// Build a Create I/O Submission Queue admin command (opcode 0x01).
-    pub fn create_io_sq(&mut self, sq_phys: u64, size: u16) -> Result<AdminCommand, NvmeError> {
+    ///
+    /// `qid` is the queue identifier to assign to this SQ (must be ≥ 1).
+    pub fn create_io_sq(
+        &mut self,
+        qid: u16,
+        sq_phys: u64,
+        size: u16,
+    ) -> Result<AdminCommand, NvmeError> {
         if self.state != NvmeState::Enabled && self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+        if qid == 0 {
             return Err(NvmeError::InvalidState);
         }
 
@@ -647,53 +675,72 @@ impl<R: RegisterBank> NvmeDriver<R> {
         let cdw0: u32 = 0x01 | ((cid as u32) << 16);
         sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
         sqe[24..32].copy_from_slice(&sq_phys.to_le_bytes());
-        let cdw10: u32 = 1 | (((size - 1) as u32) << 16);
+        let cdw10: u32 = (qid as u32) | (((size - 1) as u32) << 16);
         sqe[40..44].copy_from_slice(&cdw10.to_le_bytes());
-        let cdw11: u32 = 0x0001_0001;
+        let cdw11: u32 = 0x0001 | ((qid as u32) << 16);
         sqe[44..48].copy_from_slice(&cdw11.to_le_bytes());
 
         Ok(self.admin.submit(sqe, self.doorbell_stride))
     }
 
-    /// Build admin commands to create one I/O CQ+SQ pair (qid=1).
+    /// Build admin commands to create one I/O CQ+SQ pair for the given `qid`.
     ///
-    /// Returns `[create_cq_cmd, create_sq_cmd]`.  The caller must execute
-    /// them in order, confirm both completions succeed, then call
-    /// [`activate_io_queues`] to record the result.
-    pub fn create_io_queues(
+    /// `qid` must be ≥ 1.  Returns `[create_cq_cmd, create_sq_cmd]`.  The
+    /// caller must execute them in order, confirm both completions succeed,
+    /// then call [`activate_io_queue_pair`] to record the result.
+    ///
+    /// Both [`NvmeState::Enabled`] and [`NvmeState::Ready`] are accepted so
+    /// that additional queue pairs can be created after the first is active.
+    pub fn create_io_queue_pair(
         &mut self,
+        qid: u16,
         sq_phys: u64,
         cq_phys: u64,
         size: u16,
     ) -> Result<[AdminCommand; 2], NvmeError> {
-        // Only allow in Enabled state — not Ready (queues already exist)
-        // or Disabled (admin queue not active).
-        if self.state != NvmeState::Enabled {
+        if self.state != NvmeState::Enabled && self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+        // Reject duplicate qid — two QueuePairs with the same qid would share
+        // hardware doorbell offsets but track independent software state.
+        if self.io_queues.iter().any(|q| q.qid == qid)
+            || self.pending_io.iter().any(|&(q, _, _, _)| q == qid)
+        {
             return Err(NvmeError::InvalidState);
         }
         let size = size.min(self.max_queue_entries);
-        let cq_cmd = self.create_io_cq(cq_phys, size)?;
-        let sq_cmd = self.create_io_sq(sq_phys, size)?;
-        // Cache the effective (post-clamp) params so activate_io_queues
+        let cq_cmd = self.create_io_cq(qid, cq_phys, size)?;
+        let sq_cmd = self.create_io_sq(qid, sq_phys, size)?;
+        // Cache the effective (post-clamp) params so activate_io_queue_pair
         // creates a QueuePair that matches what the hardware was programmed with.
-        self.pending_io = Some((sq_phys, cq_phys, size));
+        self.pending_io.push((qid, sq_phys, cq_phys, size));
         Ok([cq_cmd, sq_cmd])
     }
 
-    /// Record that the I/O queues were successfully created on the
-    /// controller.
+    /// Record that the I/O queue pair identified by `qid` was successfully
+    /// created on the controller.
     ///
-    /// Call this after executing both commands from [`create_io_queues`]
+    /// Call this after executing both commands from [`create_io_queue_pair`]
     /// and confirming successful completions.  Uses the params cached by
-    /// `create_io_queues` to ensure the software QueuePair matches the
-    /// hardware.  Transitions the driver to [`NvmeState::Ready`].
-    pub fn activate_io_queues(&mut self) -> Result<(), NvmeError> {
-        if self.state != NvmeState::Enabled {
+    /// `create_io_queue_pair` to ensure the software [`QueuePair`] matches
+    /// the hardware.  Transitions the driver to [`NvmeState::Ready`] if not
+    /// already there.
+    ///
+    /// Both [`NvmeState::Enabled`] and [`NvmeState::Ready`] are accepted so
+    /// that additional queue pairs can be activated after the first.
+    pub fn activate_io_queue_pair(&mut self, qid: u16) -> Result<(), NvmeError> {
+        if self.state != NvmeState::Enabled && self.state != NvmeState::Ready {
             return Err(NvmeError::InvalidState);
         }
 
-        let (sq_phys, cq_phys, size) = self.pending_io.take().ok_or(NvmeError::InvalidState)?;
-        self.io = Some(QueuePair::new(1, sq_phys, cq_phys, size));
+        let idx = self
+            .pending_io
+            .iter()
+            .position(|&(q, _, _, _)| q == qid)
+            .ok_or(NvmeError::InvalidState)?;
+        let (_, sq_phys, cq_phys, size) = self.pending_io.remove(idx);
+        self.io_queues
+            .push(QueuePair::new(qid, sq_phys, cq_phys, size));
         self.state = NvmeState::Ready;
         Ok(())
     }
@@ -702,8 +749,21 @@ impl<R: RegisterBank> NvmeDriver<R> {
 // ── Block I/O commands ───────────────────────────────────────────────────────
 
 impl<R: RegisterBank> NvmeDriver<R> {
+    /// Return a mutable reference to the I/O queue pair at `queue_index`.
+    ///
+    /// `queue_index` is the zero-based index into the ordered list of active
+    /// I/O queue pairs (i.e., the order in which
+    /// [`activate_io_queue_pair`](Self::activate_io_queue_pair) was called).
+    /// Returns [`NvmeError::InvalidQueueIndex`] if the index is out of range.
+    fn io_queue_mut(&mut self, queue_index: usize) -> Result<&mut QueuePair, NvmeError> {
+        self.io_queues
+            .get_mut(queue_index)
+            .ok_or(NvmeError::InvalidQueueIndex)
+    }
+
     /// Build an NVM I/O command (Read or Write) and submit via the I/O queue.
     ///
+    /// `queue_index` is the zero-based index into the active I/O queue pairs.
     /// `pages` is a slice of 4 KiB-aligned physical addresses, one per logical
     /// block to transfer.  PRP1/PRP2/PRP-list are set according to the NVMe spec:
     ///
@@ -722,6 +782,7 @@ impl<R: RegisterBank> NvmeDriver<R> {
     /// [`NvmeError::TransferTooLarge`].
     fn io_rw_command(
         &mut self,
+        queue_index: usize,
         opcode: u8,
         nsid: u32,
         lba: u64,
@@ -787,70 +848,76 @@ impl<R: RegisterBank> NvmeDriver<R> {
         // CDW12: NLB (0-based block count)
         sqe[48..52].copy_from_slice(&nlb.to_le_bytes());
 
-        let mut cmd = self
-            .io
-            .as_mut()
-            .ok_or(NvmeError::InvalidState)?
-            .submit(sqe, self.doorbell_stride);
+        let doorbell_stride = self.doorbell_stride;
+        let mut cmd = self.io_queue_mut(queue_index)?.submit(sqe, doorbell_stride);
         cmd.prp_list = prp_list;
         Ok(cmd)
     }
 
     /// Build an NVM Read command for multiple logical blocks.
     ///
+    /// `queue_index` is the zero-based index into the active I/O queue pairs.
     /// `pages` contains one 4 KiB-aligned physical address per block.
     pub fn read_blocks(
         &mut self,
+        queue_index: usize,
         nsid: u32,
         lba: u64,
         pages: &[u64],
     ) -> Result<AdminCommand, NvmeError> {
-        self.io_rw_command(0x02, nsid, lba, pages)
+        self.io_rw_command(queue_index, 0x02, nsid, lba, pages)
     }
 
     /// Build an NVM Write command for multiple logical blocks.
     ///
+    /// `queue_index` is the zero-based index into the active I/O queue pairs.
     /// `pages` contains one 4 KiB-aligned physical address per block.
     pub fn write_blocks(
         &mut self,
+        queue_index: usize,
         nsid: u32,
         lba: u64,
         pages: &[u64],
     ) -> Result<AdminCommand, NvmeError> {
-        self.io_rw_command(0x01, nsid, lba, pages)
+        self.io_rw_command(queue_index, 0x01, nsid, lba, pages)
     }
 
     /// Build an NVM Read command (opcode 0x02) for one logical block.
     ///
+    /// `queue_index` is the zero-based index into the active I/O queue pairs.
     /// Thin wrapper around [`read_blocks`](Self::read_blocks) with a
     /// single-element page slice.
     pub fn read_block(
         &mut self,
+        queue_index: usize,
         nsid: u32,
         lba: u64,
         data_phys: u64,
     ) -> Result<AdminCommand, NvmeError> {
-        self.read_blocks(nsid, lba, &[data_phys])
+        self.read_blocks(queue_index, nsid, lba, &[data_phys])
     }
 
     /// Build an NVM Write command (opcode 0x01) for one logical block.
     ///
+    /// `queue_index` is the zero-based index into the active I/O queue pairs.
     /// Thin wrapper around [`write_blocks`](Self::write_blocks) with a
     /// single-element page slice.
     pub fn write_block(
         &mut self,
+        queue_index: usize,
         nsid: u32,
         lba: u64,
         data_phys: u64,
     ) -> Result<AdminCommand, NvmeError> {
-        self.write_blocks(nsid, lba, &[data_phys])
+        self.write_blocks(queue_index, nsid, lba, &[data_phys])
     }
 
     /// Build an NVM Flush command (opcode 0x00).
     ///
-    /// Submits via the I/O queue (qid=1).  Flushes all pending writes
-    /// for `nsid` to non-volatile media.  No data transfer.
-    pub fn flush(&mut self, nsid: u32) -> Result<AdminCommand, NvmeError> {
+    /// `queue_index` is the zero-based index into the active I/O queue pairs.
+    /// Flushes all pending writes for `nsid` to non-volatile media.
+    /// No data transfer.
+    pub fn flush(&mut self, queue_index: usize, nsid: u32) -> Result<AdminCommand, NvmeError> {
         if self.state != NvmeState::Ready {
             return Err(NvmeError::InvalidState);
         }
@@ -863,11 +930,8 @@ impl<R: RegisterBank> NvmeDriver<R> {
         sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
         sqe[4..8].copy_from_slice(&nsid.to_le_bytes());
 
-        Ok(self
-            .io
-            .as_mut()
-            .ok_or(NvmeError::InvalidState)?
-            .submit(sqe, self.doorbell_stride))
+        let doorbell_stride = self.doorbell_stride;
+        Ok(self.io_queue_mut(queue_index)?.submit(sqe, doorbell_stride))
     }
 
     /// Build an NVM Write Zeroes command (opcode 0x08).
@@ -877,9 +941,11 @@ impl<R: RegisterBank> NvmeDriver<R> {
     /// DEAC (Deallocate) is always 0 — reads after Write Zeroes return
     /// deterministic zero bytes.
     ///
+    /// `queue_index` is the zero-based index into the active I/O queue pairs.
     /// Requires ONCS bit 3 (Write Zeroes support).
     pub fn write_zeroes(
         &mut self,
+        queue_index: usize,
         nsid: u32,
         lba: u64,
         block_count: u32,
@@ -917,11 +983,8 @@ impl<R: RegisterBank> NvmeDriver<R> {
         // CDW12: NLB (bits 15:0), DEAC=0 (bit 25)
         sqe[48..52].copy_from_slice(&nlb.to_le_bytes());
 
-        let mut cmd = self
-            .io
-            .as_mut()
-            .ok_or(NvmeError::InvalidState)?
-            .submit(sqe, self.doorbell_stride);
+        let doorbell_stride = self.doorbell_stride;
+        let mut cmd = self.io_queue_mut(queue_index)?.submit(sqe, doorbell_stride);
         cmd.prp_list = None;
         cmd.data_buffer = None;
         Ok(cmd)
@@ -937,9 +1000,11 @@ impl<R: RegisterBank> NvmeDriver<R> {
     /// 4 KiB-aligned physical address, then patch SQE bytes 24–31 (PRP1) with
     /// that address before submitting.
     ///
+    /// `queue_index` is the zero-based index into the active I/O queue pairs.
     /// Requires ONCS bit 2 (Dataset Management support).  Max 256 ranges.
     pub fn dataset_management(
         &mut self,
+        queue_index: usize,
         nsid: u32,
         ranges: &[DsmRange],
     ) -> Result<AdminCommand, NvmeError> {
@@ -983,11 +1048,8 @@ impl<R: RegisterBank> NvmeDriver<R> {
         // CDW11: AD bit (bit 2) = Attribute Deallocate
         sqe[44..48].copy_from_slice(&0x04u32.to_le_bytes());
 
-        let mut cmd = self
-            .io
-            .as_mut()
-            .ok_or(NvmeError::InvalidState)?
-            .submit(sqe, self.doorbell_stride);
+        let doorbell_stride = self.doorbell_stride;
+        let mut cmd = self.io_queue_mut(queue_index)?.submit(sqe, doorbell_stride);
         cmd.prp_list = None;
         cmd.data_buffer = Some(buf);
         Ok(cmd)
@@ -1026,20 +1088,21 @@ impl<R: RegisterBank> NvmeDriver<R> {
 
     /// Parse a raw 16-byte I/O completion queue entry.
     ///
-    /// Delegates to the I/O [`QueuePair`]'s completion checking.
+    /// `queue_index` is the zero-based index into the active I/O queue pairs.
+    /// Delegates to the selected I/O [`QueuePair`]'s completion checking.
     /// Requires [`NvmeState::Ready`].
     pub fn check_io_completion(
         &mut self,
+        queue_index: usize,
         cqe_bytes: &[u8; 16],
     ) -> Result<Option<CompletionResult>, NvmeError> {
         if self.state != NvmeState::Ready {
             return Err(NvmeError::InvalidState);
         }
+        let doorbell_stride = self.doorbell_stride;
         Ok(self
-            .io
-            .as_mut()
-            .ok_or(NvmeError::InvalidState)?
-            .check_completion(cqe_bytes, self.doorbell_stride))
+            .io_queue_mut(queue_index)?
+            .check_completion(cqe_bytes, doorbell_stride))
     }
 }
 
@@ -1521,7 +1584,7 @@ mod tests {
     fn create_io_cq_builds_correct_sqe() {
         let mut driver = enabled_driver();
         let cq_phys: u64 = 0xAAAA_0000;
-        let cmd = driver.create_io_cq(cq_phys, 32).unwrap();
+        let cmd = driver.create_io_cq(1, cq_phys, 32).unwrap();
 
         let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
         assert_eq!(cdw0 & 0xFF, 0x05, "opcode must be 0x05 (Create I/O CQ)");
@@ -1543,7 +1606,7 @@ mod tests {
     fn create_io_sq_builds_correct_sqe() {
         let mut driver = enabled_driver();
         let sq_phys: u64 = 0xBBBB_0000;
-        let cmd = driver.create_io_sq(sq_phys, 32).unwrap();
+        let cmd = driver.create_io_sq(1, sq_phys, 32).unwrap();
 
         let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
         assert_eq!(cdw0 & 0xFF, 0x01, "opcode must be 0x01 (Create I/O SQ)");
@@ -1567,7 +1630,7 @@ mod tests {
         let mut driver = NvmeDriver::init(bank).unwrap();
         // State is Disabled — should reject
         assert_eq!(
-            driver.create_io_cq(0x1000, 16).unwrap_err(),
+            driver.create_io_cq(1, 0x1000, 16).unwrap_err(),
             NvmeError::InvalidState
         );
     }
@@ -1575,19 +1638,19 @@ mod tests {
     #[test]
     fn create_io_cq_advances_admin_doorbell() {
         let mut driver = enabled_driver();
-        let cmd1 = driver.create_io_cq(0xAAAA_0000, 16).unwrap();
-        let cmd2 = driver.create_io_cq(0xBBBB_0000, 16).unwrap();
+        let cmd1 = driver.create_io_cq(1, 0xAAAA_0000, 16).unwrap();
+        let cmd2 = driver.create_io_cq(1, 0xBBBB_0000, 16).unwrap();
         // Doorbell values should be sequential (admin SQ tail advancing)
         assert_eq!(cmd1.doorbell_value, cmd2.doorbell_value - 1);
     }
 
-    // ── create_io_queues + activate tests ─────────────────────────────────────
+    // ── create_io_queue_pair + activate tests ───────────────────────────────
 
     #[test]
-    fn create_io_queues_returns_cq_first_sq_second() {
+    fn create_io_queue_pair_returns_cq_first_sq_second() {
         let mut driver = enabled_driver();
         let cmds = driver
-            .create_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
+            .create_io_queue_pair(1, 0xBBBB_0000, 0xAAAA_0000, 32)
             .unwrap();
 
         // First command is Create I/O CQ (opcode 0x05)
@@ -1600,10 +1663,10 @@ mod tests {
     }
 
     #[test]
-    fn create_io_queues_clamps_size() {
+    fn create_io_queue_pair_clamps_size() {
         let mut driver = enabled_driver(); // MQES+1 = 64
         let cmds = driver
-            .create_io_queues(0xBBBB_0000, 0xAAAA_0000, 256)
+            .create_io_queue_pair(1, 0xBBBB_0000, 0xAAAA_0000, 256)
             .unwrap();
 
         // CDW10 of CQ: size-1 in upper 16 bits should be 63 (clamped to 64)
@@ -1612,80 +1675,62 @@ mod tests {
     }
 
     #[test]
-    fn create_io_queues_rejects_disabled_state() {
+    fn create_io_queue_pair_rejects_disabled_state() {
         let bank = mock_nvme_bank();
         let mut driver = NvmeDriver::init(bank).unwrap();
         assert_eq!(
-            driver.create_io_queues(0x1000, 0x2000, 16).unwrap_err(),
-            NvmeError::InvalidState
-        );
-    }
-
-    #[test]
-    fn create_io_queues_rejects_ready_state() {
-        let mut driver = enabled_driver();
-        let _ = driver
-            .create_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
-            .unwrap();
-        driver.activate_io_queues().unwrap();
-        assert_eq!(driver.state(), NvmeState::Ready);
-        // Already has I/O queues — should reject
-        assert_eq!(
             driver
-                .create_io_queues(0xCCCC_0000, 0xDDDD_0000, 16)
+                .create_io_queue_pair(1, 0x1000, 0x2000, 16)
                 .unwrap_err(),
             NvmeError::InvalidState
         );
     }
 
     #[test]
-    fn activate_io_queues_transitions_to_ready() {
+    fn activate_io_queue_pair_transitions_to_ready() {
         let mut driver = enabled_driver();
         assert_eq!(driver.state(), NvmeState::Enabled);
 
         let _ = driver
-            .create_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
+            .create_io_queue_pair(1, 0xBBBB_0000, 0xAAAA_0000, 32)
             .unwrap();
-        driver.activate_io_queues().unwrap();
+        driver.activate_io_queue_pair(1).unwrap();
 
         assert_eq!(driver.state(), NvmeState::Ready);
-        assert!(driver.io.is_some());
-        let io = driver.io.as_ref().unwrap();
-        assert_eq!(io.qid, 1);
-        assert_eq!(io.size, 32);
+        assert_eq!(driver.io_queue_count(), 1);
     }
 
     #[test]
-    fn activate_io_queues_rejects_double_activation() {
+    fn activate_io_queue_pair_rejects_without_pending() {
         let mut driver = enabled_driver();
         let _ = driver
-            .create_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
+            .create_io_queue_pair(1, 0xBBBB_0000, 0xAAAA_0000, 32)
             .unwrap();
-        driver.activate_io_queues().unwrap();
-        // Now Ready — second call should fail (state is Ready, not Enabled)
+        driver.activate_io_queue_pair(1).unwrap();
+        // Now Ready — activating qid=1 again should fail (no pending entry)
         assert_eq!(
-            driver.activate_io_queues().unwrap_err(),
+            driver.activate_io_queue_pair(1).unwrap_err(),
             NvmeError::InvalidState
         );
     }
 
     #[test]
-    fn activate_io_queues_rejects_disabled_state() {
+    fn activate_io_queue_pair_rejects_disabled_state() {
         let bank = mock_nvme_bank();
         let mut driver = NvmeDriver::init(bank).unwrap();
         // Disabled state — no pending_io either
         assert_eq!(
-            driver.activate_io_queues().unwrap_err(),
+            driver.activate_io_queue_pair(1).unwrap_err(),
             NvmeError::InvalidState
         );
     }
 
     #[test]
-    fn activate_io_queues_rejects_without_create() {
+    fn activate_io_queue_pair_rejects_without_create() {
         let mut driver = enabled_driver();
-        // Enabled but create_io_queues not called — no pending_io
+        // Enabled but create_io_queue_pair not called — no pending_io
         assert_eq!(
-            driver.activate_io_queues().unwrap_err(),
+            driver.activate_io_queue_pair(1).unwrap_err(),
             NvmeError::InvalidState
         );
     }
@@ -1742,9 +1787,9 @@ mod tests {
     fn identify_namespace_works_in_ready_state() {
         let mut driver = enabled_driver();
         let _ = driver
-            .create_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
+            .create_io_queue_pair(1, 0xBBBB_0000, 0xAAAA_0000, 32)
             .unwrap();
-        driver.activate_io_queues().unwrap();
+        driver.activate_io_queue_pair(1).unwrap();
         assert_eq!(driver.state(), NvmeState::Ready);
         // Should succeed in Ready state
         driver.identify_namespace(1, 0x1000).unwrap();
@@ -1815,9 +1860,9 @@ mod tests {
     fn identify_controller_works_in_ready_state() {
         let mut driver = enabled_driver();
         let _ = driver
-            .create_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
+            .create_io_queue_pair(1, 0xBBBB_0000, 0xAAAA_0000, 32)
             .unwrap();
-        driver.activate_io_queues().unwrap();
+        driver.activate_io_queue_pair(1).unwrap();
         assert_eq!(driver.state(), NvmeState::Ready);
 
         // identify_controller should still work in Ready state
@@ -1828,7 +1873,7 @@ mod tests {
 
     #[test]
     fn full_phase2_lifecycle() {
-        // init → admin queue → create I/O queues → activate → identify namespace
+        // init → admin queue → create I/O queue pair → activate → identify namespace
         let bank = mock_nvme_bank();
         let mut driver = NvmeDriver::init(bank).unwrap();
         assert_eq!(driver.state(), NvmeState::Disabled);
@@ -1838,7 +1883,7 @@ mod tests {
         assert_eq!(driver.state(), NvmeState::Enabled);
 
         let cmds = driver
-            .create_io_queues(0xBBBB_0000, 0xAAAA_0000, 32)
+            .create_io_queue_pair(1, 0xBBBB_0000, 0xAAAA_0000, 32)
             .unwrap();
         // Verify we got CQ and SQ commands
         let op0 = u32::from_le_bytes(cmds[0].sqe[0..4].try_into().unwrap()) & 0xFF;
@@ -1846,7 +1891,7 @@ mod tests {
         assert_eq!(op0, 0x05); // Create I/O CQ
         assert_eq!(op1, 0x01); // Create I/O SQ
 
-        driver.activate_io_queues().unwrap();
+        driver.activate_io_queue_pair(1).unwrap();
         assert_eq!(driver.state(), NvmeState::Ready);
 
         // Identify namespace should work in Ready state
@@ -1862,8 +1907,24 @@ mod tests {
     /// Helper: produce a Ready driver with I/O queues active.
     fn ready_driver() -> NvmeDriver<MockRegisterBank> {
         let mut driver = enabled_driver();
-        let _ = driver.create_io_queues(0x3_0000, 0x4_0000, 32).unwrap();
-        driver.activate_io_queues().unwrap();
+        let _ = driver
+            .create_io_queue_pair(1, 0x3_0000, 0x4_0000, 32)
+            .unwrap();
+        driver.activate_io_queue_pair(1).unwrap();
+        driver
+    }
+
+    fn ready_driver_multi(n: usize) -> NvmeDriver<MockRegisterBank> {
+        let mut driver = enabled_driver();
+        for i in 1..=n {
+            let qid = i as u16;
+            let sq_phys = 0x10_0000 + (i as u64) * 0x1_0000;
+            let cq_phys = 0x20_0000 + (i as u64) * 0x1_0000;
+            let _ = driver
+                .create_io_queue_pair(qid, sq_phys, cq_phys, 32)
+                .unwrap();
+            driver.activate_io_queue_pair(qid).unwrap();
+        }
         driver
     }
 
@@ -1872,7 +1933,7 @@ mod tests {
     #[test]
     fn read_block_builds_correct_sqe() {
         let mut driver = ready_driver();
-        let cmd = driver.read_block(1, 100, 0xBEEF_0000).unwrap();
+        let cmd = driver.read_block(0, 1, 100, 0xBEEF_0000).unwrap();
 
         let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
         assert_eq!(cdw0 & 0xFF, 0x02);
@@ -1896,7 +1957,7 @@ mod tests {
     #[test]
     fn read_block_uses_io_queue_doorbell() {
         let mut driver = ready_driver();
-        let cmd = driver.read_block(1, 0, 0x1000).unwrap();
+        let cmd = driver.read_block(0, 1, 0, 0x1000).unwrap();
         assert_eq!(cmd.doorbell_offset, 0x1008);
     }
 
@@ -1905,7 +1966,7 @@ mod tests {
         let mut driver = enabled_driver();
         assert_eq!(driver.state(), NvmeState::Enabled);
         assert_eq!(
-            driver.read_block(1, 0, 0x1000).unwrap_err(),
+            driver.read_block(0, 1, 0, 0x1000).unwrap_err(),
             NvmeError::InvalidState
         );
     }
@@ -1915,7 +1976,7 @@ mod tests {
         let bank = mock_nvme_bank();
         let mut driver = NvmeDriver::init(bank).unwrap();
         assert_eq!(
-            driver.read_block(1, 0, 0x1000).unwrap_err(),
+            driver.read_block(0, 1, 0, 0x1000).unwrap_err(),
             NvmeError::InvalidState
         );
     }
@@ -1924,7 +1985,7 @@ mod tests {
     fn read_block_large_lba_splits_correctly() {
         let mut driver = ready_driver();
         let lba: u64 = 0x1_ABCD_EF00;
-        let cmd = driver.read_block(1, lba, 0x1000).unwrap();
+        let cmd = driver.read_block(0, 1, lba, 0x1000).unwrap();
 
         let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
         let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
@@ -1937,7 +1998,7 @@ mod tests {
     #[test]
     fn write_block_builds_correct_sqe() {
         let mut driver = ready_driver();
-        let cmd = driver.write_block(1, 200, 0xCAFE_0000).unwrap();
+        let cmd = driver.write_block(0, 1, 200, 0xCAFE_0000).unwrap();
 
         let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
         assert_eq!(cdw0 & 0xFF, 0x01);
@@ -1960,7 +2021,7 @@ mod tests {
     #[test]
     fn write_block_uses_io_queue_doorbell() {
         let mut driver = ready_driver();
-        let cmd = driver.write_block(1, 0, 0x1000).unwrap();
+        let cmd = driver.write_block(0, 1, 0, 0x1000).unwrap();
         assert_eq!(cmd.doorbell_offset, 0x1008);
     }
 
@@ -1968,7 +2029,7 @@ mod tests {
     fn write_block_rejects_enabled_state() {
         let mut driver = enabled_driver();
         assert_eq!(
-            driver.write_block(1, 0, 0x1000).unwrap_err(),
+            driver.write_block(0, 1, 0, 0x1000).unwrap_err(),
             NvmeError::InvalidState
         );
     }
@@ -1978,7 +2039,7 @@ mod tests {
         let bank = mock_nvme_bank();
         let mut driver = NvmeDriver::init(bank).unwrap();
         assert_eq!(
-            driver.write_block(1, 0, 0x1000).unwrap_err(),
+            driver.write_block(0, 1, 0, 0x1000).unwrap_err(),
             NvmeError::InvalidState
         );
     }
@@ -1987,7 +2048,7 @@ mod tests {
     fn write_block_large_lba_splits_correctly() {
         let mut driver = ready_driver();
         let lba: u64 = 0x1_ABCD_EF00;
-        let cmd = driver.write_block(1, lba, 0x1000).unwrap();
+        let cmd = driver.write_block(0, 1, lba, 0x1000).unwrap();
 
         let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
         let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
@@ -2000,7 +2061,7 @@ mod tests {
     #[test]
     fn flush_builds_correct_sqe() {
         let mut driver = ready_driver();
-        let cmd = driver.flush(1).unwrap();
+        let cmd = driver.flush(0, 1).unwrap();
 
         let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
         assert_eq!(cdw0 & 0xFF, 0x00);
@@ -2022,21 +2083,21 @@ mod tests {
     #[test]
     fn flush_uses_io_queue_doorbell() {
         let mut driver = ready_driver();
-        let cmd = driver.flush(1).unwrap();
+        let cmd = driver.flush(0, 1).unwrap();
         assert_eq!(cmd.doorbell_offset, 0x1008);
     }
 
     #[test]
     fn flush_rejects_enabled_state() {
         let mut driver = enabled_driver();
-        assert_eq!(driver.flush(1).unwrap_err(), NvmeError::InvalidState);
+        assert_eq!(driver.flush(0, 1).unwrap_err(), NvmeError::InvalidState);
     }
 
     #[test]
     fn flush_rejects_disabled_state() {
         let bank = mock_nvme_bank();
         let mut driver = NvmeDriver::init(bank).unwrap();
-        assert_eq!(driver.flush(1).unwrap_err(), NvmeError::InvalidState);
+        assert_eq!(driver.flush(0, 1).unwrap_err(), NvmeError::InvalidState);
     }
 
     // ── I/O completion tests ──────────────────────────────────────────────
@@ -2044,7 +2105,7 @@ mod tests {
     #[test]
     fn check_io_completion_phase_match() {
         let mut driver = ready_driver();
-        let _ = driver.read_block(1, 0, 0x1000).unwrap();
+        let _ = driver.read_block(0, 1, 0, 0x1000).unwrap();
 
         let mut cqe = [0u8; 16];
         cqe[0..4].copy_from_slice(&0x42u32.to_le_bytes());
@@ -2052,7 +2113,7 @@ mod tests {
         cqe[14..16].copy_from_slice(&0x0001u16.to_le_bytes());
 
         let cr = driver
-            .check_io_completion(&cqe)
+            .check_io_completion(0, &cqe)
             .unwrap()
             .expect("phase matches");
         assert_eq!(cr.completion.result, 0x42);
@@ -2066,7 +2127,7 @@ mod tests {
         let mut cqe = [0u8; 16];
         cqe[14..16].copy_from_slice(&0x0000u16.to_le_bytes());
 
-        let result = driver.check_io_completion(&cqe).unwrap();
+        let result = driver.check_io_completion(0, &cqe).unwrap();
         assert!(result.is_none());
     }
 
@@ -2075,7 +2136,7 @@ mod tests {
         let mut driver = enabled_driver();
         let cqe = [0u8; 16];
         assert_eq!(
-            driver.check_io_completion(&cqe).unwrap_err(),
+            driver.check_io_completion(0, &cqe).unwrap_err(),
             NvmeError::InvalidState
         );
     }
@@ -2086,7 +2147,7 @@ mod tests {
         let mut cqe = [0u8; 16];
         cqe[14..16].copy_from_slice(&0x0001u16.to_le_bytes());
 
-        let cr = driver.check_io_completion(&cqe).unwrap().unwrap();
+        let cr = driver.check_io_completion(0, &cqe).unwrap().unwrap();
         assert_eq!(cr.cq_doorbell_offset, 0x100C);
     }
 
@@ -2102,8 +2163,10 @@ mod tests {
         driver.setup_admin_queue(0x1_0000, 0x2_0000, 32).unwrap();
         assert_eq!(driver.state(), NvmeState::Enabled);
 
-        let _ = driver.create_io_queues(0x3_0000, 0x4_0000, 32).unwrap();
-        driver.activate_io_queues().unwrap();
+        let _ = driver
+            .create_io_queue_pair(1, 0x3_0000, 0x4_0000, 32)
+            .unwrap();
+        driver.activate_io_queue_pair(1).unwrap();
         assert_eq!(driver.state(), NvmeState::Ready);
 
         let make_cqe = |phase: bool| -> [u8; 16] {
@@ -2114,35 +2177,35 @@ mod tests {
         };
 
         // Read block 42
-        let read_cmd = driver.read_block(1, 42, 0xBEEF_0000).unwrap();
+        let read_cmd = driver.read_block(0, 1, 42, 0xBEEF_0000).unwrap();
         let cdw0 = u32::from_le_bytes(read_cmd.sqe[0..4].try_into().unwrap());
         assert_eq!(cdw0 & 0xFF, 0x02);
         assert_eq!(read_cmd.doorbell_offset, 0x1008);
 
         let read_cr = driver
-            .check_io_completion(&make_cqe(true))
+            .check_io_completion(0, &make_cqe(true))
             .unwrap()
             .expect("read completion");
         assert_eq!(read_cr.cq_doorbell_offset, 0x100C);
 
         // Write block 42
-        let write_cmd = driver.write_block(1, 42, 0xCAFE_0000).unwrap();
+        let write_cmd = driver.write_block(0, 1, 42, 0xCAFE_0000).unwrap();
         let cdw0 = u32::from_le_bytes(write_cmd.sqe[0..4].try_into().unwrap());
         assert_eq!(cdw0 & 0xFF, 0x01);
 
         let write_cr = driver
-            .check_io_completion(&make_cqe(true))
+            .check_io_completion(0, &make_cqe(true))
             .unwrap()
             .expect("write completion");
         assert_eq!(write_cr.completion.status, 0);
 
         // Flush
-        let flush_cmd = driver.flush(1).unwrap();
+        let flush_cmd = driver.flush(0, 1).unwrap();
         let cdw0 = u32::from_le_bytes(flush_cmd.sqe[0..4].try_into().unwrap());
         assert_eq!(cdw0 & 0xFF, 0x00);
 
         let flush_cr = driver
-            .check_io_completion(&make_cqe(true))
+            .check_io_completion(0, &make_cqe(true))
             .unwrap()
             .expect("flush completion");
         assert_eq!(flush_cr.completion.status, 0);
@@ -2156,8 +2219,10 @@ mod tests {
         driver.bank.on_read(REG_CSTS, vec![CSTS_RDY]);
         driver.setup_admin_queue(0x1_0000, 0x2_0000, 32).unwrap();
 
-        let _ = driver.create_io_queues(0x3_0000, 0x4_0000, 32).unwrap();
-        driver.activate_io_queues().unwrap();
+        let _ = driver
+            .create_io_queue_pair(1, 0x3_0000, 0x4_0000, 32)
+            .unwrap();
+        driver.activate_io_queue_pair(1).unwrap();
 
         // Set MDTS=3 → max 8 pages
         driver.set_mdts(3);
@@ -2172,7 +2237,7 @@ mod tests {
 
         // Multi-block read: 4 pages
         let pages: Vec<u64> = (0..4).map(|i| (i + 1) * 0x1000).collect();
-        let read_cmd = driver.read_blocks(1, 0, &pages).unwrap();
+        let read_cmd = driver.read_blocks(0, 1, 0, &pages).unwrap();
 
         // Verify SQE
         let cdw0 = u32::from_le_bytes(read_cmd.sqe[0..4].try_into().unwrap());
@@ -2187,13 +2252,13 @@ mod tests {
 
         // Complete the read
         let cr = driver
-            .check_io_completion(&make_cqe(true))
+            .check_io_completion(0, &make_cqe(true))
             .unwrap()
             .expect("read completion");
         assert_eq!(cr.completion.status, 0);
 
         // Multi-block write: 2 pages (no PRP list needed)
-        let write_cmd = driver.write_blocks(1, 100, &[0x5000, 0x6000]).unwrap();
+        let write_cmd = driver.write_blocks(0, 1, 100, &[0x5000, 0x6000]).unwrap();
         let cdw0 = u32::from_le_bytes(write_cmd.sqe[0..4].try_into().unwrap());
         assert_eq!(cdw0 & 0xFF, 0x01); // Write opcode
         let cdw12 = u32::from_le_bytes(write_cmd.sqe[48..52].try_into().unwrap());
@@ -2201,13 +2266,13 @@ mod tests {
         assert!(write_cmd.prp_list.is_none());
 
         let cr = driver
-            .check_io_completion(&make_cqe(true))
+            .check_io_completion(0, &make_cqe(true))
             .unwrap()
             .expect("write completion");
         assert_eq!(cr.completion.status, 0);
 
         // Single-block via wrapper still works
-        let single_cmd = driver.read_block(1, 42, 0x7000).unwrap();
+        let single_cmd = driver.read_block(0, 1, 42, 0x7000).unwrap();
         let cdw12 = u32::from_le_bytes(single_cmd.sqe[48..52].try_into().unwrap());
         assert_eq!(cdw12, 0); // NLB = 1-1 = 0
         assert!(single_cmd.prp_list.is_none());
@@ -2215,7 +2280,7 @@ mod tests {
         // MDTS enforcement
         let too_many: Vec<u64> = (0..9).map(|i| (i + 1) * 0x1000).collect();
         assert_eq!(
-            driver.read_blocks(1, 0, &too_many).unwrap_err(),
+            driver.read_blocks(0, 1, 0, &too_many).unwrap_err(),
             NvmeError::TransferTooLarge
         );
     }
@@ -2255,7 +2320,7 @@ mod tests {
     #[test]
     fn read_block_has_no_prp_list() {
         let mut driver = ready_driver();
-        let cmd = driver.read_block(1, 0, 0x1000).unwrap();
+        let cmd = driver.read_block(0, 1, 0, 0x1000).unwrap();
         assert!(cmd.prp_list.is_none());
     }
 
@@ -2263,7 +2328,7 @@ mod tests {
     fn read_blocks_two_pages_uses_prp2() {
         let mut driver = ready_driver();
         let pages = [0x1_0000u64, 0x2_0000u64];
-        let cmd = driver.read_blocks(1, 0, &pages).unwrap();
+        let cmd = driver.read_blocks(0, 1, 0, &pages).unwrap();
 
         // PRP1 = pages[0]
         let prp1 = u64::from_le_bytes(cmd.sqe[24..32].try_into().unwrap());
@@ -2285,7 +2350,7 @@ mod tests {
     fn read_blocks_three_pages_builds_prp_list() {
         let mut driver = ready_driver();
         let pages = [0x1_0000u64, 0x2_0000u64, 0x3_0000u64];
-        let cmd = driver.read_blocks(1, 0, &pages).unwrap();
+        let cmd = driver.read_blocks(0, 1, 0, &pages).unwrap();
 
         // PRP1 = pages[0]
         let prp1 = u64::from_le_bytes(cmd.sqe[24..32].try_into().unwrap());
@@ -2312,7 +2377,7 @@ mod tests {
     fn read_blocks_eight_pages_prp_list_has_seven_entries() {
         let mut driver = ready_driver();
         let pages: Vec<u64> = (0..8).map(|i| (i + 1) * 0x1000).collect();
-        let cmd = driver.read_blocks(1, 0, &pages).unwrap();
+        let cmd = driver.read_blocks(0, 1, 0, &pages).unwrap();
 
         // NLB = 7 (0-based: 8 blocks - 1)
         let cdw12 = u32::from_le_bytes(cmd.sqe[48..52].try_into().unwrap());
@@ -2331,7 +2396,7 @@ mod tests {
     fn write_blocks_two_pages_uses_prp2() {
         let mut driver = ready_driver();
         let pages = [0x1_0000u64, 0x2_0000u64];
-        let cmd = driver.write_blocks(1, 0, &pages).unwrap();
+        let cmd = driver.write_blocks(0, 1, 0, &pages).unwrap();
 
         let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
         assert_eq!(cdw0 & 0xFF, 0x01); // Write opcode
@@ -2346,7 +2411,7 @@ mod tests {
     #[test]
     fn single_block_wrapper_still_works() {
         let mut driver = ready_driver();
-        let cmd = driver.read_block(1, 100, 0xBEEF_0000).unwrap();
+        let cmd = driver.read_block(0, 1, 100, 0xBEEF_0000).unwrap();
 
         // Same assertions as the existing read_block_builds_correct_sqe test
         let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
@@ -2363,8 +2428,8 @@ mod tests {
     #[test]
     fn read_blocks_cid_increments() {
         let mut driver = ready_driver();
-        let cmd1 = driver.read_blocks(1, 0, &[0x1000, 0x2000]).unwrap();
-        let cmd2 = driver.read_blocks(1, 10, &[0x3000, 0x4000]).unwrap();
+        let cmd1 = driver.read_blocks(0, 1, 0, &[0x1000, 0x2000]).unwrap();
+        let cmd2 = driver.read_blocks(0, 1, 10, &[0x3000, 0x4000]).unwrap();
         let cid1 = u32::from_le_bytes(cmd1.sqe[0..4].try_into().unwrap()) >> 16;
         let cid2 = u32::from_le_bytes(cmd2.sqe[0..4].try_into().unwrap()) >> 16;
         assert_eq!(cid2, cid1 + 1);
@@ -2376,7 +2441,7 @@ mod tests {
     fn read_blocks_rejects_empty_pages() {
         let mut driver = ready_driver();
         assert_eq!(
-            driver.read_blocks(1, 0, &[]).unwrap_err(),
+            driver.read_blocks(0, 1, 0, &[]).unwrap_err(),
             NvmeError::TransferTooLarge
         );
     }
@@ -2386,7 +2451,7 @@ mod tests {
         let mut driver = ready_driver();
         // 0x1001 is not 4 KiB-aligned
         assert_eq!(
-            driver.read_blocks(1, 0, &[0x1001]).unwrap_err(),
+            driver.read_blocks(0, 1, 0, &[0x1001]).unwrap_err(),
             NvmeError::UnalignedAddress
         );
     }
@@ -2396,7 +2461,7 @@ mod tests {
         let mut driver = ready_driver();
         // First page aligned, second is not
         assert_eq!(
-            driver.read_blocks(1, 0, &[0x1000, 0x2001]).unwrap_err(),
+            driver.read_blocks(0, 1, 0, &[0x1000, 0x2001]).unwrap_err(),
             NvmeError::UnalignedAddress
         );
     }
@@ -2407,7 +2472,7 @@ mod tests {
         driver.set_mdts(2); // max 4 pages
         let pages: Vec<u64> = (0..5).map(|i| (i + 1) * 0x1000).collect();
         assert_eq!(
-            driver.read_blocks(1, 0, &pages).unwrap_err(),
+            driver.read_blocks(0, 1, 0, &pages).unwrap_err(),
             NvmeError::TransferTooLarge
         );
     }
@@ -2417,7 +2482,7 @@ mod tests {
         let mut driver = ready_driver();
         driver.set_mdts(2); // max 4 pages
         let pages: Vec<u64> = (0..4).map(|i| (i + 1) * 0x1000).collect();
-        let cmd = driver.read_blocks(1, 0, &pages).unwrap();
+        let cmd = driver.read_blocks(0, 1, 0, &pages).unwrap();
         let cdw12 = u32::from_le_bytes(cmd.sqe[48..52].try_into().unwrap());
         assert_eq!(cdw12, 3); // NLB = 4-1 = 3
     }
@@ -2427,7 +2492,7 @@ mod tests {
         let mut driver = ready_driver();
         // mdts=0 by default, no limit
         let pages: Vec<u64> = (0..64).map(|i| (i + 1) * 0x1000).collect();
-        let cmd = driver.read_blocks(1, 0, &pages).unwrap();
+        let cmd = driver.read_blocks(0, 1, 0, &pages).unwrap();
         let cdw12 = u32::from_le_bytes(cmd.sqe[48..52].try_into().unwrap());
         assert_eq!(cdw12, 63); // NLB = 64-1
     }
@@ -2437,7 +2502,7 @@ mod tests {
         let mut driver = ready_driver();
         assert_eq!(
             driver
-                .read_blocks(1, u64::MAX, &[0x1000, 0x2000])
+                .read_blocks(0, 1, u64::MAX, &[0x1000, 0x2000])
                 .unwrap_err(),
             NvmeError::TransferTooLarge
         );
@@ -2448,7 +2513,7 @@ mod tests {
         let mut driver = ready_driver();
         // Range [u64::MAX - 1, u64::MAX] — last LBA fits in u64
         let cmd = driver
-            .read_blocks(1, u64::MAX - 1, &[0x1000, 0x2000])
+            .read_blocks(0, 1, u64::MAX - 1, &[0x1000, 0x2000])
             .unwrap();
         let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
         let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
@@ -2460,7 +2525,7 @@ mod tests {
     fn read_blocks_rejects_non_ready_state() {
         let mut driver = enabled_driver();
         assert_eq!(
-            driver.read_blocks(1, 0, &[0x1000]).unwrap_err(),
+            driver.read_blocks(0, 1, 0, &[0x1000]).unwrap_err(),
             NvmeError::InvalidState
         );
     }
@@ -2506,7 +2571,7 @@ mod tests {
     fn write_zeroes_builds_correct_sqe() {
         let mut driver = ready_driver();
         driver.set_oncs(0x08); // bit 3 = Write Zeroes
-        let cmd = driver.write_zeroes(1, 100, 16).unwrap();
+        let cmd = driver.write_zeroes(0, 1, 100, 16).unwrap();
 
         // Opcode = 0x08
         let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
@@ -2546,7 +2611,7 @@ mod tests {
         let mut driver = ready_driver();
         // ONCS = 0 — Write Zeroes not supported
         assert_eq!(
-            driver.write_zeroes(1, 0, 1).unwrap_err(),
+            driver.write_zeroes(0, 1, 0, 1).unwrap_err(),
             NvmeError::UnsupportedCommand
         );
     }
@@ -2556,7 +2621,7 @@ mod tests {
         let mut driver = ready_driver();
         driver.set_oncs(0x08);
         assert_eq!(
-            driver.write_zeroes(1, 0, 0).unwrap_err(),
+            driver.write_zeroes(0, 1, 0, 0).unwrap_err(),
             NvmeError::TransferTooLarge
         );
     }
@@ -2565,7 +2630,7 @@ mod tests {
     fn write_zeroes_accepts_max_blocks() {
         let mut driver = ready_driver();
         driver.set_oncs(0x08);
-        let cmd = driver.write_zeroes(1, 0, 65536).unwrap();
+        let cmd = driver.write_zeroes(0, 1, 0, 65536).unwrap();
         let cdw12 = u32::from_le_bytes(cmd.sqe[48..52].try_into().unwrap());
         assert_eq!(cdw12, 65535); // NLB = 65536 - 1
     }
@@ -2575,7 +2640,7 @@ mod tests {
         let mut driver = ready_driver();
         driver.set_oncs(0x08);
         assert_eq!(
-            driver.write_zeroes(1, 0, 65537).unwrap_err(),
+            driver.write_zeroes(0, 1, 0, 65537).unwrap_err(),
             NvmeError::TransferTooLarge
         );
     }
@@ -2585,7 +2650,7 @@ mod tests {
         let mut driver = ready_driver();
         driver.set_oncs(0x08);
         assert_eq!(
-            driver.write_zeroes(1, u64::MAX, 2).unwrap_err(),
+            driver.write_zeroes(0, 1, u64::MAX, 2).unwrap_err(),
             NvmeError::TransferTooLarge
         );
     }
@@ -2595,7 +2660,7 @@ mod tests {
         let mut driver = ready_driver();
         driver.set_oncs(0x08);
         // Range [u64::MAX - 1, u64::MAX] — last LBA fits in u64
-        let cmd = driver.write_zeroes(1, u64::MAX - 1, 2).unwrap();
+        let cmd = driver.write_zeroes(0, 1, u64::MAX - 1, 2).unwrap();
         let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
         let cdw11 = u32::from_le_bytes(cmd.sqe[44..48].try_into().unwrap());
         let lba = (cdw10 as u64) | ((cdw11 as u64) << 32);
@@ -2606,7 +2671,7 @@ mod tests {
     fn write_zeroes_rejects_non_ready_state() {
         let mut driver = enabled_driver();
         assert_eq!(
-            driver.write_zeroes(1, 0, 1).unwrap_err(),
+            driver.write_zeroes(0, 1, 0, 1).unwrap_err(),
             NvmeError::InvalidState
         );
     }
@@ -2615,8 +2680,8 @@ mod tests {
     fn write_zeroes_increments_cid() {
         let mut driver = ready_driver();
         driver.set_oncs(0x08);
-        let cmd1 = driver.write_zeroes(1, 0, 1).unwrap();
-        let cmd2 = driver.write_zeroes(1, 0, 1).unwrap();
+        let cmd1 = driver.write_zeroes(0, 1, 0, 1).unwrap();
+        let cmd2 = driver.write_zeroes(0, 1, 0, 1).unwrap();
         let cid1 = u32::from_le_bytes(cmd1.sqe[0..4].try_into().unwrap()) >> 16;
         let cid2 = u32::from_le_bytes(cmd2.sqe[0..4].try_into().unwrap()) >> 16;
         assert_eq!(cid2, cid1 + 1);
@@ -2632,7 +2697,7 @@ mod tests {
             lba: 100,
             block_count: 16,
         }];
-        let cmd = driver.dataset_management(1, &ranges).unwrap();
+        let cmd = driver.dataset_management(0, 1, &ranges).unwrap();
 
         // Opcode = 0x09
         let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
@@ -2672,7 +2737,7 @@ mod tests {
             block_count: 1,
         }];
         assert_eq!(
-            driver.dataset_management(1, &ranges).unwrap_err(),
+            driver.dataset_management(0, 1, &ranges).unwrap_err(),
             NvmeError::UnsupportedCommand
         );
     }
@@ -2685,7 +2750,7 @@ mod tests {
             lba: 0x0000_DEAD_BEEF_0000,
             block_count: 42,
         }];
-        let cmd = driver.dataset_management(1, &ranges).unwrap();
+        let cmd = driver.dataset_management(0, 1, &ranges).unwrap();
         let buf = cmd.data_buffer.unwrap();
 
         assert_eq!(buf.len(), 16);
@@ -2715,7 +2780,7 @@ mod tests {
                 block_count: 30,
             },
         ];
-        let cmd = driver.dataset_management(1, &ranges).unwrap();
+        let cmd = driver.dataset_management(0, 1, &ranges).unwrap();
 
         // CDW10 = NR = 2 (3 ranges, 0-based)
         let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
@@ -2747,7 +2812,7 @@ mod tests {
                 block_count: 1,
             })
             .collect();
-        let cmd = driver.dataset_management(1, &ranges).unwrap();
+        let cmd = driver.dataset_management(0, 1, &ranges).unwrap();
 
         // CDW10 = NR = 255
         let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
@@ -2768,7 +2833,7 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            driver.dataset_management(1, &ranges).unwrap_err(),
+            driver.dataset_management(0, 1, &ranges).unwrap_err(),
             NvmeError::TransferTooLarge
         );
     }
@@ -2778,7 +2843,7 @@ mod tests {
         let mut driver = ready_driver();
         driver.set_oncs(0x04);
         assert_eq!(
-            driver.dataset_management(1, &[]).unwrap_err(),
+            driver.dataset_management(0, 1, &[]).unwrap_err(),
             NvmeError::TransferTooLarge
         );
     }
@@ -2791,7 +2856,7 @@ mod tests {
             block_count: 1,
         }];
         assert_eq!(
-            driver.dataset_management(1, &ranges).unwrap_err(),
+            driver.dataset_management(0, 1, &ranges).unwrap_err(),
             NvmeError::InvalidState
         );
     }
@@ -2804,8 +2869,8 @@ mod tests {
             lba: 0,
             block_count: 1,
         }];
-        let cmd1 = driver.dataset_management(1, &ranges).unwrap();
-        let cmd2 = driver.dataset_management(1, &ranges).unwrap();
+        let cmd1 = driver.dataset_management(0, 1, &ranges).unwrap();
+        let cmd2 = driver.dataset_management(0, 1, &ranges).unwrap();
         let cid1 = u32::from_le_bytes(cmd1.sqe[0..4].try_into().unwrap()) >> 16;
         let cid2 = u32::from_le_bytes(cmd2.sqe[0..4].try_into().unwrap()) >> 16;
         assert_eq!(cid2, cid1 + 1);
@@ -2819,7 +2884,7 @@ mod tests {
             lba: 0x0102_0304_0506_0708,
             block_count: 0x0A0B_0C0D,
         }];
-        let cmd = driver.dataset_management(1, &ranges).unwrap();
+        let cmd = driver.dataset_management(0, 1, &ranges).unwrap();
         let buf = cmd.data_buffer.unwrap();
 
         // 16 bytes total
@@ -2843,5 +2908,217 @@ mod tests {
         assert_eq!(buf[13], 0x03);
         assert_eq!(buf[14], 0x02);
         assert_eq!(buf[15], 0x01);
+    }
+
+    // ── Multi-queue tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn create_second_queue_pair_in_ready_state() {
+        let mut driver = ready_driver();
+        let cmds = driver
+            .create_io_queue_pair(2, 0x5_0000, 0x6_0000, 32)
+            .unwrap();
+
+        // CDW10 of CQ command: QID in lower 16 bits should be 2
+        let cdw10_cq = u32::from_le_bytes(cmds[0].sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10_cq & 0xFFFF, 2, "CQ CDW10 QID must be 2");
+
+        // CDW10 of SQ command: QID in lower 16 bits should be 2
+        let cdw10_sq = u32::from_le_bytes(cmds[1].sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10_sq & 0xFFFF, 2, "SQ CDW10 QID must be 2");
+
+        // CDW11 of SQ command: CQID in bits 31:16 should be 2
+        let cdw11_sq = u32::from_le_bytes(cmds[1].sqe[44..48].try_into().unwrap());
+        assert_eq!(cdw11_sq >> 16, 2, "SQ CDW11 CQID must be 2");
+    }
+
+    #[test]
+    fn activate_second_queue_pair() {
+        let mut driver = ready_driver();
+        let _ = driver
+            .create_io_queue_pair(2, 0x5_0000, 0x6_0000, 32)
+            .unwrap();
+        driver.activate_io_queue_pair(2).unwrap();
+
+        assert_eq!(driver.io_queue_count(), 2);
+        assert_eq!(driver.state(), NvmeState::Ready);
+    }
+
+    #[test]
+    fn three_queue_pairs() {
+        let driver = ready_driver_multi(3);
+        assert_eq!(driver.io_queue_count(), 3);
+        assert_eq!(driver.state(), NvmeState::Ready);
+    }
+
+    #[test]
+    fn queue_pair_ordering() {
+        let driver = ready_driver_multi(3);
+        assert_eq!(driver.io_queues[0].qid, 1);
+        assert_eq!(driver.io_queues[1].qid, 2);
+        assert_eq!(driver.io_queues[2].qid, 3);
+    }
+
+    #[test]
+    fn doorbell_offsets_per_qid() {
+        let mut driver = ready_driver_multi(3);
+
+        // queue_index=0 → qid=1 → SQ doorbell = 0x1000 + (2*1)*4 = 0x1008
+        let cmd0 = driver.read_block(0, 1, 0, 0x1000).unwrap();
+        assert_eq!(cmd0.doorbell_offset, 0x1008);
+
+        // queue_index=1 → qid=2 → SQ doorbell = 0x1000 + (2*2)*4 = 0x1010
+        let cmd1 = driver.read_block(1, 1, 0, 0x1000).unwrap();
+        assert_eq!(cmd1.doorbell_offset, 0x1010);
+
+        // queue_index=2 → qid=3 → SQ doorbell = 0x1000 + (2*3)*4 = 0x1018
+        let cmd2 = driver.read_block(2, 1, 0, 0x1000).unwrap();
+        assert_eq!(cmd2.doorbell_offset, 0x1018);
+    }
+
+    #[test]
+    fn io_commands_target_correct_queue() {
+        let mut driver = ready_driver_multi(2);
+
+        let cmd0 = driver.read_block(0, 1, 0, 0x1000).unwrap();
+        let cmd1 = driver.read_block(1, 1, 0, 0x1000).unwrap();
+
+        // qid=1 → 0x1008, qid=2 → 0x1010
+        assert_eq!(cmd0.doorbell_offset, 0x1008);
+        assert_eq!(cmd1.doorbell_offset, 0x1010);
+        assert_ne!(cmd0.doorbell_offset, cmd1.doorbell_offset);
+    }
+
+    #[test]
+    fn cid_shared_across_queues() {
+        let mut driver = ready_driver_multi(2);
+
+        let cmd0 = driver.read_block(0, 1, 0, 0x1000).unwrap();
+        let cmd1 = driver.read_block(1, 1, 0, 0x1000).unwrap();
+
+        // CID is in bytes 2-3 of the SQE (upper 16 bits of CDW0)
+        let cid1 = u16::from_le_bytes(cmd0.sqe[2..4].try_into().unwrap());
+        let cid2 = u16::from_le_bytes(cmd1.sqe[2..4].try_into().unwrap());
+        assert_eq!(cid2, cid1 + 1);
+    }
+
+    #[test]
+    fn invalid_queue_index_rejected() {
+        let mut driver = ready_driver_multi(2);
+        assert_eq!(
+            driver.read_block(5, 1, 0, 0x1000).unwrap_err(),
+            NvmeError::InvalidQueueIndex
+        );
+    }
+
+    #[test]
+    fn completion_on_independent_queues() {
+        let mut driver = ready_driver_multi(2);
+
+        // Build CQEs with phase bit = 1 (byte 14 bit 0 = 1)
+        let mut cqe0 = [0u8; 16];
+        cqe0[14] = 0x01;
+        let mut cqe1 = [0u8; 16];
+        cqe1[14] = 0x01;
+
+        // queue_index=0 → qid=1 → CQ doorbell = 0x1000 + (2*1+1)*4 = 0x100C
+        let cr0 = driver
+            .check_io_completion(0, &cqe0)
+            .unwrap()
+            .expect("phase matches");
+        assert_eq!(cr0.cq_doorbell_offset, 0x100C);
+
+        // queue_index=1 → qid=2 → CQ doorbell = 0x1000 + (2*2+1)*4 = 0x1014
+        let cr1 = driver
+            .check_io_completion(1, &cqe1)
+            .unwrap()
+            .expect("phase matches");
+        assert_eq!(cr1.cq_doorbell_offset, 0x1014);
+    }
+
+    #[test]
+    fn qid_zero_rejected() {
+        let mut driver = enabled_driver();
+        assert_eq!(
+            driver
+                .create_io_queue_pair(0, 0x1000, 0x2000, 16)
+                .unwrap_err(),
+            NvmeError::InvalidState
+        );
+    }
+
+    #[test]
+    fn duplicate_qid_active_rejected() {
+        let mut driver = ready_driver(); // has qid=1
+                                         // Attempting to create qid=1 again should fail — already active
+        assert_eq!(
+            driver
+                .create_io_queue_pair(1, 0x5_0000, 0x6_0000, 32)
+                .unwrap_err(),
+            NvmeError::InvalidState
+        );
+    }
+
+    #[test]
+    fn duplicate_qid_pending_rejected() {
+        let mut driver = enabled_driver();
+        // Create qid=1 but don't activate yet
+        let _ = driver
+            .create_io_queue_pair(1, 0x3_0000, 0x4_0000, 32)
+            .unwrap();
+        // Attempting to create qid=1 again should fail — already pending
+        assert_eq!(
+            driver
+                .create_io_queue_pair(1, 0x5_0000, 0x6_0000, 32)
+                .unwrap_err(),
+            NvmeError::InvalidState
+        );
+    }
+
+    #[test]
+    fn activate_without_create_rejected() {
+        let mut driver = enabled_driver();
+        assert_eq!(
+            driver.activate_io_queue_pair(2).unwrap_err(),
+            NvmeError::InvalidState
+        );
+    }
+
+    #[test]
+    fn io_queue_count_tracks_activations() {
+        let mut driver = enabled_driver();
+        assert_eq!(driver.io_queue_count(), 0);
+
+        let _ = driver
+            .create_io_queue_pair(1, 0x3_0000, 0x4_0000, 32)
+            .unwrap();
+        // Count is still 0 before activation
+        assert_eq!(driver.io_queue_count(), 0);
+        driver.activate_io_queue_pair(1).unwrap();
+        assert_eq!(driver.io_queue_count(), 1);
+
+        let _ = driver
+            .create_io_queue_pair(2, 0x5_0000, 0x6_0000, 32)
+            .unwrap();
+        driver.activate_io_queue_pair(2).unwrap();
+        assert_eq!(driver.io_queue_count(), 2);
+    }
+
+    #[test]
+    fn first_activation_transitions_enabled_to_ready() {
+        let mut driver = enabled_driver();
+        assert_eq!(driver.state(), NvmeState::Enabled);
+
+        let _ = driver
+            .create_io_queue_pair(1, 0x3_0000, 0x4_0000, 32)
+            .unwrap();
+        driver.activate_io_queue_pair(1).unwrap();
+        assert_eq!(driver.state(), NvmeState::Ready);
+
+        let _ = driver
+            .create_io_queue_pair(2, 0x5_0000, 0x6_0000, 32)
+            .unwrap();
+        driver.activate_io_queue_pair(2).unwrap();
+        assert_eq!(driver.state(), NvmeState::Ready);
     }
 }
