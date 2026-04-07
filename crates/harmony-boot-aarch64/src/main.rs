@@ -230,6 +230,22 @@ fn main() -> Status {
         }
     };
 
+    // ── Find DTB in UEFI configuration table ──
+    // RPi5 UEFI (EDK2) exposes the device tree here. The DTB blob
+    // remains in memory after ExitBootServices; we just save the pointer.
+    let dtb_ptr: Option<*const u8> = {
+        use uefi::table::cfg::ConfigTableEntry;
+        // EFI_DTB_TABLE_GUID per UEFI spec 2.10, Table 4-6.
+        // Not defined in the uefi crate as of 0.36.
+        const DTB_GUID: uefi::Guid = uefi::guid!("b1b621d5-f19c-41a0-9382-b6784040483e");
+        uefi::system::with_config_table(|entries: &[ConfigTableEntry]| {
+            entries
+                .iter()
+                .find(|e| e.guid == DTB_GUID)
+                .map(|e| e.address as *const u8)
+        })
+    };
+
     // ── Exit boot services ── UEFI console is no longer available after this.
     // Capture the memory map -- we need it to build the identity page table.
     let memory_map = unsafe { uefi::boot::exit_boot_services(None) };
@@ -256,6 +272,15 @@ fn main() -> Status {
     let mut serial =
         harmony_unikernel::SerialWriter::new(|byte| unsafe { pl011::write_byte(byte) });
     let _ = writeln!(serial, "[PL011] Serial initialized: 115200 8N1");
+
+    // ── Parse device tree (if present) ──
+    let hw_config = dtb_ptr.map(|ptr| {
+        let _ = writeln!(serial, "[FDT] Parsing device tree at {:p}", ptr);
+        unsafe { fdt_parse::parse_fdt(ptr) }
+    });
+    if hw_config.is_none() {
+        let _ = writeln!(serial, "[FDT] No device tree found, using platform defaults");
+    }
 
     // ── Collect UEFI memory map into fixed-size array ──
     let mut regions = [MemoryRegion {
@@ -887,12 +912,15 @@ fn main() -> Status {
         use harmony_unikernel::drivers::dma_pool::{DmaBuffer, DmaPool};
         use harmony_unikernel::drivers::genet::GenetDriver;
 
-        let mut bank = unsafe { mmio::MmioRegisterBank::new(platform::GENET_BASE) };
-        let mac = platform::NODE_MAC;
+        let (mac, genet_base) = match hw_config.as_ref().and_then(|c| c.network.as_ref()) {
+            Some(net) => (net.mac_address, net.base as usize),
+            None => (platform::NODE_MAC, platform::GENET_BASE),
+        };
+        let mut bank = unsafe { mmio::MmioRegisterBank::new(genet_base) };
         let _ = writeln!(
             serial,
             "[GENET] Initializing at {:#x}, MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            platform::GENET_BASE,
+            genet_base,
             mac[0],
             mac[1],
             mac[2],
