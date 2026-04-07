@@ -222,6 +222,13 @@ impl MassStorageBus {
             TransferPhase::ReceivingCsw => {
                 let csw = parse_csw(data)?;
                 if csw.status != 0 {
+                    // Reset to Ready so the caller can retry. Without
+                    // this the bus is permanently stuck in Reading/ReceivingCsw.
+                    if self.state == BusState::Reading {
+                        self.state = BusState::Ready;
+                        self.phase = TransferPhase::SendingCbw;
+                        self.stashed_data.clear();
+                    }
                     return Err(MsError::CommandFailed { status: csw.status });
                 }
                 self.advance_after_csw()
@@ -641,5 +648,31 @@ mod tests {
         // Second start_read while already in Reading state.
         let err = bus.start_read(1).unwrap_err();
         assert_eq!(err, MsError::InvalidState);
+    }
+
+    // ── Test 12 ──────────────────────────────────────────────────
+
+    #[test]
+    fn read_recovers_after_csw_failure() {
+        let mut bus = MassStorageBus::new(1, BULK_IN_EP, BULK_OUT_EP);
+        init_bus(&mut bus);
+
+        // First read — CSW fails.
+        let cbw1 = bus.start_read(0).unwrap();
+        let tag1 = extract_tag(&cbw1);
+        bus.handle_bulk_out_complete().unwrap();
+        bus.handle_bulk_in_complete(&vec![0u8; 512]).unwrap();
+        let err = bus
+            .handle_bulk_in_complete(&make_csw_with_status(tag1, 1))
+            .unwrap_err();
+        assert_eq!(err, MsError::CommandFailed { status: 1 });
+
+        // Second read should succeed — bus recovered to Ready.
+        let cbw2 = bus.start_read(10).unwrap();
+        let tag2 = extract_tag(&cbw2);
+        bus.handle_bulk_out_complete().unwrap();
+        bus.handle_bulk_in_complete(&vec![0xAAu8; 512]).unwrap();
+        let result = bus.handle_bulk_in_complete(&make_csw(tag2)).unwrap();
+        assert_eq!(result, MsAction::ReadComplete(vec![0xAAu8; 512]));
     }
 }
