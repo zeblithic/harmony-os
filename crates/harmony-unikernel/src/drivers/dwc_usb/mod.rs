@@ -140,6 +140,8 @@ pub struct XhciDriver {
     max_slots_enabled: u8,
     /// Transfer rings keyed by (slot_id << 8 | endpoint_id).
     transfer_rings: BTreeMap<u16, ring::TransferRing>,
+    /// USB speed per device slot (populated by address_device).
+    slot_speeds: BTreeMap<u8, UsbSpeed>,
 }
 
 /// Compute transfer ring map key: (slot_id << 8) | endpoint_id.
@@ -220,6 +222,7 @@ impl XhciDriver {
             dcbaa_phys: None,
             max_slots_enabled: 0,
             transfer_rings: BTreeMap::new(),
+            slot_speeds: BTreeMap::new(),
         })
     }
 
@@ -423,6 +426,8 @@ impl XhciDriver {
             ring_key(slot_id, 1),
             ring::TransferRing::new(transfer_ring_phys),
         );
+
+        self.slot_speeds.insert(slot_id, speed);
 
         Ok(actions)
     }
@@ -842,10 +847,13 @@ impl XhciDriver {
             input_ctx_phys
         );
 
+        let speed = self.slot_speeds.get(&slot_id).copied().unwrap_or(UsbSpeed::HighSpeed);
+
         let input_ctx = context::build_configure_endpoint_input_context(
             slot_context,
             endpoints,
             xfer_ring_phys,
+            speed,
         );
 
         let mut actions = Vec::new();
@@ -1169,6 +1177,7 @@ mod tests {
             dcbaa_phys: None,
             max_slots_enabled: 0,
             transfer_rings: BTreeMap::new(),
+            slot_speeds: BTreeMap::new(),
         };
         let bank = MockRegisterBank::new();
         assert_eq!(driver.detect_ports(&bank), Err(XhciError::InvalidState));
@@ -1217,6 +1226,7 @@ mod tests {
             dcbaa_phys: None,
             max_slots_enabled: 0,
             transfer_rings: BTreeMap::new(),
+            slot_speeds: BTreeMap::new(),
         };
         assert_eq!(
             driver.setup_rings(0x2000_0000, 0x3000_0000, 0x4000_0000, 0, 0),
@@ -1429,6 +1439,7 @@ mod tests {
             dcbaa_phys: None,
             max_slots_enabled: 4,
             transfer_rings: BTreeMap::new(),
+            slot_speeds: BTreeMap::new(),
         };
 
         let result = driver.address_device(1, 1, UsbSpeed::HighSpeed, 0x6000, 0x7000, 0x8000);
