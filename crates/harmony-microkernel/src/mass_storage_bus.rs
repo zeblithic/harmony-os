@@ -232,19 +232,37 @@ impl MassStorageBus {
             }
             TransferPhase::ReceivingCsw => {
                 let result = self.parse_and_validate_csw(data);
-                if result.is_err() && self.state == BusState::Reading {
-                    // Reset to Ready so the caller can retry after any
-                    // CSW error — parse failure, tag mismatch, or command
-                    // failure. Without this the bus is permanently stuck.
-                    self.state = BusState::Ready;
-                    self.phase = TransferPhase::SendingCbw;
-                    self.stashed_data.clear();
+                if result.is_err() {
+                    self.recover_from_error();
                 }
                 result?;
                 self.advance_after_csw()
             }
             TransferPhase::SendingCbw => Err(MsError::InvalidState),
         }
+    }
+
+    /// Reset the bus after an error so the caller can retry.
+    ///
+    /// Reading → Ready (can issue another read).
+    /// Init states → Uninitialized (can re-init from scratch).
+    fn recover_from_error(&mut self) {
+        match self.state {
+            BusState::Reading => self.state = BusState::Ready,
+            BusState::InitInquiry | BusState::InitTestUnitReady | BusState::InitReadCapacity => {
+                self.state = BusState::Uninitialized
+            }
+            _ => {}
+        }
+        self.phase = TransferPhase::SendingCbw;
+        self.stashed_data.clear();
+    }
+
+    /// Reset the bus to a recoverable state after an external error
+    /// (e.g. transport failure). Call this when a bulk transfer fails
+    /// and the bus never received a completion.
+    pub fn reset_after_transport_error(&mut self) {
+        self.recover_from_error();
     }
 
     /// Parse a CSW, validate tag matches the outstanding CBW, and
@@ -738,5 +756,31 @@ mod tests {
         bus.handle_bulk_in_complete(&vec![0xBBu8; 512]).unwrap();
         let result = bus.handle_bulk_in_complete(&make_csw(tag)).unwrap();
         assert_eq!(result, MsAction::ReadComplete(vec![0xBBu8; 512]));
+    }
+
+    // ── Test 15 ──────────────────────────────────────────────────
+
+    #[test]
+    fn init_recovers_after_csw_failure() {
+        let mut bus = MassStorageBus::new(1, BULK_IN_EP, BULK_OUT_EP);
+
+        // Start init — INQUIRY succeeds, TUR CSW fails.
+        let cbw = bus.start_init().unwrap();
+        let tag1 = extract_tag(&cbw);
+        bus.handle_bulk_out_complete().unwrap();
+        bus.handle_bulk_in_complete(&make_inquiry_response())
+            .unwrap();
+        let tur = bus.handle_bulk_in_complete(&make_csw(tag1)).unwrap();
+        let tag2 = extract_tag(&tur);
+        bus.handle_bulk_out_complete().unwrap();
+        // TUR CSW with status=1 (device not ready — common during spin-up).
+        let err = bus
+            .handle_bulk_in_complete(&make_csw_with_status(tag2, 1))
+            .unwrap_err();
+        assert_eq!(err, MsError::CommandFailed { status: 1 });
+
+        // Bus should have reset to Uninitialized — re-init works.
+        let cbw = bus.start_init().unwrap();
+        assert_eq!(extract_opcode(&cbw), 0x12); // INQUIRY again
     }
 }

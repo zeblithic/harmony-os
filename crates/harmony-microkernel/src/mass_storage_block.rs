@@ -72,18 +72,38 @@ impl<T: BulkTransport> MassStorageBlockDevice<T> {
         self.drive_to_init_complete(first)
     }
 
+    /// Execute a transport operation, resetting the bus if it fails.
+    fn transport_out(&mut self, endpoint: u8, data: &[u8]) -> Result<(), IpcError> {
+        if let Err(e) = self.transport.bulk_out(endpoint, data) {
+            self.bus.reset_after_transport_error();
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Execute a transport read, resetting the bus if it fails.
+    fn transport_in(&mut self, endpoint: u8, buf: &mut [u8]) -> Result<usize, IpcError> {
+        match self.transport.bulk_in(endpoint, buf) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                self.bus.reset_after_transport_error();
+                Err(e)
+            }
+        }
+    }
+
     /// Drive the bus action loop until `InitComplete` is received.
     fn drive_to_init_complete(&mut self, first_action: MsAction) -> Result<(), IpcError> {
         let mut action = first_action;
         loop {
             action = match action {
                 MsAction::BulkOut { endpoint, data } => {
-                    self.transport.bulk_out(endpoint, &data)?;
+                    self.transport_out(endpoint, &data)?;
                     self.bus.handle_bulk_out_complete().map_err(ms_to_ipc)?
                 }
                 MsAction::BulkIn { endpoint, length } => {
                     let mut buf = vec![0u8; length as usize];
-                    let n = self.transport.bulk_in(endpoint, &mut buf)?;
+                    let n = self.transport_in(endpoint, &mut buf)?;
                     buf.truncate(n);
                     self.bus.handle_bulk_in_complete(&buf).map_err(ms_to_ipc)?
                 }
@@ -106,12 +126,12 @@ impl<T: BulkTransport> MassStorageBlockDevice<T> {
         loop {
             action = match action {
                 MsAction::BulkOut { endpoint, data } => {
-                    self.transport.bulk_out(endpoint, &data)?;
+                    self.transport_out(endpoint, &data)?;
                     self.bus.handle_bulk_out_complete().map_err(ms_to_ipc)?
                 }
                 MsAction::BulkIn { endpoint, length } => {
                     let mut recv = vec![0u8; length as usize];
-                    let n = self.transport.bulk_in(endpoint, &mut recv)?;
+                    let n = self.transport_in(endpoint, &mut recv)?;
                     recv.truncate(n);
                     self.bus.handle_bulk_in_complete(&recv).map_err(ms_to_ipc)?
                 }
@@ -372,5 +392,26 @@ mod tests {
         let tag1 = out_log_tag(&dev.transport, 3);
         let tag2 = out_log_tag(&dev.transport, 4);
         assert!(tag2 > tag1, "tags should increment: {tag1} < {tag2}");
+    }
+
+    // ── Test 20 ─────────────────────────────────────────────────────
+
+    #[test]
+    fn read_recovers_after_transport_error() {
+        let mut dev = make_initialized_device();
+
+        // First read — transport fails on data bulk IN (no response queued).
+        dev.transport.queue_response(vec![0u8; 512]); // data phase
+                                                      // No CSW queued — the data-phase read will succeed, but CSW read
+                                                      // will fail because in_responses is empty.
+        let mut buf = [0u8; 512];
+        assert!(dev.read_block(0, &mut buf).is_err());
+
+        // Second read should succeed — bus was reset by transport error.
+        dev.transport.queue_response(vec![0xAAu8; 512]);
+        dev.transport.queue_response(make_csw(5)); // tag 5: init used 1-3, failed read used 4
+        let mut buf2 = [0u8; 512];
+        dev.read_block(1, &mut buf2).unwrap();
+        assert!(buf2.iter().all(|&b| b == 0xAA));
     }
 }
