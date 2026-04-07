@@ -162,11 +162,13 @@ Per xHCI §4.6.7, Evaluate Context only examines fields listed in Table 6-9. For
 pub fn evaluate_context(
     &mut self,
     slot_id: u8,
+    max_packet_size: u16,
     input_ctx_phys: u64,
 ) -> Result<Vec<XhciAction>, XhciError>
 ```
 
 - State must be `Running`
+- Builds Input Context internally via `build_evaluate_context_ep0(max_packet_size)`
 - Enqueues Evaluate Context TRB (type 13) on command ring:
   - Parameter: `input_ctx_phys` (64-bit pointer to Input Context in DMA memory)
   - Status: 0
@@ -264,7 +266,7 @@ All tests use `MockRegisterBank`. No hardware, no DMA.
 - `enqueue_interrupt()` wrapper on `TransferRing`
 - `interrupt_transfer_in()` / `interrupt_transfer_out()` driver methods
 - `build_evaluate_context_ep0(max_packet_size)` input context builder
-- `evaluate_context(slot_id, input_ctx_phys)` driver method
+- `evaluate_context(slot_id, max_packet_size, input_ctx_phys)` driver method
 - `TRB_EVALUATE_CONTEXT` constant (type 13)
 - Average TRB length: 1024 for interrupt endpoints
 - All 19 tests listed above
