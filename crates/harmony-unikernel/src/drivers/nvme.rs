@@ -1277,9 +1277,10 @@ pub fn parse_identify_namespace(data: &[u8; 4096]) -> IdentifyNamespace {
 /// - Bits 31:16 — NCQR: allocated I/O completion queues (0-based)
 ///
 /// This function converts both to 1-based values.
+/// Saturates at `u16::MAX` to avoid overflow when a controller returns 0xFFFF.
 pub fn parse_num_queues(completion: &Completion) -> NumberOfQueues {
-    let nsqr = (completion.result & 0xFFFF) as u16 + 1;
-    let ncqr = (completion.result >> 16) as u16 + 1;
+    let nsqr = ((completion.result & 0xFFFF) as u16).saturating_add(1);
+    let ncqr = ((completion.result >> 16) as u16).saturating_add(1);
     NumberOfQueues { nsqr, ncqr }
 }
 
