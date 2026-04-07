@@ -4,6 +4,9 @@
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), no_std)]
 
+// `extern crate alloc` is needed for all build modes because modules like
+// fdt_parse.rs use `alloc::` paths. In test builds (with std), this is
+// harmless — alloc is implicitly available.
 extern crate alloc;
 
 mod bump_alloc;
@@ -160,6 +163,10 @@ const BUMP_MIN_ADDR: u64 = 0x10_0000; // 1 MiB
 const BUMP_REGION_SIZE: u64 = 2 * 1024 * 1024;
 
 #[cfg(all(target_os = "uefi", feature = "rpi5"))]
+const BUMP_REGION_SIZE: u64 = 4 * 1024 * 1024;
+
+/// Apple Silicon: 4 MiB (16K pages → larger page tables, same order as RPi5).
+#[cfg(all(target_os = "uefi", feature = "apple-silicon"))]
 const BUMP_REGION_SIZE: u64 = 4 * 1024 * 1024;
 
 /// Returns `true` if a UEFI memory type represents usable RAM after
@@ -1432,7 +1439,7 @@ fn dispatch_action(action: &harmony_unikernel::RuntimeAction, serial: &mut impl 
 // rewrites ELR to .Lelf_return (via set_return_context), restoring the
 // kernel SP and LR so that `ret` returns to the Rust caller.
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(target_os = "uefi")]
 core::arch::global_asm!(
     ".global run_elf_binary",
     "run_elf_binary:",
@@ -1466,7 +1473,7 @@ core::arch::global_asm!(
     "ret", // return to Rust caller with exit code in x0
 );
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(target_os = "uefi")]
 extern "C" {
     /// Run an ELF binary at `entry_point` with `stack_top` as its SP.
     ///

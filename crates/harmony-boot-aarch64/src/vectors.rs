@@ -16,7 +16,7 @@
 ///
 /// # Safety
 /// Must be called once, at EL1, before any SVC or fault can occur.
-#[cfg(target_arch = "aarch64")]
+#[cfg(target_os = "uefi")]
 pub unsafe fn init() {
     core::arch::asm!(
         "adr {tmp}, vector_table",
@@ -47,7 +47,7 @@ pub unsafe fn init() {
 ///   0x380  Current EL, SPx, SError           — unexpected
 ///   0x400  Lower EL, AArch64, Synchronous  — branch to el1_sync_handler
 ///   0x480-0x780  Lower EL, remaining entries  — unexpected
-#[cfg(target_arch = "aarch64")]
+#[cfg(target_os = "uefi")]
 core::arch::global_asm!(
     // ── Vector table ────────────────────────────────────────────
     ".balign 2048",
@@ -339,7 +339,7 @@ use crate::timer;
 ///
 /// The kernel SP to restore from — same as `current_sp` if no switch, or the
 /// next task's SP if the scheduler decided to switch.
-#[cfg(target_arch = "aarch64")]
+#[cfg(target_os = "uefi")]
 #[no_mangle]
 extern "C" fn irq_dispatch(current_sp: usize) -> usize {
     let intid = gic::ack();

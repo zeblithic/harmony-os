@@ -57,8 +57,8 @@ const MAIR_VALUE: u64 = 0x00FF;
 /// TCR_EL1: Translation Control Register.
 ///
 /// Configuration for TTBR0 (lower VA range):
-/// - T0SZ  = 16  (bits [5:0])   -> 48-bit virtual address space
-/// - TG0   = 0b00 (bits [15:14]) -> 4 KiB granule
+/// - T0SZ  (bits [5:0])   -> VA space size: 16 (48-bit, 4K) or 17 (47-bit, 16K)
+/// - TG0   (bits [15:14]) -> Granule: 0b00 (4 KiB) or 0b10 (16 KiB)
 /// - SH0   = 0b11 (bits [13:12]) -> Inner Shareable
 /// - ORGN0 = 0b01 (bits [11:10]) -> Normal, Outer Write-Back RA WA Cacheable
 /// - IRGN0 = 0b01 (bits [9:8])   -> Normal, Inner Write-Back RA WA Cacheable
@@ -70,12 +70,24 @@ const MAIR_VALUE: u64 = 0x00FF;
 /// EPD1 (bit 23) disables TTBR1_EL1 table walks. Since we only use the lower
 /// VA range (TTBR0), any speculative access to an upper-half VA should fault
 /// immediately rather than walking from TTBR1's uninitialized reset value.
+#[cfg(not(feature = "page-16k"))]
 const TCR_VALUE: u64 = {
     let t0sz: u64 = 16; // 48-bit VA
     let irgn0: u64 = 0b01 << 8; // Inner WB RA WA
     let orgn0: u64 = 0b01 << 10; // Outer WB RA WA
     let sh0: u64 = 0b11 << 12; // Inner Shareable
     let tg0: u64 = 0b00 << 14; // 4 KiB granule
+    let epd1: u64 = 1 << 23; // Disable TTBR1 walks
+    t0sz | irgn0 | orgn0 | sh0 | tg0 | epd1
+};
+
+#[cfg(feature = "page-16k")]
+const TCR_VALUE: u64 = {
+    let t0sz: u64 = 17; // 47-bit VA
+    let irgn0: u64 = 0b01 << 8; // Inner WB RA WA
+    let orgn0: u64 = 0b01 << 10; // Outer WB RA WA
+    let sh0: u64 = 0b11 << 12; // Inner Shareable
+    let tg0: u64 = 0b10 << 14; // 16 KiB granule
     let epd1: u64 = 1 << 23; // Disable TTBR1 walks
     t0sz | irgn0 | orgn0 | sh0 | tg0 | epd1
 };
@@ -346,6 +358,7 @@ mod tests {
         assert_eq!((MAIR_VALUE >> 8) & 0xFF, 0x00);
     }
 
+    #[cfg(not(feature = "page-16k"))]
     #[test]
     fn tcr_value_correct() {
         // Note: IPS (bits [34:32]) is set at runtime from ID_AA64MMFR0_EL1,
@@ -361,6 +374,25 @@ mod tests {
         assert_eq!((TCR_VALUE >> 12) & 0b11, 0b11);
         // TG0 = 0b00 (4 KiB granule)
         assert_eq!((TCR_VALUE >> 14) & 0b11, 0b00);
+        // EPD1 = 1 (disable TTBR1 walks)
+        assert_eq!((TCR_VALUE >> 23) & 0b1, 0b1);
+    }
+
+    #[cfg(feature = "page-16k")]
+    #[test]
+    fn tcr_value_correct_16k() {
+        // IPS placeholder = 0
+        assert_eq!((TCR_VALUE >> 32) & 0b111, 0b000);
+        // T0SZ = 17 (47-bit VA)
+        assert_eq!(TCR_VALUE & 0x3F, 17);
+        // IRGN0 = 0b01 (WB RA WA)
+        assert_eq!((TCR_VALUE >> 8) & 0b11, 0b01);
+        // ORGN0 = 0b01 (WB RA WA)
+        assert_eq!((TCR_VALUE >> 10) & 0b11, 0b01);
+        // SH0 = 0b11 (Inner Shareable)
+        assert_eq!((TCR_VALUE >> 12) & 0b11, 0b11);
+        // TG0 = 0b10 (16 KiB granule)
+        assert_eq!((TCR_VALUE >> 14) & 0b11, 0b10);
         // EPD1 = 1 (disable TTBR1 walks)
         assert_eq!((TCR_VALUE >> 23) & 0b1, 0b1);
     }
