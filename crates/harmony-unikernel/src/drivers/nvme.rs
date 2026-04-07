@@ -702,6 +702,39 @@ impl<R: RegisterBank> NvmeDriver<R> {
     }
 }
 
+// ── Abort command ─────────────────────────────────────────────────────────────
+
+impl<R: RegisterBank> NvmeDriver<R> {
+    /// Build an Abort admin command (opcode 0x08).
+    ///
+    /// `sqid` identifies the submission queue containing the command to abort.
+    /// Use 0 for the admin queue. `cid` is the Command Identifier of the
+    /// command to abort.
+    ///
+    /// The controller may or may not honor the abort. The completion status
+    /// indicates whether the target command was aborted.
+    pub fn abort(&mut self, sqid: u16, cid: u16) -> Result<AdminCommand, NvmeError> {
+        if self.state != NvmeState::Enabled && self.state != NvmeState::Ready {
+            return Err(NvmeError::InvalidState);
+        }
+
+        let own_cid = self.next_cid;
+        self.next_cid = self.next_cid.wrapping_add(1);
+
+        let mut sqe = [0u8; 64];
+
+        // CDW0: opcode=0x08 | (own CID << 16)
+        let cdw0: u32 = 0x08 | ((own_cid as u32) << 16);
+        sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
+
+        // CDW10: SQID in bits 15:0, CID-to-abort in bits 31:16
+        let cdw10: u32 = (sqid as u32) | ((cid as u32) << 16);
+        sqe[40..44].copy_from_slice(&cdw10.to_le_bytes());
+
+        Ok(self.admin.submit(sqe, self.doorbell_stride))
+    }
+}
+
 // ── I/O queue creation ───────────────────────────────────────────────────────
 
 impl<R: RegisterBank> NvmeDriver<R> {
@@ -3726,5 +3759,71 @@ mod tests {
             Err(NvmeError::InvalidState) => {}
             other => panic!("expected InvalidState in Enabled state, got {:?}", other),
         }
+    }
+
+    // ── Abort tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn abort_builds_correct_sqe() {
+        let mut driver = ready_driver();
+        let cmd = driver.abort(1, 42).unwrap();
+
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        assert_eq!(cdw0 & 0xFF, 0x08, "opcode must be 0x08 (Abort)");
+
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10 & 0xFFFF, 1, "SQID must be 1 in CDW10 bits 15:0");
+        assert_eq!(
+            (cdw10 >> 16) as u16,
+            42,
+            "CID-to-abort must be 42 in CDW10 bits 31:16"
+        );
+
+        let prp1 = u64::from_le_bytes(cmd.sqe[24..32].try_into().unwrap());
+        let prp2 = u64::from_le_bytes(cmd.sqe[32..40].try_into().unwrap());
+        assert_eq!(prp1, 0, "PRP1 must be 0");
+        assert_eq!(prp2, 0, "PRP2 must be 0");
+
+        assert!(cmd.prp_list.is_none(), "no PRP list");
+        assert!(cmd.data_buffer.is_none(), "no data buffer");
+    }
+
+    #[test]
+    fn abort_uses_own_cid() {
+        let mut driver = ready_driver();
+        let cmd = driver.abort(1, 42).unwrap();
+
+        let cdw0 = u32::from_le_bytes(cmd.sqe[0..4].try_into().unwrap());
+        let own_cid = (cdw0 >> 16) as u16;
+
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        let target_cid = (cdw10 >> 16) as u16;
+
+        assert_eq!(target_cid, 42, "target CID in CDW10");
+        assert_ne!(
+            own_cid, target_cid,
+            "command's own CID must differ from abort target CID"
+        );
+    }
+
+    #[test]
+    fn abort_rejects_wrong_state() {
+        let bank = mock_nvme_bank();
+        let mut driver = NvmeDriver::init(bank).unwrap();
+        match driver.abort(0, 0) {
+            Err(NvmeError::InvalidState) => {}
+            other => panic!("expected InvalidState in Disabled state, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn abort_admin_queue() {
+        let mut driver = enabled_driver();
+        // SQID=0 is the admin queue — aborting admin commands is valid.
+        let cmd = driver.abort(0, 5).unwrap();
+
+        let cdw10 = u32::from_le_bytes(cmd.sqe[40..44].try_into().unwrap());
+        assert_eq!(cdw10 & 0xFFFF, 0, "SQID=0 for admin queue");
+        assert_eq!((cdw10 >> 16) as u16, 5, "CID-to-abort=5");
     }
 }
