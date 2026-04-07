@@ -120,6 +120,22 @@ pub unsafe fn parse_fdt(dtb_ptr: *const u8) -> HardwareConfig {
                         });
                     }
                 }
+                "brcm,bcm2711-genet-v5" => {
+                    if let Some(reg) = node.reg().and_then(|mut r| r.next()) {
+                        if let Some(mac_prop) = node.property("local-mac-address") {
+                            if mac_prop.value.len() >= 6 {
+                                let mut mac = [0u8; 6];
+                                mac.copy_from_slice(&mac_prop.value[..6]);
+                                config.network = Some(NetworkConfig {
+                                    base: reg.starting_address as u64,
+                                    size: reg.size.unwrap_or(0x10000) as u64,
+                                    mac_address: mac,
+                                    compatible: compat.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }

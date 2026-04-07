@@ -81,6 +81,19 @@ pub struct BlockDeviceConfig {
     pub compatible: String,
 }
 
+// ── Network device ───────────────────────────────────────────────────────────
+
+/// MMIO-mapped network controller with MAC address from device tree.
+#[derive(Debug, Clone)]
+pub struct NetworkConfig {
+    pub base: u64,
+    pub size: u64,
+    /// Factory MAC address from the DTB `local-mac-address` property.
+    pub mac_address: [u8; 6],
+    /// DT `compatible` string (e.g. `"brcm,bcm2711-genet-v5"`).
+    pub compatible: String,
+}
+
 // ── Chosen / bootloader parameters ───────────────────────────────────────────
 
 /// Parameters supplied by the bootloader via `/chosen` (FDT or UEFI vars).
@@ -103,6 +116,7 @@ pub struct HardwareConfig {
     /// VirtIO MMIO transports — device sub-type determined after MMIO probe.
     pub virtio_devices: Vec<VirtioMmioConfig>,
     pub block_devices: Vec<BlockDeviceConfig>,
+    pub network: Option<NetworkConfig>,
     pub chosen: ChosenConfig,
     /// Page granule in bytes (4096 for 4 KiB, 16384 for 16 KiB).
     pub page_granule: usize,
@@ -116,6 +130,7 @@ impl Default for HardwareConfig {
             interrupt_controller: None,
             virtio_devices: Vec::new(),
             block_devices: Vec::new(),
+            network: None,
             chosen: ChosenConfig::default(),
             page_granule: crate::vm::PAGE_SIZE as usize,
         }
@@ -188,6 +203,22 @@ mod tests {
                                     redistributor_base: None,
                                     redistributor_size: None,
                                 });
+                            }
+                        }
+                        "brcm,bcm2711-genet-v5" => {
+                            if let Some(reg) = node.reg().and_then(|mut r| r.next()) {
+                                if let Some(mac_prop) = node.property("local-mac-address") {
+                                    if mac_prop.value.len() >= 6 {
+                                        let mut mac = [0u8; 6];
+                                        mac.copy_from_slice(&mac_prop.value[..6]);
+                                        config.network = Some(NetworkConfig {
+                                            base: reg.starting_address as u64,
+                                            size: reg.size.unwrap_or(0x10000) as u64,
+                                            mac_address: mac,
+                                            compatible: c.to_string(),
+                                        });
+                                    }
+                                }
                             }
                         }
                         _ => {}
@@ -272,5 +303,54 @@ mod tests {
             redistributor_size: None,
         };
         assert_eq!(config.redistributor_base, None);
+    }
+
+    #[test]
+    fn network_config_construction() {
+        let net = NetworkConfig {
+            base: 0x1F_0058_0000,
+            size: 0x10000,
+            mac_address: [0xDC, 0xA6, 0x32, 0x12, 0x34, 0x56],
+            compatible: "brcm,bcm2711-genet-v5".to_string(),
+        };
+        assert_eq!(net.base, 0x1F_0058_0000);
+        assert_eq!(net.size, 0x10000);
+        assert_eq!(net.mac_address, [0xDC, 0xA6, 0x32, 0x12, 0x34, 0x56]);
+        assert_eq!(net.compatible, "brcm,bcm2711-genet-v5");
+    }
+
+    #[test]
+    fn hardware_config_default_network_is_none() {
+        let cfg = HardwareConfig::default();
+        assert!(cfg.network.is_none());
+    }
+
+    #[test]
+    fn fdt_parse_genet_mac_and_base() {
+        let dtb = include_bytes!("../tests/fixtures/rpi5-genet.dtb");
+        let cfg = parse_fdt_for_test(dtb);
+        let net = cfg.network.expect("should find GENET network config");
+        assert_eq!(net.mac_address, [0xDC, 0xA6, 0x32, 0x12, 0x34, 0x56]);
+        assert_eq!(net.compatible, "brcm,bcm2711-genet-v5");
+        // Base address: 0x1f << 32 | 0x00580000 = 0x1F_0058_0000
+        assert_eq!(net.base, 0x1F_0058_0000);
+        assert_eq!(net.size, 0x10000);
+    }
+
+    #[test]
+    fn fdt_parse_genet_missing_mac() {
+        let dtb = include_bytes!("../tests/fixtures/rpi5-genet-no-mac.dtb");
+        let cfg = parse_fdt_for_test(dtb);
+        assert!(
+            cfg.network.is_none(),
+            "GENET without local-mac-address should not populate network"
+        );
+    }
+
+    #[test]
+    fn fdt_parse_no_genet_node() {
+        let dtb = include_bytes!("../tests/fixtures/qemu-virt.dtb");
+        let cfg = parse_fdt_for_test(dtb);
+        assert!(cfg.network.is_none(), "QEMU virt has no GENET node");
     }
 }
