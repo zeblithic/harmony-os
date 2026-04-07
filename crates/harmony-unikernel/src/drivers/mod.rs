@@ -12,6 +12,8 @@ pub mod font_8x16;
 pub mod framebuffer;
 pub mod genet;
 pub mod gpio;
+pub mod hid_boot;
+pub mod input_event;
 pub mod mass_storage;
 pub mod nvme;
 pub mod pl011;
