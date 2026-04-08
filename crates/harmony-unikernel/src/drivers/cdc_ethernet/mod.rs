@@ -204,7 +204,7 @@ impl CdcEthernetDriver {
         // NCM: one NTB up to max_ntb_size (typically 2048-16384).
         let bulk_in_max = match descs.protocol {
             CdcProtocol::Ecm => descs.max_segment_size.max(1514),
-            CdcProtocol::Ncm => (descs.max_ntb_size.min(u16::MAX as u32)) as u16,
+            CdcProtocol::Ncm => (descs.max_ntb_size.min(u16::MAX as u32) as u16).max(2048),
         };
 
         let mut actions = vec![
