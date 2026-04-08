@@ -230,10 +230,10 @@ CONFIGTXT
   users.users.zeblith = {
     isNormalUser = true;
     extraGroups = [ "wheel" "networkmanager" "dialout" ];
-    # hashedPasswordFile takes precedence when the agenix secret is available.
-    # initialPassword is the HDMI-console emergency fallback: it activates only
-    # if the agenix secret file is missing (first flash, decryption failure).
-    # SSH remains key-only (PasswordAuthentication = false above).
+    # hashedPasswordFile is the primary credential once secrets/user-password.age
+    # contains a real agenix-encrypted hash. initialPassword seeds the account
+    # on first activation (placeholder .age -> empty file -> login blocked until
+    # the real secret is deployed). SSH remains key-only regardless.
     hashedPasswordFile = config.age.secrets.user-password.path;
     initialPassword = "harmony";
     openssh.authorizedKeys.keys = [
