@@ -490,8 +490,8 @@ fn main() -> Status {
         // instead of spin-waiting.
         linuxulator.set_block_fn(|op, fd, deadline_ms| {
             use harmony_os::linuxulator::{
-                BLOCK_OP_CONNECT, BLOCK_OP_POLL, BLOCK_OP_READABLE, BLOCK_OP_SLEEP,
-                BLOCK_OP_WAIT, BLOCK_OP_WRITABLE,
+                BLOCK_OP_CONNECT, BLOCK_OP_POLL, BLOCK_OP_READABLE, BLOCK_OP_SLEEP, BLOCK_OP_WAIT,
+                BLOCK_OP_WRITABLE,
             };
             let reason = match op {
                 BLOCK_OP_READABLE => sched::WaitReason::FdReadable(fd),
@@ -612,8 +612,13 @@ fn main() -> Status {
 
                 // Check for pending signal handler.
                 let signal_setup = if let Some(signum) = lx.pending_handler_signal() {
-                    let siginfo = lx.pending_siginfo()
-                        .and_then(|(tag, info)| if tag == signum { Some(info) } else { None });
+                    let siginfo = lx.pending_siginfo().and_then(|(tag, info)| {
+                        if tag == signum {
+                            Some(info)
+                        } else {
+                            None
+                        }
+                    });
                     // Build SavedRegisters from the current state. If sigreturn
                     // just happened, use restored regs (not TrapFrame, which
                     // still has the pre-sigreturn state).

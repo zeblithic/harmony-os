@@ -174,9 +174,7 @@ pub unsafe extern "C" fn svc_handler(frame: &mut TrapFrame) {
     let syscall = if nr == 139 {
         // rt_sigreturn takes no register arguments — the kernel reads SP
         // from the saved process state. Construct the variant manually.
-        LinuxSyscall::RtSigreturn {
-            rsp: read_sp_el0(),
-        }
+        LinuxSyscall::RtSigreturn { rsp: read_sp_el0() }
     } else {
         LinuxSyscall::from_aarch64(nr, args)
     };

@@ -91,9 +91,10 @@ impl Stage2Granule {
 
     /// Generate a VTCR_EL2 base value for this guest granule.
     ///
-    /// The caller must OR in the IPS bits [34:32] from
-    /// `ID_AA64MMFR0_EL1.PARange` before writing to VTCR_EL2,
-    /// just as `mmu::configure_system_regs` does for TCR_EL1.
+    /// The caller must OR in the PS bits [18:16] from
+    /// `ID_AA64MMFR0_EL1.PARange` before writing to VTCR_EL2.
+    /// (Note: VTCR_EL2 uses PS at [18:16], unlike TCR_EL1 which
+    /// uses IPS at [34:32].)
     ///
     /// VTCR_EL2.SL0 encoding is granule-dependent (ARM DDI 0487, Table D8-41):
     ///   4K:  SL0=0b10 → start at level 0 (4-level walk for 48-bit IPA)
@@ -103,14 +104,14 @@ impl Stage2Granule {
     pub const fn vtcr_el2_value(&self) -> u64 {
         let res1: u64 = 1 << 31; // VTCR_EL2[31] is RES1
         let t0sz: u64 = match self {
-            Self::Four => 16,  // 48-bit IPA
+            Self::Four => 16,    // 48-bit IPA
             Self::Sixteen => 17, // 47-bit IPA
         };
-        let irgn0: u64 = 0b01 << 8;  // Inner WB RA WA
+        let irgn0: u64 = 0b01 << 8; // Inner WB RA WA
         let orgn0: u64 = 0b01 << 10; // Outer WB RA WA
-        let sh0: u64 = 0b11 << 12;   // Inner Shareable
+        let sh0: u64 = 0b11 << 12; // Inner Shareable
         let tg0: u64 = match self {
-            Self::Four => 0b00 << 14,  // 4 KiB
+            Self::Four => 0b00 << 14,    // 4 KiB
             Self::Sixteen => 0b10 << 14, // 16 KiB
         };
         // SL0 encoding differs by granule (Table D8-41):
@@ -527,8 +528,8 @@ mod tests {
         let vtcr = Stage2Granule::Four.vtcr_el2_value();
         // Bit [31] = RES1
         assert_eq!((vtcr >> 31) & 1, 1);
-        // IPS placeholder = 0
-        assert_eq!((vtcr >> 32) & 0b111, 0b000);
+        // PS placeholder = 0 (bits [18:16], caller must OR in PARange)
+        assert_eq!((vtcr >> 16) & 0b111, 0b000);
         // T0SZ = 16 (48-bit IPA)
         assert_eq!(vtcr & 0x3F, 16);
         // SL0 = 0b10 (4K: start at level 0)
