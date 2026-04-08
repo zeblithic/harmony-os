@@ -273,6 +273,43 @@ fn main() -> Status {
         harmony_unikernel::SerialWriter::new(|byte| unsafe { pl011::write_byte(byte) });
     let _ = writeln!(serial, "[PL011] Serial initialized: 115200 8N1");
 
+    // ── Read GENET MAC + base from DTB (before MMU, no heap) ──
+    // The DTB may reside in EfiACPIReclaimMemory (per EBBR § 4.2), which our
+    // MMU identity map does not cover. Read it now while UEFI page tables are
+    // still active. The fdt crate is zero-alloc (default-features = false),
+    // so no heap is needed.
+    let dtb_network: Option<([u8; 6], u64)> = dtb_ptr.and_then(|ptr| {
+        let _ = writeln!(serial, "[FDT] Parsing device tree at {:p}", ptr);
+        let fdt = unsafe { fdt::Fdt::from_ptr(ptr) }.ok()?;
+        for node in fdt.all_nodes() {
+            let compat = node.compatible()?;
+            if compat.all().any(|c| c == "brcm,bcm2711-genet-v5") {
+                let reg = node.reg()?.next()?;
+                let mac_prop = node.property("local-mac-address")?;
+                if mac_prop.value.len() >= 6 {
+                    let mut mac = [0u8; 6];
+                    mac.copy_from_slice(&mac_prop.value[..6]);
+                    let base = reg.starting_address as u64;
+                    let _ = writeln!(
+                        serial,
+                        "[FDT] GENET: MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, base={:#x}",
+                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], base
+                    );
+                    return Some((mac, base));
+                }
+            }
+        }
+        None
+    });
+    if dtb_ptr.is_some() && dtb_network.is_none() {
+        let _ = writeln!(
+            serial,
+            "[FDT] Device tree found but no GENET MAC, using platform defaults"
+        );
+    } else if dtb_ptr.is_none() {
+        let _ = writeln!(serial, "[FDT] No device tree found, using platform defaults");
+    }
+
     // ── Collect UEFI memory map into fixed-size array ──
     let mut regions = [MemoryRegion {
         base: 0,
@@ -432,21 +469,6 @@ fn main() -> Status {
         "[Heap] Initialized: {} bytes at {:#x}",
         heap_size, heap_base
     );
-
-    // ── Parse device tree (if present) ──
-    // Must happen after heap init: HardwareConfig uses Vec and String.
-    let hw_config = dtb_ptr.map(|ptr| {
-        let _ = writeln!(serial, "[FDT] Parsing device tree at {:p}", ptr);
-        unsafe { fdt_parse::parse_fdt(ptr) }
-    });
-    if hw_config.is_none() {
-        let _ = writeln!(serial, "[FDT] No device tree found, using platform defaults");
-    } else if hw_config.as_ref().and_then(|c| c.network.as_ref()).is_none() {
-        let _ = writeln!(
-            serial,
-            "[FDT] Device tree found but no GENET MAC, using platform defaults"
-        );
-    }
 
     // ── Generate Ed25519 identity for Reticulum wire compat ──
     //    PQ identity is generated lazily by the runtime — PQ keygen's
@@ -918,8 +940,8 @@ fn main() -> Status {
         use harmony_unikernel::drivers::dma_pool::{DmaBuffer, DmaPool};
         use harmony_unikernel::drivers::genet::GenetDriver;
 
-        let (mac, genet_base) = match hw_config.as_ref().and_then(|c| c.network.as_ref()) {
-            Some(net) => (net.mac_address, net.base as usize),
+        let (mac, genet_base) = match dtb_network {
+            Some((m, b)) => (m, b as usize),
             None => (platform::NODE_MAC, platform::GENET_BASE),
         };
         let mut bank = unsafe { mmio::MmioRegisterBank::new(genet_base) };
