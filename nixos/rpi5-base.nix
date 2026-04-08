@@ -230,13 +230,14 @@ CONFIGTXT
   users.users.zeblith = {
     isNormalUser = true;
     extraGroups = [ "wheel" "networkmanager" "dialout" ];
-    # hashedPasswordFile is the primary credential. The .age file MUST contain
-    # a real agenix-encrypted hash before flashing — the empty placeholder
-    # exists only to satisfy NixOS module evaluation.
-    # initialPassword seeds /etc/shadow on the very first activation only
-    # (before any hashedPasswordFile is processed). SSH remains key-only.
+    # IMPORTANT: The .age file MUST contain a real agenix-encrypted hash
+    # before flashing. The empty placeholder exists only to satisfy NixOS
+    # module evaluation. If deployed with an empty/invalid .age file, agenix
+    # activation will fail and the account may be locked — initialPassword
+    # does NOT act as a runtime fallback when hashedPasswordFile is set.
+    # Recovery path: SSH key-only access still works regardless.
     hashedPasswordFile = config.age.secrets.user-password.path;
-    initialPassword = "harmony";
+    initialPassword = "harmony";  # seeds /etc/shadow on first creation only
     openssh.authorizedKeys.keys = [
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM+Y/OkDTbAa/T0TXHESg7ZRkXOj0rJQ3qUlCR9STo7t zeblith@gmail.com"  # AVALON
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC9fSUat8x5KnIbuqbThWn7fqm3ork11fsvaqxAY/b5F zeblith@gmail.com"  # MacBook Pro

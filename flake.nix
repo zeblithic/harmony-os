@@ -69,6 +69,8 @@
               pkgs.git
               # aarch64 musl C cross-compiler for test fixtures
               muslCross
+              # agenix CLI for encrypting/re-encrypting NixOS secrets
+              agenix.packages.${system}.default
             ];
 
             buildInputs = [

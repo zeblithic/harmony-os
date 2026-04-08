@@ -39,7 +39,7 @@ mkpasswd → hash string → age encrypt (Mac key + host keys) → secrets/user-
 
 ### What stays the same
 
-- `initialPassword = "harmony"` — kept as HDMI console emergency fallback. NixOS uses `hashedPasswordFile` when the file exists; `initialPassword` activates only if the agenix secret is missing (first flash, decryption failure).
+- `initialPassword = "harmony"` — kept for first-activation user creation. Note: `initialPassword` does NOT act as a runtime fallback when `hashedPasswordFile` is set — if agenix decryption fails, the account will be locked. Recovery path is SSH key-only access.
 - WiFi PSK `"ZEBLITHIC"` — stays plaintext. The value is the org name, not sensitive. NetworkManager has no native secret-file support; adding a custom systemd service to inject it provides zero security value.
 - SSH config — already key-only (`PasswordAuthentication = false`).
 - Host-specific configs (luna.nix, sol.nix, terra.nix, archivist.nix) — unchanged.
