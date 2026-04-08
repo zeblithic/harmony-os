@@ -1,0 +1,21 @@
+/dts-v1/;
+
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+	compatible = "test,rpi5-genet";
+
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x00 0x40000000 0x00 0x8000000>;
+	};
+
+	chosen {
+	};
+
+	ethernet@1f00580000 {
+		compatible = "brcm,bcm2711-genet-v5";
+		reg = <0x1f 0x00580000 0x00 0x10000>;
+		local-mac-address = [dc a6 32 12 34 56];
+	};
+};

@@ -239,6 +239,22 @@ fn main() -> Status {
         }
     };
 
+    // ── Find DTB in UEFI configuration table ──
+    // RPi5 UEFI (EDK2) exposes the device tree here. The DTB blob
+    // remains in memory after ExitBootServices; we just save the pointer.
+    let dtb_ptr: Option<*const u8> = {
+        use uefi::table::cfg::ConfigTableEntry;
+        // EFI_DTB_TABLE_GUID per UEFI spec 2.10, Table 4-6 / EBBR § 4.2.
+        // Not defined in the uefi crate as of 0.36.
+        const DTB_GUID: uefi::Guid = uefi::guid!("b1b621d5-f19c-41a5-830b-d9152c69aae0");
+        uefi::system::with_config_table(|entries: &[ConfigTableEntry]| {
+            entries
+                .iter()
+                .find(|e| e.guid == DTB_GUID)
+                .map(|e| e.address as *const u8)
+        })
+    };
+
     // ── Exit boot services ── UEFI console is no longer available after this.
     // Capture the memory map -- we need it to build the identity page table.
     let memory_map = unsafe { uefi::boot::exit_boot_services(None) };
@@ -265,6 +281,49 @@ fn main() -> Status {
     let mut serial =
         harmony_unikernel::SerialWriter::new(|byte| unsafe { pl011::write_byte(byte) });
     let _ = writeln!(serial, "[PL011] Serial initialized: 115200 8N1");
+
+    // ── Read GENET MAC + base from DTB (before MMU, no heap) ──
+    // The DTB may reside in EfiACPIReclaimMemory (per EBBR § 4.2), which our
+    // MMU identity map does not cover. Read it now while UEFI page tables are
+    // still active. The fdt crate is zero-alloc (default-features = false),
+    // so no heap is needed.
+    let dtb_network: Option<([u8; 6], u64)> = dtb_ptr.and_then(|ptr| {
+        let _ = writeln!(serial, "[FDT] Parsing device tree at {:p}", ptr);
+        let fdt = unsafe { fdt::Fdt::from_ptr(ptr) }.ok()?;
+        for node in fdt.all_nodes() {
+            let Some(compat) = node.compatible() else {
+                continue;
+            };
+            if compat.all().any(|c| c == "brcm,bcm2711-genet-v5") {
+                let Some(reg) = node.reg().and_then(|mut r| r.next()) else {
+                    continue;
+                };
+                let Some(mac_prop) = node.property("local-mac-address") else {
+                    continue;
+                };
+                if mac_prop.value.len() >= 6 {
+                    let mut mac = [0u8; 6];
+                    mac.copy_from_slice(&mac_prop.value[..6]);
+                    let base = reg.starting_address as u64;
+                    let _ = writeln!(
+                        serial,
+                        "[FDT] GENET: MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, base={:#x}",
+                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], base
+                    );
+                    return Some((mac, base));
+                }
+            }
+        }
+        None
+    });
+    if dtb_ptr.is_some() && dtb_network.is_none() {
+        let _ = writeln!(
+            serial,
+            "[FDT] Device tree found but no GENET MAC, using platform defaults"
+        );
+    } else if dtb_ptr.is_none() {
+        let _ = writeln!(serial, "[FDT] No device tree found, using platform defaults");
+    }
 
     // ── Collect UEFI memory map into fixed-size array ──
     let mut regions = [MemoryRegion {
@@ -897,16 +956,20 @@ fn main() -> Status {
 
     // ── GENET Ethernet initialization (RPi5 only) ──
     #[cfg(feature = "rpi5")]
+    let (mac, genet_base) = match dtb_network {
+        Some((m, b)) => (m, b as usize),
+        None => (platform::NODE_MAC, platform::GENET_BASE),
+    };
+    #[cfg(feature = "rpi5")]
     let (mut genet_driver, mut genet_bank, mut tx_pool, mut rx_pool) = {
         use harmony_unikernel::drivers::dma_pool::{DmaBuffer, DmaPool};
         use harmony_unikernel::drivers::genet::GenetDriver;
 
-        let mut bank = unsafe { mmio::MmioRegisterBank::new(platform::GENET_BASE) };
-        let mac = platform::NODE_MAC;
+        let mut bank = unsafe { mmio::MmioRegisterBank::new(genet_base) };
         let _ = writeln!(
             serial,
             "[GENET] Initializing at {:#x}, MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            platform::GENET_BASE,
+            genet_base,
             mac[0],
             mac[1],
             mac[2],
@@ -1010,7 +1073,7 @@ fn main() -> Status {
                                         interface_name
                                     );
                                 } else {
-                                    let mac = platform::NODE_MAC;
+                                    // mac sourced from dtb_network / platform::NODE_MAC above
                                     let mut tx_frame =
                                         alloc::vec::Vec::with_capacity(14 + raw.len());
                                     tx_frame.extend_from_slice(&[0xFF; 6]);
@@ -1080,7 +1143,7 @@ fn main() -> Status {
                             interface_name
                         );
                     } else {
-                        let mac = platform::NODE_MAC;
+                        // mac sourced from dtb_network / platform::NODE_MAC above
                         let mut frame = alloc::vec::Vec::with_capacity(14 + raw.len());
                         // TODO: broadcast dst is correct for Reticulum announces
                         // but wrong for unicast responses. Needs neighbor table.
