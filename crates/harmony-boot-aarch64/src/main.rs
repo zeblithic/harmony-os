@@ -171,10 +171,6 @@ const BUMP_REGION_SIZE: u64 = 2 * 1024 * 1024;
 #[cfg(all(target_os = "uefi", feature = "rpi5"))]
 const BUMP_REGION_SIZE: u64 = 4 * 1024 * 1024;
 
-/// Apple Silicon: 4 MiB (16K pages → larger page tables, same order as RPi5).
-#[cfg(all(target_os = "uefi", feature = "apple-silicon"))]
-const BUMP_REGION_SIZE: u64 = 4 * 1024 * 1024;
-
 /// Returns `true` if a UEFI memory type represents usable RAM after
 /// ExitBootServices.
 ///
