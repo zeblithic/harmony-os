@@ -143,7 +143,9 @@ impl Default for HardwareConfig {
 mod tests {
     use super::*;
 
-    /// Parse a DTB blob into HardwareConfig (test-only, mirrors fdt_parse.rs).
+    /// Parse a DTB blob into HardwareConfig (test-only, superset of fdt_parse.rs).
+    /// Includes GENET parsing for NetworkConfig tests; the boot path reads
+    /// the DTB inline (zero-alloc) instead of calling parse_fdt().
     fn parse_fdt_for_test(dtb: &[u8]) -> HardwareConfig {
         let fdt = fdt::Fdt::new(dtb).expect("invalid FDT");
         let mut config = HardwareConfig::default();
