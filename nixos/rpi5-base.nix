@@ -230,10 +230,11 @@ CONFIGTXT
   users.users.zeblith = {
     isNormalUser = true;
     extraGroups = [ "wheel" "networkmanager" "dialout" ];
-    # hashedPasswordFile is the primary credential once secrets/user-password.age
-    # contains a real agenix-encrypted hash. initialPassword seeds the account
-    # on first activation (placeholder .age -> empty file -> login blocked until
-    # the real secret is deployed). SSH remains key-only regardless.
+    # hashedPasswordFile is the primary credential. The .age file MUST contain
+    # a real agenix-encrypted hash before flashing — the empty placeholder
+    # exists only to satisfy NixOS module evaluation.
+    # initialPassword seeds /etc/shadow on the very first activation only
+    # (before any hashedPasswordFile is processed). SSH remains key-only.
     hashedPasswordFile = config.age.secrets.user-password.path;
     initialPassword = "harmony";
     openssh.authorizedKeys.keys = [
