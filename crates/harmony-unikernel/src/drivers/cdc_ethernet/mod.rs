@@ -3,8 +3,10 @@
 //! USB CDC-ECM/NCM Ethernet class driver.
 
 pub mod codec;
+pub mod descriptor;
 pub mod ncm;
 pub mod notification;
 
 pub use codec::CdcCodec;
+pub use descriptor::{CdcDescriptors, CdcProtocol, EndpointInfo};
 pub use notification::{CdcError, CdcNotification};

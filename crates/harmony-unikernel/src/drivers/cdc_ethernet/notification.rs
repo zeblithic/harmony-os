@@ -14,6 +14,7 @@ const NOTIF_NETWORK_CONNECTION: u8 = 0x00;
 const NOTIF_CONNECTION_SPEED_CHANGE: u8 = 0x2A;
 
 /// bmRequestType for CDC notifications (class, interface, device-to-host).
+#[cfg(test)]
 const CDC_NOTIF_REQUEST_TYPE: u8 = 0xA1;
 
 // ── Error type ───────────────────────────────────────────────────
@@ -203,7 +204,7 @@ mod tests {
         buf[0] = CDC_NOTIF_REQUEST_TYPE;
         buf[1] = NOTIF_CONNECTION_SPEED_CHANGE;
         buf[6] = 4; // wLength = 4 (too short — need 8)
-        // Only 4 bytes of payload present.
+                    // Only 4 bytes of payload present.
         assert_eq!(
             parse_notification(&buf),
             Err(CdcError::NotificationTooShort)
@@ -232,6 +233,9 @@ mod tests {
     fn parse_too_short() {
         // Only 7 bytes — shorter than the 8-byte header.
         let buf = [0xA1, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
-        assert_eq!(parse_notification(&buf), Err(CdcError::NotificationTooShort));
+        assert_eq!(
+            parse_notification(&buf),
+            Err(CdcError::NotificationTooShort)
+        );
     }
 }
