@@ -136,9 +136,10 @@ CONFIGTXT
   # Pre-configured WiFi networks (RPi5 has built-in Broadcom WiFi).
   # Prioritized: MLO (WiFi 7) > 5GHz > 2.4GHz. Ethernet always preferred if available.
   #
-  # TODO(harmony-os-wifi-secrets): The PSK is committed in plaintext. This is
-  # intentionally accepted for now (it's the org name, not a secret), but should
-  # be migrated to agenix or sops-nix for proper secrets management.
+  # The PSK is the org name (ZEBLITHIC), not a real secret. Kept in plaintext
+  # because NetworkManager ensureProfiles has no native secret-file support —
+  # injecting from agenix would require a custom systemd oneshot to template
+  # NM profiles, adding meaningful complexity for zero security gain.
   networking.networkmanager.ensureProfiles.profiles = {
     "zHARMONY-MLO" = {
       connection = {
@@ -221,12 +222,19 @@ CONFIGTXT
 
   # --- Users ---
 
+  # agenix-managed hashed password for console login.
+  # Decrypted at NixOS activation time to /run/agenix/user-password.
+  # Source: secrets/user-password.age (age-encrypted mkpasswd -m sha-512 output).
+  age.secrets.user-password.file = ../secrets/user-password.age;
+
   users.users.zeblith = {
     isNormalUser = true;
     extraGroups = [ "wheel" "networkmanager" "dialout" ];
-    # initialPassword kept for local console access (HDMI + keyboard) only.
-    # SSH requires key auth (PasswordAuthentication = false above).
-    # TODO(harmony-os-user-secrets): Migrate to hashedPasswordFile via agenix/sops-nix.
+    # hashedPasswordFile takes precedence when the agenix secret is available.
+    # initialPassword is the HDMI-console emergency fallback: it activates only
+    # if the agenix secret file is missing (first flash, decryption failure).
+    # SSH remains key-only (PasswordAuthentication = false above).
+    hashedPasswordFile = config.age.secrets.user-password.path;
     initialPassword = "harmony";
     openssh.authorizedKeys.keys = [
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM+Y/OkDTbAa/T0TXHESg7ZRkXOj0rJQ3qUlCR9STo7t zeblith@gmail.com"  # AVALON
@@ -234,9 +242,8 @@ CONFIGTXT
     ];
   };
 
-  # TODO(harmony-os-sudo-hardening): Re-enable wheelNeedsPassword once
-  # hashedPasswordFile is in place via agenix/sops-nix.
-  security.sudo.wheelNeedsPassword = false;
+  # Sudo requires password now that hashedPasswordFile is in place.
+  security.sudo.wheelNeedsPassword = true;
 
   # --- Packages ---
 
