@@ -942,14 +942,15 @@ fn main() -> Status {
 
     // ── GENET Ethernet initialization (RPi5 only) ──
     #[cfg(feature = "rpi5")]
+    let (mac, genet_base) = match dtb_network {
+        Some((m, b)) => (m, b as usize),
+        None => (platform::NODE_MAC, platform::GENET_BASE),
+    };
+    #[cfg(feature = "rpi5")]
     let (mut genet_driver, mut genet_bank, mut tx_pool, mut rx_pool) = {
         use harmony_unikernel::drivers::dma_pool::{DmaBuffer, DmaPool};
         use harmony_unikernel::drivers::genet::GenetDriver;
 
-        let (mac, genet_base) = match dtb_network {
-            Some((m, b)) => (m, b as usize),
-            None => (platform::NODE_MAC, platform::GENET_BASE),
-        };
         let mut bank = unsafe { mmio::MmioRegisterBank::new(genet_base) };
         let _ = writeln!(
             serial,
@@ -1058,7 +1059,7 @@ fn main() -> Status {
                                         interface_name
                                     );
                                 } else {
-                                    let mac = platform::NODE_MAC;
+                                    // mac sourced from dtb_network / platform::NODE_MAC above
                                     let mut tx_frame =
                                         alloc::vec::Vec::with_capacity(14 + raw.len());
                                     tx_frame.extend_from_slice(&[0xFF; 6]);
@@ -1128,7 +1129,7 @@ fn main() -> Status {
                             interface_name
                         );
                     } else {
-                        let mac = platform::NODE_MAC;
+                        // mac sourced from dtb_network / platform::NODE_MAC above
                         let mut frame = alloc::vec::Vec::with_capacity(14 + raw.len());
                         // TODO: broadcast dst is correct for Reticulum announces
                         // but wrong for unicast responses. Needs neighbor table.
