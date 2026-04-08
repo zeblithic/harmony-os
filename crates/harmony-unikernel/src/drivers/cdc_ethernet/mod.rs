@@ -6,6 +6,7 @@
 //! frames (ECM passthrough or NCM NTH16/NDP16), and implements
 //! [`NetworkDevice`] for Ring 2 integration via `VirtioNetServer`.
 
+pub mod ncm;
 pub mod notification;
 
 pub use notification::{CdcError, CdcNotification};
