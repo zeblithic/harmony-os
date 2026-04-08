@@ -5,6 +5,7 @@
 //! All drivers use the [`RegisterBank`] trait for MMIO access,
 //! enabling full unit testing without hardware.
 
+pub mod cdc_ethernet;
 pub mod console;
 pub mod dma_pool;
 pub mod dwc_usb;
