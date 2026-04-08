@@ -4,6 +4,12 @@
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), no_std)]
 
+// Apple Silicon uses m1n1, not UEFI. Building the UEFI binary with
+// apple-silicon would crash on pl011::init() (PL011_BASE is a zero stub).
+// The future harmony-boot-apple crate handles Apple Silicon boot.
+#[cfg(all(target_os = "uefi", feature = "apple-silicon"))]
+compile_error!("apple-silicon uses m1n1 boot, not UEFI — use harmony-boot-apple instead");
+
 // `extern crate alloc` is needed for all build modes because modules like
 // fdt_parse.rs use `alloc::` paths. In test builds (with std), this is
 // harmless — alloc is implicitly available.
