@@ -282,10 +282,16 @@ fn main() -> Status {
         let _ = writeln!(serial, "[FDT] Parsing device tree at {:p}", ptr);
         let fdt = unsafe { fdt::Fdt::from_ptr(ptr) }.ok()?;
         for node in fdt.all_nodes() {
-            let compat = node.compatible()?;
+            let Some(compat) = node.compatible() else {
+                continue;
+            };
             if compat.all().any(|c| c == "brcm,bcm2711-genet-v5") {
-                let reg = node.reg()?.next()?;
-                let mac_prop = node.property("local-mac-address")?;
+                let Some(reg) = node.reg().and_then(|mut r| r.next()) else {
+                    continue;
+                };
+                let Some(mac_prop) = node.property("local-mac-address") else {
+                    continue;
+                };
                 if mac_prop.value.len() >= 6 {
                     let mut mac = [0u8; 6];
                     mac.copy_from_slice(&mac_prop.value[..6]);
