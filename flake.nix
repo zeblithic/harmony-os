@@ -14,9 +14,13 @@
     };
     flake-utils.url = "github:numtide/flake-utils";
     nixos-hardware.url = "github:NixOS/nixos-hardware";
+    agenix = {
+      url = "github:ryantm/agenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, fenix, flake-utils, nixos-hardware }:
+  outputs = { self, nixpkgs, fenix, flake-utils, nixos-hardware, agenix }:
     let
       # Per-system dev shell outputs (Rust cross-compilation environment)
       perSystem = flake-utils.lib.eachSystem [ "x86_64-darwin" "aarch64-darwin" "x86_64-linux" "aarch64-linux" ] (system:
@@ -105,6 +109,7 @@
         modules = [
           "${nixpkgs}/nixos/modules/installer/sd-card/sd-image-aarch64.nix"
           nixos-hardware.nixosModules.raspberry-pi-5
+          agenix.nixosModules.default
           hostConfig
         ];
       };
