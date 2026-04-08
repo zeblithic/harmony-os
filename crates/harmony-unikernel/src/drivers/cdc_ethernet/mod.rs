@@ -400,7 +400,9 @@ impl CdcEthernetDriver {
     fn bulk_in_buffer_size(&self) -> u16 {
         match self.descriptors.protocol {
             CdcProtocol::Ecm => self.descriptors.max_segment_size.max(1514),
-            CdcProtocol::Ncm => (self.descriptors.max_ntb_size.min(u16::MAX as u32)) as u16,
+            CdcProtocol::Ncm => {
+                (self.descriptors.max_ntb_size.min(u16::MAX as u32) as u16).max(2048)
+            }
         }
     }
 

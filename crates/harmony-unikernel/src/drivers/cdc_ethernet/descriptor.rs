@@ -124,6 +124,7 @@ pub fn parse_cdc_config(config_desc: &[u8]) -> Result<Option<CdcDescriptors>, Cd
     let mut data_alt_setting: u8 = 0;
     let mut header_fd_found = false;
     let mut union_fd_found = false;
+    let mut ncm_fd_found = false;
 
     // Tracks whether we are inside a CDC Control interface block.
     let mut in_cdc_control = false;
@@ -245,6 +246,7 @@ pub fn parse_cdc_config(config_desc: &[u8]) -> Result<Option<CdcDescriptors>, Cd
                         if desc.len() < 6 {
                             return Err(CdcError::DescriptorTooShort);
                         }
+                        ncm_fd_found = true;
                         // Default NTB size; real value comes from GET_NTB_PARAMETERS.
                         max_ntb_size = 16384;
                     }
@@ -304,6 +306,9 @@ pub fn parse_cdc_config(config_desc: &[u8]) -> Result<Option<CdcDescriptors>, Cd
 
     // Validate required functional descriptors.
     if !header_fd_found || !union_fd_found {
+        return Err(CdcError::MissingFunctionalDescriptor);
+    }
+    if protocol == CdcProtocol::Ncm && !ncm_fd_found {
         return Err(CdcError::MissingFunctionalDescriptor);
     }
 
@@ -779,5 +784,23 @@ pub mod tests {
 
         // First CDC interface (ECM) wins.
         assert_eq!(info.protocol, CdcProtocol::Ecm);
+    }
+
+    #[test]
+    fn parse_ncm_missing_ncm_fd() {
+        // Build an NCM descriptor but replace the NCM FD with an unknown subtype
+        // so the parser never sees CDC_FUNC_NCM.
+        let mut desc = build_ncm_config_desc();
+
+        // NCM FD is 6 bytes at offset: config(9) + comm_iface(9) + header_fd(5) + union_fd(5) = 28
+        // desc[28..34] is the NCM FD. Change the subtype from 0x1A to 0xFF.
+        assert_eq!(desc[29], 0x24); // verify we're at a CS_INTERFACE
+        assert_eq!(desc[30], 0x1A); // verify NCM subtype
+        desc[30] = 0xFF; // corrupt to unknown subtype
+
+        assert_eq!(
+            parse_cdc_config(&desc),
+            Err(CdcError::MissingFunctionalDescriptor)
+        );
     }
 }
