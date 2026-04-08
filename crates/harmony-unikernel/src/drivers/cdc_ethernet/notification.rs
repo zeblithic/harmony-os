@@ -36,6 +36,8 @@ pub enum CdcError {
     MalformedNtb,
     /// An Ethernet frame exceeded the maximum allowed size.
     FrameTooLarge,
+    /// An empty frame was passed where a non-empty frame is required.
+    FrameEmpty,
     /// The driver is not yet ready (e.g. link is down).
     NotReady,
     /// The notification packet was shorter than the 8-byte header.

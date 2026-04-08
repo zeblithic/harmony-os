@@ -121,6 +121,7 @@ pub fn parse_cdc_config(config_desc: &[u8]) -> Result<Option<CdcDescriptors>, Cd
     let mut interrupt_ep: Option<EndpointInfo> = None;
     let mut bulk_in_ep: Option<EndpointInfo> = None;
     let mut bulk_out_ep: Option<EndpointInfo> = None;
+    let mut data_alt_setting: u8 = 0;
     let mut header_fd_found = false;
     let mut union_fd_found = false;
 
@@ -197,6 +198,7 @@ pub fn parse_cdc_config(config_desc: &[u8]) -> Result<Option<CdcDescriptors>, Cd
                     // We're inside the data interface from the Union FD.
                     if if_number == data_interface && alt_setting > 0 {
                         in_data_interface = true;
+                        data_alt_setting = alt_setting;
                     }
                 }
             }
@@ -314,7 +316,7 @@ pub fn parse_cdc_config(config_desc: &[u8]) -> Result<Option<CdcDescriptors>, Cd
         protocol,
         control_interface,
         data_interface,
-        data_alt_setting: 1,
+        data_alt_setting,
         interrupt_ep,
         bulk_in_ep,
         bulk_out_ep,

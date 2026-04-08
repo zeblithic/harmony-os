@@ -374,10 +374,13 @@ impl CdcEthernetDriver {
     /// Pop the next received Ethernet frame into `out`, returning the frame
     /// length, or `None` if the receive queue is empty.
     pub fn poll_rx_frame(&mut self, out: &mut [u8]) -> Option<usize> {
-        let frame = self.rx_queue.pop_front()?;
-        let len = frame.len().min(out.len());
-        out[..len].copy_from_slice(&frame[..len]);
-        Some(len)
+        let frame = self.rx_queue.front()?;
+        if frame.len() > out.len() {
+            return None; // buffer too small — caller must retry with larger buffer
+        }
+        let frame = self.rx_queue.pop_front().unwrap();
+        out[..frame.len()].copy_from_slice(&frame);
+        Some(frame.len())
     }
 
     /// Queue an Ethernet frame for transmission.

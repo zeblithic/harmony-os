@@ -68,7 +68,15 @@ impl CdcCodec {
     pub fn encode_tx(&mut self, frame: &[u8]) -> Result<Vec<u8>, CdcError> {
         match self {
             CdcCodec::Ecm => Ok(frame.to_vec()),
-            CdcCodec::Ncm { sequence, .. } => {
+            CdcCodec::Ncm {
+                max_ntb_size,
+                sequence,
+            } => {
+                // 28 = NTH16 (12) + NDP16 (16) overhead for single-frame NTB
+                let ntb_size = 28 + frame.len();
+                if ntb_size > *max_ntb_size as usize {
+                    return Err(CdcError::FrameTooLarge);
+                }
                 let seq = *sequence;
                 let encoded = super::ncm::encode_ntb(frame, seq)?;
                 *sequence = sequence.wrapping_add(1);

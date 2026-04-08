@@ -178,7 +178,7 @@ pub fn decode_ntb(data: &[u8], out: &mut Vec<Vec<u8>>) -> Result<(), CdcError> {
 /// Returns [`CdcError::FrameTooLarge`] if `frame` is empty.
 pub fn encode_ntb(frame: &[u8], sequence: u16) -> Result<Vec<u8>, CdcError> {
     if frame.is_empty() {
-        return Err(CdcError::FrameTooLarge);
+        return Err(CdcError::FrameEmpty);
     }
 
     let total_len = NTH16_SIZE + NDP16_MIN_SIZE + frame.len();
@@ -270,7 +270,7 @@ mod tests {
     /// Empty frames must be rejected.
     #[test]
     fn encode_empty_frame_rejected() {
-        assert_eq!(encode_ntb(b"", 0), Err(CdcError::FrameTooLarge));
+        assert_eq!(encode_ntb(b"", 0), Err(CdcError::FrameEmpty));
     }
 
     /// Sequence number is reflected in the NTH16 wSequence field.
