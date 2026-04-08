@@ -199,7 +199,15 @@ impl CdcEthernetDriver {
         let bulk_in_addr = descs.bulk_in_ep.address & 0x0F;
         let interrupt_addr = descs.interrupt_ep.address & 0x0F;
 
-        let actions = vec![
+        // Bulk IN buffer must hold a complete transfer, not just one USB packet.
+        // ECM: one Ethernet frame up to max_segment_size (typically 1514).
+        // NCM: one NTB up to max_ntb_size (typically 2048-16384).
+        let bulk_in_max = match descs.protocol {
+            CdcProtocol::Ecm => descs.max_segment_size.max(1514),
+            CdcProtocol::Ncm => (descs.max_ntb_size.min(u16::MAX as u32)) as u16,
+        };
+
+        let mut actions = vec![
             // 1. SET_CONFIGURATION
             CdcAction::ControlOut {
                 request: set_configuration(descs.config_value),
@@ -210,27 +218,41 @@ impl CdcEthernetDriver {
                 request: set_interface(descs.data_interface, descs.data_alt_setting),
                 data: vec![],
             },
-            // 3. GET_STRING for MAC address
-            CdcAction::ControlIn {
+        ];
+
+        // 3. GET_STRING for MAC address (only if mac_string_index > 0;
+        // index 0 is the USB Language ID list, not a MAC address)
+        if descs.mac_string_index > 0 {
+            actions.push(CdcAction::ControlIn {
                 request: get_string_descriptor(descs.mac_string_index, 26),
                 max_len: 26,
-            },
-            // 4. SET_PACKET_FILTER — directed | multicast | broadcast = 0x000B
-            CdcAction::ControlOut {
-                request: set_packet_filter(descs.control_interface, 0x000B),
-                data: vec![],
-            },
-            // 5. Initial bulk IN read
-            CdcAction::BulkIn {
-                ep: bulk_in_addr,
-                max_len: descs.bulk_in_ep.max_packet_size,
-            },
-            // 6. Initial interrupt IN read
-            CdcAction::InterruptIn {
-                ep: interrupt_addr,
-                max_len: descs.interrupt_ep.max_packet_size,
-            },
-        ];
+            });
+        }
+
+        // 4. SET_PACKET_FILTER — directed | multicast | broadcast
+        // Bit 2 = directed, bit 3 = broadcast, bit 1 = all-multicast = 0x000E
+        actions.push(CdcAction::ControlOut {
+            request: set_packet_filter(descs.control_interface, 0x000E),
+            data: vec![],
+        });
+
+        // 5. Initial bulk IN read (sized for a complete transfer)
+        actions.push(CdcAction::BulkIn {
+            ep: bulk_in_addr,
+            max_len: bulk_in_max,
+        });
+
+        // 6. Initial interrupt IN read
+        actions.push(CdcAction::InterruptIn {
+            ep: interrupt_addr,
+            max_len: descs.interrupt_ep.max_packet_size,
+        });
+
+        // If mac_string_index is 0, there's no MAC string descriptor to
+        // fetch — mark driver as initialized with a zero MAC. The caller
+        // can discover the MAC via other means (e.g., SET_NET_ADDRESS or
+        // the first received frame's destination).
+        let initialized = descs.mac_string_index == 0;
 
         let driver = Self {
             descriptors: descs,
@@ -241,7 +263,7 @@ impl CdcEthernetDriver {
             rx_queue: VecDeque::new(),
             pending_actions: Vec::new(),
             mac: [0u8; 6],
-            initialized: false,
+            initialized,
         };
 
         Ok(Some((driver, actions)))
@@ -299,7 +321,7 @@ impl CdcEthernetDriver {
         let bulk_in_addr = self.descriptors.bulk_in_ep.address & 0x0F;
         vec![CdcAction::BulkIn {
             ep: bulk_in_addr,
-            max_len: self.descriptors.bulk_in_ep.max_packet_size,
+            max_len: self.bulk_in_buffer_size(),
         }]
     }
 
@@ -367,6 +389,15 @@ impl CdcEthernetDriver {
     /// Return the detected CDC protocol variant.
     pub fn protocol(&self) -> CdcProtocol {
         self.descriptors.protocol
+    }
+
+    /// Compute the bulk IN buffer size for a complete transfer.
+    /// ECM: one Ethernet frame. NCM: one NTB.
+    fn bulk_in_buffer_size(&self) -> u16 {
+        match self.descriptors.protocol {
+            CdcProtocol::Ecm => self.descriptors.max_segment_size.max(1514),
+            CdcProtocol::Ncm => (self.descriptors.max_ntb_size.min(u16::MAX as u32)) as u16,
+        }
     }
 
     // ── NetworkDevice-compatible methods ─────────────────────────────────────
