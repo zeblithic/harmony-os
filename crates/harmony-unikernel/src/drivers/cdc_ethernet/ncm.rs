@@ -191,7 +191,6 @@ pub fn encode_ntb(frame: &[u8], sequence: u16) -> Result<Vec<u8>, CdcError> {
     //   NDP16       : bytes 12..28  (16 bytes: header 8 + 1 entry 4 + terminator 4)
     //   frame       : bytes 28..
     let frame_offset: u16 = (NTH16_SIZE + NDP16_MIN_SIZE) as u16; // 28
-    let total_len = NTH16_SIZE + NDP16_MIN_SIZE + frame.len();
     let ndp_offset: u16 = NTH16_SIZE as u16; // 12
 
     let mut buf = Vec::with_capacity(total_len);
