@@ -365,6 +365,10 @@ impl CdcEthernetDriver {
             return Err(CdcError::NotReady);
         }
 
+        if frame.is_empty() {
+            return Err(CdcError::FrameEmpty);
+        }
+
         // ECM: check max_segment_size.  NCM: the codec handles size limits.
         if self.descriptors.max_segment_size > 0
             && frame.len() > self.descriptors.max_segment_size as usize
@@ -665,6 +669,19 @@ mod tests {
         // max_segment_size = 1514 in our test descriptor.
         let oversized = vec![0u8; 1515];
         assert_eq!(driver.send_frame(&oversized), Err(CdcError::FrameTooLarge));
+    }
+
+    #[test]
+    fn send_empty_frame_fails() {
+        let desc = super::descriptor::tests::build_ecm_config_desc();
+        let (mut driver, _) = CdcEthernetDriver::from_config_descriptor(1, &desc)
+            .unwrap()
+            .unwrap();
+
+        let mac_str = build_mac_string_descriptor(b"001122334455");
+        driver.complete_init(&mac_str).unwrap();
+
+        assert_eq!(driver.send_frame(&[]), Err(CdcError::FrameEmpty));
     }
 
     // ── queue_tx_frame ───────────────────────────────────────────────────────

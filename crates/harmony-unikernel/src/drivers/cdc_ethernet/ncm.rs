@@ -143,6 +143,12 @@ pub fn decode_ntb(data: &[u8], out: &mut Vec<Vec<u8>>) -> Result<(), CdcError> {
                 break;
             }
 
+            // Zero-length datagrams are invalid (no such thing as a
+            // zero-byte Ethernet frame) — treat as corrupt NDP entry.
+            if dg_length == 0 {
+                return Err(CdcError::MalformedNtb);
+            }
+
             // Validate the datagram window is inside the block.
             if dg_index + dg_length > block.len() {
                 return Err(CdcError::MalformedNtb);
@@ -487,6 +493,17 @@ mod tests {
             decode_ntb(&ntb, &mut Vec::new()),
             Err(CdcError::MalformedNtb)
         );
+    }
+
+    /// A datagram entry with non-zero index but zero length is malformed.
+    #[test]
+    fn decode_zero_length_datagram_rejected() {
+        let mut ntb = encode_ntb(b"test", 0).unwrap();
+        // Set wDatagramLength (offset 22..24) to 0, keeping wDatagramIndex non-zero.
+        ntb[22] = 0;
+        ntb[23] = 0;
+        let mut out = Vec::new();
+        assert_eq!(decode_ntb(&ntb, &mut out), Err(CdcError::MalformedNtb));
     }
 
     /// wNdpIndex of 0 (no NDP present) must succeed with zero frames.

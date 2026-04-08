@@ -180,7 +180,7 @@ pub fn parse_cdc_config(config_desc: &[u8]) -> Result<Option<CdcDescriptors>, Cd
                 in_cdc_control = false;
                 in_data_interface = false;
 
-                if if_class == CDC_INTERFACE_CLASS {
+                if if_class == CDC_INTERFACE_CLASS && protocol.is_none() {
                     match if_subclass {
                         CDC_SUBCLASS_ECM => {
                             protocol = Some(CdcProtocol::Ecm);
@@ -754,5 +754,30 @@ pub mod tests {
         desc[3] = (new_total >> 8) as u8;
 
         assert_eq!(parse_cdc_config(&desc), Err(CdcError::MissingEndpoint));
+    }
+
+    #[test]
+    fn parse_multi_cdc_uses_first() {
+        // Build a config descriptor with two CDC interfaces: ECM then NCM.
+        // The parser should lock in the first (ECM) and ignore the second.
+        let ecm = build_ecm_config_desc();
+        let ncm = build_ncm_config_desc();
+
+        // Combine: ECM config header + ECM body + NCM body (skip NCM's config header).
+        let mut combined = ecm.clone();
+        combined.extend_from_slice(&ncm[9..]); // skip NCM's 9-byte config header
+
+        // Patch wTotalLength and bNumInterfaces.
+        let total = combined.len() as u16;
+        combined[2] = (total & 0xFF) as u8;
+        combined[3] = (total >> 8) as u8;
+        combined[4] = 4; // 4 interfaces total
+
+        let info = parse_cdc_config(&combined)
+            .expect("parse must not fail")
+            .expect("must find CDC interface");
+
+        // First CDC interface (ECM) wins.
+        assert_eq!(info.protocol, CdcProtocol::Ecm);
     }
 }
