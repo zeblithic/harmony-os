@@ -4,6 +4,15 @@
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), no_std)]
 
+// Apple Silicon uses m1n1, not UEFI. Building the UEFI binary with
+// apple-silicon would crash on pl011::init() (PL011_BASE is a zero stub).
+// The future harmony-boot-apple crate handles Apple Silicon boot.
+#[cfg(all(target_os = "uefi", feature = "apple-silicon"))]
+compile_error!("apple-silicon uses m1n1 boot, not UEFI — use harmony-boot-apple instead");
+
+// `extern crate alloc` is needed for all build modes because modules like
+// fdt_parse.rs use `alloc::` paths. In test builds (with std), this is
+// harmless — alloc is implicitly available.
 extern crate alloc;
 
 mod bump_alloc;
@@ -483,8 +492,8 @@ fn main() -> Status {
         // instead of spin-waiting.
         linuxulator.set_block_fn(|op, fd, deadline_ms| {
             use harmony_os::linuxulator::{
-                BLOCK_OP_CONNECT, BLOCK_OP_POLL, BLOCK_OP_READABLE, BLOCK_OP_SLEEP,
-                BLOCK_OP_WAIT, BLOCK_OP_WRITABLE,
+                BLOCK_OP_CONNECT, BLOCK_OP_POLL, BLOCK_OP_READABLE, BLOCK_OP_SLEEP, BLOCK_OP_WAIT,
+                BLOCK_OP_WRITABLE,
             };
             let reason = match op {
                 BLOCK_OP_READABLE => sched::WaitReason::FdReadable(fd),
@@ -605,8 +614,13 @@ fn main() -> Status {
 
                 // Check for pending signal handler.
                 let signal_setup = if let Some(signum) = lx.pending_handler_signal() {
-                    let siginfo = lx.pending_siginfo()
-                        .and_then(|(tag, info)| if tag == signum { Some(info) } else { None });
+                    let siginfo = lx.pending_siginfo().and_then(|(tag, info)| {
+                        if tag == signum {
+                            Some(info)
+                        } else {
+                            None
+                        }
+                    });
                     // Build SavedRegisters from the current state. If sigreturn
                     // just happened, use restored regs (not TrapFrame, which
                     // still has the pre-sigreturn state).
@@ -1432,7 +1446,7 @@ fn dispatch_action(action: &harmony_unikernel::RuntimeAction, serial: &mut impl 
 // rewrites ELR to .Lelf_return (via set_return_context), restoring the
 // kernel SP and LR so that `ret` returns to the Rust caller.
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(target_os = "uefi")]
 core::arch::global_asm!(
     ".global run_elf_binary",
     "run_elf_binary:",
@@ -1466,7 +1480,7 @@ core::arch::global_asm!(
     "ret", // return to Rust caller with exit code in x0
 );
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(target_os = "uefi")]
 extern "C" {
     /// Run an ELF binary at `entry_point` with `stack_top` as its SP.
     ///

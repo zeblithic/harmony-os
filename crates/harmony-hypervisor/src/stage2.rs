@@ -88,6 +88,37 @@ impl Stage2Granule {
     pub const fn max_level(&self) -> usize {
         3
     }
+
+    /// Generate a VTCR_EL2 base value for this guest granule.
+    ///
+    /// The caller must OR in the PS bits [18:16] from
+    /// `ID_AA64MMFR0_EL1.PARange` before writing to VTCR_EL2.
+    /// (Note: VTCR_EL2 uses PS at [18:16], unlike TCR_EL1 which
+    /// uses IPS at [34:32].)
+    ///
+    /// VTCR_EL2.SL0 encoding is granule-dependent (ARM DDI 0487, Table D8-41):
+    ///   4K:  SL0=0b10 → start at level 0 (4-level walk for 48-bit IPA)
+    ///   16K: SL0=0b10 → start at level 1 (3-level walk for 47-bit IPA)
+    ///
+    /// Bit [31] is RES1 — must be written as 1 per ARM DDI 0487.
+    pub const fn vtcr_el2_value(&self) -> u64 {
+        let res1: u64 = 1 << 31; // VTCR_EL2[31] is RES1
+        let t0sz: u64 = match self {
+            Self::Four => 16,    // 48-bit IPA
+            Self::Sixteen => 17, // 47-bit IPA
+        };
+        let irgn0: u64 = 0b01 << 8; // Inner WB RA WA
+        let orgn0: u64 = 0b01 << 10; // Outer WB RA WA
+        let sh0: u64 = 0b11 << 12; // Inner Shareable
+        let tg0: u64 = match self {
+            Self::Four => 0b00 << 14,    // 4 KiB
+            Self::Sixteen => 0b10 << 14, // 16 KiB
+        };
+        // SL0 encoding differs by granule (Table D8-41):
+        //   4K:  0b10 = level 0,  16K: 0b10 = level 1
+        let sl0: u64 = 0b10 << 6;
+        res1 | t0sz | irgn0 | orgn0 | sh0 | tg0 | sl0
+    }
 }
 
 // ── Descriptor helpers ──────────────────────────────────────────────
@@ -490,5 +521,49 @@ mod tests {
         assert_eq!(g.entries_per_table(), 2048);
         assert_eq!(g.start_level(), 1);
         assert_eq!(g.addr_mask(), 0x0000_FFFF_FFFF_C000);
+    }
+
+    #[test]
+    fn vtcr_el2_4k_bits() {
+        let vtcr = Stage2Granule::Four.vtcr_el2_value();
+        // Bit [31] = RES1
+        assert_eq!((vtcr >> 31) & 1, 1);
+        // PS placeholder = 0 (bits [18:16], caller must OR in PARange)
+        assert_eq!((vtcr >> 16) & 0b111, 0b000);
+        // T0SZ = 16 (48-bit IPA)
+        assert_eq!(vtcr & 0x3F, 16);
+        // SL0 = 0b10 (4K: start at level 0)
+        assert_eq!((vtcr >> 6) & 0b11, 0b10);
+        // IRGN0 = 0b01
+        assert_eq!((vtcr >> 8) & 0b11, 0b01);
+        // ORGN0 = 0b01
+        assert_eq!((vtcr >> 10) & 0b11, 0b01);
+        // SH0 = 0b11
+        assert_eq!((vtcr >> 12) & 0b11, 0b11);
+        // TG0 = 0b00 (4K)
+        assert_eq!((vtcr >> 14) & 0b11, 0b00);
+    }
+
+    #[test]
+    fn vtcr_el2_16k_bits() {
+        let vtcr = Stage2Granule::Sixteen.vtcr_el2_value();
+        // Bit [31] = RES1
+        assert_eq!((vtcr >> 31) & 1, 1);
+        // T0SZ = 17 (47-bit IPA)
+        assert_eq!(vtcr & 0x3F, 17);
+        // SL0 = 0b10 (16K: start at level 1 — encoding is granule-dependent)
+        assert_eq!((vtcr >> 6) & 0b11, 0b10);
+        // TG0 = 0b10 (16K)
+        assert_eq!((vtcr >> 14) & 0b11, 0b10);
+    }
+
+    #[test]
+    fn vtcr_el2_cacheability_matches_across_granules() {
+        let v4 = Stage2Granule::Four.vtcr_el2_value();
+        let v16 = Stage2Granule::Sixteen.vtcr_el2_value();
+        // IRGN0, ORGN0, SH0 should be identical across granules
+        assert_eq!((v4 >> 8) & 0b11, (v16 >> 8) & 0b11);
+        assert_eq!((v4 >> 10) & 0b11, (v16 >> 10) & 0b11);
+        assert_eq!((v4 >> 12) & 0b11, (v16 >> 12) & 0b11);
     }
 }

@@ -7,8 +7,16 @@
 #[cfg(all(feature = "qemu-virt", feature = "rpi5"))]
 compile_error!("Features `qemu-virt` and `rpi5` are mutually exclusive");
 
-#[cfg(not(any(feature = "qemu-virt", feature = "rpi5")))]
-compile_error!("Exactly one platform feature must be enabled: `qemu-virt` or `rpi5`");
+#[cfg(all(feature = "qemu-virt", feature = "apple-silicon"))]
+compile_error!("Features `qemu-virt` and `apple-silicon` are mutually exclusive");
+
+#[cfg(all(feature = "rpi5", feature = "apple-silicon"))]
+compile_error!("Features `rpi5` and `apple-silicon` are mutually exclusive");
+
+#[cfg(not(any(feature = "qemu-virt", feature = "rpi5", feature = "apple-silicon")))]
+compile_error!(
+    "Exactly one platform feature must be enabled: `qemu-virt`, `rpi5`, or `apple-silicon`"
+);
 
 /// PL011 UART base address.
 #[cfg(feature = "qemu-virt")]
@@ -82,15 +90,38 @@ pub const MMIO_REGIONS: &[(usize, usize)] = &[
     (XHCI_BASE, 16),  // xHCI capability + operational + port registers (~64KB)
 ];
 
+// ── Apple Silicon stubs ────────────────────────────────────────────
+//
+// On Apple Silicon, hardware addresses come from the FDT at runtime
+// (m1n1 passes a device tree describing the SoC variant). These zero
+// placeholders exist only so the crate compiles with `apple-silicon`;
+// the actual boot path must call fdt_parse before touching hardware.
+
+/// Placeholder — Apple Silicon UART base comes from FDT.
+#[cfg(feature = "apple-silicon")]
+pub const PL011_BASE: usize = 0;
+
+/// Placeholder — Apple Silicon UART clock comes from FDT.
+#[cfg(feature = "apple-silicon")]
+pub const UART_CLOCK_HZ: u32 = 0;
+
+/// Placeholder — Apple Silicon MMIO regions come from FDT.
+#[cfg(feature = "apple-silicon")]
+pub const MMIO_REGIONS: &[(usize, usize)] = &[];
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Apple Silicon uses FDT-derived values (stubs are zero).
+    #[cfg(not(feature = "apple-silicon"))]
     #[test]
     fn pl011_base_is_set() {
         assert_ne!(PL011_BASE, 0);
     }
 
+    /// Apple Silicon uses FDT-derived values (stubs are zero).
+    #[cfg(not(feature = "apple-silicon"))]
     #[test]
     fn uart_clock_is_set() {
         assert!(UART_CLOCK_HZ > 0);
