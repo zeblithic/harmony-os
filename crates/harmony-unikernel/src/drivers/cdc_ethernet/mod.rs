@@ -404,10 +404,17 @@ impl CdcEthernetDriver {
 
     /// Pop the next received Ethernet frame into `out`, returning the frame
     /// length, or `None` if the receive queue is empty.
+    ///
+    /// If the front frame is larger than `out`, it is **dropped** to prevent
+    /// head-of-line blocking (an oversized frame would otherwise permanently
+    /// stall the queue).  Network protocols recover from drops via
+    /// retransmission.
     pub fn poll_rx_frame(&mut self, out: &mut [u8]) -> Option<usize> {
         let frame = self.rx_queue.front()?;
         if frame.len() > out.len() {
-            return None; // buffer too small — caller must retry with larger buffer
+            // Drop the oversized frame so it doesn't block subsequent frames.
+            self.rx_queue.pop_front();
+            return None;
         }
         let frame = self.rx_queue.pop_front().unwrap();
         out[..frame.len()].copy_from_slice(&frame);
@@ -741,6 +748,33 @@ mod tests {
         assert_eq!(driver.speed_up, 10_000_000);
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0], CdcAction::InterruptIn { .. }));
+    }
+
+    #[test]
+    fn poll_rx_drops_oversized_frame() {
+        let desc = super::descriptor::tests::build_ecm_config_desc();
+        let (mut driver, _) = CdcEthernetDriver::from_config_descriptor(1, &desc)
+            .unwrap()
+            .unwrap();
+
+        // Queue two frames: a large one (128 bytes) and a small one (32 bytes).
+        driver.receive_bulk_in(&[0xAA; 128]);
+        driver.receive_bulk_in(&[0xBB; 32]);
+        assert_eq!(driver.rx_queue.len(), 2);
+
+        // Try to poll with a 64-byte buffer — too small for the first frame.
+        let mut buf = [0u8; 64];
+        assert!(driver.poll_rx_frame(&mut buf).is_none());
+
+        // The oversized frame was dropped, not left blocking the queue.
+        assert_eq!(driver.rx_queue.len(), 1);
+
+        // The second (smaller) frame is now accessible.
+        let len = driver
+            .poll_rx_frame(&mut buf)
+            .expect("second frame must be available");
+        assert_eq!(len, 32);
+        assert_eq!(&buf[..len], &[0xBB; 32]);
     }
 
     #[test]

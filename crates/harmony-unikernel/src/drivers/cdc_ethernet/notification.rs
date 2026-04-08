@@ -24,8 +24,6 @@ const CDC_NOTIF_REQUEST_TYPE: u8 = 0xA1;
 pub enum CdcError {
     /// A descriptor was shorter than the minimum required length.
     DescriptorTooShort,
-    /// No CDC Communication interface was found in the configuration.
-    NoCdcInterface,
     /// A required endpoint (interrupt IN or bulk IN/OUT) was missing.
     MissingEndpoint,
     /// A required functional descriptor (e.g. ECM or NCM) was missing.
