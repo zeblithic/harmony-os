@@ -95,15 +95,15 @@ pub fn build_config_descriptor() -> Vec<u8> {
 
     // ── Configuration descriptor (9 bytes) ──────────────────────────────────
     v.extend_from_slice(&[
-        9,                                       // bLength
-        0x02,                                    // bDescriptorType: CONFIGURATION
-        (CONFIG_TOTAL_LENGTH & 0xFF) as u8,      // wTotalLength low
-        (CONFIG_TOTAL_LENGTH >> 8) as u8,        // wTotalLength high
-        2,                                       // bNumInterfaces
-        1,                                       // bConfigurationValue
-        0,                                       // iConfiguration
-        0xC0,                                    // bmAttributes: self-powered
-        50,                                      // bMaxPower (100 mA)
+        9,                                  // bLength
+        0x02,                               // bDescriptorType: CONFIGURATION
+        (CONFIG_TOTAL_LENGTH & 0xFF) as u8, // wTotalLength low
+        (CONFIG_TOTAL_LENGTH >> 8) as u8,   // wTotalLength high
+        2,                                  // bNumInterfaces
+        1,                                  // bConfigurationValue
+        0,                                  // iConfiguration
+        0xC0,                               // bmAttributes: self-powered
+        50,                                 // bMaxPower (100 mA)
     ]);
 
     // ── Communication Interface 0, alt 0 (9 bytes) ──────────────────────────
@@ -140,30 +140,30 @@ pub fn build_config_descriptor() -> Vec<u8> {
     // ── Ethernet Functional Descriptor (13 bytes) ────────────────────────────
     // iMACAddress = SIDX_MAC (4), wMaxSegmentSize = 1514 = 0x05EA
     v.extend_from_slice(&[
-        13,                                         // bLength
-        0x24,                                       // bDescriptorType: CS_INTERFACE
-        0x0F,                                       // bDescriptorSubType: Ethernet Networking
-        SIDX_MAC,                                   // iMACAddress
-        0x00,                                       // bmEthernetStatistics[0]
-        0x00,                                       // bmEthernetStatistics[1]
-        0x00,                                       // bmEthernetStatistics[2]
-        0x00,                                       // bmEthernetStatistics[3]
-        (MAX_SEGMENT_SIZE & 0xFF) as u8,            // wMaxSegmentSize low  (0xEA)
-        (MAX_SEGMENT_SIZE >> 8) as u8,              // wMaxSegmentSize high (0x05)
-        0x00,                                       // wNumberMCFilters low
-        0x00,                                       // wNumberMCFilters high
-        0,                                          // bNumberPowerFilters
+        13,                              // bLength
+        0x24,                            // bDescriptorType: CS_INTERFACE
+        0x0F,                            // bDescriptorSubType: Ethernet Networking
+        SIDX_MAC,                        // iMACAddress
+        0x00,                            // bmEthernetStatistics[0]
+        0x00,                            // bmEthernetStatistics[1]
+        0x00,                            // bmEthernetStatistics[2]
+        0x00,                            // bmEthernetStatistics[3]
+        (MAX_SEGMENT_SIZE & 0xFF) as u8, // wMaxSegmentSize low  (0xEA)
+        (MAX_SEGMENT_SIZE >> 8) as u8,   // wMaxSegmentSize high (0x05)
+        0x00,                            // wNumberMCFilters low
+        0x00,                            // wNumberMCFilters high
+        0,                               // bNumberPowerFilters
     ]);
 
     // ── Interrupt IN Endpoint (7 bytes) ──────────────────────────────────────
     v.extend_from_slice(&[
-        7,     // bLength
-        0x05,  // bDescriptorType: ENDPOINT
+        7,               // bLength
+        0x05,            // bDescriptorType: ENDPOINT
         EP_INTERRUPT_IN, // bEndpointAddress: IN, EP 3 = 0x83
-        0x03,  // bmAttributes: Interrupt
-        16,    // wMaxPacketSize low
-        0x00,  // wMaxPacketSize high
-        11,    // bInterval (ms)
+        0x03,            // bmAttributes: Interrupt
+        16,              // wMaxPacketSize low
+        0x00,            // wMaxPacketSize high
+        11,              // bInterval (ms)
     ]);
 
     // ── Data Interface 1, alt 0 (9 bytes, 0 endpoints) ───────────────────────
@@ -393,8 +393,7 @@ pub mod tests {
     #[test]
     fn roundtrip_with_host_parser() {
         let config_desc = build_config_descriptor();
-        let result =
-            parse_cdc_config(&config_desc).expect("host parser must not return an error");
+        let result = parse_cdc_config(&config_desc).expect("host parser must not return an error");
         let info = result.expect("host parser must find a CDC interface");
 
         assert_eq!(info.protocol, CdcProtocol::Ecm, "protocol must be ECM");

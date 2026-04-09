@@ -61,10 +61,21 @@ pub enum Dwc2Action {
 pub enum GadgetEvent {
     Reset,
     Configured,
-    SetupClassRequest { setup: [u8; 8] },
-    GetDescriptor { desc_type: u8, desc_index: u8, max_len: u16 },
-    BulkOut { ep: u8, data: Vec<u8> },
-    BulkInComplete { ep: u8 },
+    SetupClassRequest {
+        setup: [u8; 8],
+    },
+    GetDescriptor {
+        desc_type: u8,
+        desc_index: u8,
+        max_len: u16,
+    },
+    BulkOut {
+        ep: u8,
+        data: Vec<u8>,
+    },
+    BulkInComplete {
+        ep: u8,
+    },
     Suspended,
     Resumed,
 }
@@ -85,9 +96,16 @@ pub enum GadgetRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dwc2Error {
     FifoOverflow,
-    InvalidState { current: UsbDeviceState, attempted: &'static str },
-    InvalidEndpoint { ep: u8 },
-    TxFifoFull { ep: u8 },
+    InvalidState {
+        current: UsbDeviceState,
+        attempted: &'static str,
+    },
+    InvalidEndpoint {
+        ep: u8,
+    },
+    TxFifoFull {
+        ep: u8,
+    },
 }
 
 #[cfg(test)]

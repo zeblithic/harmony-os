@@ -321,7 +321,16 @@ mod tests {
     #[test]
     fn class_request_packet_filter() {
         let g = make_gadget();
-        let setup = [0x21, REQ_SET_ETHERNET_PACKET_FILTER, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00];
+        let setup = [
+            0x21,
+            REQ_SET_ETHERNET_PACKET_FILTER,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x02,
+            0x00,
+        ];
         let reqs = g.handle_class_request(setup);
         assert_eq!(reqs, vec![GadgetRequest::ControlAck]);
     }
@@ -340,7 +349,10 @@ mod tests {
     fn bulk_out_queues_frame() {
         let mut g = make_gadget();
         let frame = vec![0xABu8; 60];
-        let reqs = g.handle_event(GadgetEvent::BulkOut { ep: 2, data: frame.clone() });
+        let reqs = g.handle_event(GadgetEvent::BulkOut {
+            ep: 2,
+            data: frame.clone(),
+        });
         assert!(reqs.is_empty());
         assert_eq!(g.rx_queue.len(), 1);
 
@@ -462,17 +474,28 @@ mod tests {
     fn poll_rx_drops_oversized_for_buffer() {
         let mut g = make_gadget();
         // Enqueue a 128-byte frame.
-        g.handle_event(GadgetEvent::BulkOut { ep: 2, data: vec![0xAAu8; 128] });
+        g.handle_event(GadgetEvent::BulkOut {
+            ep: 2,
+            data: vec![0xAAu8; 128],
+        });
         // Enqueue a 32-byte frame.
-        g.handle_event(GadgetEvent::BulkOut { ep: 2, data: vec![0xBBu8; 32] });
+        g.handle_event(GadgetEvent::BulkOut {
+            ep: 2,
+            data: vec![0xBBu8; 32],
+        });
 
         // Try to pop into a 64-byte buffer — first frame (128 bytes) is too big → dropped.
         let mut buf = [0u8; 64];
         let result = g.poll_rx_frame(&mut buf);
-        assert!(result.is_none(), "oversized frame must be dropped (return None)");
+        assert!(
+            result.is_none(),
+            "oversized frame must be dropped (return None)"
+        );
 
         // Second frame (32 bytes) must be accessible.
-        let len = g.poll_rx_frame(&mut buf).expect("second frame must be returned");
+        let len = g
+            .poll_rx_frame(&mut buf)
+            .expect("second frame must be returned");
         assert_eq!(len, 32);
         assert!(buf[..32].iter().all(|&b| b == 0xBB));
     }

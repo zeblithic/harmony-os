@@ -20,8 +20,7 @@ pub const fn dieptxf_value(start_word: u32, depth_words: u32) -> u32 {
 
 pub const TX1_START: u32 = RX_FIFO_WORDS + TX0_FIFO_WORDS;
 pub const TX3_START: u32 = TX1_START + TX1_FIFO_WORDS;
-pub const TOTAL_FIFO_WORDS: u32 =
-    RX_FIFO_WORDS + TX0_FIFO_WORDS + TX1_FIFO_WORDS + TX3_FIFO_WORDS;
+pub const TOTAL_FIFO_WORDS: u32 = RX_FIFO_WORDS + TX0_FIFO_WORDS + TX1_FIFO_WORDS + TX3_FIFO_WORDS;
 
 #[cfg(test)]
 mod tests {
