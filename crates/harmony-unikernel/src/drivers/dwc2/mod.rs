@@ -312,7 +312,8 @@ impl Dwc2Controller {
             // GET_STATUS (0x00) — mandatory per USB 2.0 §9.4.5.
             // Return 2-byte status: bus-powered, no remote wakeup.
             0x00 => {
-                Self::write_ep0_in(bank, &[0x00, 0x00]);
+                // D0 = Self Powered (matches bmAttributes 0xC0 in config descriptor).
+                Self::write_ep0_in(bank, &[0x01, 0x00]);
                 Ok(Vec::new())
             }
             // SET_ADDRESS — defer DCFG write until status-stage ZLP is ACKed
@@ -594,8 +595,14 @@ impl Dwc2Controller {
 
     fn write_ep0_in(bank: &mut impl RegisterBank, data: &[u8]) {
         let len = data.len() as u32;
-        // EP0 MPS = 64 bytes. pktcnt = ceil(len / 64), minimum 1 (for ZLP).
-        let pkt_cnt = if len == 0 { 1 } else { len.div_ceil(64) };
+        let mps: u32 = 64;
+        // pktcnt = ceil(len / 64), minimum 1 (for ZLP).
+        // Append ZLP when len is an exact multiple of MPS so the host
+        // can detect end-of-transfer on control IN pipes.
+        let mut pkt_cnt = if len == 0 { 1 } else { len.div_ceil(mps) };
+        if len > 0 && len % mps == 0 {
+            pkt_cnt += 1;
+        }
         let dieptsiz0 = (pkt_cnt << 19) | len;
         bank.write(dieptsiz(0), dieptsiz0);
         // Enable EP0 and clear NAK
