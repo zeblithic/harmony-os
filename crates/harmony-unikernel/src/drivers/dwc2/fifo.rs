@@ -28,11 +28,14 @@ mod tests {
 
     #[test]
     fn static_partition_fits_in_4kb() {
+        // Use a local let-binding so clippy doesn't flag this as
+        // assertions_on_constants — the intent is to catch changes
+        // to the FIFO constants that would overflow the 4KB RAM.
+        let total = TOTAL_FIFO_WORDS;
+        let ram = FIFO_RAM_WORDS;
         assert!(
-            TOTAL_FIFO_WORDS <= FIFO_RAM_WORDS,
-            "FIFO partition ({} words) exceeds 4KB RAM ({} words)",
-            TOTAL_FIFO_WORDS,
-            FIFO_RAM_WORDS
+            total <= ram,
+            "FIFO partition ({total} words) exceeds 4KB RAM ({ram} words)"
         );
     }
 
@@ -73,23 +76,22 @@ mod tests {
 
     #[test]
     fn rx_fifo_holds_two_bulk_packets() {
-        // Each bulk packet is 512 bytes = 128 words; two packets = 256 words
+        // Each bulk packet is 512 bytes = 128 words; two packets = 256 words.
+        let rx = RX_FIFO_WORDS;
         assert!(
-            RX_FIFO_WORDS >= 256,
-            "RX FIFO ({} words) too small for two bulk packets (256 words)",
-            RX_FIFO_WORDS
+            rx >= 256,
+            "RX FIFO ({rx} words) too small for two bulk packets (256 words)"
         );
     }
 
     #[test]
     fn tx1_fifo_holds_ethernet_frame() {
-        // Max Ethernet frame: 1514 bytes, rounded up to 32-bit words = (1514+3)/4 = 379 words
-        let min_words = (1514u32 + 3) / 4;
+        // Max Ethernet frame: 1514 bytes, rounded up to 32-bit words.
+        let min_words = 1514u32.div_ceil(4);
+        let tx1 = TX1_FIFO_WORDS;
         assert!(
-            TX1_FIFO_WORDS >= min_words,
-            "TX1 FIFO ({} words) too small for max Ethernet frame ({} words)",
-            TX1_FIFO_WORDS,
-            min_words
+            tx1 >= min_words,
+            "TX1 FIFO ({tx1} words) too small for max Ethernet frame ({min_words} words)"
         );
     }
 }

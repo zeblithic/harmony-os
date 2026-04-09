@@ -135,14 +135,16 @@ impl EcmGadget {
     /// Returns `Some(len)` on success, `None` if the queue is empty.
     /// Frames that are larger than `out` are dropped (not re-queued).
     pub fn poll_rx_frame(&mut self, out: &mut [u8]) -> Option<usize> {
-        let frame = self.rx_queue.pop_front()?;
+        let frame = self.rx_queue.front()?;
         if frame.len() > out.len() {
-            // Drop oversized frame — same pattern as host driver.
+            // Drop the oversized frame to prevent head-of-line blocking.
+            // Same pattern as the host-side CdcEthernetDriver::poll_rx_frame.
+            self.rx_queue.pop_front();
             return None;
         }
-        let len = frame.len();
-        out[..len].copy_from_slice(&frame);
-        Some(len)
+        let frame = self.rx_queue.pop_front().unwrap();
+        out[..frame.len()].copy_from_slice(&frame);
+        Some(frame.len())
     }
 
     /// Enqueue an Ethernet frame for transmission over the bulk IN endpoint.

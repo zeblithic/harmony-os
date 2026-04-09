@@ -31,6 +31,9 @@ pub struct Dwc2Controller {
     state: UsbDeviceState,
     speed: DeviceSpeed,
     address: u8,
+    /// Deferred address — written to DCFG only after status-stage ZLP is ACKed
+    /// (USB 2.0 §9.4.6: device must not change address until status stage completes).
+    pending_address: Option<u8>,
     setup_data: Option<[u8; 8]>,
     device_desc: Option<Vec<u8>>,
     config_desc: Option<Vec<u8>>,
@@ -163,6 +166,7 @@ impl Dwc2Controller {
             state: UsbDeviceState::Default,
             speed: DeviceSpeed::HighSpeed,
             address: 0,
+            pending_address: None,
             setup_data: None,
             device_desc: None,
             config_desc: None,
@@ -201,11 +205,7 @@ impl Dwc2Controller {
         bank: &mut impl RegisterBank,
     ) -> Result<Vec<GadgetEvent>, Dwc2Error> {
         match event {
-            Dwc2Event::BusReset => Ok(Self::handle_bus_reset(
-                bank,
-                &mut self.state,
-                &mut self.address,
-            )),
+            Dwc2Event::BusReset => Ok(self.handle_bus_reset(bank)),
             Dwc2Event::EnumerationDone { speed } => {
                 self.speed = speed;
                 Ok(Vec::new())
@@ -213,6 +213,15 @@ impl Dwc2Controller {
             Dwc2Event::SetupReceived { data } => self.handle_setup(data, bank),
             Dwc2Event::RxFifoNonEmpty => self.handle_rx_fifo(bank),
             Dwc2Event::InTransferComplete { ep } => {
+                // Commit deferred SET_ADDRESS after EP0 status-stage ZLP is ACKed.
+                if ep == 0 {
+                    if let Some(addr) = self.pending_address.take() {
+                        let dcfg = (bank.read(DCFG) & !DCFG_DAD_MASK) | dcfg_dad(addr);
+                        bank.write(DCFG, dcfg);
+                        self.address = addr;
+                    }
+                    return Ok(Vec::new());
+                }
                 Ok(alloc::vec![GadgetEvent::BulkInComplete { ep }])
             }
             Dwc2Event::OutTransferComplete { ep } => {
@@ -229,14 +238,12 @@ impl Dwc2Controller {
         }
     }
 
-    fn handle_bus_reset(
-        bank: &mut impl RegisterBank,
-        state: &mut UsbDeviceState,
-        address: &mut u8,
-    ) -> Vec<GadgetEvent> {
-        // Return to Default state
-        *state = UsbDeviceState::Default;
-        *address = 0;
+    fn handle_bus_reset(&mut self, bank: &mut impl RegisterBank) -> Vec<GadgetEvent> {
+        // Return to Default state, clear all pending state.
+        self.state = UsbDeviceState::Default;
+        self.address = 0;
+        self.pending_address = None;
+        self.setup_data = None;
 
         // Clear address in DCFG
         let dcfg = bank.read(DCFG) & !DCFG_DAD_MASK;
@@ -307,17 +314,14 @@ impl Dwc2Controller {
         bank: &mut impl RegisterBank,
     ) -> Result<Vec<GadgetEvent>, Dwc2Error> {
         match b_request {
-            // SET_ADDRESS
+            // SET_ADDRESS — defer DCFG write until status-stage ZLP is ACKed
+            // (USB 2.0 §9.4.6: device must not change address until status stage completes).
             0x05 => {
                 let addr = (w_value & 0x7F) as u8;
-                self.address = addr;
+                self.pending_address = Some(addr);
                 self.state = UsbDeviceState::Address;
 
-                // Program address into DCFG
-                let dcfg = (bank.read(DCFG) & !DCFG_DAD_MASK) | dcfg_dad(addr);
-                bank.write(DCFG, dcfg);
-
-                // Send ZLP status on EP0 IN
+                // Send ZLP status on EP0 IN — DCFG written on InTransferComplete{ep:0}
                 Self::write_ep0_in(bank, &[]);
 
                 Ok(Vec::new())
@@ -392,12 +396,11 @@ impl Dwc2Controller {
         bank.write(diepctl(1), ep1_in);
 
         // EP2 OUT bulk, MPS=512
-        let ep2_out = 512u32 | EPCTL_USBAEP | epctl_eptype(EPTYPE_BULK) | EPCTL_EPENA | EPCTL_CNAK;
-        bank.write(doepctl(2), ep2_out);
-
-        // Arm EP2 OUT to receive data
+        // DWC2 requires transfer size programmed BEFORE endpoint enable.
         let doeptsiz2: u32 = (1 << 19) | 512; // pktcnt=1, xfersize=512
         bank.write(doeptsiz(2), doeptsiz2);
+        let ep2_out = 512u32 | EPCTL_USBAEP | epctl_eptype(EPTYPE_BULK) | EPCTL_EPENA | EPCTL_CNAK;
+        bank.write(doepctl(2), ep2_out);
 
         // EP3 IN interrupt, MPS=16, FIFO=3
         let ep3_in = 16u32
@@ -528,8 +531,9 @@ impl Dwc2Controller {
 
     fn write_ep0_in(bank: &mut impl RegisterBank, data: &[u8]) {
         let len = data.len() as u32;
-        // Program DIEPTSIZ0: pktcnt=1, xfersize=len
-        let dieptsiz0 = (1u32 << 19) | len;
+        // EP0 MPS = 64 bytes. pktcnt = ceil(len / 64), minimum 1 (for ZLP).
+        let pkt_cnt = if len == 0 { 1 } else { len.div_ceil(64) };
+        let dieptsiz0 = (pkt_cnt << 19) | len;
         bank.write(dieptsiz(0), dieptsiz0);
         // Enable EP0 and clear NAK
         bank.write(diepctl(0), bank.read(diepctl(0)) | EPCTL_EPENA | EPCTL_CNAK);
@@ -539,8 +543,14 @@ impl Dwc2Controller {
 
     fn write_tx_fifo(ep: u8, data: &[u8], bank: &mut impl RegisterBank) {
         let len = data.len() as u32;
-        // Program DIEPTSIZn: pktcnt=1, xfersize=len
-        let dieptsiz_val = (1u32 << 19) | len;
+        // MPS: EP0=64, EP3 interrupt=16, bulk EPs=512.
+        let mps: u32 = match ep {
+            0 => 64,
+            3 => 16,
+            _ => 512,
+        };
+        let pkt_cnt = if len == 0 { 1 } else { len.div_ceil(mps) };
+        let dieptsiz_val = (pkt_cnt << 19) | len;
         bank.write(dieptsiz(ep), dieptsiz_val);
         // Enable EP and clear NAK
         bank.write(
@@ -698,18 +708,23 @@ mod tests {
     fn set_address_programs_dcfg() {
         let (mut ctrl, mut bank) = init_controller();
 
-        // SET_ADDRESS: bmRequestType=0x00, bRequest=0x05, wValue=5 (addr), rest 0
+        // SET_ADDRESS(5): bmRequestType=0x00, bRequest=0x05, wValue=5
         let setup: [u8; 8] = [0x00, 0x05, 5, 0, 0, 0, 0, 0];
-
-        // Pre-configure DCFG read (current value = 0)
-        bank.on_read(DCFG, alloc::vec![0u32]);
-        // Pre-configure diepctl(0) read for the EP0 enable step
         bank.on_read(diepctl(0), alloc::vec![0u32]);
 
         ctrl.handle_event(Dwc2Event::SetupReceived { data: setup }, &mut bank)
             .expect("handle_event failed");
 
-        // Verify DCFG was written with the address
+        // State should be Address, but DCFG not yet written (deferred per USB §9.4.6).
+        assert_eq!(ctrl.state(), UsbDeviceState::Address);
+        assert!(ctrl.pending_address == Some(5));
+
+        // Simulate EP0 IN transfer complete (status-stage ZLP ACKed by host).
+        bank.on_read(DCFG, alloc::vec![0u32]);
+        ctrl.handle_event(Dwc2Event::InTransferComplete { ep: 0 }, &mut bank)
+            .expect("in_transfer_complete failed");
+
+        // Now DCFG should be written with address 5.
         let dcfg_write = bank
             .writes
             .iter()
@@ -718,11 +733,8 @@ mod tests {
             dcfg_write.is_some(),
             "DCFG should be written with address 5"
         );
-        assert_eq!(
-            ctrl.state(),
-            UsbDeviceState::Address,
-            "state should be Address"
-        );
+        assert_eq!(ctrl.address, 5);
+        assert!(ctrl.pending_address.is_none());
     }
 
     #[test]
@@ -1043,14 +1055,20 @@ mod tests {
             .unwrap();
         assert!(events.is_empty());
 
-        // 5. SET_ADDRESS(7).
-        bank.on_read(DCFG, alloc::vec![0]);
+        // 5. SET_ADDRESS(7) — deferred until status ZLP ACKed.
+        bank.on_read(diepctl(0), alloc::vec![0u32]);
         let setup_addr = [0x00, 0x05, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00];
         let events = ctrl
             .handle_event(Dwc2Event::SetupReceived { data: setup_addr }, &mut bank)
             .unwrap();
         assert!(events.is_empty());
         assert_eq!(ctrl.state(), UsbDeviceState::Address);
+
+        // 5b. EP0 IN transfer complete — commits the address to DCFG.
+        bank.on_read(DCFG, alloc::vec![0]);
+        ctrl.handle_event(Dwc2Event::InTransferComplete { ep: 0 }, &mut bank)
+            .unwrap();
+        assert_eq!(ctrl.address, 7);
 
         // 6. GET_DESCRIPTOR(Device).
         bank.writes.clear();
@@ -1090,7 +1108,7 @@ mod tests {
         // 8. Bulk OUT: host sends 60-byte frame.
         bank.writes.clear();
         let frame_data: alloc::vec::Vec<u8> = (0u8..60).collect();
-        let words = (frame_data.len() + 3) / 4;
+        let words = frame_data.len().div_ceil(4);
         let grxstsp_val: u32 =
             2 | ((frame_data.len() as u32) << 4) | ((PKTSTS_OUT_DATA as u32) << 17);
         bank.on_read(GRXSTSP, alloc::vec![grxstsp_val]);
