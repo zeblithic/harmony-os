@@ -865,4 +865,101 @@ mod tests {
             "should return InvalidEndpoint error for ep=5"
         );
     }
+
+    #[test]
+    fn full_enumeration_flow() {
+        use crate::drivers::ecm_gadget::EcmGadget;
+
+        let mac = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
+        let mut bank = MockRegisterBank::new();
+        bank.on_read(DCTL, alloc::vec![DCTL_SFTDISCON, 0]);
+
+        // 1. Init controller.
+        let (mut ctrl, _) = Dwc2Controller::init(&mut bank).unwrap();
+
+        // 2. Create gadget and register descriptors.
+        let (mut gadget, dev_desc, cfg_desc, str_descs) = EcmGadget::new(mac);
+        ctrl.set_descriptors(dev_desc, cfg_desc, str_descs);
+
+        // 3. Bus reset.
+        bank.writes.clear();
+        bank.on_read(DCFG, alloc::vec![0]);
+        let events = ctrl.handle_event(Dwc2Event::BusReset, &mut bank).unwrap();
+        assert_eq!(events, alloc::vec![GadgetEvent::Reset]);
+        let reqs = gadget.handle_event(GadgetEvent::Reset);
+        assert_eq!(reqs.len(), 1); // disconnect notification
+
+        // 4. Enumeration done.
+        let events = ctrl
+            .handle_event(Dwc2Event::EnumerationDone { speed: DeviceSpeed::HighSpeed }, &mut bank)
+            .unwrap();
+        assert!(events.is_empty());
+
+        // 5. SET_ADDRESS(7).
+        bank.on_read(DCFG, alloc::vec![0]);
+        let setup_addr = [0x00, 0x05, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let events = ctrl.handle_event(Dwc2Event::SetupReceived { data: setup_addr }, &mut bank).unwrap();
+        assert!(events.is_empty());
+        assert_eq!(ctrl.state(), UsbDeviceState::Address);
+
+        // 6. GET_DESCRIPTOR(Device).
+        bank.writes.clear();
+        let setup_get_dev = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 18, 0x00];
+        let events = ctrl.handle_event(Dwc2Event::SetupReceived { data: setup_get_dev }, &mut bank).unwrap();
+        assert!(events.is_empty()); // Served internally.
+        let fifo_writes: alloc::vec::Vec<_> = bank.writes.iter().filter(|(off, _)| *off == ep_fifo(0)).collect();
+        assert!(!fifo_writes.is_empty());
+
+        // 7. SET_CONFIGURATION(1).
+        bank.writes.clear();
+        let setup_set_cfg = [0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let events = ctrl.handle_event(Dwc2Event::SetupReceived { data: setup_set_cfg }, &mut bank).unwrap();
+        assert_eq!(ctrl.state(), UsbDeviceState::Configured);
+        assert!(events.contains(&GadgetEvent::Configured));
+        let reqs = gadget.handle_event(GadgetEvent::Configured);
+        assert_eq!(reqs.len(), 2); // connect + speed change
+
+        // 8. Bulk OUT: host sends 60-byte frame.
+        bank.writes.clear();
+        let frame_data: alloc::vec::Vec<u8> = (0u8..60).collect();
+        let words = (frame_data.len() + 3) / 4;
+        let grxstsp_val: u32 = 2 | ((frame_data.len() as u32) << 4) | ((PKTSTS_OUT_DATA as u32) << 17);
+        bank.on_read(GRXSTSP, alloc::vec![grxstsp_val]);
+        // Build all FIFO words in a single Vec so on_read queues them in order.
+        let mut fifo_words: alloc::vec::Vec<u32> = alloc::vec::Vec::with_capacity(words);
+        for i in 0..words {
+            let offset = i * 4;
+            let mut word_bytes = [0u8; 4];
+            let take = (frame_data.len() - offset).min(4);
+            word_bytes[..take].copy_from_slice(&frame_data[offset..offset + take]);
+            fifo_words.push(u32::from_le_bytes(word_bytes));
+        }
+        bank.on_read(ep_fifo(2), fifo_words);
+        let events = ctrl.handle_event(Dwc2Event::RxFifoNonEmpty, &mut bank).unwrap();
+        assert_eq!(events.len(), 1);
+        let gadget_reqs = gadget.handle_event(events.into_iter().next().unwrap());
+        assert!(gadget_reqs.is_empty()); // Frame queued internally.
+
+        // 9. poll_rx_frame — retrieve the frame.
+        let mut buf = [0u8; 2048];
+        let len = gadget.poll_rx_frame(&mut buf).unwrap();
+        assert_eq!(len, 60);
+        assert_eq!(&buf[..len], &frame_data[..]);
+
+        // 10. queue_tx_frame — send a frame back to host.
+        let tx_frame = alloc::vec![0xFF; 100];
+        assert!(gadget.queue_tx_frame(&tx_frame));
+        let pending = gadget.drain_pending_requests();
+        assert_eq!(pending.len(), 1);
+        bank.on_read(diepctl(1), alloc::vec![0]);
+        let actions = ctrl.submit_request(pending.into_iter().next().unwrap(), &mut bank).unwrap();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Dwc2Action::WriteTxFifo { ep, data } => {
+                assert_eq!(*ep, 1);
+                assert_eq!(data.as_slice(), &tx_frame[..]);
+            }
+            other => panic!("expected WriteTxFifo, got {:?}", other),
+        }
+    }
 }
