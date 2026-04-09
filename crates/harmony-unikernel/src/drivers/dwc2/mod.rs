@@ -319,7 +319,12 @@ impl Dwc2Controller {
             0x05 => {
                 let addr = (w_value & 0x7F) as u8;
                 self.pending_address = Some(addr);
-                self.state = UsbDeviceState::Address;
+                // USB 2.0 §9.4.6: SET_ADDRESS(0) returns to Default state.
+                self.state = if addr == 0 {
+                    UsbDeviceState::Default
+                } else {
+                    UsbDeviceState::Address
+                };
 
                 // Send ZLP status on EP0 IN — DCFG written on InTransferComplete{ep:0}
                 Self::write_ep0_in(bank, &[]);

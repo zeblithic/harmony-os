@@ -86,18 +86,29 @@ impl EcmGadget {
 
             GadgetEvent::Configured => {
                 self.configured = true;
-                // Send NETWORK_CONNECTION immediately, queue SPEED_CHANGE
-                // for deferred delivery after EP3 InTransferComplete.
-                // Only one interrupt IN transfer can be active at a time.
-                self.intr_in_flight = true;
+                // Queue SPEED_CHANGE for deferred delivery after the first completes.
                 self.pending_requests.push(GadgetRequest::InterruptIn {
                     ep: EP_INTERRUPT_IN,
                     data: Self::build_speed_change(480_000_000, 480_000_000),
                 });
-                vec![GadgetRequest::InterruptIn {
-                    ep: EP_INTERRUPT_IN,
-                    data: Self::build_network_connection(true),
-                }]
+                if self.intr_in_flight {
+                    // EP3 busy — queue NETWORK_CONNECTION too; both drain later.
+                    self.pending_requests.insert(
+                        0,
+                        GadgetRequest::InterruptIn {
+                            ep: EP_INTERRUPT_IN,
+                            data: Self::build_network_connection(true),
+                        },
+                    );
+                    vec![]
+                } else {
+                    // EP3 idle — send NETWORK_CONNECTION immediately.
+                    self.intr_in_flight = true;
+                    vec![GadgetRequest::InterruptIn {
+                        ep: EP_INTERRUPT_IN,
+                        data: Self::build_network_connection(true),
+                    }]
+                }
             }
 
             GadgetEvent::SetupClassRequest { setup } => self.handle_class_request(setup),
