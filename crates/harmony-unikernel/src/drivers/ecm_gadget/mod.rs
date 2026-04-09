@@ -44,7 +44,7 @@ pub struct EcmGadget {
     /// An interrupt IN transfer is currently in-flight on EP3.
     intr_in_flight: bool,
     rx_queue: VecDeque<Vec<u8>>,
-    pending_requests: Vec<GadgetRequest>,
+    pending_requests: VecDeque<GadgetRequest>,
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -64,7 +64,7 @@ impl EcmGadget {
             tx_in_flight: false,
             intr_in_flight: false,
             rx_queue: VecDeque::new(),
-            pending_requests: Vec::new(),
+            pending_requests: VecDeque::new(),
         };
 
         (gadget, device_desc, config_desc, string_descs)
@@ -87,19 +87,17 @@ impl EcmGadget {
             GadgetEvent::Configured => {
                 self.configured = true;
                 // Queue SPEED_CHANGE for deferred delivery after the first completes.
-                self.pending_requests.push(GadgetRequest::InterruptIn {
+                self.pending_requests.push_back(GadgetRequest::InterruptIn {
                     ep: EP_INTERRUPT_IN,
                     data: Self::build_speed_change(480_000_000, 480_000_000),
                 });
                 if self.intr_in_flight {
                     // EP3 busy — queue NETWORK_CONNECTION too; both drain later.
-                    self.pending_requests.insert(
-                        0,
-                        GadgetRequest::InterruptIn {
+                    self.pending_requests
+                        .push_front(GadgetRequest::InterruptIn {
                             ep: EP_INTERRUPT_IN,
                             data: Self::build_network_connection(true),
-                        },
-                    );
+                        });
                     vec![]
                 } else {
                     // EP3 idle — send NETWORK_CONNECTION immediately.
@@ -193,7 +191,7 @@ impl EcmGadget {
             return false;
         }
         self.tx_in_flight = true;
-        self.pending_requests.push(GadgetRequest::BulkIn {
+        self.pending_requests.push_back(GadgetRequest::BulkIn {
             ep: EP_BULK_IN,
             data: frame.to_vec(),
         });
@@ -208,7 +206,7 @@ impl EcmGadget {
         if self.pending_requests.is_empty() {
             return None;
         }
-        let req = self.pending_requests.remove(0);
+        let req = self.pending_requests.pop_front().unwrap();
         // Set in-flight for interrupt requests queued internally (e.g.,
         // SPEED_CHANGE from Configured). BulkIn is already guarded by
         // queue_tx_frame setting tx_in_flight eagerly on enqueue.
