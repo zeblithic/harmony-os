@@ -35,10 +35,11 @@ pub struct Dwc2Controller {
     /// (USB 2.0 §9.4.6: device must not change address until status stage completes).
     pending_address: Option<u8>,
     setup_data: Option<[u8; 8]>,
-    /// Per-endpoint OUT reassembly buffer. Multi-packet transfers (e.g., a
-    /// 1514-byte Ethernet frame over 512-byte bulk MPS) arrive as multiple
+    /// OUT reassembly buffer for EP2 bulk OUT. Multi-packet transfers (e.g.,
+    /// a 1514-byte Ethernet frame over 512-byte bulk MPS) arrive as multiple
     /// PKTSTS_OUT_DATA entries; we accumulate here and emit a single
-    /// GadgetEvent::BulkOut on PKTSTS_OUT_COMPLETE.
+    /// GadgetEvent::BulkOut on PKTSTS_OUT_COMPLETE. Only EP2 is used for
+    /// bulk OUT in this CDC-ECM configuration.
     rx_reassembly: Vec<u8>,
     device_desc: Option<Vec<u8>>,
     config_desc: Option<Vec<u8>>,
@@ -228,7 +229,7 @@ impl Dwc2Controller {
                     }
                     return Ok(Vec::new());
                 }
-                Ok(alloc::vec![GadgetEvent::BulkInComplete { ep }])
+                Ok(alloc::vec![GadgetEvent::InTransferComplete { ep }])
             }
             Dwc2Event::OutTransferComplete { ep } => {
                 // Re-arm EP0 if needed; for other EPs, no re-arm here (done in rx_fifo handler)
@@ -1170,10 +1171,10 @@ mod tests {
 
         // 7b. Simulate EP3 transfer complete to release intr_in_flight,
         //     then drain the queued SPEED_CHANGE notification.
-        gadget.handle_event(GadgetEvent::BulkInComplete { ep: 3 });
+        gadget.handle_event(GadgetEvent::InTransferComplete { ep: 3 });
         let speed_req = gadget.drain_pending_requests();
         assert!(speed_req.is_some());
-        gadget.handle_event(GadgetEvent::BulkInComplete { ep: 3 });
+        gadget.handle_event(GadgetEvent::InTransferComplete { ep: 3 });
 
         // 8. Bulk OUT: host sends 60-byte frame (two RxFifoNonEmpty events).
         bank.writes.clear();

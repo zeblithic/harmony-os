@@ -125,10 +125,10 @@ impl EcmGadget {
                 vec![]
             }
 
-            GadgetEvent::BulkInComplete { ep } => {
-                if ep == 1 {
+            GadgetEvent::InTransferComplete { ep } => {
+                if ep == EP_BULK_IN {
                     self.tx_in_flight = false;
-                } else if ep == 3 {
+                } else if ep == EP_INTERRUPT_IN {
                     self.intr_in_flight = false;
                 }
                 vec![]
@@ -302,11 +302,11 @@ mod tests {
         let mut g = make_gadget();
         g.handle_event(GadgetEvent::Configured);
         // Simulate EP3 completion to release intr_in_flight.
-        g.handle_event(GadgetEvent::BulkInComplete { ep: 3 });
+        g.handle_event(GadgetEvent::InTransferComplete { ep: 3 });
         // Drain the queued SPEED_CHANGE notification.
         let _ = g.drain_pending_requests();
         // Simulate EP3 completion for the SPEED_CHANGE.
-        g.handle_event(GadgetEvent::BulkInComplete { ep: 3 });
+        g.handle_event(GadgetEvent::InTransferComplete { ep: 3 });
         g
     }
 
@@ -365,7 +365,7 @@ mod tests {
         // SPEED_CHANGE is queued for deferred delivery after EP3 completes.
         assert!(g.intr_in_flight);
         // Simulate EP3 transfer complete.
-        g.handle_event(GadgetEvent::BulkInComplete { ep: 3 });
+        g.handle_event(GadgetEvent::InTransferComplete { ep: 3 });
         assert!(!g.intr_in_flight);
 
         // Now drain the queued SPEED_CHANGE notification.
@@ -468,7 +468,7 @@ mod tests {
         // Second frame rejected — transfer still in-flight.
         assert!(!g.queue_tx_frame(&[0xBB; 60]));
         // After BulkInComplete, next frame is accepted.
-        g.handle_event(GadgetEvent::BulkInComplete { ep: 1 });
+        g.handle_event(GadgetEvent::InTransferComplete { ep: 1 });
         assert!(g.queue_tx_frame(&[0xCC; 60]));
     }
 

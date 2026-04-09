@@ -72,7 +72,8 @@ pub enum GadgetEvent {
         ep: u8,
         data: Vec<u8>,
     },
-    BulkInComplete {
+    /// An IN transfer completed on the given endpoint (bulk or interrupt).
+    InTransferComplete {
         ep: u8,
     },
     Suspended,
@@ -160,7 +161,7 @@ mod tests {
             ep: 2,
             data: alloc::vec![0u8; 64],
         };
-        let _bulk_in_complete = GadgetEvent::BulkInComplete { ep: 1 };
+        let _bulk_in_complete = GadgetEvent::InTransferComplete { ep: 1 };
         let _suspended = GadgetEvent::Suspended;
         let _resumed = GadgetEvent::Resumed;
     }

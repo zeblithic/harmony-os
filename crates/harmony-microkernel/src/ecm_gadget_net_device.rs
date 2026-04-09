@@ -79,10 +79,10 @@ mod tests {
         dev.gadget_mut().handle_event(GadgetEvent::Configured);
         // Drain queued SPEED_CHANGE notification and clear in-flight flags.
         dev.gadget_mut()
-            .handle_event(GadgetEvent::BulkInComplete { ep: 3 });
+            .handle_event(GadgetEvent::InTransferComplete { ep: 3 });
         let _ = dev.drain_request(); // SPEED_CHANGE
         dev.gadget_mut()
-            .handle_event(GadgetEvent::BulkInComplete { ep: 3 });
+            .handle_event(GadgetEvent::InTransferComplete { ep: 3 });
         dev
     }
 
