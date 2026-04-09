@@ -395,18 +395,23 @@ impl Dwc2Controller {
                 Ok(Vec::new())
             }
             // SET_INTERFACE (0x0B) — enable/disable data endpoints per alternate setting.
+            // Emit Configured/Reset so the gadget tracks endpoint state.
             0x0B => {
                 let iface = (w_index & 0xFF) as u8;
                 let alt = (w_value & 0xFF) as u8;
-                if iface == 1 {
+                let events = if iface == 1 {
                     if alt == 1 {
                         Self::enable_data_endpoints(bank);
+                        alloc::vec![GadgetEvent::Configured]
                     } else {
                         Self::disable_data_endpoints(bank);
+                        alloc::vec![GadgetEvent::Reset]
                     }
-                }
+                } else {
+                    Vec::new()
+                };
                 Self::write_ep0_in(bank, &[]);
-                Ok(Vec::new())
+                Ok(events)
             }
             _ => {
                 // Unknown standard request — stall EP0

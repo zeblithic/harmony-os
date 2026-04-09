@@ -194,11 +194,11 @@ impl EcmGadget {
             return None;
         }
         let req = self.pending_requests.remove(0);
-        // Track in-flight state for the endpoint being used.
-        match &req {
-            GadgetRequest::InterruptIn { .. } => self.intr_in_flight = true,
-            GadgetRequest::BulkIn { .. } => self.tx_in_flight = true,
-            _ => {}
+        // Set in-flight for interrupt requests queued internally (e.g.,
+        // SPEED_CHANGE from Configured). BulkIn is already guarded by
+        // queue_tx_frame setting tx_in_flight eagerly on enqueue.
+        if matches!(&req, GadgetRequest::InterruptIn { .. }) {
+            self.intr_in_flight = true;
         }
         Some(req)
     }

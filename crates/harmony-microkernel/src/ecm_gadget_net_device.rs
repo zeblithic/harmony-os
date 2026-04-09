@@ -77,6 +77,12 @@ mod tests {
     fn make_configured_device() -> EcmGadgetNetDevice {
         let mut dev = make_gadget_net_device();
         dev.gadget_mut().handle_event(GadgetEvent::Configured);
+        // Drain queued SPEED_CHANGE notification and clear in-flight flags.
+        dev.gadget_mut()
+            .handle_event(GadgetEvent::BulkInComplete { ep: 3 });
+        let _ = dev.drain_request(); // SPEED_CHANGE
+        dev.gadget_mut()
+            .handle_event(GadgetEvent::BulkInComplete { ep: 3 });
         dev
     }
 
