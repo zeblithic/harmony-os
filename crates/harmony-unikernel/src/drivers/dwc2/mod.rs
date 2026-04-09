@@ -35,6 +35,11 @@ pub struct Dwc2Controller {
     /// (USB 2.0 §9.4.6: device must not change address until status stage completes).
     pending_address: Option<u8>,
     setup_data: Option<[u8; 8]>,
+    /// Per-endpoint OUT reassembly buffer. Multi-packet transfers (e.g., a
+    /// 1514-byte Ethernet frame over 512-byte bulk MPS) arrive as multiple
+    /// PKTSTS_OUT_DATA entries; we accumulate here and emit a single
+    /// GadgetEvent::BulkOut on PKTSTS_OUT_COMPLETE.
+    rx_reassembly: Vec<u8>,
     device_desc: Option<Vec<u8>>,
     config_desc: Option<Vec<u8>>,
     string_descs: Vec<Vec<u8>>,
@@ -168,6 +173,7 @@ impl Dwc2Controller {
             address: 0,
             pending_address: None,
             setup_data: None,
+            rx_reassembly: Vec::new(),
             device_desc: None,
             config_desc: None,
             string_descs: Vec::new(),
@@ -244,6 +250,7 @@ impl Dwc2Controller {
         self.address = 0;
         self.pending_address = None;
         self.setup_data = None;
+        self.rx_reassembly.clear();
 
         // Clear address in DCFG
         let dcfg = bank.read(DCFG) & !DCFG_DAD_MASK;
@@ -411,13 +418,9 @@ impl Dwc2Controller {
     }
 
     fn enable_data_endpoints(bank: &mut impl RegisterBank) {
-        // EP1 IN bulk, MPS=512, FIFO=1
-        let ep1_in = 512u32
-            | EPCTL_USBAEP
-            | epctl_eptype(EPTYPE_BULK)
-            | epctl_txfnum(1)
-            | EPCTL_EPENA
-            | EPCTL_CNAK;
+        // EP1 IN bulk, MPS=512, FIFO=1 — configure only, no EPENA.
+        // write_tx_fifo arms the endpoint when real data is ready.
+        let ep1_in = 512u32 | EPCTL_USBAEP | epctl_eptype(EPTYPE_BULK) | epctl_txfnum(1);
         bank.write(diepctl(1), ep1_in);
 
         // EP2 OUT bulk, MPS=512
@@ -428,13 +431,9 @@ impl Dwc2Controller {
         let ep2_out = 512u32 | EPCTL_USBAEP | epctl_eptype(EPTYPE_BULK) | EPCTL_EPENA | EPCTL_CNAK;
         bank.write(doepctl(2), ep2_out);
 
-        // EP3 IN interrupt, MPS=16, FIFO=3
-        let ep3_in = 16u32
-            | EPCTL_USBAEP
-            | epctl_eptype(EPTYPE_INTERRUPT)
-            | epctl_txfnum(3)
-            | EPCTL_EPENA
-            | EPCTL_CNAK;
+        // EP3 IN interrupt, MPS=16, FIFO=3 — configure only, no EPENA.
+        // write_tx_fifo arms the endpoint when a notification is submitted.
+        let ep3_in = 16u32 | EPCTL_USBAEP | epctl_eptype(EPTYPE_INTERRUPT) | epctl_txfnum(3);
         bank.write(diepctl(3), ep3_in);
 
         // Update DAINTMSK to include EP1 IN, EP2 OUT, EP3 IN
@@ -490,26 +489,34 @@ impl Dwc2Controller {
                 }
             }
             PKTSTS_OUT_DATA if ep > 0 && bcnt > 0 => {
-                // Read (bcnt+3)/4 words from ep FIFO
+                // Accumulate into reassembly buffer. Multi-packet transfers
+                // (e.g., 1514 bytes over 512-byte MPS) arrive as multiple
+                // OUT_DATA entries; we emit a single BulkOut on OUT_COMPLETE.
                 let words = (bcnt as usize).div_ceil(4);
-                let mut raw = Vec::new();
                 for _ in 0..words {
                     let w = bank.read(ep_fifo(ep));
-                    raw.extend_from_slice(&w.to_le_bytes());
+                    self.rx_reassembly.extend_from_slice(&w.to_le_bytes());
                 }
-                // Truncate to exact bcnt
-                raw.truncate(bcnt as usize);
-                Ok(alloc::vec![GadgetEvent::BulkOut { ep, data: raw }])
+                // Trim to exact byte count (last word may have padding).
+                let target_len = self.rx_reassembly.len() - (words * 4 - bcnt as usize);
+                self.rx_reassembly.truncate(target_len);
+                Ok(Vec::new())
             }
             PKTSTS_OUT_COMPLETE if ep > 0 => {
-                // Re-arm the OUT endpoint for a full Ethernet frame.
+                // All packets received — emit the reassembled frame.
+                let data = core::mem::take(&mut self.rx_reassembly);
+                // Re-arm the OUT endpoint for the next frame.
                 let doeptsiz_val: u32 = (3 << 19) | 1514; // pktcnt=3, xfersize=1514
                 bank.write(doeptsiz(ep), doeptsiz_val);
                 bank.write(
                     doepctl(ep),
                     bank.read(doepctl(ep)) | EPCTL_EPENA | EPCTL_CNAK,
                 );
-                Ok(Vec::new())
+                if data.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    Ok(alloc::vec![GadgetEvent::BulkOut { ep, data }])
+                }
             }
             _ => {
                 // Drain any remaining FIFO words to avoid stall
@@ -908,38 +915,32 @@ mod tests {
     fn rx_fifo_bulk_out_produces_gadget_event() {
         let (mut ctrl, mut bank) = init_controller();
 
-        // Mock GRXSTSP: EP=2, bcnt=4, pktsts=OUT_DATA(2)
-        // epnum=2, bcnt=4, pktsts=2
-        // val = 2 | (4 << 4) | (2 << 17)
-        let grxstsp_val: u32 = 2 | (4 << 4) | (2u32 << 17);
-        bank.on_read(GRXSTSP, alloc::vec![grxstsp_val]);
-
-        // Mock EP2 FIFO read — 1 word = 4 bytes
+        // Step 1: OUT_DATA — accumulates into reassembly buffer.
+        let grxstsp_data: u32 = 2 | (4 << 4) | ((PKTSTS_OUT_DATA as u32) << 17);
+        bank.on_read(GRXSTSP, alloc::vec![grxstsp_data]);
         bank.on_read(ep_fifo(2), alloc::vec![0xDEADBEEFu32]);
 
         let events = ctrl
             .handle_event(Dwc2Event::RxFifoNonEmpty, &mut bank)
-            .expect("handle_event failed");
+            .expect("OUT_DATA must succeed");
+        assert!(events.is_empty(), "OUT_DATA accumulates, no event yet");
 
-        let bulk_out = events
-            .iter()
-            .find(|e| matches!(e, GadgetEvent::BulkOut { ep: 2, .. }));
-        assert!(
-            bulk_out.is_some(),
-            "should produce GadgetEvent::BulkOut for ep=2"
-        );
+        // Step 2: OUT_COMPLETE — emits the reassembled frame.
+        let grxstsp_complete: u32 = 2 | ((PKTSTS_OUT_COMPLETE as u32) << 17);
+        bank.on_read(GRXSTSP, alloc::vec![grxstsp_complete]);
+        bank.on_read(doepctl(2), alloc::vec![0u32]);
 
-        if let Some(GadgetEvent::BulkOut { data, .. }) = bulk_out {
-            assert_eq!(
-                data.len(),
-                4,
-                "bulk out data should be exactly bcnt=4 bytes"
-            );
-            assert_eq!(
-                &data[..],
-                &0xDEADBEEFu32.to_le_bytes(),
-                "data should match FIFO words"
-            );
+        let events = ctrl
+            .handle_event(Dwc2Event::RxFifoNonEmpty, &mut bank)
+            .expect("OUT_COMPLETE must succeed");
+
+        assert_eq!(events.len(), 1);
+        if let GadgetEvent::BulkOut { ep, data } = &events[0] {
+            assert_eq!(*ep, 2);
+            assert_eq!(data.len(), 4);
+            assert_eq!(&data[..], &0xDEADBEEFu32.to_le_bytes());
+        } else {
+            panic!("expected BulkOut, got {:?}", events[0]);
         }
     }
 
@@ -1164,14 +1165,15 @@ mod tests {
         assert!(speed_req.is_some());
         gadget.handle_event(GadgetEvent::BulkInComplete { ep: 3 });
 
-        // 8. Bulk OUT: host sends 60-byte frame.
+        // 8. Bulk OUT: host sends 60-byte frame (two RxFifoNonEmpty events).
         bank.writes.clear();
         let frame_data: alloc::vec::Vec<u8> = (0u8..60).collect();
         let words = frame_data.len().div_ceil(4);
-        let grxstsp_val: u32 =
+
+        // 8a. OUT_DATA — accumulates into reassembly buffer.
+        let grxstsp_data: u32 =
             2 | ((frame_data.len() as u32) << 4) | ((PKTSTS_OUT_DATA as u32) << 17);
-        bank.on_read(GRXSTSP, alloc::vec![grxstsp_val]);
-        // Build all FIFO words in a single Vec so on_read queues them in order.
+        bank.on_read(GRXSTSP, alloc::vec![grxstsp_data]);
         let mut fifo_words: alloc::vec::Vec<u32> = alloc::vec::Vec::with_capacity(words);
         for i in 0..words {
             let offset = i * 4;
@@ -1181,6 +1183,15 @@ mod tests {
             fifo_words.push(u32::from_le_bytes(word_bytes));
         }
         bank.on_read(ep_fifo(2), fifo_words);
+        let events = ctrl
+            .handle_event(Dwc2Event::RxFifoNonEmpty, &mut bank)
+            .unwrap();
+        assert!(events.is_empty()); // Accumulating, no event yet.
+
+        // 8b. OUT_COMPLETE — emits the reassembled frame.
+        let grxstsp_complete: u32 = 2 | ((PKTSTS_OUT_COMPLETE as u32) << 17);
+        bank.on_read(GRXSTSP, alloc::vec![grxstsp_complete]);
+        bank.on_read(doepctl(2), alloc::vec![0u32]);
         let events = ctrl
             .handle_event(Dwc2Event::RxFifoNonEmpty, &mut bank)
             .unwrap();

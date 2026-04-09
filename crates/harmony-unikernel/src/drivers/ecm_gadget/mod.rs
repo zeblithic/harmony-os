@@ -354,7 +354,9 @@ mod tests {
         assert!(!g.intr_in_flight);
 
         // Now drain the queued SPEED_CHANGE notification.
-        let speed_req = g.drain_pending_requests().expect("SPEED_CHANGE must be queued");
+        let speed_req = g
+            .drain_pending_requests()
+            .expect("SPEED_CHANGE must be queued");
         if let GadgetRequest::InterruptIn { ep, data } = &speed_req {
             assert_eq!(*ep, EP_INTERRUPT_IN);
             assert_eq!(data[1], NOTIF_CONNECTION_SPEED_CHANGE);
