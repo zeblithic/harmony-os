@@ -18,6 +18,7 @@ pub mod config_server;
 #[cfg(feature = "kernel")]
 pub mod content_server;
 pub mod echo;
+pub mod ecm_gadget_net_device;
 pub mod fat32;
 pub mod fat_server;
 #[doc(hidden)] // pub for bench access only — not a stable API

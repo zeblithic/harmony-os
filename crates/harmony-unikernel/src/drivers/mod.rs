@@ -8,7 +8,9 @@
 pub mod cdc_ethernet;
 pub mod console;
 pub mod dma_pool;
+pub mod dwc2;
 pub mod dwc_usb;
+pub mod ecm_gadget;
 pub mod font_8x16;
 pub mod framebuffer;
 pub mod genet;
