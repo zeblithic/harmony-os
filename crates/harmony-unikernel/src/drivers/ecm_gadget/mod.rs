@@ -40,8 +40,9 @@ pub struct EcmGadget {
     mac: [u8; 6],
     configured: bool,
     /// A bulk IN transfer is currently in-flight on EP1.
-    /// Only one transfer can be active per endpoint at a time.
     tx_in_flight: bool,
+    /// An interrupt IN transfer is currently in-flight on EP3.
+    intr_in_flight: bool,
     rx_queue: VecDeque<Vec<u8>>,
     pending_requests: Vec<GadgetRequest>,
 }
@@ -61,6 +62,7 @@ impl EcmGadget {
             mac,
             configured: false,
             tx_in_flight: false,
+            intr_in_flight: false,
             rx_queue: VecDeque::new(),
             pending_requests: Vec::new(),
         };
@@ -74,6 +76,7 @@ impl EcmGadget {
             GadgetEvent::Reset => {
                 self.configured = false;
                 self.tx_in_flight = false;
+                self.intr_in_flight = false;
                 self.rx_queue.clear();
                 self.pending_requests.clear();
                 // No notification — EP3 is disabled during bus reset / deconfigure.
@@ -83,16 +86,18 @@ impl EcmGadget {
 
             GadgetEvent::Configured => {
                 self.configured = true;
-                vec![
-                    GadgetRequest::InterruptIn {
-                        ep: EP_INTERRUPT_IN,
-                        data: Self::build_network_connection(true),
-                    },
-                    GadgetRequest::InterruptIn {
-                        ep: EP_INTERRUPT_IN,
-                        data: Self::build_speed_change(480_000_000, 480_000_000),
-                    },
-                ]
+                // Send NETWORK_CONNECTION immediately, queue SPEED_CHANGE
+                // for deferred delivery after EP3 InTransferComplete.
+                // Only one interrupt IN transfer can be active at a time.
+                self.intr_in_flight = true;
+                self.pending_requests.push(GadgetRequest::InterruptIn {
+                    ep: EP_INTERRUPT_IN,
+                    data: Self::build_speed_change(480_000_000, 480_000_000),
+                });
+                vec![GadgetRequest::InterruptIn {
+                    ep: EP_INTERRUPT_IN,
+                    data: Self::build_network_connection(true),
+                }]
             }
 
             GadgetEvent::SetupClassRequest { setup } => self.handle_class_request(setup),
@@ -109,14 +114,18 @@ impl EcmGadget {
                 vec![]
             }
 
-            GadgetEvent::BulkInComplete { .. } => {
-                // Previous transfer finished — allow the next one.
-                self.tx_in_flight = false;
+            GadgetEvent::BulkInComplete { ep } => {
+                if ep == 1 {
+                    self.tx_in_flight = false;
+                } else if ep == 3 {
+                    self.intr_in_flight = false;
+                }
                 vec![]
             }
 
             GadgetEvent::Suspended => {
-                if self.configured {
+                if self.configured && !self.intr_in_flight {
+                    self.intr_in_flight = true;
                     vec![GadgetRequest::InterruptIn {
                         ep: EP_INTERRUPT_IN,
                         data: Self::build_network_connection(false),
@@ -127,7 +136,8 @@ impl EcmGadget {
             }
 
             GadgetEvent::Resumed => {
-                if self.configured {
+                if self.configured && !self.intr_in_flight {
+                    self.intr_in_flight = true;
                     vec![GadgetRequest::InterruptIn {
                         ep: EP_INTERRUPT_IN,
                         data: Self::build_network_connection(true),
@@ -266,6 +276,19 @@ mod tests {
         gadget
     }
 
+    /// Create a configured gadget with all pending notifications drained.
+    fn make_configured_gadget() -> EcmGadget {
+        let mut g = make_gadget();
+        g.handle_event(GadgetEvent::Configured);
+        // Simulate EP3 completion to release intr_in_flight.
+        g.handle_event(GadgetEvent::BulkInComplete { ep: 3 });
+        // Drain the queued SPEED_CHANGE notification.
+        let _ = g.drain_pending_requests();
+        // Simulate EP3 completion for the SPEED_CHANGE.
+        g.handle_event(GadgetEvent::BulkInComplete { ep: 3 });
+        g
+    }
+
     // ── Constructor ──────────────────────────────────────────────────────────
 
     #[test]
@@ -307,9 +330,9 @@ mod tests {
         let reqs = g.handle_event(GadgetEvent::Configured);
         assert!(g.configured);
         assert!(g.link_up());
-        assert_eq!(reqs.len(), 2, "must return 2 requests");
 
-        // First: NETWORK_CONNECTION(connected)
+        // Only NETWORK_CONNECTION sent immediately (one transfer per EP3 at a time).
+        assert_eq!(reqs.len(), 1, "must return 1 immediate request");
         if let GadgetRequest::InterruptIn { ep, data } = &reqs[0] {
             assert_eq!(*ep, EP_INTERRUPT_IN);
             assert_eq!(data[1], NOTIF_NETWORK_CONNECTION);
@@ -318,17 +341,22 @@ mod tests {
             panic!("first request must be InterruptIn");
         }
 
-        // Second: CONNECTION_SPEED_CHANGE (480 Mbps)
-        if let GadgetRequest::InterruptIn { ep, data } = &reqs[1] {
+        // SPEED_CHANGE is queued for deferred delivery after EP3 completes.
+        assert!(g.intr_in_flight);
+        // Simulate EP3 transfer complete.
+        g.handle_event(GadgetEvent::BulkInComplete { ep: 3 });
+        assert!(!g.intr_in_flight);
+
+        // Now drain the queued SPEED_CHANGE notification.
+        let speed_req = g.drain_pending_requests().expect("SPEED_CHANGE must be queued");
+        if let GadgetRequest::InterruptIn { ep, data } = &speed_req {
             assert_eq!(*ep, EP_INTERRUPT_IN);
             assert_eq!(data[1], NOTIF_CONNECTION_SPEED_CHANGE);
             assert_eq!(data.len(), 16);
             let downstream = u32::from_le_bytes(data[8..12].try_into().unwrap());
-            let upstream = u32::from_le_bytes(data[12..16].try_into().unwrap());
             assert_eq!(downstream, 480_000_000);
-            assert_eq!(upstream, 480_000_000);
         } else {
-            panic!("second request must be InterruptIn");
+            panic!("queued request must be InterruptIn SPEED_CHANGE");
         }
     }
 
@@ -390,8 +418,7 @@ mod tests {
 
     #[test]
     fn push_rx_returns_bulk_in() {
-        let mut g = make_gadget();
-        g.handle_event(GadgetEvent::Configured);
+        let mut g = make_configured_gadget();
         let frame = vec![0xBBu8; 100];
         assert!(g.queue_tx_frame(&frame));
         let req = g
@@ -413,8 +440,7 @@ mod tests {
 
     #[test]
     fn push_rx_while_in_flight_rejected() {
-        let mut g = make_gadget();
-        g.handle_event(GadgetEvent::Configured);
+        let mut g = make_configured_gadget();
         assert!(g.queue_tx_frame(&[0xAA; 60]));
         // Second frame rejected — transfer still in-flight.
         assert!(!g.queue_tx_frame(&[0xBB; 60]));
@@ -451,8 +477,7 @@ mod tests {
 
     #[test]
     fn suspended_sends_disconnect_notification() {
-        let mut g = make_gadget();
-        g.handle_event(GadgetEvent::Configured);
+        let mut g = make_configured_gadget();
         let reqs = g.handle_event(GadgetEvent::Suspended);
         assert_eq!(reqs.len(), 1);
         if let GadgetRequest::InterruptIn { ep, data } = &reqs[0] {
@@ -465,8 +490,7 @@ mod tests {
 
     #[test]
     fn resumed_while_configured_sends_connect() {
-        let mut g = make_gadget();
-        g.handle_event(GadgetEvent::Configured);
+        let mut g = make_configured_gadget();
         let reqs = g.handle_event(GadgetEvent::Resumed);
         assert_eq!(reqs.len(), 1);
         if let GadgetRequest::InterruptIn { ep, data } = &reqs[0] {

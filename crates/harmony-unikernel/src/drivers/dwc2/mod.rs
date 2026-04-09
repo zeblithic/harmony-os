@@ -592,7 +592,12 @@ impl Dwc2Controller {
             3 => 16,
             _ => 512,
         };
-        let pkt_cnt = if len == 0 { 1 } else { len.div_ceil(mps) };
+        let mut pkt_cnt = if len == 0 { 1 } else { len.div_ceil(mps) };
+        // USB 2.0: if transfer length is an exact multiple of MPS, append a ZLP
+        // so the host can detect end-of-transfer. DWC2 does not do this automatically.
+        if len > 0 && len % mps == 0 {
+            pkt_cnt += 1;
+        }
         let dieptsiz_val = (pkt_cnt << 19) | len;
         bank.write(dieptsiz(ep), dieptsiz_val);
         // Enable EP and clear NAK
@@ -1146,7 +1151,14 @@ mod tests {
         assert_eq!(ctrl.state(), UsbDeviceState::Configured);
         assert!(events.contains(&GadgetEvent::Configured));
         let reqs = gadget.handle_event(GadgetEvent::Configured);
-        assert_eq!(reqs.len(), 2); // connect + speed change
+        assert_eq!(reqs.len(), 1); // NETWORK_CONNECTION only (SPEED_CHANGE queued)
+
+        // 7b. Simulate EP3 transfer complete to release intr_in_flight,
+        //     then drain the queued SPEED_CHANGE notification.
+        gadget.handle_event(GadgetEvent::BulkInComplete { ep: 3 });
+        let speed_req = gadget.drain_pending_requests();
+        assert!(speed_req.is_some());
+        gadget.handle_event(GadgetEvent::BulkInComplete { ep: 3 });
 
         // 8. Bulk OUT: host sends 60-byte frame.
         bank.writes.clear();
