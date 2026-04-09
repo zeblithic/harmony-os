@@ -285,7 +285,14 @@ impl Dwc2Controller {
         match req_type {
             0 => {
                 // Standard request
-                self.handle_standard_setup(b_request, w_value, w_index, w_length, bank)
+                self.handle_standard_setup(
+                    bm_request_type,
+                    b_request,
+                    w_value,
+                    w_index,
+                    w_length,
+                    bank,
+                )
             }
             1 => {
                 // Class request — forward to gadget
@@ -302,6 +309,7 @@ impl Dwc2Controller {
 
     fn handle_standard_setup(
         &mut self,
+        bm_request_type: u8,
         b_request: u8,
         w_value: u16,
         w_index: u16,
@@ -310,10 +318,18 @@ impl Dwc2Controller {
     ) -> Result<Vec<GadgetEvent>, Dwc2Error> {
         match b_request {
             // GET_STATUS (0x00) — mandatory per USB 2.0 §9.4.5.
-            // Return 2-byte status: bus-powered, no remote wakeup.
             0x00 => {
-                // D0 = Self Powered (matches bmAttributes 0xC0 in config descriptor).
-                Self::write_ep0_in(bank, &[0x01, 0x00]);
+                let recipient = bm_request_type & 0x1F;
+                let status: [u8; 2] = match recipient {
+                    // Device: D0=Self Powered (matches bmAttributes 0xC0), D1=no remote wakeup.
+                    0 => [0x01, 0x00],
+                    // Interface: always 0x0000.
+                    1 => [0x00, 0x00],
+                    // Endpoint: D0=Halt. Report 0 (not halted) for all endpoints.
+                    2 => [0x00, 0x00],
+                    _ => [0x00, 0x00],
+                };
+                Self::write_ep0_in(bank, &status);
                 Ok(Vec::new())
             }
             // SET_ADDRESS — defer DCFG write until status-stage ZLP is ACKed
