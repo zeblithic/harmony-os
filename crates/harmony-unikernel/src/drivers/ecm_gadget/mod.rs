@@ -71,10 +71,9 @@ impl EcmGadget {
                 self.configured = false;
                 self.rx_queue.clear();
                 self.pending_requests.clear();
-                vec![GadgetRequest::InterruptIn {
-                    ep: EP_INTERRUPT_IN,
-                    data: Self::build_network_connection(false),
-                }]
+                // No notification — EP3 is disabled during bus reset / deconfigure.
+                // The host isn't listening on a reset bus anyway.
+                vec![]
             }
 
             GadgetEvent::Configured => {
@@ -275,14 +274,8 @@ mod tests {
         let reqs = g.handle_event(GadgetEvent::Reset);
         assert!(!g.configured, "configured must be false after reset");
         assert!(g.rx_queue.is_empty(), "rx_queue must be empty after reset");
-        // Must send NETWORK_CONNECTION(disconnected) on EP3.
-        assert_eq!(reqs.len(), 1);
-        if let GadgetRequest::InterruptIn { ep, data } = &reqs[0] {
-            assert_eq!(*ep, EP_INTERRUPT_IN);
-            assert_eq!(data[2], 0x00, "connected byte must be 0");
-        } else {
-            panic!("expected InterruptIn");
-        }
+        // No notification on reset — EP3 is disabled, host isn't listening.
+        assert!(reqs.is_empty());
     }
 
     // ── Configured ───────────────────────────────────────────────────────────

@@ -249,23 +249,8 @@ impl Dwc2Controller {
         let dcfg = bank.read(DCFG) & !DCFG_DAD_MASK;
         bank.write(DCFG, dcfg);
 
-        // Disable non-EP0 endpoints
-        for ep in 1..MAX_ENDPOINTS {
-            // Disable IN endpoints
-            let diepctl_val = bank.read(diepctl(ep));
-            if diepctl_val & EPCTL_EPENA != 0 {
-                bank.write(diepctl(ep), EPCTL_EPDIS | EPCTL_SNAK);
-            } else {
-                bank.write(diepctl(ep), EPCTL_SNAK);
-            }
-            // Disable OUT endpoints
-            let doepctl_val = bank.read(doepctl(ep));
-            if doepctl_val & EPCTL_EPENA != 0 {
-                bank.write(doepctl(ep), EPCTL_EPDIS | EPCTL_SNAK);
-            } else {
-                bank.write(doepctl(ep), EPCTL_SNAK);
-            }
-        }
+        // Disable non-EP0 endpoints.
+        Self::disable_data_endpoints(bank);
 
         // Re-arm EP0 OUT for SETUP
         let doeptsiz0 = DOEPTSIZ0_SUPCNT_1 | DOEPTSIZ0_PKTCNT_1 | 8u32;
@@ -364,10 +349,11 @@ impl Dwc2Controller {
                     Self::write_ep0_in(bank, &[]);
                     Ok(alloc::vec![GadgetEvent::Configured])
                 } else {
+                    // Deconfigure: disable data endpoints, return to Address.
                     self.state = UsbDeviceState::Address;
-                    // Send ZLP status
+                    Self::disable_data_endpoints(bank);
                     Self::write_ep0_in(bank, &[]);
-                    Ok(Vec::new())
+                    Ok(alloc::vec![GadgetEvent::Reset])
                 }
             }
             // SET_INTERFACE
@@ -414,6 +400,25 @@ impl Dwc2Controller {
         // Update DAINTMSK to include EP1 IN, EP2 OUT, EP3 IN
         let daintmsk: u32 = (1 << 0) | (1 << 1) | (1 << 3) | (1 << 16) | (1 << 18);
         bank.write(DAINTMSK, daintmsk);
+    }
+
+    fn disable_data_endpoints(bank: &mut impl RegisterBank) {
+        for ep in 1..MAX_ENDPOINTS {
+            let diepctl_val = bank.read(diepctl(ep));
+            if diepctl_val & EPCTL_EPENA != 0 {
+                bank.write(diepctl(ep), EPCTL_EPDIS | EPCTL_SNAK);
+            } else {
+                bank.write(diepctl(ep), EPCTL_SNAK);
+            }
+            let doepctl_val = bank.read(doepctl(ep));
+            if doepctl_val & EPCTL_EPENA != 0 {
+                bank.write(doepctl(ep), EPCTL_EPDIS | EPCTL_SNAK);
+            } else {
+                bank.write(doepctl(ep), EPCTL_SNAK);
+            }
+        }
+        // Revert DAINTMSK to EP0 only.
+        bank.write(DAINTMSK, (1 << 0) | (1 << 16));
     }
 
     fn handle_rx_fifo(
@@ -1042,7 +1047,7 @@ mod tests {
         let events = ctrl.handle_event(Dwc2Event::BusReset, &mut bank).unwrap();
         assert_eq!(events, alloc::vec![GadgetEvent::Reset]);
         let reqs = gadget.handle_event(GadgetEvent::Reset);
-        assert_eq!(reqs.len(), 1); // disconnect notification
+        assert!(reqs.is_empty()); // No notification — EP3 disabled during reset
 
         // 4. Enumeration done.
         let events = ctrl

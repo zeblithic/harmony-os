@@ -50,7 +50,6 @@ pub enum Dwc2Event {
 pub enum Dwc2Action {
     WriteRegister { offset: usize, value: u32 },
     WriteTxFifo { ep: u8, data: Vec<u8> },
-    ReadRxFifo { words: usize },
     Stall { ep: u8 },
 }
 
@@ -144,7 +143,6 @@ mod tests {
             ep: 1,
             data: alloc::vec![0u8; 64],
         };
-        let _read = Dwc2Action::ReadRxFifo { words: 16 };
         let _stall = Dwc2Action::Stall { ep: 0 };
     }
 
