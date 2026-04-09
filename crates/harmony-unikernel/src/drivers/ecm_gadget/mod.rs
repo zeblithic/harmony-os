@@ -39,6 +39,9 @@ const REQ_SET_ETHERNET_PACKET_FILTER: u8 = 0x43;
 pub struct EcmGadget {
     mac: [u8; 6],
     configured: bool,
+    /// A bulk IN transfer is currently in-flight on EP1.
+    /// Only one transfer can be active per endpoint at a time.
+    tx_in_flight: bool,
     rx_queue: VecDeque<Vec<u8>>,
     pending_requests: Vec<GadgetRequest>,
 }
@@ -57,6 +60,7 @@ impl EcmGadget {
         let gadget = EcmGadget {
             mac,
             configured: false,
+            tx_in_flight: false,
             rx_queue: VecDeque::new(),
             pending_requests: Vec::new(),
         };
@@ -69,6 +73,7 @@ impl EcmGadget {
         match event {
             GadgetEvent::Reset => {
                 self.configured = false;
+                self.tx_in_flight = false;
                 self.rx_queue.clear();
                 self.pending_requests.clear();
                 // No notification — EP3 is disabled during bus reset / deconfigure.
@@ -105,7 +110,8 @@ impl EcmGadget {
             }
 
             GadgetEvent::BulkInComplete { .. } => {
-                // Nothing — handled by queue_tx_frame / drain_pending_requests.
+                // Previous transfer finished — allow the next one.
+                self.tx_in_flight = false;
                 vec![]
             }
 
@@ -153,11 +159,15 @@ impl EcmGadget {
     /// Enqueue an Ethernet frame for transmission over the bulk IN endpoint.
     ///
     /// Returns `false` if the gadget is not configured, the frame is empty,
-    /// or the frame exceeds `MAX_FRAME_SIZE`.
+    /// the frame exceeds `MAX_FRAME_SIZE`, or a transfer is already in-flight.
+    /// USB allows at most one active IN transfer per endpoint — call this
+    /// again after receiving `BulkInComplete`.
     pub fn queue_tx_frame(&mut self, frame: &[u8]) -> bool {
-        if !self.configured || frame.is_empty() || frame.len() > MAX_FRAME_SIZE {
+        if !self.configured || self.tx_in_flight || frame.is_empty() || frame.len() > MAX_FRAME_SIZE
+        {
             return false;
         }
+        self.tx_in_flight = true;
         self.pending_requests.push(GadgetRequest::BulkIn {
             ep: EP_BULK_IN,
             data: frame.to_vec(),
@@ -165,9 +175,16 @@ impl EcmGadget {
         true
     }
 
-    /// Take all pending requests (e.g. queued TX frames) for the controller.
-    pub fn drain_pending_requests(&mut self) -> Vec<GadgetRequest> {
-        core::mem::take(&mut self.pending_requests)
+    /// Take the next pending request for the controller.
+    ///
+    /// Returns one request at a time to enforce single-transfer-per-endpoint
+    /// flow control on the bulk IN path.
+    pub fn drain_pending_requests(&mut self) -> Option<GadgetRequest> {
+        if self.pending_requests.is_empty() {
+            None
+        } else {
+            Some(self.pending_requests.remove(0))
+        }
     }
 
     /// Return the gadget MAC address.
@@ -377,13 +394,14 @@ mod tests {
         g.handle_event(GadgetEvent::Configured);
         let frame = vec![0xBBu8; 100];
         assert!(g.queue_tx_frame(&frame));
-        let reqs = g.drain_pending_requests();
-        assert_eq!(reqs.len(), 1);
-        if let GadgetRequest::BulkIn { ep, data } = &reqs[0] {
+        let req = g
+            .drain_pending_requests()
+            .expect("should have one pending request");
+        if let GadgetRequest::BulkIn { ep, data } = &req {
             assert_eq!(*ep, EP_BULK_IN);
             assert_eq!(data, &frame);
         } else {
-            panic!("expected BulkIn");
+            panic!("expected BulkIn, got {:?}", req);
         }
     }
 
@@ -391,6 +409,18 @@ mod tests {
     fn push_rx_before_configured_fails() {
         let mut g = make_gadget();
         assert!(!g.queue_tx_frame(&[0u8; 64]));
+    }
+
+    #[test]
+    fn push_rx_while_in_flight_rejected() {
+        let mut g = make_gadget();
+        g.handle_event(GadgetEvent::Configured);
+        assert!(g.queue_tx_frame(&[0xAA; 60]));
+        // Second frame rejected — transfer still in-flight.
+        assert!(!g.queue_tx_frame(&[0xBB; 60]));
+        // After BulkInComplete, next frame is accepted.
+        g.handle_event(GadgetEvent::BulkInComplete { ep: 1 });
+        assert!(g.queue_tx_frame(&[0xCC; 60]));
     }
 
     #[test]

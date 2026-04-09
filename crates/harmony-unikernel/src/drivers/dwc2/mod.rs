@@ -21,12 +21,12 @@ const MAX_ENDPOINTS: u8 = 4;
 
 // ── Controller ──────────────────────────────────────────────────────────────
 
-/// Sans-I/O DWC2 USB device controller state machine.
+/// DWC2 USB device controller state machine.
 ///
-/// All register access goes through the [`RegisterBank`] trait.
-/// The controller never performs I/O directly; instead it returns
-/// [`Dwc2Action`] values for the caller to execute, and accepts
-/// [`Dwc2Event`] values back from hardware.
+/// All register access goes through the [`RegisterBank`] trait, which
+/// the caller provides. The controller performs I/O via the bank and
+/// also returns [`Dwc2Action`] values describing what was written,
+/// for the caller's bookkeeping and logging.
 pub struct Dwc2Controller {
     state: UsbDeviceState,
     speed: DeviceSpeed,
@@ -268,6 +268,7 @@ impl Dwc2Controller {
         let bm_request_type = setup[0];
         let b_request = setup[1];
         let w_value = u16::from_le_bytes([setup[2], setup[3]]);
+        let w_index = u16::from_le_bytes([setup[4], setup[5]]);
         let w_length = u16::from_le_bytes([setup[6], setup[7]]);
 
         // Type field is bits [6:5] of bmRequestType
@@ -276,7 +277,7 @@ impl Dwc2Controller {
         match req_type {
             0 => {
                 // Standard request
-                self.handle_standard_setup(b_request, w_value, w_length, bank)
+                self.handle_standard_setup(b_request, w_value, w_index, w_length, bank)
             }
             1 => {
                 // Class request — forward to gadget
@@ -295,10 +296,17 @@ impl Dwc2Controller {
         &mut self,
         b_request: u8,
         w_value: u16,
+        w_index: u16,
         w_length: u16,
         bank: &mut impl RegisterBank,
     ) -> Result<Vec<GadgetEvent>, Dwc2Error> {
         match b_request {
+            // GET_STATUS (0x00) — mandatory per USB 2.0 §9.4.5.
+            // Return 2-byte status: bus-powered, no remote wakeup.
+            0x00 => {
+                Self::write_ep0_in(bank, &[0x00, 0x00]);
+                Ok(Vec::new())
+            }
             // SET_ADDRESS — defer DCFG write until status-stage ZLP is ACKed
             // (USB 2.0 §9.4.6: device must not change address until status stage completes).
             0x05 => {
@@ -356,9 +364,38 @@ impl Dwc2Controller {
                     Ok(alloc::vec![GadgetEvent::Reset])
                 }
             }
-            // SET_INTERFACE
+            // GET_CONFIGURATION (0x08) — return current bConfigurationValue.
+            0x08 => {
+                let val = if self.state == UsbDeviceState::Configured {
+                    1u8
+                } else {
+                    0u8
+                };
+                Self::write_ep0_in(bank, &[val]);
+                Ok(Vec::new())
+            }
+            // GET_INTERFACE (0x0A) — return current alternate setting.
+            0x0A => {
+                // Interface 1 (data): alt 1 when endpoints are active, else alt 0.
+                let alt = if self.state == UsbDeviceState::Configured {
+                    1u8
+                } else {
+                    0u8
+                };
+                Self::write_ep0_in(bank, &[alt]);
+                Ok(Vec::new())
+            }
+            // SET_INTERFACE (0x0B) — enable/disable data endpoints per alternate setting.
             0x0B => {
-                // Accept and acknowledge
+                let iface = (w_index & 0xFF) as u8;
+                let alt = (w_value & 0xFF) as u8;
+                if iface == 1 {
+                    if alt == 1 {
+                        Self::enable_data_endpoints(bank);
+                    } else {
+                        Self::disable_data_endpoints(bank);
+                    }
+                }
                 Self::write_ep0_in(bank, &[]);
                 Ok(Vec::new())
             }
@@ -1144,12 +1181,11 @@ mod tests {
         // 10. queue_tx_frame — send a frame back to host.
         let tx_frame = alloc::vec![0xFF; 100];
         assert!(gadget.queue_tx_frame(&tx_frame));
-        let pending = gadget.drain_pending_requests();
-        assert_eq!(pending.len(), 1);
+        let pending = gadget
+            .drain_pending_requests()
+            .expect("should have one pending request");
         bank.on_read(diepctl(1), alloc::vec![0]);
-        let actions = ctrl
-            .submit_request(pending.into_iter().next().unwrap(), &mut bank)
-            .unwrap();
+        let actions = ctrl.submit_request(pending, &mut bank).unwrap();
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             Dwc2Action::WriteTxFifo { ep, data } => {

@@ -17,7 +17,15 @@ pub const GRXSTSP: usize = 0x020;
 pub const GRXFSIZ: usize = 0x024;
 pub const GNPTXFSIZ: usize = 0x028;
 
+/// Device IN Endpoint TX FIFO Size Register for EP `n` (1-based, n >= 1).
+/// EP0's TX FIFO is configured via GNPTXFSIZ, not this register.
+///
+/// # Panics
+///
+/// Panics in debug mode if `n == 0` (no DIEPTXF0 register exists).
 pub const fn dieptxf(n: u8) -> usize {
+    // Safety: n=0 would underflow. EP0 uses GNPTXFSIZ instead.
+    assert!(n >= 1, "dieptxf(0) is invalid — use GNPTXFSIZ for EP0");
     0x104 + (n as usize - 1) * 4
 }
 

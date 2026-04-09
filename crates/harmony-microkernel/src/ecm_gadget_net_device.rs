@@ -7,8 +7,6 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
-
 use harmony_unikernel::drivers::dwc2::types::GadgetRequest;
 use harmony_unikernel::drivers::ecm_gadget::EcmGadget;
 
@@ -34,12 +32,11 @@ impl EcmGadgetNetDevice {
         &mut self.gadget
     }
 
-    /// Drain pending USB requests from `push_rx` calls.
+    /// Take the next pending USB request from `push_rx` calls.
     ///
-    /// After calling [`NetworkDevice::push_rx`], the ECM gadget buffers
-    /// [`GadgetRequest::BulkIn`] requests internally.  Call this method to
-    /// retrieve them for submission to the DWC2 controller.
-    pub fn drain_requests(&mut self) -> Vec<GadgetRequest> {
+    /// Returns one request at a time for single-transfer-per-endpoint
+    /// flow control on the bulk IN path.
+    pub fn drain_request(&mut self) -> Option<GadgetRequest> {
         self.gadget.drain_pending_requests()
     }
 }
@@ -107,9 +104,10 @@ mod tests {
         let frame = [0xAA; 64];
         assert!(dev.push_rx(&frame));
 
-        let requests = dev.drain_requests();
-        assert_eq!(requests.len(), 1);
-        assert!(matches!(requests[0], GadgetRequest::BulkIn { ep: 1, .. }));
+        let req = dev
+            .drain_request()
+            .expect("should have one pending request");
+        assert!(matches!(req, GadgetRequest::BulkIn { ep: 1, .. }));
     }
 
     #[test]
