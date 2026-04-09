@@ -191,10 +191,16 @@ impl EcmGadget {
     /// flow control on the bulk IN path.
     pub fn drain_pending_requests(&mut self) -> Option<GadgetRequest> {
         if self.pending_requests.is_empty() {
-            None
-        } else {
-            Some(self.pending_requests.remove(0))
+            return None;
         }
+        let req = self.pending_requests.remove(0);
+        // Track in-flight state for the endpoint being used.
+        match &req {
+            GadgetRequest::InterruptIn { .. } => self.intr_in_flight = true,
+            GadgetRequest::BulkIn { .. } => self.tx_in_flight = true,
+            _ => {}
+        }
+        Some(req)
     }
 
     /// Return the gadget MAC address.

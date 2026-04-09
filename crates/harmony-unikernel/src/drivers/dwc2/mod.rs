@@ -376,8 +376,10 @@ impl Dwc2Controller {
             }
             // GET_INTERFACE (0x0A) — return current alternate setting.
             0x0A => {
-                // Interface 1 (data): alt 1 when endpoints are active, else alt 0.
-                let alt = if self.state == UsbDeviceState::Configured {
+                let iface = (w_index & 0xFF) as u8;
+                // Interface 0 (control) always has alt 0.
+                // Interface 1 (data) reports alt 1 when configured, alt 0 otherwise.
+                let alt = if iface == 1 && self.state == UsbDeviceState::Configured {
                     1u8
                 } else {
                     0u8
@@ -593,9 +595,11 @@ impl Dwc2Controller {
             _ => 512,
         };
         let mut pkt_cnt = if len == 0 { 1 } else { len.div_ceil(mps) };
-        // USB 2.0: if transfer length is an exact multiple of MPS, append a ZLP
-        // so the host can detect end-of-transfer. DWC2 does not do this automatically.
-        if len > 0 && len % mps == 0 {
+        // Only bulk endpoints require a ZLP when the payload is an exact multiple
+        // of MPS to signal end-of-transfer. Interrupt and control endpoints send
+        // a fixed-size response per polling interval — no ZLP needed.
+        let is_bulk = ep != 0 && ep != 3;
+        if is_bulk && len > 0 && len % mps == 0 {
             pkt_cnt += 1;
         }
         let dieptsiz_val = (pkt_cnt << 19) | len;
