@@ -110,10 +110,14 @@ impl EcmGadget {
             }
 
             GadgetEvent::Suspended => {
-                vec![GadgetRequest::InterruptIn {
-                    ep: EP_INTERRUPT_IN,
-                    data: Self::build_network_connection(false),
-                }]
+                if self.configured {
+                    vec![GadgetRequest::InterruptIn {
+                        ep: EP_INTERRUPT_IN,
+                        data: Self::build_network_connection(false),
+                    }]
+                } else {
+                    vec![]
+                }
             }
 
             GadgetEvent::Resumed => {
@@ -447,6 +451,13 @@ mod tests {
     fn resumed_while_not_configured_no_notification() {
         let mut g = make_gadget();
         let reqs = g.handle_event(GadgetEvent::Resumed);
+        assert!(reqs.is_empty());
+    }
+
+    #[test]
+    fn suspended_while_not_configured_no_notification() {
+        let mut g = make_gadget();
+        let reqs = g.handle_event(GadgetEvent::Suspended);
         assert!(reqs.is_empty());
     }
 

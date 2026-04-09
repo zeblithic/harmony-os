@@ -383,7 +383,8 @@ impl Dwc2Controller {
 
         // EP2 OUT bulk, MPS=512
         // DWC2 requires transfer size programmed BEFORE endpoint enable.
-        let doeptsiz2: u32 = (1 << 19) | 512; // pktcnt=1, xfersize=512
+        // Arm for a full Ethernet frame: 1514 bytes = 3 USB packets (512+512+490).
+        let doeptsiz2: u32 = (3 << 19) | 1514; // pktcnt=3, xfersize=1514
         bank.write(doeptsiz(2), doeptsiz2);
         let ep2_out = 512u32 | EPCTL_USBAEP | epctl_eptype(EPTYPE_BULK) | EPCTL_EPENA | EPCTL_CNAK;
         bank.write(doepctl(2), ep2_out);
@@ -462,8 +463,8 @@ impl Dwc2Controller {
                 Ok(alloc::vec![GadgetEvent::BulkOut { ep, data: raw }])
             }
             PKTSTS_OUT_COMPLETE if ep > 0 => {
-                // Re-arm the OUT endpoint
-                let doeptsiz_val: u32 = (1 << 19) | 512; // pktcnt=1, xfersize=512
+                // Re-arm the OUT endpoint for a full Ethernet frame.
+                let doeptsiz_val: u32 = (3 << 19) | 1514; // pktcnt=3, xfersize=1514
                 bank.write(doeptsiz(ep), doeptsiz_val);
                 bank.write(
                     doepctl(ep),
