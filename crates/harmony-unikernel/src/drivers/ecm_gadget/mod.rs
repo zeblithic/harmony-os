@@ -84,12 +84,16 @@ impl EcmGadget {
                 vec![]
             }
 
-            GadgetEvent::Configured => {
+            GadgetEvent::Configured { speed } => {
                 self.configured = true;
+                let bps = match speed {
+                    crate::drivers::dwc2::DeviceSpeed::HighSpeed => 480_000_000u32,
+                    crate::drivers::dwc2::DeviceSpeed::FullSpeed => 12_000_000u32,
+                };
                 // Queue SPEED_CHANGE for deferred delivery after the first completes.
                 self.pending_requests.push_back(GadgetRequest::InterruptIn {
                     ep: EP_INTERRUPT_IN,
-                    data: Self::build_speed_change(480_000_000, 480_000_000),
+                    data: Self::build_speed_change(bps, bps),
                 });
                 if self.intr_in_flight {
                     // EP3 busy — queue NETWORK_CONNECTION too; both drain later.
@@ -298,7 +302,9 @@ mod tests {
     /// Create a configured gadget with all pending notifications drained.
     fn make_configured_gadget() -> EcmGadget {
         let mut g = make_gadget();
-        g.handle_event(GadgetEvent::Configured);
+        g.handle_event(GadgetEvent::Configured {
+            speed: crate::drivers::dwc2::DeviceSpeed::HighSpeed,
+        });
         // Simulate EP3 completion to release intr_in_flight.
         g.handle_event(GadgetEvent::InTransferComplete { ep: 3 });
         // Drain the queued SPEED_CHANGE notification.
@@ -326,7 +332,9 @@ mod tests {
     #[test]
     fn reset_clears_state() {
         let mut g = make_gadget();
-        g.handle_event(GadgetEvent::Configured);
+        g.handle_event(GadgetEvent::Configured {
+            speed: crate::drivers::dwc2::DeviceSpeed::HighSpeed,
+        });
         // Push a frame so the rx_queue is non-empty.
         g.handle_event(GadgetEvent::BulkOut {
             ep: 2,
@@ -346,7 +354,9 @@ mod tests {
     #[test]
     fn configured_sends_network_connection() {
         let mut g = make_gadget();
-        let reqs = g.handle_event(GadgetEvent::Configured);
+        let reqs = g.handle_event(GadgetEvent::Configured {
+            speed: crate::drivers::dwc2::DeviceSpeed::HighSpeed,
+        });
         assert!(g.configured);
         assert!(g.link_up());
 
@@ -473,7 +483,9 @@ mod tests {
     #[test]
     fn oversized_frame_rejected() {
         let mut g = make_gadget();
-        g.handle_event(GadgetEvent::Configured);
+        g.handle_event(GadgetEvent::Configured {
+            speed: crate::drivers::dwc2::DeviceSpeed::HighSpeed,
+        });
         let big = vec![0u8; MAX_FRAME_SIZE + 1];
         assert!(!g.queue_tx_frame(&big));
     }
@@ -481,7 +493,9 @@ mod tests {
     #[test]
     fn empty_frame_rejected() {
         let mut g = make_gadget();
-        g.handle_event(GadgetEvent::Configured);
+        g.handle_event(GadgetEvent::Configured {
+            speed: crate::drivers::dwc2::DeviceSpeed::HighSpeed,
+        });
         assert!(!g.queue_tx_frame(&[]));
     }
 

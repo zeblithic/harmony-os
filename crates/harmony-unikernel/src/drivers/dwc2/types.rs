@@ -59,7 +59,9 @@ pub enum Dwc2Action {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GadgetEvent {
     Reset,
-    Configured,
+    Configured {
+        speed: DeviceSpeed,
+    },
     SetupClassRequest {
         setup: [u8; 8],
     },
@@ -150,7 +152,9 @@ mod tests {
     #[test]
     fn gadget_event_variants_constructible() {
         let _reset = GadgetEvent::Reset;
-        let _configured = GadgetEvent::Configured;
+        let _configured = GadgetEvent::Configured {
+            speed: DeviceSpeed::HighSpeed,
+        };
         let _setup = GadgetEvent::SetupClassRequest { setup: [0u8; 8] };
         let _get_desc = GadgetEvent::GetDescriptor {
             desc_type: 1,

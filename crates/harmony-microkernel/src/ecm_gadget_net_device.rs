@@ -76,7 +76,9 @@ mod tests {
     /// Create a configured `EcmGadgetNetDevice` (link is up).
     fn make_configured_device() -> EcmGadgetNetDevice {
         let mut dev = make_gadget_net_device();
-        dev.gadget_mut().handle_event(GadgetEvent::Configured);
+        dev.gadget_mut().handle_event(GadgetEvent::Configured {
+            speed: harmony_unikernel::drivers::dwc2::DeviceSpeed::HighSpeed,
+        });
         // Drain queued SPEED_CHANGE notification and clear in-flight flags.
         dev.gadget_mut()
             .handle_event(GadgetEvent::InTransferComplete { ep: 3 });

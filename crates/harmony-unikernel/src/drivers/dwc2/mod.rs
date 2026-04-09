@@ -385,7 +385,7 @@ impl Dwc2Controller {
                     Self::enable_data_endpoints(bank);
                     // Send ZLP status
                     Self::write_ep0_in(bank, &[]);
-                    Ok(alloc::vec![GadgetEvent::Configured])
+                    Ok(alloc::vec![GadgetEvent::Configured { speed: self.speed }])
                 } else {
                     // Deconfigure: disable data endpoints, return to Address.
                     self.state = UsbDeviceState::Address;
@@ -425,7 +425,7 @@ impl Dwc2Controller {
                 let events = if iface == 1 {
                     if alt == 1 {
                         Self::enable_data_endpoints(bank);
-                        alloc::vec![GadgetEvent::Configured]
+                        alloc::vec![GadgetEvent::Configured { speed: self.speed }]
                     } else {
                         Self::disable_data_endpoints(bank);
                         alloc::vec![GadgetEvent::Reset]
@@ -1183,8 +1183,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ctrl.state(), UsbDeviceState::Configured);
-        assert!(events.contains(&GadgetEvent::Configured));
-        let reqs = gadget.handle_event(GadgetEvent::Configured);
+        assert!(events.contains(&GadgetEvent::Configured {
+            speed: DeviceSpeed::HighSpeed
+        }));
+        let reqs = gadget.handle_event(GadgetEvent::Configured {
+            speed: DeviceSpeed::HighSpeed,
+        });
         assert_eq!(reqs.len(), 1); // NETWORK_CONNECTION only (SPEED_CHANGE queued)
 
         // 7b. Simulate EP3 transfer complete to release intr_in_flight,
