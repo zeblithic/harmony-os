@@ -136,7 +136,11 @@ impl EcmGadget {
             }
 
             GadgetEvent::Resumed => {
-                if self.configured && !self.intr_in_flight {
+                // Clear intr_in_flight unconditionally: any in-flight notification
+                // from Suspended cannot have completed (host wasn't polling during
+                // suspend), so it's stale. The connect notification supersedes it.
+                self.intr_in_flight = false;
+                if self.configured {
                     self.intr_in_flight = true;
                     vec![GadgetRequest::InterruptIn {
                         ep: EP_INTERRUPT_IN,
@@ -521,6 +525,32 @@ mod tests {
         let mut g = make_gadget();
         let reqs = g.handle_event(GadgetEvent::Suspended);
         assert!(reqs.is_empty());
+    }
+
+    #[test]
+    fn suspend_then_resume_sends_both_notifications() {
+        let mut g = make_configured_gadget();
+
+        // Suspend — sends disconnect.
+        let reqs = g.handle_event(GadgetEvent::Suspended);
+        assert_eq!(reqs.len(), 1);
+        if let GadgetRequest::InterruptIn { ep, data } = &reqs[0] {
+            assert_eq!(*ep, EP_INTERRUPT_IN);
+            assert_eq!(data[2], 0x00, "must be disconnected");
+        } else {
+            panic!("expected InterruptIn");
+        }
+        assert!(g.intr_in_flight);
+
+        // Resume — clears stale in-flight, sends connect.
+        // (The disconnect couldn't have completed — host wasn't polling.)
+        let reqs = g.handle_event(GadgetEvent::Resumed);
+        assert_eq!(reqs.len(), 1);
+        if let GadgetRequest::InterruptIn { data, .. } = &reqs[0] {
+            assert_eq!(data[2], 0x01, "must be connected");
+        } else {
+            panic!("expected InterruptIn");
+        }
     }
 
     // ── GetDescriptor ────────────────────────────────────────────────────────
