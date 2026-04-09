@@ -281,7 +281,29 @@ impl Dwc2Controller {
             0x06 => {
                 let desc_type = (w_value >> 8) as u8;
                 let desc_index = (w_value & 0xFF) as u8;
-                Ok(alloc::vec![GadgetEvent::GetDescriptor { desc_type, desc_index, max_len: w_length }])
+                let max_len = w_length;
+
+                // Serve pre-registered descriptors directly.
+                // Only emit GadgetEvent::GetDescriptor for unknown types.
+                let found: Option<Vec<u8>> = match desc_type {
+                    1 => self.device_desc.clone(),
+                    2 => self.config_desc.clone(),
+                    3 => self.string_descs.get(desc_index as usize).cloned(),
+                    _ => None,
+                };
+
+                if let Some(mut d) = found {
+                    d.truncate(max_len as usize);
+                    Self::write_ep0_in(bank, &d);
+                    Ok(Vec::new())
+                } else {
+                    // Descriptor not found — ask gadget.
+                    Ok(alloc::vec![GadgetEvent::GetDescriptor {
+                        desc_type,
+                        desc_index,
+                        max_len,
+                    }])
+                }
             }
             // SET_CONFIGURATION
             0x09 => {
@@ -490,37 +512,6 @@ impl Dwc2Controller {
         }
     }
 
-    /// Handle a pre-registered descriptor GET_DESCRIPTOR request internally.
-    ///
-    /// This is called by the class driver after receiving a `GadgetEvent::GetDescriptor`
-    /// to let the controller serve descriptors from its internal cache.
-    pub fn serve_descriptor(
-        &mut self,
-        desc_type: u8,
-        desc_index: u8,
-        max_len: u16,
-        bank: &mut impl RegisterBank,
-    ) -> Result<Vec<Dwc2Action>, Dwc2Error> {
-        let data = match desc_type {
-            1 => self.device_desc.clone(),
-            2 => self.config_desc.clone(),
-            3 => self.string_descs.get(desc_index as usize).cloned(),
-            _ => None,
-        };
-
-        if let Some(mut desc) = data {
-            if desc.len() > max_len as usize {
-                desc.truncate(max_len as usize);
-            }
-            Self::write_ep0_in(bank, &desc);
-            Ok(alloc::vec![Dwc2Action::WriteTxFifo { ep: 0, data: desc }])
-        } else {
-            // Stall EP0 if descriptor not found
-            bank.write(diepctl(0), bank.read(diepctl(0)) | EPCTL_STALL);
-            bank.write(doepctl(0), bank.read(doepctl(0)) | EPCTL_STALL);
-            Ok(alloc::vec![Dwc2Action::Stall { ep: 0 }])
-        }
-    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -719,39 +710,29 @@ mod tests {
     fn get_descriptor_serves_device_desc() {
         let (mut ctrl, mut bank) = init_controller();
 
-        // Pre-register a fake device descriptor (18 bytes typical)
+        // Pre-register a fake device descriptor (18 bytes).
         let fake_desc: Vec<u8> = (0u8..18).collect();
         ctrl.set_descriptors(fake_desc.clone(), alloc::vec![], alloc::vec![]);
 
-        // GET_DESCRIPTOR: bRequest=0x06, wValue=0x0100 (device desc, index 0), wLength=18
-        let setup: [u8; 8] = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 18, 0];
-
+        // GET_DESCRIPTOR(Device, index=0, wLength=18)
+        let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 18, 0x00];
         let events = ctrl
             .handle_event(Dwc2Event::SetupReceived { data: setup }, &mut bank)
-            .expect("handle_event failed");
+            .expect("setup must succeed");
 
-        // Should produce GetDescriptor event
-        let get_desc = events.iter().find(|e| matches!(e, GadgetEvent::GetDescriptor { desc_type: 1, .. }));
-        assert!(get_desc.is_some(), "should produce GetDescriptor event for device descriptor");
+        // Descriptor served internally — no gadget events.
+        assert!(events.is_empty());
 
-        // Now serve the descriptor
-        bank.on_read(diepctl(0), alloc::vec![0u32]);
-        let actions = ctrl
-            .serve_descriptor(1, 0, 18, &mut bank)
-            .expect("serve_descriptor failed");
-
-        // Verify a WriteTxFifo action was returned with the descriptor data
-        let fifo_action = actions.iter().find(|a| matches!(a, Dwc2Action::WriteTxFifo { ep: 0, .. }));
-        assert!(fifo_action.is_some(), "should return WriteTxFifo action");
-        if let Some(Dwc2Action::WriteTxFifo { data, .. }) = fifo_action {
-            assert_eq!(data, &fake_desc, "descriptor data should match registered device desc");
-        }
-
-        // Verify data was written to EP0 FIFO
-        let fifo_writes: Vec<_> = bank.writes.iter()
+        // Verify data was written to EP0 IN FIFO.
+        let fifo_writes: Vec<_> = bank
+            .writes
+            .iter()
             .filter(|(off, _)| *off == ep_fifo(0))
             .collect();
-        assert!(!fifo_writes.is_empty(), "data should be written to EP0 TX FIFO");
+        assert!(
+            !fifo_writes.is_empty(),
+            "Device descriptor must be written to EP0 FIFO"
+        );
     }
 
     #[test]
