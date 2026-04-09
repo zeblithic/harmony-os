@@ -595,14 +595,9 @@ impl Dwc2Controller {
 
     fn write_ep0_in(bank: &mut impl RegisterBank, data: &[u8]) {
         let len = data.len() as u32;
-        let mps: u32 = 64;
-        // pktcnt = ceil(len / 64), minimum 1 (for ZLP).
-        // Append ZLP when len is an exact multiple of MPS so the host
-        // can detect end-of-transfer on control IN pipes.
-        let mut pkt_cnt = if len == 0 { 1 } else { len.div_ceil(mps) };
-        if len > 0 && len % mps == 0 {
-            pkt_cnt += 1;
-        }
+        // EP0 MPS = 64. No ZLP needed — control IN transfers have an explicit
+        // wLength so the host knows the expected byte count.
+        let pkt_cnt = if len == 0 { 1 } else { len.div_ceil(64) };
         let dieptsiz0 = (pkt_cnt << 19) | len;
         bank.write(dieptsiz(0), dieptsiz0);
         // Enable EP0 and clear NAK
