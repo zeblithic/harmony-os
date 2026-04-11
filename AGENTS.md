@@ -47,27 +47,41 @@ Use the Linear MCP plugin tools (e.g., `list_issues`, `save_issue`, `get_issue`,
 - Do NOT create markdown TODO lists for project tracking
 - Do NOT use bd/beads (legacy system, now read-only)
 
+## Code Changes MUST Go Through Pull Requests
+
+**NEVER push code changes directly to main.** All implementation work goes through feature branches and pull requests with code review.
+
+**MANDATORY WORKFLOW for code changes:**
+
+1. **Create a feature branch** before starting work (e.g., `feat/mail-v1-smtp`)
+2. **Commit to the branch** — not to main
+3. **Push the branch** and create a PR against main
+4. **Code review** — PRs are reviewed by automated code review agents. Use the `/review-pr` skill or `pr-review-toolkit` plugin. Do NOT merge without review.
+5. **Merge after review passes**
+
+The ONLY exception is trivial documentation/guidance updates (like CLAUDE.md or AGENTS.md edits) — those may go directly to main if the user explicitly approves.
+
 ## Landing the Plane (Session Completion)
 
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until your branch is pushed and a PR is created.
 
 **MANDATORY WORKFLOW:**
 
 1. **File issues for remaining work** - Create issues in Linear for anything that needs follow-up
 2. **Run quality gates** (if code changed) - Tests, linters, builds
 3. **Update issue status** - Update Linear issues (close finished work, update in-progress items)
-4. **PUSH TO REMOTE** - This is MANDATORY:
+4. **PUSH BRANCH TO REMOTE AND CREATE PR** - This is MANDATORY:
    ```bash
-   git pull --rebase
-   git push
-   git status  # MUST show "up to date with origin"
+   git push -u origin <your-branch>
+   gh pr create --title "..." --body "..."
    ```
 5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
+6. **Verify** - All changes committed, pushed, and PR created
 7. **Hand off** - Provide context for next session
 
 **CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
+- NEVER push directly to main — always use feature branches + PRs
+- Work is NOT complete until your branch is pushed and a PR exists
 - NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
+- NEVER say "ready to push when you are" - YOU must push the branch
 - If push fails, resolve and retry until it succeeds
